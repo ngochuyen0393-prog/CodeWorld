@@ -2,12 +2,23 @@
 //!
 //! 框架所有配额参数集中在此。MVP阶段是静态常量配置，
 //! 用 struct + impl 常量函数定义（参考架构文档 3.3 节）。
+//!
+//! 设计原则：框架不提供任何游戏资源（无金币/点卡/能量），只提供基础设施。
+//! 以下约束都是【技术保护】（防死循环/防内存爆炸/防DoS）或【物理限制】
+//! （payload 大小/渲染频率），玩家不应感知，不影响游戏内数值。
+//! probe/attack 不扣手续费，占用的是 on_tick 的执行时间。
 
 use serde::{Deserialize, Serialize};
 
 /// 框架接口约束与配额参数
 ///
 /// 所有数值来自架构文档 3.3 节，MVP阶段为静态常量。
+///
+/// 这些参数全部是技术保护或物理限制，不是游戏资源：
+/// - 技术保护：防死循环、防内存爆炸、防DoS（玩家不应感知）
+/// - 物理限制：payload 大小、渲染频率等（防服务器资源耗尽）
+///
+/// 框架不收任何"手续费"，probe/attack 只占用 on_tick 的执行时间。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Constraints {
     // === spawn 配额 ===
@@ -22,22 +33,20 @@ pub struct Constraints {
     /// 每tick每实体超时（100ms）
     pub tick_callback_timeout_ms: u64,
 
-    // === probe ===
-    /// probe消耗指令数（10万条）
-    pub probe_instruction_cost: u64,
-    /// 被探测方on_probe预算（严格小于cost的1/10）
+    // === probe（技术保护：防死循环+防DoS，不是游戏消耗） ===
+    // probe 不扣手续费，占用的是 on_tick 的执行时间（见 3.3 节）
+    /// 被探测方 on_probe 预算（防被探测方死循环）
     pub probe_target_instruction_limit: u64,
     /// probe超时（50ms）
     pub probe_timeout_ms: u64,
     /// probe最大调用深度（防跨沙箱死锁）
     pub probe_max_call_depth: u32,
 
-    // === attack ===
-    /// attack消耗指令数（50万条）
-    pub attack_instruction_cost: u64,
-    /// attack payload最大字节数（64KB）
+    // === attack（技术保护：防死循环+防内存爆炸，不是游戏消耗） ===
+    // attack 不扣手续费，占用的是 on_tick 的执行时间（见 3.3 节）
+    /// attack payload最大字节数（64KB，防内存爆炸）
     pub attack_payload_max_size: u64,
-    /// 被攻击方on_attack预算
+    /// 被攻击方 on_attack 预算（防被攻击方死循环）
     pub attack_target_instruction_limit: u64,
     /// attack超时（200ms）
     pub attack_timeout_ms: u64,
@@ -88,14 +97,12 @@ impl Constraints {
             tick_callback_instruction_limit: 1_000_000,
             tick_callback_timeout_ms: 100,
 
-            // probe
-            probe_instruction_cost: 100_000,
+            // probe（不扣手续费，占用 on_tick 执行时间）
             probe_target_instruction_limit: 10_000,
             probe_timeout_ms: 50,
             probe_max_call_depth: 3,
 
-            // attack
-            attack_instruction_cost: 500_000,
+            // attack（不扣手续费，占用 on_tick 执行时间）
             attack_payload_max_size: 64 * 1024,
             attack_target_instruction_limit: 200_000,
             attack_timeout_ms: 200,
@@ -134,11 +141,11 @@ mod tests {
         assert_eq!(c.spawn_total_per_player, 100);
         assert_eq!(c.tick_callback_instruction_limit, 1_000_000);
         assert_eq!(c.tick_callback_timeout_ms, 100);
-        assert_eq!(c.probe_instruction_cost, 100_000);
+        // probe/attack 不再扣手续费（3.3 节：框架不提供游戏资源），
+        // 故此处不再断言 probe_instruction_cost / attack_instruction_cost。
         assert_eq!(c.probe_target_instruction_limit, 10_000);
         assert_eq!(c.probe_timeout_ms, 50);
         assert_eq!(c.probe_max_call_depth, 3);
-        assert_eq!(c.attack_instruction_cost, 500_000);
         assert_eq!(c.attack_payload_max_size, 64 * 1024);
         assert_eq!(c.attack_target_instruction_limit, 200_000);
         assert_eq!(c.attack_timeout_ms, 200);
@@ -156,21 +163,24 @@ mod tests {
     }
 
     #[test]
-    fn probe_target_budget_is_at_most_tenth_of_cost() {
-        // 边界：被探测方 on_probe 预算应不大于 probe 指令消耗的 1/10
-        // （架构文档 4.3 节安全性约束：防被探测方反耗攻击者）
+    fn constraints_has_no_game_resource_cost_fields() {
+        // 设计原则（架构文档 3.3 节）：框架不提供任何游戏资源（无金币/点卡/能量），
+        // 只提供基础设施。probe/attack 不扣手续费，占用的是 on_tick 的执行时间。
+        // 因此 Constraints 不应再包含任何 *_instruction_cost 字段（那是"手续费"概念）。
         //
-        // ⚠️ 文档不一致：3.3 节定 probe_target_instruction_limit=10_000、
-        //    probe_instruction_cost=100_000，恰为 1/10（相等而非"严格小于"）；
-        //    4.3 节文字要求"严格小于 1/10"。任务规定按 3.3 节数值为准，
-        //    故此处断言 <=（相等成立），并在报告中标注该文档矛盾待澄清。
+        // 通过 serde 序列化后的 JSON key 来断言"手续费"概念已彻底移除--
+        // 若字段仍存在于结构体，序列化结果必然包含对应 key。
         let c = Constraints::default();
+        let json = serde_json::to_string(&c).expect("Constraints 序列化失败");
         assert!(
-            c.probe_target_instruction_limit * 10 <= c.probe_instruction_cost,
-            "on_probe 预算 * 10 应 <= probe 消耗，实际 {} * 10 = {} > {}",
-            c.probe_target_instruction_limit,
-            c.probe_target_instruction_limit * 10,
-            c.probe_instruction_cost
+            !json.contains("probe_instruction_cost"),
+            "Constraints 不应再包含 probe_instruction_cost（probe 不扣手续费，见 3.3 节），实际 JSON: {}",
+            json
+        );
+        assert!(
+            !json.contains("attack_instruction_cost"),
+            "Constraints 不应再包含 attack_instruction_cost（attack 不扣手续费，见 3.3 节），实际 JSON: {}",
+            json
         );
     }
 
