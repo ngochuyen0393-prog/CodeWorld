@@ -183,6 +183,21 @@ struct RenderRequest {
     action_state: ActionState,  // 当前动作（影响外观帧）
     priority: i32,              // 同图层同Y值时的微调优先级（默认0）
 }
+
+/// 视口内可见实体（感知接口返回）
+/// 只包含"眼睛能看到"的信息，不包含代码层面信息
+struct VisibleEntity {
+    id: EntityId,
+    pos: (f64, f64),            // 坐标（可见所以可知）
+    appearance: Appearance,     // 外观（可见所以可知）
+}
+
+/// 攻击结果
+struct AttackResult {
+    hit: bool,                  // 是否命中（坐标上有实体）
+    intercepted: bool,          // 是否被on_attack拦截
+    success: bool,              // 是否击杀成功（life()被覆写为false）
+}
 ```
 
 ### 2.3 生存点数（框架管理的唯一硬数值）
@@ -386,11 +401,20 @@ import fn get_history_snapshot(target_tick: u64) -> SnapshotHandle;
                                                 // v2: 支持状态替换（真正回溯）
 
 // === 空间接口 ===
-import fn get_pos(entity: EntityId) -> (f64, f64);
-import fn set_pos(entity: EntityId, x: f64, y: f64) -> void;
-                                                // 经过Space Engine变换管线
+import fn get_pos() -> (f64, f64);
+// 读取自己的坐标。不能读其他实体的坐标。
+import fn set_pos(x: f64, y: f64) -> void;
+// 设置自己的坐标。经过物理规则校验（碰撞挤压等）和Space Engine变换管线。
 import fn register_transform(fn: FnHandle, scope: TransformScope, priority: i32) -> TransformId;
 import fn remove_transform(id: TransformId) -> void;
+
+// === 感知接口 ===
+import fn get_visible_entities() -> Vec<VisibleEntity>;
+// 获取当前视口内可见的实体列表（渲染模块已在画的那些）。
+// 不暴露屏幕外实体的任何信息。
+// VisibleEntity { id: EntityId, pos: (f64, f64), appearance: Appearance }
+// 这是"眼睛"--你能看到远处有个人，但不知道他在想什么。
+// 要看代码层面的信息需要probe。
 
 // === 渲染接口 ===
 import fn render(request: RenderRequest) -> void;
@@ -409,22 +433,30 @@ import fn spawn(code: Bytes) -> EntityId;
 // 注入新实体。受配额限制。
 import fn destroy(entity: EntityId) -> void;
 // 销毁实体。只能destroy自己spawn的或通过attack击杀的。
-import fn get_entities_in_range(x: f64, y: f64, radius: f64) -> Vec<EntityId>;
-// 查询附近实体
 
 // === 沙箱通道 ===
+// 通道开启条件：
+// - 视距内：通过get_visible_entities()发现目标 -> probe/attack_at
+// - 接触式：物理碰撞触发 -> 框架自动为双方开启通道 -> 双方获得对方EntityId和坐标
+// - 超视距：玩家自行定位坐标 -> attack_at(推测坐标) -> 可能miss
+
 import fn probe(target: EntityId, request: Bytes) -> ProbeResult;
-// 探测目标。返回 {
+// 探测目标。需要先通过感知或接触获得EntityId。
+// 返回 {
 //   response: Bytes,           // 目标on_probe返回的数据（可造假）
 //   meta: ProbeMeta,           // 被动观测（不可伪造）
 // }
 // ProbeMeta包含: gas_consumed, mem_read_count, mem_write_count, api_calls
 
-import fn attack(target: EntityId, payload: Bytes) -> AttackResult;
-// 攻击目标。payload注入目标沙箱。
-// 只能覆写目标的export函数（如life），不能改import（系统API）。
-// 返回 { intercepted: bool, success: bool }
-// success=true表示life()已被覆写为false（击杀成功）
+import fn attack_at(pos: (f64, f64), payload: Bytes) -> AttackResult;
+// 攻击指定坐标。不是攻击EntityId，是攻击一个位置。
+// 框架检查该坐标上有没有实体：
+// - 有 -> 命中，执行attack流程（销毁旧实例+用payload重建）
+// - 没有 -> 空打，攻击落空（可能miss）
+// payload是完整的WASM模块，替换目标的整个代码。
+// 返回 { hit: bool, intercepted: bool, success: bool }
+// hit=false表示坐标上没有实体（miss）
+// success=true表示击杀成功（life()被覆写为false）
 
 import fn compute(task: ComputeTask) -> ComputeResult;
 // 提交计算任务给外接算力
@@ -571,7 +603,11 @@ struct Constraints {
       - 执行默认物理规则（重力/碰撞/地面约束）
         * 重力：对每个实体 y -= gravity * dt
         * 地面约束：if y < ground_y then y = ground_y
-        * 碰撞：检测坐标重叠，按默认规则分离
+        * 碰撞：检测坐标重叠，产生挤压（一方被挤走）
+          坐标不能有多个实体，挤压由物理规则强制执行
+      - 接触/挤压触发：框架自动为碰撞双方开启沙箱通道
+        * 双方获得对方的EntityId和坐标
+        * 是否probe/attack由玩家代码决定，框架只负责开通道
       - 执行覆盖规则（按priority排序，高优先级先执行）
         * 每条覆盖规则跑在WASM沙箱里
         * 超时/崩溃 -> 该规则本tick不生效，其他规则不受影响
@@ -628,32 +664,45 @@ struct Constraints {
 ### 4.2 攻击流程
 
 ```
-玩家A调用 attack(B, payload):
+攻击前置条件：攻击方必须知道目标坐标
+- 视距内：get_visible_entities()看到目标 -> 获得坐标
+- 接触式：物理碰撞触发 -> 框架自动开通道 -> 双方获得对方坐标
+- 超视距：玩家自行定位（分析probe数据/移动痕迹等）-> 推测坐标
+
+玩家A调用 attack_at((x, y), payload):
 
 1. code-arena检查A的指令配额 ≥ attack_instruction_cost
 2. 扣除A的attack_instruction_cost
-3. 在B的沙箱中执行：
+3. 框架检查坐标(x,y)上有没有实体：
+   a. 没有 -> 返回 { hit: false } （攻击落空，miss）
+   b. 有实体B -> 命中，继续执行attack流程
+4. 在B的沙箱中执行：
    a. 如果B导出了on_attack:
       - 给on_attack分配attack_target_instruction_limit预算
       - 执行 on_attack(payload)
       - on_attack可以:
-        - 拦截 (intercepted=true) → 攻击失败
-        - 部分拦截 → 减轻伤害
-        - 反制 → 在A的沙箱触发事件
-        - 卡死/超时 → on_attack本身指令配额耗尽
-          → 框架使用默认行为：life()维持原值（不被覆写）
-          → B被"囚禁"（本tick无法行动），但不死
+        - 拦截 (intercepted=true) -> 攻击失败
+        - 部分拦截 -> 减轻伤害
+        - 反制 -> 在A的沙箱触发事件
+        - 卡死/超时 -> on_attack本身指令配额耗尽
+          -> 框架使用默认行为：life()维持原值（不被覆写）
+          -> B被"囚禁"（本tick无法行动），但不死
    b. 如果B没导出on_attack:
-      - payload直接尝试覆写life()
-      - 覆写成功 → life()返回false → B死亡
-4. 返回AttackResult给A
-5. 如果B死亡:
+      - payload直接替换B的整个WASM模块（路线A：整模块替换）
+      - 替换后life()返回false -> B死亡
+5. 返回AttackResult给A
+6. 如果B死亡:
    a. 框架自动从B转移1天生存点数给A（击杀掠夺）
    b. 静默删除B的代码和状态
-   b. B注册的所有service标记为Void
-   c. B注册的所有transform移除
-   d. 正在call B的实体收到Void
-   e. 不广播，不记录公共日志
+   c. B注册的所有service标记为Void
+   d. B注册的所有transform移除
+   e. 正在call B的实体收到Void
+   f. 不广播，不记录公共日志
+
+注意：attack_at是攻击坐标不是EntityId
+- 目标移动后坐标变化，攻击可能miss
+- 这天然实现了"攻击可以躲避"
+- payload内容决定攻击效果：击杀(life=false)/击晕(life=true但on_tick瘫痪)/绑架(on_tick改成移动)
 ```
 
 ### 4.3 探测流程
@@ -1539,40 +1588,44 @@ Tick 0: 世界创建
   Entity A (owner: player1, pos: (0,0))
   Entity B (owner: player2, pos: (100,0))
 
-=== Tick 1-10: A探测B ===
+=== Tick 1-10: A通过视口发现B并探测 ===
 A.on_tick:
+  visible = get_visible_entities()
+  -> 发现B在(100,0)，外观为战士
+  -> A获得B的EntityId和坐标
   result = probe(B, "scan")
-  → B.on_probe("scan") 返回 "defense: shield"
-  → 被动观测: gas=8000, mem_reads=234, mem_writes=12
-  → A的代码记录: B声称有护盾，但gas消耗低，可能是假的
+  -> B.on_probe("scan") 返回 "defense: shield"
+  -> 被动观测: gas=8000, mem_reads=234, mem_writes=12
+  -> A的代码记录: B声称有护盾，但gas消耗低，可能是假的
 
 === Tick 11-20: A分析 ===
 A.on_tick:
   result = probe(B, "deep_scan")
-  → B.on_probe("deep_scan") 返回 "defense: shield, armor: 50"
-  → 被动观测: gas=8500, mem_reads=245, mem_writes=15
-  → A分析: 两次probe结果一致，但gas消耗几乎不变
-  → A判断: B的on_probe可能是查表返回固定值，不是实时计算
-  → A生成payload: 注入一个绕过查表的攻击
+  -> B.on_probe("deep_scan") 返回 "defense: shield, armor: 50"
+  -> 被动观测: gas=8500, mem_reads=245, mem_writes=15
+  -> A分析: 两次probe结果一致，但gas消耗几乎不变
+  -> A判断: B的on_probe可能是查表返回固定值，不是实时计算
+  -> A生成payload: 完整的WASM模块(life()=false)
 
 === Tick 21: A发起攻击 ===
 A.on_tick:
-  attack(B, payload)
-  → payload尝试覆写B的life()为 always-false
-  → B.on_attack(payload) 执行:
-    - B检测到覆写尝试
+  attack_at((100, 0), payload)
+  -> 框架检查坐标(100,0)：有实体B -> 命中(hit=true)
+  -> B.on_attack(payload) 执行:
+    - B检测到攻击
     - B的防御代码尝试拦截
     - 但payload绕过了查表防御
     - B.on_attack拦截失败 (intercepted=false)
-  → life()被覆写为false
-  → B死亡
+  -> payload替换B的整个WASM模块
+  -> 新模块life()返回false
+  -> B死亡
 
 === Tick 22: B死亡后 ===
   B从世界状态中移除
-  A的attack返回 success=true
+  A的attack_at返回 success=true
   无广播
-  A独享战果（如果B身上有特殊代码，A可以probe B的位置获取）
-  其他玩家probe B的位置 → 返回Void
+  A独享战果
+  其他玩家get_visible_entities()不再看到B
 ```
 
 ---
@@ -1582,21 +1635,21 @@ A.on_tick:
 ```typescript
 // attacker.as - 一个简单的攻击型角色
 
-import { tick, get_pos, probe, attack, render, life_override } from "codeworld"
+import { tick, get_pos, get_visible_entities, probe, attack_at, render } from "codeworld"
 
 let target: EntityId | null = null
+let target_pos: (f64, f64) | null = null
 let probe_data: ProbeResult[] = []
 
 export function on_tick(): void {
-    // 找最近的敌人
-    if (!target) {
-        let nearby = get_entities_in_range(get_pos(self), 200)
-        if (nearby.length > 0) {
-            target = nearby[0]
-        }
+    // 查找视口内可见的敌人
+    let visible = get_visible_entities();
+    if visible.length > 0 {
+        target = visible[0].id;
+        target_pos = visible[0].pos;
     }
     
-    if (target) {
+    if (target && target_pos) {
         // 阶段1: 探测
         let result = probe(target, "scan")
         probe_data.push(result)
@@ -1605,11 +1658,12 @@ export function on_tick(): void {
         if (probe_data.length >= 5) {
             let pattern = analyze_pattern(probe_data)
             if (pattern.weakness_found) {
-                // 阶段3: 攻击
+                // 阶段3: 攻击坐标（不是攻击EntityId）
                 let payload = generate_payload(pattern)
-                let result = attack(target, payload)
+                let result = attack_at(target_pos, payload)
                 if (result.success) {
                     target = null  // 目标已死，找下一个
+                    target_pos = null
                 }
             }
         }
