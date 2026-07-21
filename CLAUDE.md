@@ -68,10 +68,11 @@ Phase 1 MVP 按以下顺序推进：
 
 2026-07-21完成三条路线技术spike验证，16测试全通过。
 
-MVP采用路线A（玩家attack） + 路线C（框架强制死亡）：
-- 路线A（整模块替换）作为玩家attack：是真正的"覆写对方代码"，语义正确。击杀场景内存丢失可接受
-- 路线C（Host Hook）专门用于框架强制死亡：生存点数归零时host层拦截life()返回值，本就该由框架控制
-- 路线B（funcref表）留作Phase 2：需定制编译工具链，跨沙箱注入需框架broker模型
+MVP只用路线A（一个方案搞定所有场景）：
+- 路线A（整模块替换）是唯一attack机制：销毁旧实例+用payload重建
+- 玩家attack：payload来自攻击者（击杀/击晕/绑架都由payload内容决定，框架不管）
+- 框架强制死亡：payload来自框架（life()=false最小模块）
+- 路线B（funcref表）留作Phase 2：需定制编译工具链
 
 spike代码在 spike/ 目录下。
 

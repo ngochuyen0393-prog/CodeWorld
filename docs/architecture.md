@@ -1482,15 +1482,17 @@ codeworld/
   缺点: 只能拦截返回值，不能改函数内部逻辑
   适用: attack=影响函数返回值（life()从true变false足够）
 
-MVP决策：路线A（玩家attack） + 路线C（框架强制死亡）
-  - 路线A作为玩家attack机制：整模块替换，是真正的"覆写对方代码"
-    attack目标=击杀(life->false)，死实体状态本就要丢弃，内存丢失可接受
-    on_attack防御仍按架构4.2在替换前执行
-  - 路线C专门用于框架强制死亡：生存点数归零时host层hook拦截life()返回值
-    这本就该由框架控制(不是玩家攻击)，host hook是其天然语义
-    开销可忽略(~34ns)，按实例隔离，内存保留
+MVP决策：只用路线A（一个方案搞定所有场景）
+  - 路线A是唯一的attack机制：销毁旧实例 + 用payload重建
+  - 玩家attack：payload来自攻击者（击杀/击晕/绑架都由payload内容决定）
+    击杀=payload里life()=false
+    击晕=payload里life()=true但on_tick被改成不能行动
+    绑架=payload里on_tick改成往攻击者坐标移动
+    这些都是玩家代码层面的事，框架不管
+  - 框架强制死亡：payload来自框架（life()=false的最小模块）
   - 路线B留作Phase 2：需定制编译工具链让attackable export走funcref表
     跨沙箱注入被wasmtime拒绝，需框架broker模型(攻击者代码编进受害者Store)
+  - 路线C不采用：不需要额外的host hook机制，路线A已覆盖所有场景
 ```
 
 ### 11.3 算力验证的Bootstrap问题
