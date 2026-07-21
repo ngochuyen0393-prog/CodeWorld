@@ -6,3 +6,13 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# 序列化（为后续持久化准备）
+serde = { workspace = true }
+# 实体ID用UUID
+uuid = { workspace = true, features = ["serde"] }
+# 日志
+tracing = { workspace = true }
+
+[dev-dependencies]
+# 测试用序列化往返校验
+serde_json = { workspace = true }
