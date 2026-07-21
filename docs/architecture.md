@@ -519,44 +519,51 @@ import fn harvest(input: Bytes) -> bool;            // 获取生存点数（预�
 
 ### 3.3 接口约束与配额
 
+设计原则：框架不提供任何游戏资源（无金币/点卡/能量），只提供基础设施（沙箱/通道/渲染/基础世界架构）。
+以下约束分两类：
+- 技术保护：防死循环、防内存爆炸、防DoS。玩家不应感知，不影响游戏内数值。
+- 物理限制：payload大小、渲染频率等，防止服务器资源耗尽。
+
 ```rust
 struct Constraints {
-    // spawn配额
+    // spawn配额（防刷屏）
     spawn_per_player_per_tick: 1,
     spawn_total_per_player: 100,
     
-    // 指令配额（防死循环，非游戏数值）
+    // 指令配额（技术保护：防死循环，非游戏数值）
+    // 这是每tick每实体的总执行预算，玩家在on_tick里自由分配
+    // 花在移动/probe/attack上全由玩家代码决定，框架不收手续费
     tick_callback_instruction_limit: 1_000_000,  // 每tick每实体100万条指令
     tick_callback_timeout_ms: 100,       // 100ms超时
     
-    // probe
-    probe_instruction_cost: 100_000,            // probe消耗10万条指令
-    probe_target_instruction_limit: 10_000,     // 被探测方的on_probe预算（严格小）
+    // probe（技术保护：防死循环+防DoS，不是游戏消耗）
+    // probe不扣手续费，占用的是on_tick的执行时间
+    probe_target_instruction_limit: 10_000,     // 被探测方on_probe预算（技术保护）
     probe_timeout_ms: 50,
     probe_max_call_depth: 3,             // 防止跨沙箱死锁
     
-    // attack
-    attack_instruction_cost: 500_000,
-    attack_payload_max_size: 64 * 1024,  // 64KB
-    attack_target_instruction_limit: 200_000,  // 被攻击方on_attack预算
+    // attack（技术保护：防死循环，不是游戏消耗）
+    // attack不扣手续费，占用的是on_tick的执行时间
+    attack_payload_max_size: 64 * 1024,  // 64KB（防内存爆炸）
+    attack_target_instruction_limit: 200_000,  // 被攻击方on_attack预算（技术保护）
     attack_timeout_ms: 200,
     
-    // call
+    // call（技术保护）
     call_timeout_ms: 100,
     call_response_max_size: 64 * 1024,
-    call_per_tick: 10,
+    call_per_tick: 10,                   // 防DoS
     
-    // compute
+    // compute（技术保护）
     compute_timeout_ms: 5000,            // 外接算力5秒超时
     compute_fallback: true,              // 超时降级基础算力
     
-    // render
+    // render（物理限制）
     render_state_max_size: 64 * 1024,
     render_per_tick: 1,                  // 每tick最多提交1次渲染状态
     
-    // physics override
+    // physics override（物理限制）
     physics_override_per_entity: 10,     // 每实体最多注册10条覆盖规则
-    physics_override_instruction_limit: 200_000, // 每条规则每tick执行预算
+    physics_override_instruction_limit: 200_000, // 每条规则执行预算（技术保护）
     physics_override_timeout_ms: 50,     // 超时则该规则本tick不生效
     physics_global_override_total: 5,    // 全世界最多5条全局覆盖
 }
@@ -671,8 +678,7 @@ struct Constraints {
 
 玩家A调用 attack_at((x, y), payload):
 
-1. code-arena检查A的指令配额 ≥ attack_instruction_cost
-2. 扣除A的attack_instruction_cost
+1. A调用attack_at，占用A的on_tick执行时间（无额外手续费）
 3. 框架检查坐标(x,y)上有没有实体：
    a. 没有 -> 返回 { hit: false } （攻击落空，miss）
    b. 有实体B -> 命中，继续执行attack流程
@@ -710,13 +716,13 @@ struct Constraints {
 ```
 玩家A调用 probe(B, request):
 
-1. 扣除A的probe_instruction_cost
+1. A调用probe，占用A的on_tick执行时间（无额外手续费）
 2. 在B的沙箱中执行：
    a. 如果B导出了on_probe:
-      - 给on_probe分配probe_target_instruction_limit预算（严格小于probe_instruction_cost的1/10）
+      - 给on_probe分配probe_target_instruction_limit预算（技术保护防死循环）
       - 执行 on_probe(request)
       - B可以返回任意数据（假数据/真数据/部分数据）
-      - B的on_probe超时/卡死 → 返回默认空响应
+      - B的on_probe超时/卡死 -> 返回默认空响应
    b. 如果B没导出on_probe:
       - 返回空响应
 3. 框架收集被动观测数据（B无法伪造）：
@@ -730,6 +736,10 @@ struct Constraints {
 5. A拿到ProbeResult后自己决定怎么用
    - 小白: 把response+meta喂给AI分析
    - 程序员: 自己写分析代码
+
+注意：probe能否成功取决于双方代码能力，不消耗游戏资源。
+攻击方分析代码强就探测得到，防御方on_probe代码强就探测不到。
+框架只提供通道和超时保护，不收费不限制次数（次数由on_tick总预算自然约束）。
 ```
 
 ### 4.4 算力流程
