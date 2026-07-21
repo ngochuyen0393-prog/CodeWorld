@@ -9,6 +9,10 @@ members = [
     "crates/render",
     "crates/storage",
     "bin/codeworld",
+    # attack覆写机制技术spike验证程序（非生产代码，验证三条候选路径）
+    "spike/route_a",
+    "spike/route_b",
+    "spike/route_c",
 ]
 
 [workspace.package]
@@ -20,6 +24,8 @@ authors = ["土豆"]
 [workspace.dependencies]
 # WASM运行时
 wasmtime = "25"
+# WAT文本 -> WASM字节码（spike验证用，手写wat模块）
+wat = "1"
 
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
