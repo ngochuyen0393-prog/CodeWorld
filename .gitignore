@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.pdb
+.Cargo.lock
+# 去掉Cargo.lock的gitignore（二进制项目需要锁版本）
+!/Cargo.lock

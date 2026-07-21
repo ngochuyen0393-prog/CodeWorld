@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/arena",
+    "crates/time",
+    "crates/space",
+    "crates/physics",
+    "crates/render",
+    "crates/storage",
+    "bin/codeworld",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["土豆"]
+
+[workspace.dependencies]
+# WASM运行时
+wasmtime = "25"
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 存储
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# 错误处理
+anyhow = "1"
+thiserror = "1"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
