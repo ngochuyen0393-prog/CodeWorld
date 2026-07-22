@@ -6,3 +6,21 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# 世界状态数据结构
+codeworld-core = { path = "../core" }
+# WASM 运行时
+wasmtime = { workspace = true }
+# WAT 文本 -> WASM 字节码（测试用，spike 验证）
+wat = { workspace = true }
+# 日志
+tracing = { workspace = true }
+# 错误处理
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+# 序列化（数据结构 derive）
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# 测试构造固定 EntityId
+uuid = { workspace = true }

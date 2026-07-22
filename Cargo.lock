@@ -122,6 +122,17 @@ version = "0.1.0"
 [[package]]
 name = "codeworld-arena"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "codeworld-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+ "wasmtime",
+ "wat",
+]
 
 [[package]]
 name = "codeworld-core"
