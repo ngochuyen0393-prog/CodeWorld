@@ -4,6 +4,9 @@
 //! TimeEngine 只管 tick 计数与触发判定，不持有 WorldState（模块边界：主循环负责
 //! 协调 WorldState.advance_tick）。
 
+/// 默认快照触发间隔（架构文档 4.1：每 100 tick 快照）
+pub const DEFAULT_SNAPSHOT_INTERVAL: u64 = 100;
+
 /// tick 主循环驱动器（架构文档 4.1 节）
 ///
 /// 维护全局 tick 计数与快照触发间隔。每个 tick 调用 [`advance_tick`](Self::advance_tick)
@@ -20,14 +23,16 @@ pub struct TimeEngine {
 impl TimeEngine {
     /// 创建引擎：tick=0，默认快照间隔 100（架构文档 4.1：每 100 tick 快照）
     pub fn new() -> Self {
-        tracing::debug!(tick = 0, snapshot_interval = 100, "TimeEngine 创建");
+        tracing::debug!(tick = 0, snapshot_interval = DEFAULT_SNAPSHOT_INTERVAL, "TimeEngine 创建");
         Self {
             tick: 0,
-            snapshot_interval: 100,
+            snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
         }
     }
 
     /// 创建引擎：tick=0，自定义快照间隔
+    ///
+    /// 间隔为 0 时永不触发快照（[`advance_tick`](Self::advance_tick) 始终返回 false）。
     pub fn new_with_interval(snapshot_interval: u64) -> Self {
         tracing::debug!(tick = 0, snapshot_interval, "TimeEngine 创建(自定义间隔)");
         Self {
@@ -135,6 +140,16 @@ mod tests {
             e.advance_tick();
         }
         assert!(e.advance_tick(), "tick 10 应触发");
+    }
+
+    #[test]
+    fn new_with_interval_zero_never_triggers() {
+        // 边界：interval=0 永不触发快照（防 is_multiple_of(0) 误触发）
+        let mut e = TimeEngine::new_with_interval(0);
+        for _ in 0..10 {
+            assert!(!e.advance_tick(), "interval=0 不应触发");
+        }
+        assert_eq!(e.snapshot_interval(), 0);
     }
 
     #[test]

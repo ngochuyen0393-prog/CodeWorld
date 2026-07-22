@@ -3,11 +3,6 @@
 //! 架构文档 七节（持久化）+ 3.2 节（get_history_snapshot，MVP 只读）。
 //! 基于 core 的 SnapshotStore 实现，MVP 不实现 WAL 增量日志（storage 模块负责）。
 
-//! 快照管理：SnapshotManager 创建/查询/保留历史快照
-//!
-//! 架构文档 七节（持久化）+ 3.2 节（get_history_snapshot，MVP 只读）。
-//! 基于 core 的 SnapshotStore 实现，MVP 不实现 WAL 增量日志（storage 模块负责）。
-
 use codeworld_core::world::{SnapshotStore, WorldSnapshot, WorldState};
 use thiserror::Error;
 
@@ -50,6 +45,10 @@ impl SnapshotManager {
     /// 创建并存储世界状态快照，返回快照对应的 tick
     ///
     /// 序列化 WorldState 为字节存入 SnapshotStore。同 tick 重复创建会覆盖。
+    ///
+    /// 注意：序列化整个 WorldState（含 `snapshots` 字段）。MVP 运行时该字段为空；
+    /// Phase 2 从存储加载世界后若 `world.snapshots` 非空，会嵌套历史快照致数据膨胀，
+    /// 届时需改为只序列化当前状态子集。
     pub fn create_snapshot(&mut self, world: &WorldState) -> Result<u64, TimeError> {
         let tick = world.tick();
         let data = serde_json::to_vec(world)?;
