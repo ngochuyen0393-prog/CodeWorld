@@ -105,7 +105,12 @@ impl OverrideManager {
     /// 获取所有覆盖按 priority 降序排序
     pub fn get_overrides_sorted(world: &WorldState) -> Vec<&PhysicsOverride> {
         let mut sorted: Vec<&PhysicsOverride> = world.physics_overrides.iter().collect();
-        sorted.sort_by_key(|o| std::cmp::Reverse(o.priority));
+        // priority 降序；同 priority 按 created_tick 升序（先创建先执行），增强确定性
+        sorted.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.created_tick.cmp(&b.created_tick))
+        });
         tracing::debug!(count = sorted.len(), "覆盖排序");
         sorted
     }

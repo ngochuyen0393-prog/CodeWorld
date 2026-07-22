@@ -360,6 +360,44 @@ mod tests {
     }
 
     #[test]
+    fn step_skips_dead_entities() {
+        // 边界：死亡实体不受物理影响（y 不变，无变更）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut e = make_entity(1, 5.0, 100.0, 0);
+        e.kill();
+        let id = e.id;
+        world.entities.insert(id, e);
+        let changes = engine.step(&mut world);
+        assert!(changes.is_empty(), "死亡实体不应产生物理变更");
+        assert_eq!(world.entities.get(&id).unwrap().pos(), (5.0, 100.0)); // y 未减
+    }
+
+    #[test]
+    fn step_skips_collision_when_disabled() {
+        // 边界：collision_enabled=false 时不检测碰撞
+        let params = DefaultPhysics {
+            gravity: 0.0,
+            ground_y: 0.0,
+            collision_enabled: false,
+            max_velocity: 100.0,
+        };
+        let engine = DefaultPhysicsEngine::new_with_params(params);
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, 5.0, 0.0, 0);
+        let e2 = make_entity(2, 5.0, 0.0, 1);
+        world.entities.insert(e1.id, e1);
+        world.entities.insert(e2.id, e2);
+        let changes = engine.step(&mut world);
+        assert!(
+            changes
+                .iter()
+                .all(|c| c.reason != PhysicsReason::Collision),
+            "collision_enabled=false 不应有碰撞变更"
+        );
+    }
+
+    #[test]
     fn step_executes_full_pipeline() {
         // 集成：step 执行完整流程，产生重力变更
         let engine = DefaultPhysicsEngine::new();
