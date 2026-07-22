@@ -144,6 +144,12 @@ version = "0.1.0"
 [[package]]
 name = "codeworld-space"
 version = "0.1.0"
+dependencies = [
+ "codeworld-core",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "codeworld-storage"
