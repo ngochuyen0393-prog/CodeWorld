@@ -6,3 +6,13 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# 世界状态数据结构
+codeworld-core = { path = "../core" }
+# 日志
+tracing = { workspace = true }
+# 错误类型
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# 测试构造固定 EntityId
+uuid = { workspace = true }
