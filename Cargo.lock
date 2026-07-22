@@ -152,6 +152,13 @@ version = "0.1.0"
 [[package]]
 name = "codeworld-time"
 version = "0.1.0"
+dependencies = [
+ "codeworld-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
 
 [[package]]
 name = "cpp_demangle"

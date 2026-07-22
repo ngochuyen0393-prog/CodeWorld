@@ -6,3 +6,12 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# 世界状态数据结构
+codeworld-core = { path = "../core" }
+# 序列化（快照存 WorldState）
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 日志
+tracing = { workspace = true }
+# 错误类型
+thiserror = { workspace = true }
