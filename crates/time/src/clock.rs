@@ -78,7 +78,7 @@ mod tests {
         // 创建：new() tick=0，默认快照间隔 100
         let e = TimeEngine::new();
         assert_eq!(e.current_tick(), 0);
-        assert_eq!(e.snapshot_interval(), 100);
+        assert_eq!(e.snapshot_interval(), DEFAULT_SNAPSHOT_INTERVAL);
     }
 
     #[test]
