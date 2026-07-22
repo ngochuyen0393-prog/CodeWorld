@@ -36,6 +36,10 @@ impl ZoneManager {
     /// 移除区域（架构 3.2：remove_zone）
     ///
     /// 移除成功返回 true，不存在返回 false。
+    ///
+    /// 注意：不清理 `WorldState.transforms` 中 `TransformScope::Zone(zone_id)` 的关联变换
+    /// （它们会因 zone 不存在而在 `get_transforms_for_entity` 中被跳过；MVP 接受残留，
+    /// Phase 2 区域频繁增删时再同步清理）。
     pub fn remove_zone(world: &mut WorldState, zone_id: ZoneId) -> bool {
         let removed = world.zones.remove(&zone_id).is_some();
         tracing::info!(?zone_id, removed, "区域移除");

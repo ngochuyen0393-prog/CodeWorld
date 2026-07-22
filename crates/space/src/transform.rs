@@ -94,7 +94,8 @@ impl TransformPipeline {
     /// 应用变换（架构 4.1 c 步：按 priority 降序依次应用）
     ///
     /// `physical_pos = transform_n(...transform_1(logical_pos))`，高 priority 先应用。
-    /// 内部按 priority 降序排序，不依赖输入顺序。
+    /// 内部按 priority 降序排序，不依赖输入顺序（防御性设计：调用方可传任意顺序，
+    /// 即使 [`get_transforms_for_entity`](Self::get_transforms_for_entity) 已排序也无害）。
     pub fn apply_transforms(
         pos: (f64, f64),
         transforms: &[&TransformEntry],

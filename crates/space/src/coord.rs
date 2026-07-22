@@ -3,11 +3,6 @@
 //! 架构文档 3.2 节（空间接口）+ 4.1 节 c 步（space-engine 在 tick 阶段二处理）。
 //! SpaceEngine 无状态，所有坐标存于 WorldState.entities。
 
-//! 坐标系：SpaceEngine 负责坐标读写与视口查询
-//!
-//! 架构文档 3.2 节（空间接口）+ 4.1 节 c 步（space-engine 在 tick 阶段二处理）。
-//! SpaceEngine 无状态，所有坐标存于 WorldState.entities。
-
 use codeworld_core::entity::EntityId;
 use codeworld_core::render::VisibleEntity;
 use codeworld_core::world::{BoundingBox, WorldState};
