@@ -63,8 +63,10 @@ impl ChannelManager {
 
     /// 攻击坐标（架构 4.2）
     ///
-    /// MVP：坐标有实体 -> 命中（hit=true），不真实替换沙箱
-    /// （需 EntityId->SandboxHandle 映射，Phase 2 实现真实替换+life 检查）。
+    /// MVP 限制：坐标有实体 -> 命中（hit=true, intercepted=false, success=false），
+    /// 不调用 on_attack/不替换沙箱/不检查 life()。完整攻击流程（路线A替换+life判定）
+    /// 需 EntityId->SandboxHandle 映射（arena 未维护），Phase 2 实现。
+    /// 当前仅返回命中状态，攻击通道 MVP 阶段不可用（已标注 Phase 2）。
     pub fn attack_at(
         world: &WorldState,
         _sandbox_mgr: &SandboxManager,

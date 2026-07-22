@@ -52,6 +52,9 @@ impl SandboxManager {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
         config.consume_fuel(true);
+        // 内存限制：每个 WASM 实例最大 64MB（CLAUDE.md 技术约束）
+        // static_memory_maximum_size 设静态内存上限；完整动态内存硬上限用 ResourceLimiter（Phase 2）
+        config.static_memory_maximum_size(64 * 1024 * 1024);
         let engine = Engine::new(&config)?;
         let linker = Self::make_linker(&engine)?;
         tracing::debug!("SandboxManager 创建");
