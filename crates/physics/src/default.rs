@@ -9,7 +9,7 @@ use codeworld_core::world::WorldState;
 use std::collections::HashMap;
 
 /// 碰撞对（两个坐标重叠的实体）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CollisionPair {
     /// 实体 A
     pub a: EntityId,
@@ -87,6 +87,9 @@ impl DefaultPhysicsEngine {
     /// 速度限制：超出 max_velocity 时截断
     ///
     /// 截断 velocity 但不产生位置 PhysicsChange（速度限制改速度不改位置）。
+    ///
+    /// 返回 None：PhysicsChange 记录位置变更，速度限制不改位置故无变更。
+    /// 签名保留 Option<PhysicsChange> 与其他 apply_* 一致（任务签名要求）。
     pub fn apply_velocity_limit(&self, entity: &mut Entity) -> Option<PhysicsChange> {
         let (vx, vy) = entity.velocity();
         let speed = (vx * vx + vy * vy).sqrt();
@@ -107,9 +110,12 @@ impl DefaultPhysicsEngine {
     /// 检测所有坐标重叠的实体对
     pub fn detect_collisions(&self, entities: &HashMap<EntityId, Entity>) -> Vec<CollisionPair> {
         let mut pairs = Vec::new();
-        let list: Vec<&Entity> = entities.values().collect();
+        let mut list: Vec<&Entity> = entities.values().collect();
+        list.sort_by_key(|e| e.id.0); // 按 EntityId(Uuid) 排序，保证碰撞检测顺序确定（可重现）
         for i in 0..list.len() {
             for j in (i + 1)..list.len() {
+                // MVP：坐标完全相同（精确相等）判定碰撞，符合验收"坐标完全相同"。
+                // 真实物理引擎用 epsilon 容差处理浮点精度，MVP 简化。
                 if list[i].pos() == list[j].pos() {
                     tracing::debug!(a = ?list[i].id, b = ?list[j].id, pos = ?list[i].pos(), "检测到碰撞");
                     pairs.push(CollisionPair {
@@ -124,6 +130,8 @@ impl DefaultPhysicsEngine {
     }
 
     /// 解决碰撞（MVP 策略：后创建的实体挤到旁边一格 (x+1, y)）
+    ///
+    /// 注意：MVP 不处理级联碰撞（挤到新位置后若与第三实体重叠，本 tick 不重新检测）。
     pub fn resolve_collision(
         &self,
         pair: CollisionPair,
@@ -164,6 +172,9 @@ impl DefaultPhysicsEngine {
         let mut changes = Vec::new();
         // 重力 + 地面 + 速度（逐实体）
         for entity in world.entities.values_mut() {
+            if !entity.is_alive() {
+                continue; // 死亡实体不受物理影响
+            }
             if let Some(c) = self.apply_gravity(entity) {
                 changes.push(c);
             }

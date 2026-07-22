@@ -81,6 +81,8 @@ impl OverrideManager {
     /// 查询影响某实体的所有覆盖 ID（架构 3.2：get_active_overrides）
     ///
     /// scope 过滤：Entity 匹配 id；Zone 匹配实体所在 zone；Global 影响所有。
+    ///
+    /// 注意：MVP 不检查 owner 存活状态（core 设计"owner 死亡则覆盖失效"留 Phase 2）。
     pub fn get_active_overrides(world: &WorldState, entity_id: EntityId) -> Vec<PhysicsOverrideId> {
         let pos = world.entities.get(&entity_id).map(|e| e.pos());
         let ids: Vec<PhysicsOverrideId> = world
@@ -111,6 +113,9 @@ impl OverrideManager {
     /// 执行单条覆盖规则（架构 4.1b：覆盖规则跑在 WASM 沙箱）
     ///
     /// 用 executor 执行规则字节码，返回 PhysicsChange(Override(id))。
+    ///
+    /// 注意：MVP IdentityExecutor 恒等（位置不变），仍返回 Some(PhysicsChange)。
+    /// 真实 WasmExecutor（arena 模块）会改变坐标；位置未变是否返回 None 留 Phase 2。
     pub fn execute_override(
         override_entry: &PhysicsOverride,
         entity: &Entity,

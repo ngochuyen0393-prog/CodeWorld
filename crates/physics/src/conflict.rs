@@ -27,7 +27,8 @@ impl ConflictResolver {
         for c in changes {
             map.insert(c.entity, c); // 后插入覆盖前者 = last-write-wins
         }
-        let result: Vec<PhysicsChange> = map.into_values().collect();
+        let mut result: Vec<PhysicsChange> = map.into_values().collect();
+        result.sort_by_key(|c| c.entity.0); // 按 EntityId(Uuid) 排序，保证输出顺序确定（可重现）
         tracing::info!(count = result.len(), "冲突解决完成");
         result
     }
@@ -47,7 +48,8 @@ impl ConflictResolver {
         for c in override_changes {
             map.insert(c.entity, c); // override 覆盖 default
         }
-        let result: Vec<PhysicsChange> = map.into_values().collect();
+        let mut result: Vec<PhysicsChange> = map.into_values().collect();
+        result.sort_by_key(|c| c.entity.0); // 按 EntityId(Uuid) 排序，保证输出顺序确定（可重现）
         tracing::info!(count = result.len(), "变更合并完成");
         result
     }
