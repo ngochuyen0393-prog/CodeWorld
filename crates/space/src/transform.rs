@@ -238,6 +238,19 @@ mod tests {
     }
 
     #[test]
+    fn get_transforms_for_entity_zone_missing_skipped() {
+        // 边界：Zone scope 的 zone 不存在于 WorldState.zones 时，变换被跳过
+        let mut w = WorldState::new();
+        let owner = EntityId(Uuid::from_u128(1));
+        let e = make_entity(1, 5.0, 5.0);
+        w.entities.insert(e.id, e);
+        let missing_zone_id = codeworld_core::world::ZoneId::new();
+        TransformPipeline::register_transform(&mut w, owner, TransformScope::Zone(missing_zone_id), vec![], 7, 0);
+        let ts = TransformPipeline::get_transforms_for_entity(&w, EntityId(Uuid::from_u128(1)));
+        assert_eq!(ts.len(), 0);
+    }
+
+    #[test]
     fn get_transforms_for_entity_sorted_desc_by_priority() {
         // 排序：按 priority 降序
         let mut w = WorldState::new();
