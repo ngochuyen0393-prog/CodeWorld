@@ -6,13 +6,16 @@ use crate::sandbox::SandboxData;
 use serde::{Deserialize, Serialize};
 
 /// 被动观测数据（架构 4.3，B 无法伪造）
+///
+/// 注意：MVP 阶段 `mem_read_count`/`mem_write_count` 恒为 0（wasmtime 不直接暴露，
+/// 需 import 函数拦截，Phase 2 实现）。`gas_consumed`/`api_calls` 真实统计。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeMeta {
     /// gas（fuel）消耗
     pub gas_consumed: u64,
-    /// 内存读次数
+    /// 内存读次数（MVP 恒 0，Phase 2 真实统计）
     pub mem_read_count: u64,
-    /// 内存写次数
+    /// 内存写次数（MVP 恒 0，Phase 2 真实统计）
     pub mem_write_count: u64,
     /// API 调用列表
     pub api_calls: Vec<String>,

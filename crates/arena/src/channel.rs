@@ -15,7 +15,7 @@ pub enum CallStatus {
     Ok,
     /// 服务不存在/owner 死亡（不报错，不泄露信息）
     Void,
-    /// 超时
+    /// 超时（MVP 未实现，Phase 2 加 wasmtime 超时检测）
     Timeout,
 }
 
@@ -48,10 +48,13 @@ impl ChannelManager {
         sandbox: &mut SandboxHandle,
         request: &[u8],
     ) -> ProbeResult {
-        let response = if sandbox_mgr.has_export(sandbox, "on_probe").unwrap_or(false) {
-            sandbox_mgr.call_on_probe(sandbox, request).unwrap_or_default()
-        } else {
-            Vec::new()
+        let response = match sandbox_mgr.call_on_probe(sandbox, request) {
+            Ok(r) => r,
+            Err(e) => {
+                // 探测不应崩溃：on_probe 调用失败（fuel 耗尽/trap）记 warn，返回空响应
+                tracing::warn!(error = %e, "on_probe 调用失败，返回空响应");
+                Vec::new()
+            }
         };
         let meta = collect_meta(sandbox.store.data());
         tracing::info!(resp_len = response.len(), gas = meta.gas_consumed, "probe 完成");
@@ -68,6 +71,7 @@ impl ChannelManager {
         pos: (f64, f64),
         _payload: &[u8],
     ) -> AttackResult {
+        // MVP O(n) 线性扫描；后续用空间索引优化（Phase 2）
         let target = world.entities.values().find(|e| e.pos() == pos);
         let Some(_) = target else {
             tracing::info!(?pos, "attack 落空");

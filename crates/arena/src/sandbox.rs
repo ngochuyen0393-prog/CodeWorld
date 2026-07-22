@@ -123,9 +123,16 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// 调用 on_probe(request) -> Vec<u8>（WASM 签名 i32->i32，request 取首字节，返回 le 4 字节）
+    /// 调用 on_probe(request) -> Vec<u8>
+    ///
+    /// WASM 签名 i32->i32，request 前 4 字节（le）转 i32（不足补 0；完整 Vec 需内存传递，Phase 2）。
+    /// 没导出 on_probe 时返回空 Vec（防御性，公共 API 自保）。
     pub fn call_on_probe(&self, handle: &mut SandboxHandle, request: &[u8]) -> Result<Vec<u8>> {
-        let arg = request.first().copied().unwrap_or(0) as i32;
+        if !self.has_export(handle, "on_probe")? {
+            tracing::debug!("on_probe 未导出，返回空响应");
+            return Ok(Vec::new());
+        }
+        let arg = bytes_to_i32(request);
         let func = handle.instance.get_typed_func::<i32, i32>(&mut handle.store, "on_probe")?;
         let result = func.call(&mut handle.store, arg)?;
         self.update_fuel(handle)?;
@@ -134,8 +141,15 @@ impl SandboxManager {
     }
 
     /// 调用 on_attack(payload) -> bool（i32 != 0 = 拦截）
+    ///
+    /// 没导出 on_attack 时返回 false（不拦截，架构 4.2：直接替换）。
+    /// payload 前 4 字节（le）转 i32（同 call_on_probe）。
     pub fn call_on_attack(&self, handle: &mut SandboxHandle, payload: &[u8]) -> Result<bool> {
-        let arg = payload.first().copied().unwrap_or(0) as i32;
+        if !self.has_export(handle, "on_attack")? {
+            tracing::debug!("on_attack 未导出，不拦截");
+            return Ok(false);
+        }
+        let arg = bytes_to_i32(payload);
         let func = handle.instance.get_typed_func::<i32, i32>(&mut handle.store, "on_attack")?;
         let result = func.call(&mut handle.store, arg)?;
         self.update_fuel(handle)?;
@@ -152,6 +166,14 @@ impl SandboxManager {
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
+}
+
+/// &[u8] 前 4 字节（le）转 i32（不足补 0；WASM i32 限制，完整 Vec 需内存传递 Phase 2）
+fn bytes_to_i32(bytes: &[u8]) -> i32 {
+    let mut arr = [0u8; 4];
+    let len = bytes.len().min(4);
+    arr[..len].copy_from_slice(&bytes[..len]);
+    i32::from_le_bytes(arr)
 }
 
 #[cfg(test)]
