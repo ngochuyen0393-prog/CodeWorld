@@ -6,3 +6,20 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# 7 个 crate 串成 tick 循环（架构文档 4.1 节）
+codeworld-core = { path = "../../crates/core" }
+codeworld-time = { path = "../../crates/time" }
+codeworld-space = { path = "../../crates/space" }
+codeworld-physics = { path = "../../crates/physics" }
+codeworld-arena = { path = "../../crates/arena" }
+codeworld-render = { path = "../../crates/render" }
+codeworld-storage = { path = "../../crates/storage" }
+# 错误处理
+anyhow = { workspace = true }
+# 日志
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# 测试构造固定 EntityId
+uuid = { workspace = true }
