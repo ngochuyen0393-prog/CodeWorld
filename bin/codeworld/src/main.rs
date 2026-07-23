@@ -55,11 +55,9 @@ fn main() -> Result<()> {
     );
     let mut renderer = Renderer::new(viewport);
 
-    // 新世界或恢复后无实体：放一个测试实体让 MVP 有东西渲染
+    // 新世界或恢复后无实体：放测试实体让 MVP 有东西渲染
     if world.entities.is_empty() {
-        let e = create_test_entity((0.0, 0.0), world.tick());
-        tracing::info!(entity_id = %e.id.0, pos = ?e.pos(), "创建测试实体");
-        world.entities.insert(e.id, e);
+        spawn_test_entities(&mut world);
     }
 
     // 信号处理：后台线程监听 stdin，按 Enter/EOF 置退出标志（零依赖，符合 MVP 最简方案）
@@ -171,6 +169,18 @@ fn create_test_entity(pos: (f64, f64), tick: u64) -> Entity {
     )
 }
 
+/// 生成测试实体塞入世界（让 MVP 有东西渲染）
+///
+/// 两个实体分别置于 (0, 10) 与 (5, 20)，都不站地面（y=0），
+/// 这样默认重力规则下能看到下落效果，日志比实体贴在地面更有信息量。
+fn spawn_test_entities(world: &mut WorldState) {
+    for pos in [(0.0, 10.0), (5.0, 20.0)] {
+        let e = create_test_entity(pos, world.tick());
+        tracing::info!(entity_id = %e.id.0, pos = ?e.pos(), "创建测试实体");
+        world.entities.insert(e.id, e);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +277,26 @@ mod tests {
             storage.snapshot_count().unwrap(),
             1,
             "tick 100 应存一次快照"
+        );
+    }
+
+    #[test]
+    fn spawn_test_entities_inserts_two_at_expected_positions() {
+        // 测试实体初始位置：一个 (0,10) 一个 (5,20)，均在空中（不站地面 y=0）
+        // 这样默认重力规则下能看到下落效果
+        let mut world = WorldState::new();
+        spawn_test_entities(&mut world);
+        assert_eq!(world.entities.len(), 2, "应创建两个测试实体");
+        let positions: Vec<(f64, f64)> = world.entities.values().map(|e| e.pos()).collect();
+        assert!(
+            positions.contains(&(0.0, 10.0)),
+            "应有实体在 (0,10)，实际 {:?}",
+            positions
+        );
+        assert!(
+            positions.contains(&(5.0, 20.0)),
+            "应有实体在 (5,20)，实际 {:?}",
+            positions
         );
     }
 
