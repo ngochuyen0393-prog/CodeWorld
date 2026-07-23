@@ -155,6 +155,13 @@ dependencies = [
 [[package]]
 name = "codeworld-render"
 version = "0.1.0"
+dependencies = [
+ "codeworld-core",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "codeworld-space"

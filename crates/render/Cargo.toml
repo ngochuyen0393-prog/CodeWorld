@@ -6,3 +6,14 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# 世界状态与渲染数据结构（RenderLayer/RenderRequest/Entity/WorldState）
+codeworld-core = { path = "../core" }
+# 日志
+tracing = { workspace = true }
+# 序列化（为后续持久化与渲染协议准备）
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# 测试构造固定 EntityId
+uuid = { workspace = true }
