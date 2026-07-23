@@ -18,7 +18,7 @@ use codeworld_arena::sandbox::{SandboxHandle, SandboxManager};
 use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 use codeworld_core::pending::PendingChange;
 use codeworld_core::world::WorldState;
-use codeworld_physics::default::DefaultPhysicsEngine;
+use codeworld_physics::default::{CollisionPair, DefaultPhysicsEngine};
 use codeworld_render::{Renderer, Viewport};
 use codeworld_storage::StorageEngine;
 use codeworld_time::clock::TimeEngine;
@@ -241,9 +241,19 @@ fn tick(
     decay_survival(world, current_tick);
 
     //   c. 物理规则（重力/地面/速度/碰撞，架构 4.1 b 步）
+    //      先检测碰撞（接触事件），再执行物理步骤（含碰撞解决），最后处理接触事件。
+    //      在 step 之前检测：step 内部的 resolve_collision 会把重叠实体挤到 x+1，
+    //      挤完坐标变了再检测就测不到接触，故接触事件必须在 step 之前捕获。
+    //      （step 内部也会再 detect 一次用于 resolve，MVP 实体少可接受重复调用。）
+    let collision_pairs = physics.detect_collisions(&world.entities);
     let changes = physics.step(world);
     if !changes.is_empty() {
         tracing::debug!(tick = current_tick, change_count = changes.len(), "物理变更");
+    }
+    //      接触触发沙箱通道（架构 4.1 b 步）：记录碰撞双方信息，MVP 仅日志
+    let contact_count = handle_collisions(&collision_pairs);
+    if contact_count > 0 {
+        tracing::info!(tick = current_tick, contact_count, "接触事件处理");
     }
 
     //   d. 死亡清理：移除死亡实体 + 销毁对应沙箱（释放 WASM 实例内存）
@@ -360,6 +370,26 @@ fn decay_survival(world: &mut WorldState, current_tick: u64) {
             );
         }
     }
+}
+
+/// 处理碰撞事件（架构文档 4.1 节 b 步：接触触发沙箱通道）
+///
+/// 架构 4.1：物理碰撞后，框架自动为碰撞双方开启沙箱通道，双方获得对方的
+/// EntityId 和坐标；是否 probe/attack 由玩家代码决定，框架只负责开通道。
+///
+/// MVP：只记录日志（接触双方 EntityId + 重叠坐标），返回碰撞对数量便于测试断言。
+/// Phase 2：通过 sandbox_map 为双方开启 probe/attack 通道，让玩家代码在下一 tick
+/// 的 on_tick 中可以 probe/attack 对方（当前 MVP 的 on_tick 是空操作 WAT，无此能力）。
+fn handle_collisions(pairs: &[CollisionPair]) -> usize {
+    for pair in pairs {
+        tracing::info!(
+            a = %pair.a.0,
+            b = %pair.b.0,
+            pos = ?pair.pos,
+            "接触事件：框架为碰撞双方开启沙箱通道"
+        );
+    }
+    pairs.len()
 }
 
 /// 创建测试实体（让 MVP 有东西渲染）
@@ -965,5 +995,94 @@ mod tests {
         assert_eq!(loaded.entities.len(), 1);
         assert!(loaded.entities.contains_key(&id));
         assert_eq!(loaded.entities.get(&id).unwrap().pos(), (3.0, 0.0));
+    }
+
+    // === handle_collisions（阶段二 c 步：接触触发沙箱通道）===
+
+    /// 构造碰撞对（测试辅助，固定 EntityId 便于断言）
+    fn make_collision_pair(a: u128, b: u128, pos: (f64, f64)) -> CollisionPair {
+        CollisionPair {
+            a: EntityId(Uuid::from_u128(a)),
+            b: EntityId(Uuid::from_u128(b)),
+            pos,
+        }
+    }
+
+    #[test]
+    fn handle_collisions_returns_zero_when_no_collision() {
+        // 无碰撞对：返回 0，不 panic（架构 4.1 b 步：无接触则不开通道）
+        let pairs: Vec<CollisionPair> = Vec::new();
+        let count = handle_collisions(&pairs);
+        assert_eq!(count, 0, "无碰撞对应返回 0");
+    }
+
+    #[test]
+    fn handle_collisions_returns_one_for_single_pair() {
+        // 单个碰撞对：返回 1（两个实体同坐标 -> 1 对接触）
+        let pairs = vec![make_collision_pair(1, 2, (5.0, 5.0))];
+        let count = handle_collisions(&pairs);
+        assert_eq!(count, 1, "单个碰撞对应返回 1");
+    }
+
+    #[test]
+    fn handle_collisions_returns_three_for_three_pairs() {
+        // 三个碰撞对（三个实体两两同坐标，C(3,2)=3）：返回 3
+        let pairs = vec![
+            make_collision_pair(1, 2, (5.0, 5.0)),
+            make_collision_pair(1, 3, (5.0, 5.0)),
+            make_collision_pair(2, 3, (5.0, 5.0)),
+        ];
+        let count = handle_collisions(&pairs);
+        assert_eq!(count, 3, "三个碰撞对应返回 3");
+    }
+
+    #[test]
+    fn handle_collisions_counts_pairs_from_detect_collisions() {
+        // 集成：两实体同坐标 -> detect_collisions 返回 1 对 -> handle_collisions 返回 1
+        // 验证 detect -> handle 链路：物理引擎检测到的碰撞对原样传给接触处理
+        let engine = DefaultPhysicsEngine::new();
+        let mut entities = HashMap::new();
+        let e1 = make_entity(1, (5.0, 5.0));
+        let e2 = make_entity(2, (5.0, 5.0));
+        entities.insert(e1.id, e1);
+        entities.insert(e2.id, e2);
+        let pairs = engine.detect_collisions(&entities);
+        assert_eq!(pairs.len(), 1, "同坐标应检测到 1 对碰撞");
+        let count = handle_collisions(&pairs);
+        assert_eq!(count, 1, "handle_collisions 应返回 1");
+    }
+
+    #[test]
+    fn tick_detects_collision_before_resolve() {
+        // 集成（架构 4.1 b 步）：两实体同坐标 -> tick 在 physics.step 之前检测接触事件，
+        // step 解决碰撞（后创建的挤到 x+1），tick 后两实体坐标不再相同。
+        // 站地面 (y=0) 排除重力干扰，专测碰撞解决；同时回归保护：tick 内
+        // "先 detect 再 step" 的重排未破坏既有碰撞解决流程。
+        let mut world = WorldState::new();
+        let id1 = EntityId(Uuid::from_u128(1));
+        let id2 = EntityId(Uuid::from_u128(2));
+        world.entities.insert(id1, make_entity(1, (5.0, 0.0)));
+        world.entities.insert(id2, make_entity(2, (5.0, 0.0)));
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut sandbox_map = test_sandbox_map();
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut sandbox_map,
+        );
+        let pos1 = world.entities.get(&id1).unwrap().pos();
+        let pos2 = world.entities.get(&id2).unwrap().pos();
+        assert_ne!(
+            pos1, pos2,
+            "碰撞解决后两实体坐标应不同（一方被挤开），实际 {pos1:?} 与 {pos2:?}"
+        );
     }
 }
