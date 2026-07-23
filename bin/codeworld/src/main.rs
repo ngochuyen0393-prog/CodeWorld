@@ -251,7 +251,8 @@ fn tick(
         tracing::debug!(tick = current_tick, change_count = changes.len(), "物理变更");
     }
     //      接触触发沙箱通道（架构 4.1 b 步）：记录碰撞双方信息，MVP 仅日志
-    let contact_count = handle_collisions(&collision_pairs);
+    //      TODO(Phase2)：让 step() 返回碰撞对，消除此处与 step 内部的重复 detect_collisions 调用
+    let contact_count = handle_collisions(&collision_pairs, &world.entities);
     if contact_count > 0 {
         tracing::info!(tick = current_tick, contact_count, "接触事件处理");
     }
@@ -377,19 +378,31 @@ fn decay_survival(world: &mut WorldState, current_tick: u64) {
 /// 架构 4.1：物理碰撞后，框架自动为碰撞双方开启沙箱通道，双方获得对方的
 /// EntityId 和坐标；是否 probe/attack 由玩家代码决定，框架只负责开通道。
 ///
-/// MVP：只记录日志（接触双方 EntityId + 重叠坐标），返回碰撞对数量便于测试断言。
+/// MVP：只记录日志（接触双方 EntityId + 重叠坐标），返回接触对数量便于测试断言。
+/// 跳过含死亡实体的碰撞对：死亡实体本 tick 会被死亡清理步移除，不应为其开通道/
+/// 记接触（阶段一 life()=false 或 decay_survival 归零 kill 的实体此时仍在
+/// world.entities 中，detect_collisions 会扫到，需在此按 is_alive 过滤）。
 /// Phase 2：通过 sandbox_map 为双方开启 probe/attack 通道，让玩家代码在下一 tick
 /// 的 on_tick 中可以 probe/attack 对方（当前 MVP 的 on_tick 是空操作 WAT，无此能力）。
-fn handle_collisions(pairs: &[CollisionPair]) -> usize {
+fn handle_collisions(pairs: &[CollisionPair], entities: &HashMap<EntityId, Entity>) -> usize {
+    let mut count = 0;
     for pair in pairs {
-        tracing::info!(
+        // 跳过含死亡实体的碰撞对（架构 4.1 接触触发针对存活实体间交互）
+        let a_alive = entities.get(&pair.a).map(|e| e.is_alive()).unwrap_or(false);
+        let b_alive = entities.get(&pair.b).map(|e| e.is_alive()).unwrap_or(false);
+        if !a_alive || !b_alive {
+            tracing::debug!(a = %pair.a.0, b = %pair.b.0, "跳过含死亡实体的碰撞对");
+            continue;
+        }
+        tracing::debug!(
             a = %pair.a.0,
             b = %pair.b.0,
             pos = ?pair.pos,
             "接触事件：框架为碰撞双方开启沙箱通道"
         );
+        count += 1;
     }
-    pairs.len()
+    count
 }
 
 /// 创建测试实体（让 MVP 有东西渲染）
@@ -1008,32 +1021,45 @@ mod tests {
         }
     }
 
+    /// 构造存活实体表（测试辅助，id 与 make_collision_pair 的 a/b 对齐）
+    fn make_entities(ids: &[u128]) -> HashMap<EntityId, Entity> {
+        ids.iter()
+            .map(|&id| {
+                let e = make_entity(id, (5.0, 5.0));
+                (e.id, e)
+            })
+            .collect()
+    }
+
     #[test]
     fn handle_collisions_returns_zero_when_no_collision() {
         // 无碰撞对：返回 0，不 panic（架构 4.1 b 步：无接触则不开通道）
         let pairs: Vec<CollisionPair> = Vec::new();
-        let count = handle_collisions(&pairs);
+        let entities = HashMap::new();
+        let count = handle_collisions(&pairs, &entities);
         assert_eq!(count, 0, "无碰撞对应返回 0");
     }
 
     #[test]
     fn handle_collisions_returns_one_for_single_pair() {
-        // 单个碰撞对：返回 1（两个实体同坐标 -> 1 对接触）
+        // 单个存活碰撞对：返回 1（两个实体同坐标 -> 1 对接触）
+        let entities = make_entities(&[1, 2]);
         let pairs = vec![make_collision_pair(1, 2, (5.0, 5.0))];
-        let count = handle_collisions(&pairs);
-        assert_eq!(count, 1, "单个碰撞对应返回 1");
+        let count = handle_collisions(&pairs, &entities);
+        assert_eq!(count, 1, "单个存活碰撞对应返回 1");
     }
 
     #[test]
     fn handle_collisions_returns_three_for_three_pairs() {
-        // 三个碰撞对（三个实体两两同坐标，C(3,2)=3）：返回 3
+        // 三个存活碰撞对（三个实体两两同坐标，C(3,2)=3）：返回 3
+        let entities = make_entities(&[1, 2, 3]);
         let pairs = vec![
             make_collision_pair(1, 2, (5.0, 5.0)),
             make_collision_pair(1, 3, (5.0, 5.0)),
             make_collision_pair(2, 3, (5.0, 5.0)),
         ];
-        let count = handle_collisions(&pairs);
-        assert_eq!(count, 3, "三个碰撞对应返回 3");
+        let count = handle_collisions(&pairs, &entities);
+        assert_eq!(count, 3, "三个存活碰撞对应返回 3");
     }
 
     #[test]
@@ -1048,16 +1074,38 @@ mod tests {
         entities.insert(e2.id, e2);
         let pairs = engine.detect_collisions(&entities);
         assert_eq!(pairs.len(), 1, "同坐标应检测到 1 对碰撞");
-        let count = handle_collisions(&pairs);
+        let count = handle_collisions(&pairs, &entities);
         assert_eq!(count, 1, "handle_collisions 应返回 1");
     }
 
     #[test]
-    fn tick_detects_collision_before_resolve() {
-        // 集成（架构 4.1 b 步）：两实体同坐标 -> tick 在 physics.step 之前检测接触事件，
-        // step 解决碰撞（后创建的挤到 x+1），tick 后两实体坐标不再相同。
-        // 站地面 (y=0) 排除重力干扰，专测碰撞解决；同时回归保护：tick 内
-        // "先 detect 再 step" 的重排未破坏既有碰撞解决流程。
+    fn handle_collisions_skips_pairs_with_dead_entity() {
+        // 接触事件只对存活实体对记录：含死亡实体的碰撞对应跳过（不计入返回数）。
+        // 架构 4.1 接触触发针对存活实体间交互；死亡实体本 tick 会被死亡清理步移除，
+        // 不应为其开通道/记接触。阶段一 life()=false 或 decay_survival 归零 kill 的
+        // 实体此时仍在 world.entities 中（死亡清理在 step d 步），detect_collisions
+        // 会扫到，故 handle_collisions 需按 is_alive 过滤。
+        let mut entities = HashMap::new();
+        let alive_e = make_entity(1, (5.0, 5.0));
+        let mut dead_e = make_entity(2, (5.0, 5.0));
+        dead_e.kill();
+        entities.insert(alive_e.id, alive_e);
+        entities.insert(dead_e.id, dead_e);
+        let pairs = vec![make_collision_pair(1, 2, (5.0, 5.0))];
+        let count = handle_collisions(&pairs, &entities);
+        assert_eq!(count, 0, "含死亡实体的碰撞对应被跳过，返回 0");
+    }
+
+    #[test]
+    fn tick_resolves_overlapping_entities_after_detect_reorder() {
+        // 回归测试（架构 4.1 b 步）：两实体同坐标 -> tick 在 physics.step 之前检测
+        // 接触事件，step 解决碰撞（后创建的挤到 x+1），tick 后两实体坐标不再相同。
+        //
+        // 本测试只断言"碰撞解决后坐标不同"——这是 physics.step 的既有能力，并非
+        // handle_collisions 的新行为。保留它的意义是回归保护：验证 tick 内
+        // "先 detect 再 step 再 handle" 的重排没有破坏既有碰撞解决流程。
+        // handle_collisions 本身（含死亡实体跳过）由其单元测试覆盖；
+        // tick() 返回 ()，无法在此断言接触计数（已知测试缺口，见报告）。
         let mut world = WorldState::new();
         let id1 = EntityId(Uuid::from_u128(1));
         let id2 = EntityId(Uuid::from_u128(2));
