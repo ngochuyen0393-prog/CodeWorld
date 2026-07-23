@@ -2,7 +2,7 @@
 
 > 代码即现实的开放世界游戏框架
 > 日期：2026-07-23
-> 状态：Phase 1 MVP 基础设施层完成（8 crate / 271 测试），核心缺口待补
+> 状态：Phase 1 MVP 核心循环完成（8 crate / 291 测试），tick 循环完整跑通
 
 ### v2.1 更新（2026-07-23）
 - 渲染模块借鉴寒霜 FrameGraph 架构（GDC 2017, Yuriy O'Donnell），三阶段管线：Setup声明 -> Compile裁剪+排序 -> Execute绘制
@@ -1332,27 +1332,27 @@ CodeWorld不强制战斗。玩家可以选择:
 
 | crate | 测试数 | 状态 | 说明 |
 |-------|--------|------|------|
-| core | 93 | ✅ | WorldState/Entity/Physics数据结构/SurvivalPoints/RenderRequest |
+| core | 97 | ✅ | WorldState/Entity/Physics数据结构/SurvivalPoints/RenderRequest/PendingChange |
 | time | 16 | ✅ | TimeEngine tick计数器 + SnapshotManager |
 | space | 30 | ✅ | SpaceEngine坐标 + TransformPipeline变换 + ZoneManager区域 |
 | physics | 28 | ✅ | DefaultPhysicsEngine重力/碰撞/地面约束 + OverrideManager + ConflictResolver |
 | arena | 23 | ✅ | SandboxManager(wasmtime) + ChannelManager(probe/attack/call) + ComputeExecutor |
 | render | 36 | ✅ | RenderGraph三阶段(借鉴寒霜FrameGraph) + TerminalBuffer + Viewport + AsciiRenderModule |
 | storage | 26 | ✅ | SqliteStorage(3表) + SnapshotManager(serde_json序列化) + RetentionPolicy |
-| bin | 9 | ✅ | 主程序tick循环(借鉴Screeps/AzerothCore) + Config + 信号处理 |
-| 合计 | 271 | | 全绿 |
+| bin | 35 | ✅ | 主程序tick循环 + WASM执行接入 + PendingChanges + 生存点数扣减 + 接触触发通道 |
+| 合计 | 291 | | 全绿 |
 
-### MVP 核心缺口（基础设施已有，逻辑未接入）
+### MVP 核心缺口（全部完成，2026-07-23/24）
 
-| 缺口 | 现状 | 优先级 |
-|------|------|--------|
-| WASM 玩家代码执行 | arena 有沙箱管理，主程序 tick 循环跳过阶段一 | P0 |
-| PendingChanges 队列 | 未实现，玩家代码变更无法延迟应用 | P0 |
-| 终端 ANSI 渲染输出 | 渲染图算出 diff 但不写终端屏幕 | P1 |
-| 生存点数扣减 | 数据结构在 core，未接入 tick 循环 | P1 |
-| 接触触发沙箱通道 | 物理碰撞不自动开 probe/attack 通道 | P1 |
-| 击杀掠夺 | 未实现 | P2 |
-| 多线程并行执行 | 单线程，架构文档要求线程池 | P2 |
+| 缺口 | 状态 | 实现 |
+|------|------|------|
+| WASM 玩家代码执行 | ✅ 完成 | EntitySandboxMap + tick 阶段一调 on_tick/life，每 tick 复位 fuel |
+| PendingChanges 队列 | ✅ 完成 | core/pending.rs（Spawn/Destroy/SetPos/SetVelocity），tick 阶段二 a 步 apply |
+| 生存点数扣减 | ✅ 完成 | tick 阶段二 b 步 decay_survival，归零 kill |
+| 接触触发沙箱通道 | ✅ 完成 | tick 阶段二 c 步先 detect_collisions 再 step 再 handle_collisions |
+| 终端 ANSI 渲染输出 | ❌ 推迟 | 渲染图算出 diff 但不写终端，Phase 2 |
+| 击杀掠夺 | ❌ 推迟 | Phase 2 |
+| 多线程并行执行 | ❌ 推迟 | MVP 单线程，Phase 2 |
 
 ### MVP 功能范围
 

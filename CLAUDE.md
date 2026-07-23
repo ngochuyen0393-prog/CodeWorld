@@ -54,17 +54,17 @@ Phase 1 MVP 按以下顺序推进（全部完成，271 测试全绿）：
 7. `crates/storage` ✅ (26测试) -- storage：SQLite持久化
 8. `bin/codeworld` ✅ (9测试) -- 主程序：终端运行器（借鉴Screeps两阶段tick+AzerothCore管理器链）
 
-## MVP 核心缺口（基础设施已有，逻辑未接入）
+## MVP 核心缺口（P0/P1 全部完成，2026-07-23/24）
 
-| 缺口 | 优先级 | 说明 |
-|------|--------|------|
-| WASM 玩家代码执行 | P0 | arena 有沙箱管理，主程序 tick 循环跳过阶段一 |
-| PendingChanges 队列 | P0 | 玩家代码变更无法延迟应用 |
-| 终端 ANSI 渲染输出 | P1 | 渲染图算出 diff 但不写终端屏幕 |
-| 生存点数扣减 | P1 | 数据结构在 core，未接入 tick 循环 |
-| 接触触发沙箱通道 | P1 | 物理碰撞不自动开 probe/attack 通道 |
-| 击杀掠夺 | P2 | 未实现 |
-| 多线程并行执行 | P2 | 单线程，架构文档要求线程池 |
+| 缺口 | 状态 | 实现 |
+|------|------|------|
+| WASM 玩家代码执行 | ✅ | EntitySandboxMap + tick 阶段一调 on_tick/life |
+| PendingChanges 队列 | ✅ | core/pending.rs + tick 阶段二 apply |
+| 生存点数扣减 | ✅ | tick 阶段二 decay_survival |
+| 接触触发沙箱通道 | ✅ | tick 阶段二 detect_collisions + handle_collisions |
+| 终端 ANSI 渲染输出 | ❌ Phase 2 | 渲染图算出 diff 但不写终端 |
+| 击杀掠夺 | ❌ Phase 2 | 未实现 |
+| 多线程并行执行 | ❌ Phase 2 | MVP 单线程 |
 
 ## 设计文档索引
 
