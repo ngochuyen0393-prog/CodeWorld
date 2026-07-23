@@ -1,8 +1,15 @@
-# CodeWorld 技术方案文档 v2.0
+# CodeWorld 技术方案文档 v2.1
 
 > 代码即现实的开放世界游戏框架
-> 日期：2026-07-21
-> 状态：技术方案设计（v2: 新增物理规则模块、模块化设计、角色登录门槛）
+> 日期：2026-07-23
+> 状态：Phase 1 MVP 基础设施层完成（8 crate / 271 测试），核心缺口待补
+
+### v2.1 更新（2026-07-23）
+- 渲染模块借鉴寒霜 FrameGraph 架构（GDC 2017, Yuriy O'Donnell），三阶段管线：Setup声明 -> Compile裁剪+排序 -> Execute绘制
+- 物理模块 V2 设计完成（docs/physics-v2-design.md），借鉴 PhysX 5 & Chaos，Phase 2 实施
+- 主程序借鉴 Screeps 两阶段 tick 模型 + AzerothCore 管理器链 + Bevy 插件式组合
+- 渲染模块文件结构更新：graph.rs/buffer.rs/viewport.rs/module.rs（原 ascii.rs/layer.rs/protocol.rs 已废弃）
+- MVP 缺口记录：WASM 玩家代码执行/PendingChanges/终端 ANSI 渲染/生存点数扣减/接触触发通道/击杀掠夺
 
 ---
 
@@ -1319,18 +1326,52 @@ CodeWorld不强制战斗。玩家可以选择:
 
 目标：验证"代码即生命，攻击=破解"的核心循环
 
+### 基础设施层完成状态（2026-07-23）
+
+8 个 crate 全部编译通过，271 测试全绿，主程序可运行：
+
+| crate | 测试数 | 状态 | 说明 |
+|-------|--------|------|------|
+| core | 93 | ✅ | WorldState/Entity/Physics数据结构/SurvivalPoints/RenderRequest |
+| time | 16 | ✅ | TimeEngine tick计数器 + SnapshotManager |
+| space | 30 | ✅ | SpaceEngine坐标 + TransformPipeline变换 + ZoneManager区域 |
+| physics | 28 | ✅ | DefaultPhysicsEngine重力/碰撞/地面约束 + OverrideManager + ConflictResolver |
+| arena | 23 | ✅ | SandboxManager(wasmtime) + ChannelManager(probe/attack/call) + ComputeExecutor |
+| render | 36 | ✅ | RenderGraph三阶段(借鉴寒霜FrameGraph) + TerminalBuffer + Viewport + AsciiRenderModule |
+| storage | 26 | ✅ | SqliteStorage(3表) + SnapshotManager(serde_json序列化) + RetentionPolicy |
+| bin | 9 | ✅ | 主程序tick循环(借鉴Screeps/AzerothCore) + Config + 信号处理 |
+| 合计 | 271 | | 全绿 |
+
+### MVP 核心缺口（基础设施已有，逻辑未接入）
+
+| 缺口 | 现状 | 优先级 |
+|------|------|--------|
+| WASM 玩家代码执行 | arena 有沙箱管理，主程序 tick 循环跳过阶段一 | P0 |
+| PendingChanges 队列 | 未实现，玩家代码变更无法延迟应用 | P0 |
+| 终端 ANSI 渲染输出 | 渲染图算出 diff 但不写终端屏幕 | P1 |
+| 生存点数扣减 | 数据结构在 core，未接入 tick 循环 | P1 |
+| 接触触发沙箱通道 | 物理碰撞不自动开 probe/attack 通道 | P1 |
+| 击杀掠夺 | 未实现 | P2 |
+| 多线程并行执行 | 单线程，架构文档要求线程池 | P2 |
+
+### MVP 功能范围
+
 ```
-功能范围:
-  ✅ world-core: tick时钟 + 2D坐标 + ASCII渲染
-  ✅ code-arena: 两个WASM沙箱 + probe/attack通道
+  ✅ world-core: tick时钟 + 2D坐标 + ASCII渲染（基础设施）
+  ✅ code-arena: WASM沙箱管理 + probe/attack/call通道（沙箱能力已有，未接入tick循环）
   ✅ 被动观测: gas/内存/API调用元数据
   ✅ physics: 默认物理规则（重力/碰撞/地面约束）+ 覆盖接口
-  ✅ 角色登录门槛: 默认模板（外观/移动/跳跃/life/on_tick/on_probe/on_attack）
-  ✅ 生存点数: 3天初始 + 每天消耗 + 归零死亡 + 掠夺
-  ✅ compute: 本地子进程算力接入
-  ✅ 死亡: 静默删除 + 联系断裂
+  ✅ 角色登录门槛: 默认模板（examples/ 三个 .as 文件）
+  ✅ 生存点数: 数据结构已有（3天初始 + 每天消耗 + 归零死亡 + 掠夺），未接入tick循环
+  ✅ compute: LocalExecutor 空壳
+  ✅ 死亡: 静默删除 + 联系断裂（死亡清理已有，掠夺未实现）
   ✅ 持久化: SQLite全管（元数据+内存快照BLOB+快照索引）
   
+  ❌ WASM玩家代码执行接入tick循环（P0，Phase 2 优先）
+  ❌ PendingChanges延迟队列（P0）
+  ❌ 终端ANSI渲染输出（P1）
+  ❌ 生存点数扣减接入tick循环（P1）
+  ❌ 接触触发沙箱通道（P1）
   ❌ 时间篡改（Phase 2）
   ❌ 空间扭曲（Phase 2）
   ❌ 玩家自建区域（Phase 2）
@@ -1443,12 +1484,13 @@ codeworld/
 │   │   │   ├── override.rs    # 规则覆盖接口
 │   │   │   └── conflict.rs    # 冲突执行（规则碰撞=攻击）
 │   │   └── Cargo.toml
-│   ├── render/                # renderer
+│   ├── render/                # renderer（借鉴寒霜 FrameGraph 三阶段管线）
 │   │   ├── src/
-│   │   │   ├── lib.rs
-│   │   │   ├── ascii.rs       # ASCII渲染器(MVP)
-│   │   │   ├── layer.rs       # 图层排序（图层优先级+Y轴深度排序）
-│   │   │   └── protocol.rs    # ECS state协议
+│   │   │   ├── lib.rs         # Renderer 编排器 + 三阶段入口
+│   │   │   ├── graph.rs       # RenderGraph + RenderNode（Setup/Compile/Execute）
+│   │   │   ├── buffer.rs      # TerminalBuffer + Cell（双缓冲 + diff flush）
+│   │   │   ├── viewport.rs    # Viewport（世界坐标<->终端行列映射 + 视口裁剪）
+│   │   │   └── module.rs      # RenderModule trait + AsciiRenderModule
 │   │   └── Cargo.toml
 │   └── storage/               # 持久化
 │       ├── src/

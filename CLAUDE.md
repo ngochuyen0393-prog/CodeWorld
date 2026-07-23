@@ -43,16 +43,35 @@ CodeWorld 是"代码即现实"的开放世界游戏框架。
 
 ## 开发顺序
 
-Phase 1 MVP 按以下顺序推进：
+Phase 1 MVP 按以下顺序推进（全部完成，271 测试全绿）：
 
-1. `crates/core` -- world-core：WorldState、Entity、EntityId、SurvivalPoints、InstructionGuard
-2. `crates/time` -- time-engine：tick计数器、基础快照
-3. `crates/space` -- space-engine：2D坐标系、基础get_pos/set_pos
-4. `crates/physics` -- physics：默认物理规则（重力/碰撞/地面约束）+ 覆盖接口
-5. `crates/arena` -- code-arena：WASM沙箱管理、probe/attack/call通道
-6. `crates/render` -- renderer：ASCII渲染、图层排序
-7. `crates/storage` -- storage：SQLite持久化
-8. `bin/codeworld` -- 主程序：终端运行器
+1. `crates/core` ✅ (93测试) -- world-core：WorldState、Entity、EntityId、SurvivalPoints、InstructionGuard
+2. `crates/time` ✅ (16测试) -- time-engine：tick计数器、基础快照
+3. `crates/space` ✅ (30测试) -- space-engine：2D坐标系、基础get_pos/set_pos
+4. `crates/physics` ✅ (28测试) -- physics：默认物理规则（重力/碰撞/地面约束）+ 覆盖接口
+5. `crates/arena` ✅ (23测试) -- code-arena：WASM沙箱管理、probe/attack/call通道
+6. `crates/render` ✅ (36测试) -- renderer：ASCII渲染、图层排序（借鉴寒霜FrameGraph三阶段管线）
+7. `crates/storage` ✅ (26测试) -- storage：SQLite持久化
+8. `bin/codeworld` ✅ (9测试) -- 主程序：终端运行器（借鉴Screeps两阶段tick+AzerothCore管理器链）
+
+## MVP 核心缺口（基础设施已有，逻辑未接入）
+
+| 缺口 | 优先级 | 说明 |
+|------|--------|------|
+| WASM 玩家代码执行 | P0 | arena 有沙箱管理，主程序 tick 循环跳过阶段一 |
+| PendingChanges 队列 | P0 | 玩家代码变更无法延迟应用 |
+| 终端 ANSI 渲染输出 | P1 | 渲染图算出 diff 但不写终端屏幕 |
+| 生存点数扣减 | P1 | 数据结构在 core，未接入 tick 循环 |
+| 接触触发沙箱通道 | P1 | 物理碰撞不自动开 probe/attack 通道 |
+| 击杀掠夺 | P2 | 未实现 |
+| 多线程并行执行 | P2 | 单线程，架构文档要求线程池 |
+
+## 设计文档索引
+
+- `docs/architecture.md` -- 权威技术方案文档（v2.1）
+- `docs/physics-v2-design.md` -- 物理引擎 V2 设计（借鉴 PhysX 5 & Chaos，Phase 2）
+- `docs/render-design.md` -- 渲染模块设计（借鉴寒霜 FrameGraph）
+- `docs/main-design.md` -- 主程序设计（借鉴 Screeps/AzerothCore/Skynet/Bevy）
 
 ## 技术约束
 
