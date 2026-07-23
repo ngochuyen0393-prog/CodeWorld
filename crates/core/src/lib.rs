@@ -12,6 +12,7 @@
 pub mod config;
 pub mod entity;
 pub mod guard;
+pub mod pending;
 pub mod physics;
 pub mod render;
 pub mod survival;

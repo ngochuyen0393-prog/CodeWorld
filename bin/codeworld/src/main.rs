@@ -15,6 +15,7 @@ mod config;
 
 use anyhow::Result;
 use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
+use codeworld_core::pending::PendingChange;
 use codeworld_core::world::WorldState;
 use codeworld_physics::default::DefaultPhysicsEngine;
 use codeworld_render::{Renderer, Viewport};
@@ -69,6 +70,10 @@ fn main() -> Result<()> {
         r.store(false, Ordering::SeqCst);
     });
 
+    // 延迟变更队列（架构文档 4.1 节阶段一产出、阶段二 a 统一应用）
+    // MVP 无玩家代码，pending 始终为空；Phase 2 接入 WASM 后由玩家代码填充
+    let mut pending: Vec<PendingChange> = Vec::new();
+
     tracing::info!("tick 循环开始（按 Enter 退出）");
     while running.load(Ordering::SeqCst) {
         tick(
@@ -77,6 +82,7 @@ fn main() -> Result<()> {
             &physics,
             &mut renderer,
             &mut storage,
+            &mut pending,
         );
         std::thread::sleep(config.tick_interval());
     }
@@ -103,6 +109,7 @@ fn tick(
     physics: &DefaultPhysicsEngine,
     renderer: &mut Renderer,
     storage: &mut StorageEngine,
+    pending: &mut Vec<PendingChange>,
 ) {
     // ① 时间推进（time-engine 计数 + 世界 tick 同步推进）
     let should_snapshot = time_engine.advance_tick();
@@ -110,15 +117,28 @@ fn tick(
     let current_tick = world.tick();
 
     // ② 阶段一：玩家代码执行（MVP 跳过，Phase 2 接入 WASM）
+    //    玩家代码执行期间产生的变更放入 pending，阶段二统一应用。
+    //    注意：不在此处清空 pending——apply_pending_changes 的 drain(..) 会消费并清空队列，
+    //    保证不跨 tick 残留（架构 4.1 "不立即应用、同 tick 统一应用"）。
+    //    测试可预填 pending 模拟阶段一产出的变更。
+    //    TODO(Phase2)：架构文档 4.1 要求生存点数检查在阶段一每个实体线程内、on_tick 之前
+    //    执行（归零则不跑 on_tick）。当前 decay_survival 放在阶段二（任务要求），
+    //    接入 WASM 后需前移到阶段一，否则将死的实体会多跑一个 tick 的 on_tick。
 
     // ③ 阶段二：状态更新（串行）
-    //   a. 物理规则（重力/地面/速度/碰撞，架构 4.1 b 步）
+    //   a. 应用 PendingChanges（spawn/destroy/set_pos/set_velocity，架构 4.1 a 步）
+    apply_pending_changes(world, pending);
+
+    //   b. 生存点数扣减（架构 4.1：每 86400 tick 扣 1 点，归零标记死亡）
+    decay_survival(world, current_tick);
+
+    //   c. 物理规则（重力/地面/速度/碰撞，架构 4.1 b 步）
     let changes = physics.step(world);
     if !changes.is_empty() {
         tracing::debug!(tick = current_tick, change_count = changes.len(), "物理变更");
     }
 
-    //   b. 死亡清理：移除死亡实体
+    //   d. 死亡清理：移除死亡实体
     let before = world.entities.len();
     world.entities.retain(|_, e| e.is_alive());
     let removed = before - world.entities.len();
@@ -126,14 +146,14 @@ fn tick(
         tracing::info!(tick = current_tick, removed, "死亡实体清理");
     }
 
-    //   c. 渲染输出（架构 4.1 e 步；有差异才 flush）
+    //   e. 渲染输出（架构 4.1 e 步；有差异才 flush）
     let diffs = renderer.render(world);
     if !diffs.is_empty() {
         renderer.flush();
         tracing::debug!(tick = current_tick, diff_count = diffs.len(), "渲染输出");
     }
 
-    //   d. 快照存储（每 100 tick，架构 4.1 d 步）
+    //   f. 快照存储（每 100 tick，架构 4.1 d 步）
     if should_snapshot {
         match storage.save_world_snapshot(world) {
             Ok(saved_tick) if saved_tick > 0 => {
@@ -153,6 +173,74 @@ fn tick(
             entities = world.entities.len(),
             "tick 运行中"
         );
+    }
+}
+
+/// 应用延迟变更队列（架构文档 4.1 节阶段二 a 步）
+///
+/// 阶段一玩家代码执行期间产生的变更（spawn/destroy/set_pos/set_velocity）
+/// 放入 pending 队列，此处统一应用到 WorldState。应用后队列清空。
+fn apply_pending_changes(world: &mut WorldState, pending: &mut Vec<PendingChange>) {
+    for change in pending.drain(..) {
+        match change {
+            PendingChange::Spawn { entity } => {
+                tracing::info!(entity_id = %entity.id.0, "应用 Spawn");
+                world.entities.insert(entity.id, entity);
+            }
+            PendingChange::Destroy { entity } => {
+                tracing::info!(entity_id = %entity.0, "应用 Destroy");
+                if let Some(e) = world.entities.get_mut(&entity) {
+                    e.kill();
+                }
+            }
+            PendingChange::SetPos { entity, new_pos } => {
+                tracing::debug!(entity_id = %entity.0, ?new_pos, "应用 SetPos");
+                if let Some(e) = world.entities.get_mut(&entity) {
+                    e.set_pos(new_pos);
+                }
+            }
+            PendingChange::SetVelocity {
+                entity,
+                new_velocity,
+            } => {
+                tracing::debug!(entity_id = %entity.0, ?new_velocity, "应用 SetVelocity");
+                if let Some(e) = world.entities.get_mut(&entity) {
+                    e.set_velocity(new_velocity);
+                }
+            }
+        }
+    }
+}
+
+/// 生存点数扣减（架构文档 4.1 节阶段二 b 步）
+///
+/// 遍历存活实体调用 survival.decay(current_tick)，归零则标记死亡。
+/// 死亡清理步（retain is_alive）会随后移除死亡实体。
+fn decay_survival(world: &mut WorldState, current_tick: u64) {
+    for entity in world.entities.values_mut() {
+        if !entity.is_alive() {
+            continue;
+        }
+        let before = entity.survival.points();
+        entity.survival.decay(current_tick);
+        let after = entity.survival.points();
+        if after < before {
+            tracing::info!(
+                entity_id = %entity.id.0,
+                tick = current_tick,
+                before,
+                after,
+                "生存点数扣减"
+            );
+        }
+        if entity.survival.is_dead() {
+            entity.kill();
+            tracing::info!(
+                entity_id = %entity.id.0,
+                tick = current_tick,
+                "生存点数归零，实体死亡"
+            );
+        }
     }
 }
 
@@ -205,6 +293,141 @@ mod tests {
         )
     }
 
+    // === apply_pending_changes（阶段二 a 步）===
+
+    #[test]
+    fn apply_pending_changes_spawn_inserts_entity() {
+        // 阶段二 a 步：Spawn 变更把实体插入 world
+        let mut world = WorldState::new();
+        let entity = make_entity(7, (3.0, 4.0));
+        let id = entity.id;
+        let mut pending: Vec<PendingChange> = vec![PendingChange::Spawn { entity }];
+        apply_pending_changes(&mut world, &mut pending);
+        assert!(world.entities.contains_key(&id), "Spawn 后实体应在 world 中");
+        assert_eq!(world.entities.get(&id).unwrap().pos(), (3.0, 4.0));
+    }
+
+    #[test]
+    fn apply_pending_changes_destroy_kills_entity() {
+        // 阶段二 a 步：Destroy 变更标记实体死亡（死亡清理步才真正移除）
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world.entities.insert(id, make_entity(1, (0.0, 0.0)));
+        let mut pending: Vec<PendingChange> = vec![PendingChange::Destroy { entity: id }];
+        apply_pending_changes(&mut world, &mut pending);
+        assert!(
+            !world.entities.get(&id).unwrap().is_alive(),
+            "Destroy 应标记死亡"
+        );
+    }
+
+    #[test]
+    fn apply_pending_changes_setpos_moves_entity() {
+        // 阶段二 a 步：SetPos 变更更新实体坐标
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(2));
+        world.entities.insert(id, make_entity(2, (0.0, 0.0)));
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id,
+            new_pos: (8.0, 9.0),
+        }];
+        apply_pending_changes(&mut world, &mut pending);
+        assert_eq!(world.entities.get(&id).unwrap().pos(), (8.0, 9.0));
+    }
+
+    #[test]
+    fn apply_pending_changes_setvelocity_sets_velocity() {
+        // 阶段二 a 步：SetVelocity 变更更新实体速度
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(3));
+        world.entities.insert(id, make_entity(3, (0.0, 0.0)));
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetVelocity {
+            entity: id,
+            new_velocity: (1.0, 2.0),
+        }];
+        apply_pending_changes(&mut world, &mut pending);
+        assert_eq!(world.entities.get(&id).unwrap().velocity(), (1.0, 2.0));
+    }
+
+    #[test]
+    fn apply_pending_changes_drains_queue() {
+        // 阶段二 a 步：apply 后 pending 队列清空
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(4));
+        world.entities.insert(id, make_entity(4, (0.0, 0.0)));
+        let mut pending: Vec<PendingChange> = vec![
+            PendingChange::SetPos {
+                entity: id,
+                new_pos: (1.0, 1.0),
+            },
+            PendingChange::Destroy { entity: id },
+        ];
+        apply_pending_changes(&mut world, &mut pending);
+        assert!(pending.is_empty(), "apply 后 pending 应清空");
+    }
+
+    #[test]
+    fn apply_pending_changes_unknown_entity_no_panic() {
+        // 边界：对不存在的 EntityId 做 SetPos/SetVelocity/Destroy 应静默跳过、不 panic
+        let mut world = WorldState::new();
+        let unknown = EntityId(Uuid::from_u128(999));
+        let mut pending: Vec<PendingChange> = vec![
+            PendingChange::SetPos {
+                entity: unknown,
+                new_pos: (1.0, 1.0),
+            },
+            PendingChange::SetVelocity {
+                entity: unknown,
+                new_velocity: (2.0, 2.0),
+            },
+            PendingChange::Destroy { entity: unknown },
+        ];
+        apply_pending_changes(&mut world, &mut pending);
+        assert!(pending.is_empty(), "即使目标不存在，变更也应被消费清空");
+        assert!(world.entities.is_empty(), "不应插入任何实体");
+    }
+
+    // === decay_survival（阶段二 b 步）===
+
+    #[test]
+    fn decay_survival_kills_when_points_zero() {
+        // 阶段二 b 步：生存点数归零时实体被标记死亡
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world.entities.insert(id, make_entity(1, (0.0, 0.0))); // created_tick=0，初始3天
+        // 经过 3 天(86400*3 tick)：点数 3->0
+        decay_survival(&mut world, 86400 * 3);
+        let e = world.entities.get(&id).unwrap();
+        assert!(e.survival.is_dead(), "点数应归零");
+        assert!(!e.is_alive(), "归零应标记实体死亡");
+    }
+
+    #[test]
+    fn decay_survival_no_effect_when_not_enough_ticks() {
+        // 阶段二 b 步：不足 86400 tick 不扣减、不死亡
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(2));
+        world.entities.insert(id, make_entity(2, (0.0, 0.0)));
+        decay_survival(&mut world, 86399);
+        let e = world.entities.get(&id).unwrap();
+        assert!(e.is_alive(), "不足一天不应死亡");
+        assert_eq!(e.survival.points(), 3, "不足一天不应扣减");
+    }
+
+    #[test]
+    fn decay_survival_skips_already_dead_entity() {
+        // 边界：已标记死亡的实体不参与 decay（不 panic、点数不变）
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(3));
+        let mut e = make_entity(3, (0.0, 0.0));
+        e.kill(); // 预先标记死亡
+        world.entities.insert(id, e);
+        decay_survival(&mut world, 86400 * 3); // 足够归零的 tick
+        let e = world.entities.get(&id).unwrap();
+        assert!(!e.is_alive(), "应保持死亡");
+        assert_eq!(e.survival.points(), 3, "死亡实体不应被 decay，点数保持初始值");
+    }
+
     #[test]
     fn tick_advances_world_tick() {
         // 修改：连续 tick 推进世界与时间引擎计数
@@ -213,8 +436,9 @@ mod tests {
         let physics = DefaultPhysicsEngine::new();
         let mut renderer = test_renderer();
         let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
         for _ in 0..5 {
-            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage);
+            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending);
         }
         assert_eq!(world.tick(), 5);
         assert_eq!(time.current_tick(), 5);
@@ -230,7 +454,8 @@ mod tests {
         let physics = DefaultPhysicsEngine::new();
         let mut renderer = test_renderer();
         let mut storage = StorageEngine::open_in_memory().unwrap();
-        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage);
+        let mut pending: Vec<PendingChange> = Vec::new();
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending);
         let e = world.entities.get(&id).unwrap();
         // 重力 -9.8：10.0 -> 0.2
         assert!(e.pos().1 < 10.0, "重力应使实体下落");
@@ -239,6 +464,41 @@ mod tests {
             "下落到约 0.2，实际 {}",
             e.pos().1
         );
+    }
+
+    #[test]
+    fn tick_applies_pending_then_physics() {
+        // 集成：pending 的 SetPos 变更在 physics 之前应用（架构 4.1 阶段二 a 在 b 之前）
+        // 实体初始在地面 (0,0)，pending 设 SetPos 到 (0,10)
+        // - 若 pending 先于 physics：实体到 (0,10) 后受重力 -> (0,0.2)
+        // - 若 pending 后于 physics：实体留在 (0,0)（地面无重力），再被 SetPos 覆盖到 (0,10)
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world.entities.insert(id, make_entity(1, (0.0, 0.0)));
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id,
+            new_pos: (0.0, 10.0),
+        }];
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+        );
+        let y = world.entities.get(&id).unwrap().pos().1;
+        // SetPos 先应用 -> 重力 10.0 -> 0.2（既非 10.0 也非 0.0）
+        assert!(
+            (y - 0.2).abs() < 0.01,
+            "pending 应在 physics 之前应用：预期 ~0.2，实际 {}",
+            y
+        );
+        assert!(pending.is_empty(), "tick 后 pending 应被 apply 清空");
     }
 
     #[test]
@@ -255,7 +515,8 @@ mod tests {
         let physics = DefaultPhysicsEngine::new();
         let mut renderer = test_renderer();
         let mut storage = StorageEngine::open_in_memory().unwrap();
-        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage);
+        let mut pending: Vec<PendingChange> = Vec::new();
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending);
         assert_eq!(world.entities.len(), 1, "死亡实体应被清理");
         assert!(world.entities.contains_key(&alive));
         assert!(!world.entities.contains_key(&dead));
@@ -269,8 +530,9 @@ mod tests {
         let physics = DefaultPhysicsEngine::new();
         let mut renderer = test_renderer();
         let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
         for _ in 0..100 {
-            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage);
+            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending);
         }
         assert_eq!(world.tick(), 100);
         assert_eq!(
@@ -310,8 +572,9 @@ mod tests {
         let physics = DefaultPhysicsEngine::new();
         let mut renderer = test_renderer();
         let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
         for _ in 0..5 {
-            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage);
+            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending);
         }
         assert_eq!(world.tick(), 5);
         assert_eq!(world.entities.len(), 1);
