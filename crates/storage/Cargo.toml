@@ -6,3 +6,20 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# 世界状态数据结构
+codeworld-core = { path = "../core" }
+# SQLite 存储后端（bundled 自带 SQLite 编译，不依赖系统 SQLite）
+rusqlite = { workspace = true }
+# 序列化（快照存 WorldState 为 JSON 字节）
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 日志
+tracing = { workspace = true }
+# 错误处理
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# 测试用 UUID 构造实体
+uuid = { workspace = true }
+# 测试用临时文件数据库
+tempfile = "3"
