@@ -14,6 +14,8 @@ codeworld-physics = { path = "../../crates/physics" }
 codeworld-arena = { path = "../../crates/arena" }
 codeworld-render = { path = "../../crates/render" }
 codeworld-storage = { path = "../../crates/storage" }
+# WAT 文本 -> WASM 字节码（测试实体沙箱用，spike 验证模式）
+wat = { workspace = true }
 # 错误处理
 anyhow = { workspace = true }
 # 日志
