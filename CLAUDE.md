@@ -43,16 +43,16 @@ CodeWorld 是"代码即现实"的开放世界游戏框架。
 
 ## 开发顺序
 
-Phase 1 MVP 按以下顺序推进（全部完成，271 测试全绿）：
+Phase 1 MVP 按以下顺序推进（全部完成，333 测试全绿）：
 
-1. `crates/core` ✅ (93测试) -- world-core：WorldState、Entity、EntityId、SurvivalPoints、InstructionGuard
+1. `crates/core` ✅ (97测试) -- world-core：WorldState、Entity、EntityId、SurvivalPoints、InstructionGuard
 2. `crates/time` ✅ (16测试) -- time-engine：tick计数器、基础快照
 3. `crates/space` ✅ (30测试) -- space-engine：2D坐标系、基础get_pos/set_pos
 4. `crates/physics` ✅ (28测试) -- physics：默认物理规则（重力/碰撞/地面约束）+ 覆盖接口
-5. `crates/arena` ✅ (23测试) -- code-arena：WASM沙箱管理、probe/attack/call通道
-6. `crates/render` ✅ (36测试) -- renderer：ASCII渲染、图层排序（借鉴寒霜FrameGraph三阶段管线）
+5. `crates/arena` ✅ (28测试) -- code-arena：WASM沙箱管理、probe/attack/call通道
+6. `crates/render` ✅ (48测试) -- renderer：ASCII渲染、图层排序（借鉴寒霜FrameGraph三阶段管线）
 7. `crates/storage` ✅ (26测试) -- storage：SQLite持久化
-8. `bin/codeworld` ✅ (9测试) -- 主程序：终端运行器（借鉴Screeps两阶段tick+AzerothCore管理器链）
+8. `bin/codeworld` ✅ (44测试) -- 主程序：终端运行器（借鉴Screeps两阶段tick+AzerothCore管理器链）
 
 ## MVP 核心缺口（P0/P1 全部完成，2026-07-23/24）
 
@@ -62,8 +62,8 @@ Phase 1 MVP 按以下顺序推进（全部完成，271 测试全绿）：
 | PendingChanges 队列 | ✅ | core/pending.rs + tick 阶段二 apply |
 | 生存点数扣减 | ✅ | tick 阶段二 decay_survival |
 | 接触触发沙箱通道 | ✅ | tick 阶段二 detect_collisions + handle_collisions |
-| 终端 ANSI 渲染输出 | ❌ Phase 2 | 渲染图算出 diff 但不写终端 |
-| 击杀掠夺 | ❌ Phase 2 | 未实现 |
+| 终端 ANSI 渲染输出 | ✅ | Renderer::flush_to + ANSI diff 输出到 stdout |
+| 击杀掠夺 | ✅ | tick 阶段二 process_attacks + plunder_survival |
 | 多线程并行执行 | ❌ Phase 2 | MVP 单线程 |
 
 ## 设计文档索引
