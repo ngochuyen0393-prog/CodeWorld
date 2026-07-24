@@ -29,6 +29,8 @@ pub struct Renderer {
     buffer: TerminalBuffer,
     viewport: Viewport,
     module: AsciiRenderModule,
+    /// 上一帧 render() 算出的 diff，供 flush() 复用（避免 flush_diff 重复扫描全缓冲）
+    last_diff: Vec<(usize, usize)>,
 }
 
 impl Renderer {
@@ -40,6 +42,7 @@ impl Renderer {
             buffer: TerminalBuffer::new(rows, cols),
             viewport,
             module: AsciiRenderModule::new(),
+            last_diff: Vec::new(),
         }
     }
 
@@ -59,8 +62,9 @@ impl Renderer {
         self.graph.compile(&self.viewport);
         // ④ 执行：按序写入 buffer（画家算法：后写覆盖先写）
         self.graph.execute(&mut self.buffer);
-        // ⑤ 计算差异（返回供调用方判断是否 flush）
+        // ⑤ 计算差异（缓存供 flush 复用，避免 flush_diff 重复扫描全缓冲）
         let diff = self.buffer.diff_cells();
+        self.last_diff = diff.clone();
         // ⑥ swap 在 flush() 中完成：输出 diff 后再 swap
         tracing::debug!(diff_count = diff.len(), "Renderer 渲染完成");
         diff
@@ -78,6 +82,9 @@ impl Renderer {
             return;
         }
         // 显式 flush：stdout 行缓冲，ANSI 转义无换行需手动冲刷才即时显示
+        // 注：此时 flush_to 已成功输出并 swap。若此处 out.flush() 失败，本帧画面
+        // 可能未真正上屏（视觉丢失），但缓冲已 swap、数据一致性不受影响（下帧 diff
+        // 基于已 swap 状态计算）；仅记日志不回滚。
         if let Err(e) = out.flush() {
             tracing::warn!(error = %e, "[flush] stdout flush 失败");
         }
@@ -88,7 +95,7 @@ impl Renderer {
     /// 输出 buffer 的 diff 格子（flush_diff），成功后 swap 缓冲。
     /// 输出失败则不 swap（保留 diff 状态供下帧重试）。
     pub fn flush_to<W: std::io::Write>(&mut self, out: &mut W) -> std::io::Result<()> {
-        self.buffer.flush_diff(out)?;
+        self.buffer.flush_diff(out, &self.last_diff)?;
         self.buffer.swap();
         tracing::debug!("[flush_to] 渲染输出完成并已 swap");
         Ok(())

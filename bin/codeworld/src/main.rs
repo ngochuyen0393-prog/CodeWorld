@@ -175,6 +175,12 @@ fn main() -> Result<()> {
     if let Err(e) = enter_terminal(&mut std::io::stdout().lock()) {
         tracing::warn!(error = %e, "进入终端渲染模式失败，继续以普通输出运行");
     }
+    // panic 时尽力恢复终端（隐藏光标/颜色状态不能残留砖化终端），再交回默认 hook 打印 panic 信息
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = exit_terminal(&mut std::io::stdout().lock());
+        default_panic_hook(info);
+    }));
     while running.load(Ordering::SeqCst) {
         tick(
             &mut world,

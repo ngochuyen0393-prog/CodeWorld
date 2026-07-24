@@ -108,24 +108,27 @@ impl TerminalBuffer {
             .unwrap_or_else(|| EMPTY.get_or_init(Cell::default))
     }
 
-    /// 把 current 与 previous 的差异格子以 ANSI 转义序列写入 output
+    /// 把指定的 diff 格子以 ANSI 转义序列写入 output
     ///
     /// 只重绘变化格子（diff 优化）：对每个 diff 格子输出
     /// `\x1b[{row+1};{col+1}H`（光标移动，buffer 0-based 转 ANSI 1-based）
     /// + `\x1b[{code}m`（颜色码）+ glyph。
     ///
-    /// 不交换缓冲：swap 由调用方在输出完成后调用（见 Renderer::flush），
+    /// diffs 由调用方传入（复用 render() 已算的 diff，避免每 tick 重复扫描全缓冲）。
+    /// 不交换缓冲：swap 由调用方在输出完成后调用（见 Renderer::flush_to），
     /// 以便"输出失败时不破坏 diff 状态"并可单独测试输出内容。
-    pub fn flush_diff<W: Write>(&self, output: &mut W) -> std::io::Result<()> {
-        let diffs = self.diff_cells();
-        let count = diffs.len();
-        for (row, col) in diffs {
+    pub fn flush_diff<W: Write>(
+        &self,
+        output: &mut W,
+        diffs: &[(usize, usize)],
+    ) -> std::io::Result<()> {
+        for &(row, col) in diffs {
             let cell = self.cell_at(row, col);
             let code = crate::ansi::color_to_ansi(&cell.color);
             // 光标定位(1-based) + 设颜色 + 写字符
             write!(output, "\x1b[{};{}H\x1b[{}m{}", row + 1, col + 1, code, cell.glyph)?;
         }
-        tracing::debug!(diff_count = count, "[flush_diff] ANSI 输出完成");
+        tracing::debug!(diff_count = diffs.len(), "[flush_diff] ANSI 输出完成");
         Ok(())
     }
 }
@@ -230,8 +233,9 @@ mod tests {
         // 读写：单个变化格子 -> 光标移动(1-based) + 颜色码 + 字符
         let mut b = TerminalBuffer::new(3, 3);
         b.write(0, 0, "@", "red");
+        let diffs = b.diff_cells();
         let mut out = Vec::new();
-        b.flush_diff(&mut out).unwrap();
+        b.flush_diff(&mut out, &diffs).unwrap();
         let s = String::from_utf8(out).unwrap();
         // (row=0,col=0) -> 光标 1;1，red->31
         assert_eq!(s, "\x1b[1;1H\x1b[31m@");
@@ -241,8 +245,9 @@ mod tests {
     fn flush_diff_empty_when_no_diff() {
         // 边界：current==previous（新缓冲全空格）-> 无 diff -> 无输出
         let b = TerminalBuffer::new(3, 3);
+        let diffs = b.diff_cells();
         let mut out = Vec::new();
-        b.flush_diff(&mut out).unwrap();
+        b.flush_diff(&mut out, &diffs).unwrap();
         assert!(out.is_empty());
     }
 
@@ -252,8 +257,9 @@ mod tests {
         let mut b = TerminalBuffer::new(3, 3);
         b.write(0, 0, "A", "red");
         b.write(2, 1, "B", "blue");
+        let diffs = b.diff_cells();
         let mut out = Vec::new();
-        b.flush_diff(&mut out).unwrap();
+        b.flush_diff(&mut out, &diffs).unwrap();
         let s = String::from_utf8(out).unwrap();
         // (0,0)->1;1 red 31 A ; (2,1)->3;2 blue 34 B
         assert_eq!(s, "\x1b[1;1H\x1b[31mA\x1b[3;2H\x1b[34mB");
@@ -264,8 +270,9 @@ mod tests {
         // 边界：未知颜色当 default（码 0）
         let mut b = TerminalBuffer::new(2, 2);
         b.write(1, 1, "X", "purple");
+        let diffs = b.diff_cells();
         let mut out = Vec::new();
-        b.flush_diff(&mut out).unwrap();
+        b.flush_diff(&mut out, &diffs).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert_eq!(s, "\x1b[2;2H\x1b[0mX");
     }
@@ -276,9 +283,25 @@ mod tests {
         // 输出后 current 仍持有本帧、diff 仍非空（证明未 swap）
         let mut b = TerminalBuffer::new(2, 2);
         b.write(0, 0, "@", "red");
+        let diffs = b.diff_cells();
         let mut out = Vec::new();
-        b.flush_diff(&mut out).unwrap();
+        b.flush_diff(&mut out, &diffs).unwrap();
         assert_eq!(b.get(0, 0).unwrap().glyph, "@"); // current 未变
         assert!(b.diff_cells().contains(&(0, 0))); // 未 swap -> diff 仍在
+    }
+
+    #[test]
+    fn flush_diff_uses_passed_diffs_not_internal_scan() {
+        // 修改：flush_diff 按传入的 diffs 输出，不自行扫描缓冲
+        // buffer 有变化但传入空 diffs -> 无输出（证明用传入列表而非内部 diff_cells）
+        let mut b = TerminalBuffer::new(2, 2);
+        b.write(0, 0, "@", "red");
+        let mut out = Vec::new();
+        b.flush_diff(&mut out, &[]).unwrap();
+        assert!(
+            out.is_empty(),
+            "传入空 diffs 应无输出，即使缓冲有变化，实际 {:?}",
+            out
+        );
     }
 }
