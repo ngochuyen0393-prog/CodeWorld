@@ -6,17 +6,20 @@
 //! 架构文档 4.1 节 e 步定义渲染流程：从渲染队列取 RenderRequest，
 //! 按图层排序后绘制（Background < Entity < Effect < UI，层内按 Y 轴深度排序）。
 
+pub mod ansi;
 pub mod buffer;
 pub mod graph;
 pub mod module;
 pub mod viewport;
 
+pub use ansi::{color_to_ansi, enter_terminal, exit_terminal};
 pub use buffer::{Cell, TerminalBuffer};
 pub use graph::{RenderGraph, RenderNode};
 pub use module::{AsciiRenderModule, RenderModule};
 pub use viewport::Viewport;
 
 use codeworld_core::world::WorldState;
+use std::io::Write;
 
 /// Renderer 编排器（借鉴寒霜 WorldRenderer 角色：只编排，不分配资源）
 ///
@@ -43,11 +46,10 @@ impl Renderer {
     /// 完整渲染流程（三阶段），返回本帧与上帧的差异格子坐标列表
     ///
     /// 流程：① clear -> ② setup（声明）-> ③ compile（裁剪+排序）-> ④ execute（绘制）
-    ///      -> ⑤ diff_cells（计算差异）-> ⑥ swap（flush 后调用）
+    ///      -> ⑤ diff_cells（计算差异）；⑥ swap 在 flush() 中完成（输出 ANSI 后 swap）
     ///
-    /// 注：步骤⑥ swap 语义为"flush 后调用"，MVP 步骤⑤"只计算不输出"即无真实 flush，
-    /// 故暂不执行 swap——buffer.current 持有本帧画面供读取/测试。
-    /// 接入真实终端 flush 时，在 flush 完成后调用 self.buffer.swap()。
+    /// 注：render() 本身不交换缓冲，buffer.current 持有本帧画面供 flush 读取。
+    /// flush() 输出 diff 后再 swap（供下帧 diff）；render() 不调用 swap。
     pub fn render(&mut self, world: &WorldState) -> Vec<(usize, usize)> {
         // ① 清空当前帧
         self.buffer.clear();
@@ -57,19 +59,39 @@ impl Renderer {
         self.graph.compile(&self.viewport);
         // ④ 执行：按序写入 buffer（画家算法：后写覆盖先写）
         self.graph.execute(&mut self.buffer);
-        // ⑤ 计算差异（MVP 只计算不输出，返回供测试验证）
+        // ⑤ 计算差异（返回供调用方判断是否 flush）
         let diff = self.buffer.diff_cells();
-        // ⑥ swap：flush 后调用；MVP 无真实输出，暂不交换（见上注）
+        // ⑥ swap 在 flush() 中完成：输出 diff 后再 swap
         tracing::debug!(diff_count = diff.len(), "Renderer 渲染完成");
         diff
     }
 
-    /// Flush：真实终端输出完成后调用，交换缓冲（供下帧 diff）
+    /// Flush：把本帧 diff 以 ANSI 转义序列输出到 stdout，再交换缓冲（供下帧 diff）
     ///
-    /// MVP 无真实终端输出，render() 不调用本方法（buffer.current 持有本帧供读取/测试）。
-    /// 接入真实终端 flush 时：先输出 buffer.current，再调用本方法交换缓冲。
+    /// 仅当 render() 返回非空 diff 时调用（main.rs tick 第 e 步）。
+    /// 输出失败仅记日志不 panic（终端不可写不应崩主循环），且不 swap 以便下帧重试未绘变更。
     pub fn flush(&mut self) {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        if let Err(e) = self.flush_to(&mut out) {
+            tracing::warn!(error = %e, "[flush] 渲染输出到 stdout 失败");
+            return;
+        }
+        // 显式 flush：stdout 行缓冲，ANSI 转义无换行需手动冲刷才即时显示
+        if let Err(e) = out.flush() {
+            tracing::warn!(error = %e, "[flush] stdout flush 失败");
+        }
+    }
+
+    /// Flush 到任意 writer（测试用 Vec<u8> 验证 ANSI 输出）
+    ///
+    /// 输出 buffer 的 diff 格子（flush_diff），成功后 swap 缓冲。
+    /// 输出失败则不 swap（保留 diff 状态供下帧重试）。
+    pub fn flush_to<W: std::io::Write>(&mut self, out: &mut W) -> std::io::Result<()> {
+        self.buffer.flush_diff(out)?;
         self.buffer.swap();
+        tracing::debug!("[flush_to] 渲染输出完成并已 swap");
+        Ok(())
     }
 
     /// 只读访问 buffer（测试验证用）
@@ -214,5 +236,50 @@ mod tests {
         let r = renderer_10x10();
         assert_eq!(r.viewport().term_rows, 10);
         assert_eq!(r.viewport().term_cols, 10);
+    }
+
+    // === flush_to：Renderer ANSI 输出 ===
+
+    #[test]
+    fn flush_to_outputs_ansi_for_rendered_entities() {
+        // 读写：render 后 flush_to 输出实体的 ANSI 序列（光标+颜色+字符）
+        let mut r = renderer_10x10();
+        let mut world = WorldState::new();
+        world.entities.insert(
+            EntityId(Uuid::from_u128(1)),
+            make_entity(1, (5.0, 5.0), "@", true),
+        );
+        let diff = r.render(&world);
+        assert!(!diff.is_empty(), "首帧应有 diff");
+        let mut out = Vec::new();
+        r.flush_to(&mut out).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        // 世界 (5,5) -> 屏幕 (5,5) -> ANSI 光标 6;6；red->31；glyph @
+        assert!(
+            s.contains("\x1b[6;6H\x1b[31m@"),
+            "应输出实体 ANSI，实际 {:?}",
+            s
+        );
+    }
+
+    #[test]
+    fn flush_to_swaps_so_next_render_has_no_diff() {
+        // 修改：flush_to 输出后 swap -> 同状态再 render 无 diff（证明 swap 生效）
+        let mut r = renderer_10x10();
+        let mut world = WorldState::new();
+        world.entities.insert(
+            EntityId(Uuid::from_u128(1)),
+            make_entity(1, (5.0, 5.0), "@", true),
+        );
+        let first = r.render(&world);
+        assert!(!first.is_empty(), "首帧应有 diff");
+        let mut out = Vec::new();
+        r.flush_to(&mut out).unwrap();
+        let second = r.render(&world);
+        assert!(
+            second.is_empty(),
+            "flush_to 应 swap 使下帧无 diff，实际 {:?}",
+            second
+        );
     }
 }

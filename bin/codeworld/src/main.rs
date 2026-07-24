@@ -19,7 +19,7 @@ use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 use codeworld_core::pending::PendingChange;
 use codeworld_core::world::WorldState;
 use codeworld_physics::default::{CollisionPair, DefaultPhysicsEngine};
-use codeworld_render::{Renderer, Viewport};
+use codeworld_render::{enter_terminal, exit_terminal, Renderer, Viewport};
 use codeworld_storage::StorageEngine;
 use codeworld_time::clock::TimeEngine;
 use config::Config;
@@ -170,6 +170,11 @@ fn main() -> Result<()> {
     let mut pending: Vec<PendingChange> = Vec::new();
 
     tracing::info!("tick 循环开始（按 Enter 退出）");
+    // 进入终端渲染模式：清屏 + 隐藏光标
+    // stdout 专供 ANSI 画面，日志已走 stderr，进入后画面由 tick 第 e 步 flush 维护
+    if let Err(e) = enter_terminal(&mut std::io::stdout().lock()) {
+        tracing::warn!(error = %e, "进入终端渲染模式失败，继续以普通输出运行");
+    }
     while running.load(Ordering::SeqCst) {
         tick(
             &mut world,
@@ -183,17 +188,28 @@ fn main() -> Result<()> {
         std::thread::sleep(config.tick_interval());
     }
 
-    // 关闭：强制存快照（架构文档 4.1 收尾）
+    // 关闭：恢复终端 + 强制存快照（架构文档 4.1 收尾）
     tracing::info!("收到退出信号，正在保存世界快照...");
-    storage.force_save(&world)?;
+    let save_result = storage.force_save(&world);
+    // 无论保存结果如何都恢复终端（避免残留隐藏光标/颜色状态）
+    if let Err(e) = exit_terminal(&mut std::io::stdout().lock()) {
+        tracing::warn!(error = %e, "恢复终端失败");
+    }
+    save_result?;
     tracing::info!(tick = world.tick(), entities = world.entities.len(), "主程序已关闭");
     Ok(())
 }
 
 /// 初始化 tracing 日志，级别从配置字符串读取（非法时回退 info）
+///
+/// 日志写 stderr：stdout 专供 ANSI 画面渲染，若日志走默认 stdout 会与画面交错破坏显示。
+/// （日志走 stderr 可 `codeworld 2>logs.txt` 分离查看；同一 TTY 裸跑仍可能交错，MVP 限制）
 fn init_tracing(log_level: &str) {
     let level = log_level.parse::<LevelFilter>().unwrap_or(LevelFilter::INFO);
-    tracing_subscriber::fmt().with_max_level(level).init();
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 /// 单 tick 串行状态更新（架构文档 4.1 节 MVP 简化版）
