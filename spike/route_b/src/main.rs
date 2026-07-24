@@ -28,17 +28,17 @@ fn make_linker(engine: &Engine) -> Result<Linker<HostData>> {
 
 fn compile(engine: &Engine, wat_text: &str) -> Result<Module> {
     let wasm = wat::parse_bytes(wat_text.as_bytes())?;
-    Ok(Module::new(engine, &wasm)?)
+    Module::new(engine, &wasm)
 }
 
 fn call_life(store: &mut Store<HostData>, instance: &Instance) -> Result<i32> {
     let life = instance.get_typed_func::<(), i32>(&mut *store, "life")?;
-    Ok(life.call(&mut *store, ())?)
+    life.call(&mut *store, ())
 }
 
 fn call_get_state(store: &mut Store<HostData>, instance: &Instance) -> Result<i32> {
     let f = instance.get_typed_func::<(), i32>(&mut *store, "get_state")?;
-    Ok(f.call(&mut *store, ())?)
+    f.call(&mut *store, ())
 }
 
 fn call_set_state(store: &mut Store<HostData>, instance: &Instance, v: i32) -> Result<()> {
@@ -50,7 +50,7 @@ fn call_set_state(store: &mut Store<HostData>, instance: &Instance, v: i32) -> R
 /// 调用 life_via(idx)：经call_indirect调用vtable[idx]，用于验证"只改一项"
 fn call_life_via(store: &mut Store<HostData>, instance: &Instance, idx: i32) -> Result<i32> {
     let f = instance.get_typed_func::<i32, i32>(&mut *store, "life_via")?;
-    Ok(f.call(&mut *store, idx)?)
+    f.call(&mut *store, idx)
 }
 
 // === 受害者模块 ===

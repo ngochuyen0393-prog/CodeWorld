@@ -305,7 +305,7 @@ mod tests {
         // 降序应用顺序：10 + 5 + 1 = 16（验证高 priority 先应用）
         let owner = EntityId(Uuid::from_u128(1));
         let scope = TransformScope::Entity(owner);
-        let transforms = vec![
+        let transforms = [
             TransformEntry::new(owner, scope.clone(), vec![1], 1, 0),
             TransformEntry::new(owner, scope.clone(), vec![10], 10, 0),
             TransformEntry::new(owner, scope, vec![5], 5, 0),

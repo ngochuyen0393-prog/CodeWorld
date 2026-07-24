@@ -34,7 +34,7 @@ fn make_linker(engine: &Engine) -> Result<Linker<HostData>> {
 
 fn compile(engine: &Engine, wat_text: &str) -> Result<Module> {
     let wasm = wat::parse_bytes(wat_text.as_bytes())?;
-    Ok(Module::new(engine, &wasm)?)
+    Module::new(engine, &wasm)
 }
 
 /// Host层hook：未attack时调真实WASM life()；attack后(life_override=true)直接返回0
@@ -45,12 +45,12 @@ fn hook_life(store: &mut Store<HostData>, instance: &Instance) -> Result<i32> {
         return Ok(0);
     }
     let life = instance.get_typed_func::<(), i32>(&mut *store, "life")?;
-    Ok(life.call(&mut *store, ())?)
+    life.call(&mut *store, ())
 }
 
 fn call_get_state(store: &mut Store<HostData>, instance: &Instance) -> Result<i32> {
     let f = instance.get_typed_func::<(), i32>(&mut *store, "get_state")?;
-    Ok(f.call(&mut *store, ())?)
+    f.call(&mut *store, ())
 }
 
 fn call_set_state(store: &mut Store<HostData>, instance: &Instance, v: i32) -> Result<()> {

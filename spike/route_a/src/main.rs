@@ -65,7 +65,7 @@ fn make_linker(engine: &Engine) -> Result<Linker<HostData>> {
 /// 调用实例的 life() -> i32
 fn call_life(store: &mut Store<HostData>, instance: &Instance) -> Result<i32> {
     let life = instance.get_typed_func::<(), i32>(&mut *store, "life")?;
-    Ok(life.call(&mut *store, ())?)
+    life.call(&mut *store, ())
 }
 
 /// 写入实例Linear Memory首4字节（模拟角色保存状态）
@@ -78,13 +78,13 @@ fn call_set_state(store: &mut Store<HostData>, instance: &Instance, v: i32) -> R
 /// 读取实例Linear Memory首4字节
 fn call_get_state(store: &mut Store<HostData>, instance: &Instance) -> Result<i32> {
     let f = instance.get_typed_func::<(), i32>(&mut *store, "get_state")?;
-    Ok(f.call(&mut *store, ())?)
+    f.call(&mut *store, ())
 }
 
 /// 把WAT文本编译成wasmtime模块
 fn compile(engine: &Engine, wat_text: &str) -> Result<Module> {
     let wasm = wat::parse_bytes(wat_text.as_bytes())?;
-    Ok(Module::new(engine, &wasm)?)
+    Module::new(engine, &wasm)
 }
 
 /// 受害者刚实例化时 life() 的返回值
