@@ -13,7 +13,8 @@
 
 mod config;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use codeworld_arena::attack::{PendingAttack, DEFAULT_KILL_WASM};
 use codeworld_arena::sandbox::{SandboxHandle, SandboxManager};
 use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 use codeworld_core::pending::PendingChange;
@@ -48,7 +49,7 @@ impl EntitySandboxMap {
 
     /// 为实体创建沙箱
     fn create(&mut self, entity_id: EntityId, wasm_bytes: &[u8], fuel: u64) -> Result<()> {
-        let handle = self.manager.create_sandbox(wasm_bytes, fuel)?;
+        let handle = self.manager.create_sandbox(wasm_bytes, fuel, entity_id)?;
         self.sandboxes.insert(entity_id, handle);
         tracing::info!(entity_id = %entity_id.0, "沙箱创建");
         Ok(())
@@ -114,6 +115,89 @@ impl EntitySandboxMap {
         }
         to_kill
     }
+
+    /// 收集本 tick 所有沙箱排队的攻击请求（架构 4.2：阶段一 on_tick 调 env.attack_at 排队）
+    ///
+    /// drain 各沙箱 pending_attacks 后清空，保证不跨 tick 残留。在 tick 阶段二 a2 步调用。
+    fn collect_pending_attacks(&mut self) -> Vec<PendingAttack> {
+        let mut all = Vec::new();
+        for handle in self.sandboxes.values_mut() {
+            let data = handle.store.data_mut();
+            all.append(&mut data.pending_attacks);
+        }
+        if !all.is_empty() {
+            tracing::info!(count = all.len(), "[collect_pending_attacks] 收集攻击请求");
+        }
+        all
+    }
+
+    /// 对目标实体执行单次攻击（架构 4.2：on_attack 拦截 -> 路线A替换沙箱 -> 检查 life）
+    ///
+    /// - on_attack 返回 true -> 拦截，不替换、不击杀。
+    /// - 未拦截 -> 用 payload 替换目标整个 WASM 模块（路线A）；payload 为空用 DEFAULT_KILL_WASM。
+    /// - 替换后调 life()：false=击杀成功；调用失败视为击杀（破损沙箱等同死亡）。
+    /// - 不处理掠夺：掠夺需改 world（survival），由调用方 process_attacks 在击杀后处理。
+    fn attack_target(&mut self, target_id: &EntityId, payload: &[u8]) -> Result<AttackOutcome> {
+        // 1. on_attack 拦截检查（旧沙箱）
+        let intercepted = {
+            let Some(handle) = self.sandboxes.get_mut(target_id) else {
+                anyhow::bail!("目标 {:?} 无沙箱，无法攻击代码", target_id);
+            };
+            self.manager.call_on_attack(handle, payload)?
+        };
+        if intercepted {
+            tracing::info!(target = %target_id.0, "[attack_target] 攻击被 on_attack 拦截");
+            return Ok(AttackOutcome {
+                intercepted: true,
+                killed: false,
+            });
+        }
+        // 2. 替换沙箱（路线A）：移出旧 handle -> replace（保留 entity_id）-> 插回
+        let old = self
+            .sandboxes
+            .remove(target_id)
+            .context("目标沙箱在 on_attack 后已不存在")?;
+        let fuel = old.store.data().fuel_limit; // 沿用原指令配额
+        let wasm_bytes: &[u8] = if payload.is_empty() {
+            &DEFAULT_KILL_WASM
+        } else {
+            payload
+        };
+        let new_handle = self.manager.replace_sandbox(old, wasm_bytes, fuel)?;
+        self.sandboxes.insert(*target_id, new_handle);
+        tracing::info!(target = %target_id.0, "[attack_target] 目标沙箱已替换（路线A）");
+        // 3. 检查 life()：false=击杀成功
+        let killed = {
+            let handle = self
+                .sandboxes
+                .get_mut(target_id)
+                .context("替换后目标沙箱丢失")?;
+            match self.manager.call_life(handle) {
+                Ok(false) => true,
+                Ok(true) => false,
+                Err(e) => {
+                    tracing::warn!(
+                        target = %target_id.0,
+                        error = %e,
+                        "[attack_target] 替换后 life() 调用失败，视为击杀"
+                    );
+                    true
+                }
+            }
+        };
+        Ok(AttackOutcome {
+            intercepted: false,
+            killed,
+        })
+    }
+}
+
+/// 单次攻击结果（attack_target 返回，供 process_attacks 决定是否掠夺）
+struct AttackOutcome {
+    /// 是否被 on_attack 拦截
+    intercepted: bool,
+    /// 是否击杀成功（替换后 life()=false）
+    killed: bool,
 }
 
 fn main() -> Result<()> {
@@ -259,6 +343,14 @@ fn tick(
     //   a. 应用 PendingChanges（spawn/destroy/set_pos/set_velocity，架构 4.1 a 步）
     apply_pending_changes(world, pending);
 
+    //   a2. 处理攻击（架构 4.2：阶段一 on_tick 调 env.attack_at 排队的请求在此统一执行）
+    //      插在 apply_pending_changes 之后、decay_survival 之前：攻击产生的死亡先于每日衰减处理。
+    //      import 函数只排队（无 world 访问权），实际 hit/miss/击杀/掠夺在此判断。
+    let pending_attacks = sandbox_map.collect_pending_attacks();
+    if !pending_attacks.is_empty() {
+        process_attacks(world, sandbox_map, &pending_attacks);
+    }
+
     //   b. 生存点数扣减（架构 4.1：每 86400 tick 扣 1 点，归零标记死亡）
     decay_survival(world, current_tick);
 
@@ -392,6 +484,118 @@ fn decay_survival(world: &mut WorldState, current_tick: u64) {
                 "生存点数归零，实体死亡"
             );
         }
+    }
+}
+
+/// 处理阶段一排队的攻击请求（架构 4.2 + 4.1 阶段二 a2 步）
+///
+/// 对每个 PendingAttack：在坐标找存活实体（attack_at 攻击坐标不是 EntityId，目标移动
+/// 可能 miss）-> attack_target（on_attack 拦截 / 路线A替换 / 检查 life）-> 击杀成功则
+/// 击杀掠夺（从死者转移 1 生存点数给攻击者，自攻自跳过）并标记死亡（清理步 d 移除实体+销毁沙箱）。
+///
+/// 攻击在阶段二处理（不实时）：玩家代码调 import 只排队，实际击杀结果下一 tick 才能感知。
+fn process_attacks(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, attacks: &[PendingAttack]) {
+    for atk in attacks {
+        // 找目标：坐标上的存活实体（find 返回第一个命中；HashMap 顺序随机，测试用唯一坐标避免歧义）
+        let target_id = world
+            .entities
+            .values()
+            .find(|e| e.is_alive() && e.pos() == atk.target_pos)
+            .map(|e| e.id);
+        let Some(target_id) = target_id else {
+            tracing::info!(
+                attacker = %atk.attacker.0,
+                pos = ?atk.target_pos,
+                "[process_attacks] 攻击落空（坐标无存活实体）"
+            );
+            continue;
+        };
+        // 执行攻击：on_attack 拦截 -> 替换沙箱 -> 检查 life
+        let outcome = match sandbox_map.attack_target(&target_id, &atk.payload) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(
+                    attacker = %atk.attacker.0,
+                    target = %target_id.0,
+                    error = %e,
+                    "[process_attacks] 攻击执行失败"
+                );
+                continue;
+            }
+        };
+        if outcome.intercepted {
+            tracing::info!(
+                attacker = %atk.attacker.0,
+                target = %target_id.0,
+                "[process_attacks] 攻击被拦截"
+            );
+            continue;
+        }
+        if outcome.killed {
+            // 击杀掠夺：从死者转移 1 生存点数给攻击者（自攻自跳过转移但仍击杀）
+            if atk.attacker != target_id {
+                plunder_survival(world, target_id, atk.attacker, 1);
+            } else {
+                tracing::info!(
+                    entity = %target_id.0,
+                    "[process_attacks] 自攻自击杀，跳过掠夺"
+                );
+            }
+            // 标记死亡（死亡清理步 d 移除实体 + 销毁沙箱）
+            if let Some(e) = world.entities.get_mut(&target_id) {
+                e.kill();
+            }
+            tracing::info!(
+                attacker = %atk.attacker.0,
+                target = %target_id.0,
+                "[process_attacks] 击杀成功"
+            );
+        } else {
+            tracing::info!(
+                attacker = %atk.attacker.0,
+                target = %target_id.0,
+                "[process_attacks] 命中但未击杀（life=true）"
+            );
+        }
+    }
+}
+
+/// 击杀掠夺：从 donor（死者）转移 n 生存点数给 recipient（攻击者）
+///
+/// 借用处理：transfer 需同时 &mut 两个 SurvivalPoints（同 HashMap 两个 key）。
+/// 解法--临时移出 donor 到局部变量，get_mut recipient 做转移，再插回 donor
+/// （自攻自由调用方跳过，不进本函数，donor_id != recipient_id）。
+fn plunder_survival(world: &mut WorldState, donor_id: EntityId, recipient_id: EntityId, n: u64) {
+    // 临时移出 donor 避免同时 &mut HashMap 两个 key
+    let mut donor = match world.entities.remove(&donor_id) {
+        Some(e) => e,
+        None => {
+            tracing::warn!(donor = %donor_id.0, "[plunder_survival] donor 不存在，跳过");
+            return;
+        }
+    };
+    let mut transferred = false;
+    if let Some(recipient) = world.entities.get_mut(&recipient_id) {
+        // transfer：self=donor（捐赠方/死者），to=recipient（攻击者）；不足返回 false 双方不变
+        transferred = donor.survival.transfer(&mut recipient.survival, n);
+    } else {
+        tracing::warn!(recipient = %recipient_id.0, "[plunder_survival] recipient 不存在");
+    }
+    world.entities.insert(donor_id, donor);
+    if transferred {
+        tracing::info!(
+            from = %donor_id.0,
+            to = %recipient_id.0,
+            n,
+            "[plunder_survival] 击杀掠夺：生存点数转移"
+        );
+    } else {
+        tracing::info!(
+            from = %donor_id.0,
+            to = %recipient_id.0,
+            n,
+            "[plunder_survival] 转移失败（点数不足或 recipient 不存在）"
+        );
     }
 }
 
@@ -1153,6 +1357,224 @@ mod tests {
         assert_ne!(
             pos1, pos2,
             "碰撞解决后两实体坐标应不同（一方被挤开），实际 {pos1:?} 与 {pos2:?}"
+        );
+    }
+
+    // === attack_target（架构 4.2：on_attack 拦截 -> 替换沙箱 -> 检查 life）===
+
+    /// 目标 WAT：life()=true，无 on_attack（不拦截）
+    const TARGET_WAT: &str = r#"(module (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 防御目标 WAT：life()=true + on_attack 返回 1（拦截攻击）
+    const DEFENDED_TARGET_WAT: &str = r#"(module
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "on_attack") (param i32) (result i32) i32.const 1))"#;
+
+    #[test]
+    fn attack_target_empty_payload_kills() {
+        // 空 payload -> 默认击杀 WAT（life=false）-> 替换后 life()=false -> 击杀成功
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(5));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        let outcome = map.attack_target(&target_id, &[]).unwrap();
+        assert!(!outcome.intercepted, "无 on_attack 不应拦截");
+        assert!(outcome.killed, "空 payload 默认击杀，life 应为 false");
+    }
+
+    #[test]
+    fn attack_target_on_attack_intercepts() {
+        // 目标导出 on_attack 返回 1 -> 拦截，不替换沙箱、不击杀
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(6));
+        map.create(target_id, &wasm(DEFENDED_TARGET_WAT), 1_000_000).unwrap();
+        let outcome = map.attack_target(&target_id, &[]).unwrap();
+        assert!(outcome.intercepted, "on_attack 返回 1 应拦截");
+        assert!(!outcome.killed, "拦截后不应击杀");
+    }
+
+    #[test]
+    fn attack_target_payload_life_true_not_killed() {
+        // payload 为 life=true 的 WASM -> 替换后 life()=true -> 命中但未击杀（如击晕）
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(7));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        let outcome = map.attack_target(&target_id, &wasm(TARGET_WAT)).unwrap();
+        assert!(!outcome.intercepted);
+        assert!(!outcome.killed, "life=true payload 不应击杀");
+    }
+
+    #[test]
+    fn attack_target_no_sandbox_errors() {
+        // 边界：目标无沙箱 -> Err（不 panic）
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(8));
+        let result = map.attack_target(&target_id, &[]);
+        assert!(result.is_err(), "无沙箱目标应返回 Err");
+    }
+
+    // === process_attacks（阶段二 a2：找目标 -> attack_target -> 掠夺 -> kill）===
+
+    /// 构造存活实体并挂沙箱（测试辅助）
+    fn make_entity_with_sandbox(
+        world: &mut WorldState,
+        map: &mut EntitySandboxMap,
+        id_u: u128,
+        pos: (f64, f64),
+        wat: &str,
+    ) -> EntityId {
+        let id = EntityId(Uuid::from_u128(id_u));
+        let e = make_entity(id_u, pos);
+        map.create(id, &wasm(wat), 1_000_000).unwrap();
+        world.entities.insert(id, e);
+        id
+    }
+
+    #[test]
+    fn process_attacks_miss_when_no_entity_at_pos() {
+        // 攻击落空（验收#5）：坐标无存活实体 -> 不崩溃、不击杀
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let attacker =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (0.0, 0.0), PLAYER_WAT);
+        let attacks = vec![PendingAttack {
+            attacker,
+            target_pos: (99.0, 99.0),
+            payload: vec![],
+        }];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert_eq!(world.entities.len(), 1, "落空不应移除实体");
+        assert!(world.entities.contains_key(&attacker));
+    }
+
+    #[test]
+    fn process_attacks_kills_and_plunders() {
+        // 击杀+掠夺（验收#4）：空 payload 默认击杀 -> 目标死亡 + 从死者转移 1 生存点数给攻击者
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let attacker =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (0.0, 0.0), PLAYER_WAT);
+        let target =
+            make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), TARGET_WAT);
+        assert_eq!(world.entities.get(&attacker).unwrap().survival.points(), 3);
+        let attacks = vec![PendingAttack {
+            attacker,
+            target_pos: (5.0, 0.0),
+            payload: vec![],
+        }];
+        process_attacks(&mut world, &mut map, &attacks);
+        // 目标被标记死亡（kill，retain 在 tick 死亡清理步才移除）
+        assert!(!world.entities.get(&target).unwrap().is_alive(), "目标应被击杀");
+        // 攻击者掠夺 +1（3 -> 4）
+        assert_eq!(
+            world.entities.get(&attacker).unwrap().survival.points(),
+            4,
+            "击杀掠夺 +1 生存点数"
+        );
+        // 死者被掠夺 -1（3 -> 2）
+        assert_eq!(
+            world.entities.get(&target).unwrap().survival.points(),
+            2,
+            "死者被掠夺 -1"
+        );
+    }
+
+    #[test]
+    fn process_attacks_intercepted_no_plunder() {
+        // on_attack 拦截（验收#2）：不击杀、不掠夺（双方生存点数不变）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let attacker =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (0.0, 0.0), PLAYER_WAT);
+        let target =
+            make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), DEFENDED_TARGET_WAT);
+        let attacks = vec![PendingAttack {
+            attacker,
+            target_pos: (5.0, 0.0),
+            payload: vec![],
+        }];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert!(world.entities.get(&target).unwrap().is_alive(), "拦截后目标应存活");
+        assert_eq!(
+            world.entities.get(&attacker).unwrap().survival.points(),
+            3,
+            "拦截不掠夺"
+        );
+        assert_eq!(
+            world.entities.get(&target).unwrap().survival.points(),
+            3,
+            "拦截不扣减"
+        );
+    }
+
+    #[test]
+    fn process_attacks_self_attack_kills_no_plunder() {
+        // 自攻自（技术约束）：允许击杀但跳过掠夺转移（生存点数不变）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let attacker =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.0), TARGET_WAT);
+        // attacker 攻击自己所在坐标 -> target_id == attacker
+        let attacks = vec![PendingAttack {
+            attacker,
+            target_pos: (5.0, 0.0),
+            payload: vec![],
+        }];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert!(
+            !world.entities.get(&attacker).unwrap().is_alive(),
+            "自攻自应击杀自己"
+        );
+        assert_eq!(
+            world.entities.get(&attacker).unwrap().survival.points(),
+            3,
+            "自攻自不掠夺，点数不变"
+        );
+    }
+
+    // === 攻击全链路集成（验收#1：玩家代码调 attack_at import）===
+
+    /// 攻击方 WAT：导出 memory + on_tick 调 env.attack_at(5.0, 0.0, 0, 0)（空 payload 默认击杀）
+    const ATTACKER_WAT: &str = r#"(module
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    f64.const 5.0 f64.const 0.0 i32.const 0 i32.const 0 call $attack_at drop)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn tick_attack_pipeline_kills_and_plunders() {
+        // 集成：ATTACKER 的 on_tick 调 env.attack_at -> 排队 -> 阶段二 process_attacks
+        // -> 击杀目标 + 掠夺 1 生存点数给攻击者
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut sandbox_map = test_sandbox_map();
+        // 攻击方在 (0,0)，on_tick 调 attack_at(5.0, 0.0, 0, 0)（空 payload 默认击杀）
+        let attacker =
+            make_entity_with_sandbox(&mut world, &mut sandbox_map, 1, (0.0, 0.0), ATTACKER_WAT);
+        // 目标在 (5.0, 0.0)，life=true 无 on_attack
+        let target =
+            make_entity_with_sandbox(&mut world, &mut sandbox_map, 2, (5.0, 0.0), TARGET_WAT);
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut sandbox_map,
+        );
+        // 目标被击杀并在死亡清理步移除
+        assert!(!world.entities.contains_key(&target), "目标应被击杀移除");
+        // 攻击者存活且掠夺 +1（3 -> 4）
+        assert!(world.entities.contains_key(&attacker), "攻击者应存活");
+        assert_eq!(
+            world.entities.get(&attacker).unwrap().survival.points(),
+            4,
+            "击杀掠夺 +1 生存点数"
         );
     }
 }

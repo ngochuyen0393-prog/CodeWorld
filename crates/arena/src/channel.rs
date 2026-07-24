@@ -61,12 +61,12 @@ impl ChannelManager {
         ProbeResult { response, meta }
     }
 
-    /// 攻击坐标（架构 4.2）
+    /// 检查坐标是否有实体（架构 4.2 的坐标命中判定）
     ///
-    /// MVP 限制：坐标有实体 -> 命中（hit=true, intercepted=false, success=false），
-    /// 不调用 on_attack/不替换沙箱/不检查 life()。完整攻击流程（路线A替换+life判定）
-    /// 需 EntityId->SandboxHandle 映射（arena 未维护），Phase 2 实现。
-    /// 当前仅返回命中状态，攻击通道 MVP 阶段不可用（已标注 Phase 2）。
+    /// 注意：这是同步的坐标命中检查，**不是**完整攻击流程。Phase 2 的真实攻击走队列模型
+    /// （玩家代码调 `env.attack_at` import 排队 -> 主循环阶段二 `process_attacks` 统一执行
+    /// on_attack 拦截 / 路线A替换 / life 判定 / 击杀掠夺，见 bin/codeworld）。本函数仅做
+    /// 坐标->实体的命中探测，保留供需要同步判断坐标占用的场景使用，不被攻击主流程调用。
     pub fn attack_at(
         world: &WorldState,
         _sandbox_mgr: &SandboxManager,
@@ -79,7 +79,7 @@ impl ChannelManager {
             tracing::info!(?pos, "attack 落空");
             return AttackResult::miss();
         };
-        tracing::info!(?pos, "attack 命中（MVP 不真实替换，Phase 2）");
+        tracing::info!(?pos, "attack 命中（坐标检查；完整流程走 process_attacks）");
         AttackResult::new(true, false, false) // hit, not intercepted, not killed
     }
 
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn probe_returns_response_and_meta() {
         let mgr = SandboxManager::new().unwrap();
-        let mut handle = mgr.create_sandbox(&wasm(PROBE_WAT), 1000).unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(PROBE_WAT), 1000, EntityId(Uuid::from_u128(1))).unwrap();
         let result = ChannelManager::probe(&mgr, &mut handle, &[42]);
         // on_probe(42) -> 43，响应非空
         assert!(!result.response.is_empty());
@@ -168,7 +168,7 @@ mod tests {
     fn probe_no_export_returns_empty_response() {
         let mgr = SandboxManager::new().unwrap();
         let wat = r#"(module (func (export "life") (result i32) i32.const 1))"#;
-        let mut handle = mgr.create_sandbox(&wasm(wat), 1000).unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(wat), 1000, EntityId(Uuid::from_u128(1))).unwrap();
         let result = ChannelManager::probe(&mgr, &mut handle, &[]);
         assert!(result.response.is_empty()); // 没 on_probe -> 空响应
     }
