@@ -8,12 +8,14 @@
 
 pub mod ansi;
 pub mod buffer;
+pub mod caption;
 pub mod graph;
 pub mod module;
 pub mod viewport;
 
 pub use ansi::{color_to_ansi, enter_terminal, exit_terminal};
 pub use buffer::{Cell, TerminalBuffer};
+pub use caption::{CaptionState, format_caption};
 pub use graph::{RenderGraph, RenderNode};
 pub use module::{AsciiRenderModule, RenderModule};
 pub use viewport::Viewport;
@@ -31,6 +33,8 @@ pub struct Renderer {
     module: AsciiRenderModule,
     /// 上一帧 render() 算出的 diff，供 flush() 复用（避免 flush_diff 重复扫描全缓冲）
     last_diff: Vec<(usize, usize)>,
+    /// 战况字幕状态（第 0 行，渲染层展示，非游戏状态）
+    caption: CaptionState,
 }
 
 impl Renderer {
@@ -43,13 +47,32 @@ impl Renderer {
             viewport,
             module: AsciiRenderModule::new(),
             last_diff: Vec::new(),
+            caption: CaptionState::new(),
         }
+    }
+
+    /// 更新战况字幕（host 每 tick 喂入只读战况快照）
+    ///
+    /// - tick/距离/存活数来自 world；盾量来自玩家代码 env.log marker 上报（host 解析）。
+    /// - `d_present`：防御者是否在场（不在场则盾显示占位符）。
+    /// - `shield_report`：本 tick 的盾量上报，None = 无新上报（保持上次值）。
+    /// - 战况值（距离 0.1 精度/盾量/存活数）变化时打一条 info 日志，不每 tick 刷屏。
+    /// - 实际写 buffer 发生在 render()（本帧 diff 计算之前，保证变化进 diff）。
+    pub fn update_caption(
+        &mut self,
+        tick: u64,
+        dist: Option<f64>,
+        d_present: bool,
+        shield_report: Option<i32>,
+        alive: usize,
+    ) {
+        self.caption.update(tick, dist, d_present, shield_report, alive);
     }
 
     /// 完整渲染流程（三阶段），返回本帧与上帧的差异格子坐标列表
     ///
     /// 流程：① clear -> ② setup（声明）-> ③ compile（裁剪+排序）-> ④ execute（绘制）
-    ///      -> ⑤ diff_cells（计算差异）；⑥ swap 在 flush() 中完成（输出 ANSI 后 swap）
+    ///      -> ⑤ 字幕写第 0 行 -> ⑥ diff_cells（计算差异）；swap 在 flush() 中完成
     ///
     /// 注：render() 本身不交换缓冲，buffer.current 持有本帧画面供 flush 读取。
     /// flush() 输出 diff 后再 swap（供下帧 diff）；render() 不调用 swap。
@@ -62,10 +85,15 @@ impl Renderer {
         self.graph.compile(&self.viewport);
         // ④ 执行：按序写入 buffer（画家算法：后写覆盖先写）
         self.graph.execute(&mut self.buffer);
-        // ⑤ 计算差异（缓存供 flush 复用，避免 flush_diff 重复扫描全缓冲）
+        // ⑤ 字幕写第 0 行（UI 层语义，后写覆盖战场格子；真实视口下 row 0 = 世界
+        //    y=-25 的地下空白区，正常布局不与生物重叠）
+        for (col, ch) in self.caption.line().chars().take(self.viewport.term_cols).enumerate() {
+            self.buffer.write(0, col, &ch.to_string(), "yellow");
+        }
+        // ⑥ 计算差异（缓存供 flush 复用，避免 flush_diff 重复扫描全缓冲）
         let diff = self.buffer.diff_cells();
         self.last_diff = diff.clone();
-        // ⑥ swap 在 flush() 中完成：输出 diff 后再 swap
+        // swap 在 flush() 中完成：输出 diff 后再 swap
         tracing::debug!(diff_count = diff.len(), "Renderer 渲染完成");
         diff
     }
@@ -104,6 +132,12 @@ impl Renderer {
     /// 只读访问 buffer（测试验证用）
     pub fn buffer(&self) -> &TerminalBuffer {
         &self.buffer
+    }
+
+    /// 当前字幕行内容（测试验证用；flush swap 后 buffer current 不再持有本帧，
+    /// 字幕内容的稳定观测点是 CaptionState 保存的行字符串）
+    pub fn caption_line(&self) -> &str {
+        self.caption.line()
     }
 
     /// 只读访问 graph（测试验证用）
@@ -287,6 +321,142 @@ mod tests {
             second.is_empty(),
             "flush_to 应 swap 使下帧无 diff，实际 {:?}",
             second
+        );
+    }
+
+    // === 战况字幕：update_caption + render 写第 0 行 ===
+
+    /// 读取 buffer 第 0 行拼成字符串（截掉尾部空格），字幕内容断言用
+    fn row0_line(r: &Renderer) -> String {
+        let mut s = String::new();
+        for col in 0..r.viewport().term_cols {
+            s.push_str(r.buffer().get(0, col).unwrap().glyph.as_str());
+        }
+        s.trim_end().to_string()
+    }
+
+    /// 宽屏渲染器（对齐真实配置 50x80：字幕 47 字符完整放下，不触发截断）
+    fn renderer_80cols() -> Renderer {
+        Renderer::new(Viewport::new((0.0, 0.0), 50.0, 25.0, 50, 80))
+    }
+
+    #[test]
+    fn update_caption_render_writes_row0() {
+        // 读写：update_caption 存字幕行，render 后第 0 行显示字幕；diff 含 row 0 格子
+        let mut r = renderer_80cols();
+        let world = WorldState::new();
+        r.update_caption(12, Some(2.44), true, Some(7), 3);
+        let diff = r.render(&world);
+        assert_eq!(
+            row0_line(&r),
+            "tick=12 | A->D dist=2.4 | D shield=7 | alive=3",
+            "第 0 行应为字幕内容"
+        );
+        assert!(diff.contains(&(0, 0)), "字幕首格应在 diff 中");
+    }
+
+    #[test]
+    fn caption_change_appears_in_next_render_diff() {
+        // 修改：字幕内容变化 -> 下帧 diff 含 row 0（随 tick 更新的依据：换行即重绘）
+        let mut r = renderer_80cols();
+        let world = WorldState::new();
+        r.update_caption(1, Some(9.0), true, None, 2);
+        r.render(&world);
+        let mut out = Vec::new();
+        r.flush_to(&mut out).unwrap(); // swap
+        r.update_caption(2, Some(8.0), true, None, 2);
+        let diff = r.render(&world);
+        assert!(
+            diff.iter().any(|&(row, _)| row == 0),
+            "字幕变化后 diff 应含第 0 行格子，实际 {:?}",
+            diff
+        );
+    }
+
+    #[test]
+    fn caption_tick_only_change_limits_diff_to_tick_digits() {
+        // 边界：语义值（距离/盾/存活）不变、仅 tick 前进 -> 只有 tick 数字格重绘，
+        // 语义段（col>=10，"| A->D..." 起）不产生 diff（画面不闪烁，日志不刷屏同理）
+        let mut r = renderer_80cols();
+        let world = WorldState::new();
+        r.update_caption(1, Some(9.0), true, None, 2);
+        r.render(&world);
+        let mut out = Vec::new();
+        r.flush_to(&mut out).unwrap(); // swap
+        r.update_caption(2, Some(9.0), true, None, 2); // 仅 tick 变化
+        let diff = r.render(&world);
+        assert!(
+            diff.iter().all(|&(_, col)| col < 10),
+            "仅 tick 变化时 diff 应局限在 tick 数字区（col<10），实际 {:?}",
+            diff
+        );
+    }
+
+    #[test]
+    fn caption_truncated_to_terminal_cols() {
+        // 边界：字幕行超过终端列数 -> 截断到 cols，不越界、不影响其他行
+        let mut r = Renderer::new(Viewport::new((5.0, 5.0), 5.0, 5.0, 10, 10));
+        let world = WorldState::new();
+        r.update_caption(1, Some(1.0), true, Some(1), 1);
+        r.render(&world);
+        let line = row0_line(&r);
+        assert!(
+            line.chars().count() <= 10,
+            "字幕应截断到 10 列，实际 {} 字符",
+            line.chars().count()
+        );
+    }
+
+    #[test]
+    fn caption_overwrites_entity_at_row0() {
+        // 边界：实体恰好映射到 row 0（10x10 视口下 y=0）-> 字幕后写覆盖（画家算法，
+        // 字幕=UI 层语义）。战场区在真实视口位于 row>=25，此覆盖仅极端小视口发生。
+        let mut r = renderer_10x10();
+        let mut world = WorldState::new();
+        world.entities.insert(
+            EntityId(Uuid::from_u128(1)),
+            make_entity(1, (5.0, 0.0), "@", true), // y=0 -> row 0
+        );
+        r.update_caption(1, Some(1.0), true, None, 1);
+        r.render(&world);
+        assert_eq!(
+            r.buffer().get(0, 0).unwrap().glyph,
+            "t",
+            "row 0 首格应是字幕字符（覆盖实体）"
+        );
+    }
+
+    #[test]
+    fn caption_shield_persists_between_reports() {
+        // 读写：盾量只在 D 上报时更新，两次上报之间保持上次值（不闪回占位符）
+        let mut r = renderer_80cols();
+        let world = WorldState::new();
+        r.update_caption(1, Some(9.0), true, Some(9), 2);
+        r.render(&world);
+        assert!(row0_line(&r).contains("shield=9"), "上报后应显示盾 9");
+        // 下一 tick 无新上报（report=None）-> 保持 9
+        r.update_caption(2, Some(8.0), true, None, 2);
+        r.render(&world);
+        assert!(
+            row0_line(&r).contains("shield=9"),
+            "无新上报应保持上次盾量，实际 {:?}",
+            row0_line(&r)
+        );
+    }
+
+    #[test]
+    fn caption_shield_hidden_when_defender_absent() {
+        // 负面路径：D 已死（d_present=false）-> 盾显示占位符（死人不报盾）
+        let mut r = renderer_80cols();
+        let world = WorldState::new();
+        r.update_caption(1, Some(9.0), true, Some(9), 2);
+        r.render(&world);
+        r.update_caption(2, None, false, None, 1); // D 不在场
+        r.render(&world);
+        assert!(
+            row0_line(&r).contains("shield=?"),
+            "D 不在场时盾应显示占位符，实际 {:?}",
+            row0_line(&r)
         );
     }
 }

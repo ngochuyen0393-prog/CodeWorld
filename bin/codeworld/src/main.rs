@@ -156,6 +156,18 @@ impl EntitySandboxMap {
         all
     }
 
+    /// 收集本 tick 所有沙箱的 log marker 值序列（战况字幕数据源）
+    ///
+    /// drain 各沙箱 log_markers 后清空，保证不跨 tick 残留。在阶段二攻击结算之后
+    /// 调用（D 的盾量上报发生在 on_attack 收件期间，早于此步）。
+    fn collect_all_log_markers(&mut self) -> Vec<i32> {
+        let mut all = Vec::new();
+        for handle in self.sandboxes.values_mut() {
+            all.append(&mut handle.store.data_mut().log_markers);
+        }
+        all
+    }
+
     /// 收件：调目标【当前沙箱】的 on_attack 询问是否拦截（架构 4.2 两阶段-收件）
     ///
     /// 只问不改：不换血、不击杀；防守方 fuel 随每次调用自然消耗（围殴=磨算力）。
@@ -276,7 +288,7 @@ fn main() -> Result<()> {
 
     // 新世界或恢复后无实体：放测试实体（含 WASM 沙箱）让 MVP 有东西渲染、能跑玩家代码
     if world.entities.is_empty() {
-        spawn_test_entities(&mut world, &mut sandbox_map);
+        spawn_test_entities(&mut world, &mut sandbox_map, config.d_shield, config.h_enabled);
     }
 
     // 信号处理：后台线程监听 stdin，按 Enter/EOF 置退出标志（零依赖，符合 MVP 最简方案）
@@ -430,6 +442,37 @@ fn tick(
     if removed > 0 {
         tracing::info!(tick = current_tick, removed, "死亡实体清理");
     }
+
+    //   d2. 战况字幕（渲染层展示，随 tick 更新；架构 4.2 铁律 3：字幕不写回 world）
+    //      盾量来自 D 玩家代码 env.log marker 自愿上报（收件期 on_attack 的 log(7)+log(余量)），
+    //      host 只解析上报流、不读沙箱内部全局（沙箱隔离不破坏）。
+    //      距离/存活数取死亡清理后的 world 快照（entities 里只剩存活实体，len 即存活数）；
+    //      A 或 D 缺席（被击杀/未登场）则距离显示占位符。
+    let markers = sandbox_map.collect_all_log_markers();
+    let shield_report = parse_shield_markers(&markers);
+    let attacker = world
+        .entities
+        .values()
+        .find(|e| e.code_hash == ATTACKER_CODE);
+    let defender = world
+        .entities
+        .values()
+        .find(|e| e.code_hash == DEFENDER_CODE);
+    let dist = match (attacker, defender) {
+        (Some(a), Some(d)) => {
+            let (ax, ay) = a.pos();
+            let (dx, dy) = d.pos();
+            Some(((ax - dx).powi(2) + (ay - dy).powi(2)).sqrt())
+        }
+        _ => None,
+    };
+    renderer.update_caption(
+        current_tick,
+        dist,
+        defender.is_some(),
+        if defender.is_some() { shield_report } else { None },
+        world.entities.len(),
+    );
 
     //   e. 渲染输出（架构 4.1 e 步；有差异才 flush）
     let diffs = renderer.render(world);
@@ -790,6 +833,32 @@ fn handle_collisions(pairs: &[CollisionPair], entities: &HashMap<EntityId, Entit
     count
 }
 
+/// 解析 log marker 流中的盾量上报（战况字幕数据源，纯函数）
+///
+/// D 的玩家代码上报协议（env.log marker，位置配对不猜值）：
+/// - `log(7)`（拦截）后紧跟 `log(余量)` —— 配对消费，7 后的下一个值即盾量
+/// - `log(8)`（盾尽放行）—— 盾 0，其后无配对值
+/// - 其他 marker（A 的 0/2/3、D 的 9 反制、H 的 4/5/6）不携带盾信息，忽略
+///
+/// 返回最新一次上报的盾量；流中无上报（或截断对）返回 None（字幕显示占位符）。
+fn parse_shield_markers(markers: &[i32]) -> Option<i32> {
+    let mut shield = None;
+    let mut prev_was_intercept = false;
+    for &m in markers {
+        if prev_was_intercept {
+            // 7 后紧跟的值 = 盾余量（含"盾值恰好等于 7"的情况，位置配对天然正确）
+            shield = Some(m);
+            prev_was_intercept = false;
+        } else if m == 8 {
+            shield = Some(0);
+            prev_was_intercept = false;
+        } else {
+            prev_was_intercept = m == 7;
+        }
+    }
+    shield
+}
+
 /// 感知规则：找 target 最近的其他存活实体坐标（env.scan 的数据源，MVP 上帝视角单敌人）
 ///
 /// - 排除自己（不能锁定自己为敌人）
@@ -814,17 +883,27 @@ fn find_nearest_enemy(world: &WorldState, target: &EntityId) -> Option<(f64, f64
     Some(pos)
 }
 
-/// 生成两只真性格生物（最简可玩版开局布阵）
+/// 生物代码标识（code_hash 字段承载身份，字幕与布阵日志按它找实体）
+const ATTACKER_CODE: &str = "attacker";
+const DEFENDER_CODE: &str = "defender";
+const HUNTER_CODE: &str = "hunter";
+
+/// 生成开局布阵生物（可玩性三连版）
 ///
 /// A 攻击者（红"A"）@(5,0)：直线冲锋逼近，进范围连砍空 payload 击杀刀
-/// D 防御者（青"D"）@(15,0)：原地站桩+盾 10 拦截+每 4 tick 反制
-/// 都站地面 y=0：地面实体不受重力，坐标 tick 间稳定，scan/attack_at 的
+/// D 防御者（青"D"）@(15,0)：原地站桩+盾 d_shield 拦截+每 4 tick 反制
+/// H 搅局者（黄"H"）@(10,8)：中场上空，落地后观望游走，敌人进 3 格参战（h_enabled 开关）
+/// A/D 站地面 y=0：地面实体不受重力，坐标 tick 间稳定，scan/attack_at 的
 /// 坐标精确匹配（f64 相等）不被物理漂移打穿。
-/// 默认参数下 D 的反制先杀死 A（盾 10 > A 进范围后的 3 刀）；把盾调小
-/// （如 defender_wat(1)）则 A 磨穿防守反杀——两种结局都由参数决定。
-fn spawn_test_entities(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap) {
+/// 默认参数（盾 10）双生物剧本 D 的反制先杀死 A；盾 1 则 A 磨穿防守反杀。
+/// H 登场后 A 冲锋路线上多一个变数：混战结局由结算顺序与拦截奇偶共同决定。
+fn spawn_test_entities(
+    world: &mut WorldState,
+    sandbox_map: &mut EntitySandboxMap,
+    d_shield: i32,
+    h_enabled: bool,
+) {
     let fuel = 1_000_000; // 100 万条指令配额（fuel trap 会进程 abort，配额必须给足）
-    let d_shield = 10;
     let mut spawn = |code_id: &str, glyph: &str, color: &str, pos: (f64, f64), wat: &[u8]| -> bool {
         let e = Entity::new(
             EntityId::new(),
@@ -845,20 +924,28 @@ fn spawn_test_entities(world: &mut WorldState, sandbox_map: &mut EntitySandboxMa
             false
         }
     };
-    let a_ok = spawn("attacker", "A", "red", (5.0, 0.0), &wasm(ATTACKER_WAT));
+    let a_ok = spawn(ATTACKER_CODE, "A", "red", (5.0, 0.0), &wasm(ATTACKER_WAT));
     let d_ok = spawn(
-        "defender",
+        DEFENDER_CODE,
         "D",
         "cyan",
         (15.0, 0.0),
         &wasm(&defender_wat(d_shield)),
     );
+    // H 搅局者（可选登场）：出生中场上空 (10,8)，受重力 1-2 tick 内落地站稳
+    let h_ok = if h_enabled {
+        spawn(HUNTER_CODE, "H", "yellow", (10.0, 8.0), &wasm(HUNTER_WAT))
+    } else {
+        false
+    };
     tracing::info!(
         attacker_spawned = a_ok,
         defender_spawned = d_ok,
-        distance = 10.0,
+        hunter_spawned = h_ok,
+        distance_a_d = 10.0,
         defender_shield = d_shield,
-        "开局布阵：A 攻击者冲锋 / D 防御者站桩（盾每拦一刀-1，每4tick反制）"
+        "开局布阵：A 攻击者冲锋 / D 防御者站桩（盾每拦一刀-1，每4tick反制）/ H 搅局者={}（投机者：敌人进3格参战，被攻击50%拦截）",
+        if h_enabled { "登场" } else { "缺席" }
     );
 }
 
@@ -975,6 +1062,70 @@ fn defender_wat(shield: i32) -> String {
   (func (export "get_shield") (result i32) global.get $shield))"#
     )
 }
+
+/// 搅局者 H 的玩家代码 WAT（黄色，性格：投机者——挑软柿子捏，谁近打谁）
+///
+/// 策略（on_tick 每 tick 执行）：
+/// 1. scan 找最近敌人，找不到（log 0）就待机（全场只剩自己时不折腾）
+/// 2. 算与最近敌人的距离：
+///    - 距离 <= 3.0：参战（log 5），对敌人坐标排空 payload 击杀刀，站定不出游
+///    - 距离 > 3.0：观望（log 4），原地小幅游走（x 方向 ±0.5，方向按 tick 奇偶
+///      ——WAT 无随机源，用 tick 奇偶当伪随机）
+/// 3. on_attack（被攻击时）：50% 拦截（tick 奇偶伪随机，log 6），否则放行
+///    （$ticks 在 on_tick 里自增，被攻击时机的奇偶不可预测 -> 效果等价随机）
+///
+/// 日志 marker：0=无敌待机 4=观望游走 5=参战攻击 6=拦截成功
+const HUNTER_WAT: &str = r#"(module
+  (import "env" "log" (func $log (param i32)))
+  (import "env" "get_pos" (func $get_pos (result f64 f64)))
+  (import "env" "scan" (func $scan (param i32 i32) (result i32)))
+  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  ;; tick 计数：on_attack 的 50% 伪随机源（奇=拦截），也是游走方向源
+  (global $ticks (mut i32) (i32.const 0))
+  ;; 被攻击：奇数 tick 拦截（log 6），偶数放行
+  (func (export "on_attack") (param i32) (result i32)
+    global.get $ticks i32.const 1 i32.and
+    if (result i32)
+      i32.const 6 call $log
+      i32.const 1
+    else
+      i32.const 0
+    end)
+  (func (export "on_tick")
+    (local $ex f64) (local $ey f64) (local $mx f64) (local $my f64)
+    (local $dx f64) (local $dy f64) (local $dist f64)
+    global.get $ticks i32.const 1 i32.add global.set $ticks
+    ;; 1. 扫描最近敌人；没有就待机
+    (if (i32.eqz (call $scan (i32.const 0) (i32.const 8)))
+      (then
+        (call $log (i32.const 0))
+        (return)))
+    (local.set $ex (f64.load (i32.const 0)))
+    (local.set $ey (f64.load (i32.const 8)))
+    (call $get_pos)
+    (local.set $my)
+    (local.set $mx)
+    (local.set $dx (f64.sub (local.get $ex) (local.get $mx)))
+    (local.set $dy (f64.sub (local.get $ey) (local.get $my)))
+    (local.set $dist (f64.sqrt
+      (f64.add (f64.mul (local.get $dx) (local.get $dx))
+               (f64.mul (local.get $dy) (local.get $dy)))))
+    ;; 2. 距离 <= 3.0：参战，对敌人坐标排击杀刀
+    (if (f64.le (local.get $dist) (f64.const 3.0))
+      (then
+        (call $log (i32.const 5))
+        (drop (call $attack_at (local.get $ex) (local.get $ey)
+                               (i32.const 0) (i32.const 0)))
+        (return)))
+    ;; 3. 观望：原地小幅游走（偶数 tick +0.5，奇数 tick -0.5）
+    (call $log (i32.const 4))
+    (if (i32.eqz (i32.and (global.get $ticks) (i32.const 1)))
+      (then (drop (call $move_by (f64.const 0.5) (f64.const 0.0))))
+      (else (drop (call $move_by (f64.const -0.5) (f64.const 0.0))))))
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "get_ticks") (result i32) global.get $ticks))"#;
 
 #[cfg(test)]
 mod tests {
@@ -1520,12 +1671,12 @@ mod tests {
 
     #[test]
     fn spawn_test_entities_inserts_two_at_expected_positions() {
-        // 最简可玩版开局布阵：A 攻击者红"A"@(5,0)，D 防御者青"D"@(15,0)。
+        // 经典双生物布阵（H 关闭）：A 攻击者红"A"@(5,0)，D 防御者青"D"@(15,0)。
         // 都站地面 y=0（地面实体不受重力，坐标稳定，scan/attack 坐标精确匹配）。
         let mut world = WorldState::new();
         let mut sandbox_map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut sandbox_map);
-        assert_eq!(world.entities.len(), 2, "应创建两只生物");
+        spawn_test_entities(&mut world, &mut sandbox_map, 10, false);
+        assert_eq!(world.entities.len(), 2, "H 关闭时应创建两只生物");
         let attacker = world
             .entities
             .values()
@@ -1547,6 +1698,43 @@ mod tests {
             sandbox_map.sandboxes.contains_key(&attacker.id)
                 && sandbox_map.sandboxes.contains_key(&defender.id),
             "两只生物都应有沙箱"
+        );
+    }
+
+    #[test]
+    fn spawn_test_entities_three_with_h_enabled() {
+        // 混战布阵（H 登场）：第三只生物 H 黄"H"@(10,8) 中场上空，落地后受重力站稳
+        let mut world = WorldState::new();
+        let mut sandbox_map = test_sandbox_map();
+        spawn_test_entities(&mut world, &mut sandbox_map, 10, true);
+        assert_eq!(world.entities.len(), 3, "H 登场时应创建三只生物");
+        let hunter = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "hunter")
+            .expect("应有搅局者 H");
+        assert_eq!(hunter.pos(), (10.0, 8.0), "H 应在 (10,8) 中场上空");
+        assert_eq!(hunter.appearance.glyph, "H");
+        assert_eq!(hunter.appearance.color, "yellow");
+        assert!(sandbox_map.sandboxes.contains_key(&hunter.id), "H 应有沙箱");
+    }
+
+    #[test]
+    fn spawn_test_entities_d_shield_passthrough() {
+        // ② 翻盘实验：d_shield 参数透传到 D 沙箱的盾全局（观测导出 get_shield）
+        let mut world = WorldState::new();
+        let mut sandbox_map = test_sandbox_map();
+        spawn_test_entities(&mut world, &mut sandbox_map, 1, false);
+        let d = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "defender")
+            .expect("应有防御者 D")
+            .id;
+        assert_eq!(
+            call_i32_export(&mut sandbox_map, &d, "get_shield"),
+            1,
+            "d_shield=1 应透传到 D 的盾全局（翻盘剧本）"
         );
     }
 
@@ -2420,6 +2608,7 @@ mod tests {
 
     /// 战场脚手架：A(攻击者)@(5,0) 红、D(防御者)@(15,0) 青，各挂玩家代码沙箱，
     /// 返回 (world, time, physics, renderer, storage, pending, sandbox_map, a_id, d_id)
+    /// 渲染器用宽屏 50x80（对齐真实配置；字幕整行 47 字符需完整放下供断言）
     #[allow(clippy::type_complexity)]
     fn battle_stage(
         defender_shield: i32,
@@ -2454,7 +2643,7 @@ mod tests {
             world,
             TimeEngine::new(),
             DefaultPhysicsEngine::new(),
-            test_renderer(),
+            Renderer::new(Viewport::new((0.0, 0.0), 50.0, 25.0, 50, 80)),
             StorageEngine::open_in_memory().unwrap(),
             Vec::new(),
             sandbox_map,
@@ -2617,6 +2806,337 @@ mod tests {
             world.entities.get(&attacker).unwrap().survival.points(),
             4,
             "击杀掠夺 +1 生存点数"
+        );
+    }
+
+    // === 战况字幕：盾量 marker 解析与收集 ===
+
+    /// 连发两个 marker 的 WAT（字幕收集测试用，与 arena 侧 DOUBLE_LOG_WAT 同款；
+    /// 本地重定义避免跨 crate 引用 tests 内私有常量）
+    const CAPTION_LOG_WAT: &str = r#"(module
+  (import "env" "log" (func $log (param i32)))
+  (func (export "on_tick")
+    i32.const 7 call $log
+    i32.const 5 call $log)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn parse_shield_markers_pair_reports_value() {
+        // 规则：log(7)（拦截）后紧跟的值 = D 上报的剩余盾量
+        assert_eq!(parse_shield_markers(&[7, 9]), Some(9), "拦截对 [7,9] 应上报盾量 9");
+    }
+
+    #[test]
+    fn parse_shield_markers_latest_pair_wins() {
+        // 规则：多次拦截取最后一对的值；反制 marker 9 混在流中不干扰位置配对
+        // 序列语义：反制9 | 拦截+盾9 | 反制9 | 拦截+盾8 | 反制9 | 拦截+盾7
+        let markers = [9, 7, 9, 9, 7, 8, 9, 7, 7];
+        assert_eq!(parse_shield_markers(&markers), Some(7), "最后一对 [7,7] 应上报盾量 7");
+    }
+
+    #[test]
+    fn parse_shield_markers_exhausted_marker_means_zero() {
+        // 规则：log(8)（盾尽放行）= 盾 0；盾尽后不再有配对值
+        assert_eq!(parse_shield_markers(&[7, 1, 8]), Some(0), "盾尽 marker 应解析为 0");
+    }
+
+    #[test]
+    fn parse_shield_markers_non_defender_markers_mean_none() {
+        // 负面路径：A 的 marker（0/2/3）不含盾上报 -> None（字幕显示占位符）
+        assert_eq!(parse_shield_markers(&[0, 2, 3]), None);
+    }
+
+    #[test]
+    fn parse_shield_markers_empty_and_truncated() {
+        // 边界：空流 -> None；截断对（只有 7 没有盾值）-> None（不臆测）
+        assert_eq!(parse_shield_markers(&[]), None);
+        assert_eq!(parse_shield_markers(&[7]), None, "截断对不应臆测盾量");
+    }
+
+    #[test]
+    fn collect_all_log_markers_drains_all_sandboxes_and_clears() {
+        // 收集：drain 全部沙箱的 log_markers 并清空（不跨 tick 残留）
+        let mut world = WorldState::new();
+        let a = EntityId(Uuid::from_u128(71));
+        let b = EntityId(Uuid::from_u128(72));
+        world.entities.insert(a, make_entity(71, (0.0, 0.0)));
+        world.entities.insert(b, make_entity(72, (5.0, 0.0)));
+        let mut map = test_sandbox_map();
+        map.create(a, &wasm(CAPTION_LOG_WAT), 1_000_000).unwrap();
+        map.create(b, &wasm(CAPTION_LOG_WAT), 1_000_000).unwrap();
+        // 触发两个沙箱各 log 两次（marker 7,5）
+        map.run_player_code(&world);
+        let markers = map.collect_all_log_markers();
+        assert_eq!(markers.len(), 4, "两个沙箱各 2 条 marker 应共 4 条");
+        assert!(
+            markers.iter().filter(|&&m| m == 7).count() == 2
+                && markers.iter().filter(|&&m| m == 5).count() == 2,
+            "应含两个沙箱的 [7,5] 序列（沙箱遍历顺序随机，只验集合）"
+        );
+        assert!(
+            map.collect_all_log_markers().is_empty(),
+            "收集后应清空（不跨调用残留）"
+        );
+    }
+
+    // === 第三只生物 H（黄"H" 搅局者）：行为分支与混战链路 ===
+
+    #[test]
+    fn hunter_watches_when_enemy_far() {
+        // H 行为分支一（观望）：最近敌人距离 > 3 -> marker 4 + 原地小幅游走 ±0.5，不出刀
+        let mut world = WorldState::new();
+        let h = EntityId(Uuid::from_u128(80));
+        let enemy = EntityId(Uuid::from_u128(81));
+        world
+            .entities
+            .insert(h, make_creature(80, (0.0, 0.0), "hunter", "H", "yellow"));
+        world
+            .entities
+            .insert(enemy, make_creature(81, (20.0, 20.0), "far", "F", "gray"));
+        let mut map = test_sandbox_map();
+        map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
+        map.create(enemy, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        map.run_player_code(&world);
+        let markers = map.collect_all_log_markers();
+        assert!(
+            markers.contains(&4),
+            "远处敌人应观望（marker 4），实际 {:?}",
+            markers
+        );
+        let handle = map.sandboxes.get_mut(&h).unwrap();
+        let moves = &handle.store.data().pending_moves;
+        assert_eq!(moves.len(), 1, "观望应小幅游走 1 步");
+        match &moves[0] {
+            PendingChange::SetPos { new_pos, .. } => {
+                // 游走方向 ±0.5 沿 x 轴（tick 奇偶决定正负，二者皆合法）
+                assert!(
+                    (new_pos.0.abs() - 0.5).abs() < 1e-9 && new_pos.1 == 0.0,
+                    "游走步幅应为 x ±0.5，实际 {:?}",
+                    new_pos
+                );
+            }
+            other => panic!("观望应排队 SetPos，实际 {other:?}"),
+        }
+        assert!(
+            handle.store.data().pending_attacks.is_empty(),
+            "观望状态不应出刀"
+        );
+    }
+
+    #[test]
+    fn hunter_attacks_when_enemy_close() {
+        // H 行为分支二（参战）：最近敌人距离 <= 3 -> marker 5 + 对敌人坐标出刀，不移动
+        let mut world = WorldState::new();
+        let h = EntityId(Uuid::from_u128(82));
+        let enemy = EntityId(Uuid::from_u128(83));
+        world
+            .entities
+            .insert(h, make_creature(82, (0.0, 0.0), "hunter", "H", "yellow"));
+        world
+            .entities
+            .insert(enemy, make_creature(83, (1.0, 0.0), "prey", "P", "gray"));
+        let mut map = test_sandbox_map();
+        map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
+        map.create(enemy, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        map.run_player_code(&world);
+        let markers = map.collect_all_log_markers();
+        assert!(
+            markers.contains(&5),
+            "近距离敌人应参战（marker 5），实际 {:?}",
+            markers
+        );
+        let handle = map.sandboxes.get_mut(&h).unwrap();
+        let attacks = &handle.store.data().pending_attacks;
+        assert_eq!(attacks.len(), 1, "参战应排队 1 刀");
+        assert_eq!(
+            attacks[0].target_pos,
+            (1.0, 0.0),
+            "刀应落在 scan 到的敌人坐标"
+        );
+        assert!(
+            handle.store.data().pending_moves.is_empty(),
+            "参战状态不应游走"
+        );
+    }
+
+    #[test]
+    fn hunter_intercepts_on_odd_ticks_only() {
+        // H 防守：50% 拦截（tick 奇偶伪随机）——奇数 tick 拦截（marker 6），偶数放行
+        let mut map = test_sandbox_map();
+        let h = EntityId(Uuid::from_u128(84));
+        map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
+        // on_tick 自增 $ticks：调 1 次 -> ticks=1（奇）
+        map.manager
+            .call_on_tick(map.sandboxes.get_mut(&h).unwrap())
+            .unwrap();
+        assert!(
+            map.manager
+                .call_on_attack(map.sandboxes.get_mut(&h).unwrap(), &[0])
+                .unwrap(),
+            "奇数 tick 应拦截"
+        );
+        // 再调 1 次 -> ticks=2（偶）
+        map.manager
+            .call_on_tick(map.sandboxes.get_mut(&h).unwrap())
+            .unwrap();
+        assert!(
+            !map
+                .manager
+                .call_on_attack(map.sandboxes.get_mut(&h).unwrap(), &[0])
+                .unwrap(),
+            "偶数 tick 应放行"
+        );
+        let markers = map.collect_all_log_markers();
+        assert!(
+            markers.contains(&6),
+            "拦截成功应上报 marker 6，实际 {:?}",
+            markers
+        );
+    }
+
+    #[test]
+    fn hunter_idle_when_no_enemy() {
+        // H 负面路径：全场只剩自己（无敌人）-> marker 0 待机，不游走不出刀
+        let mut world = WorldState::new();
+        let h = EntityId(Uuid::from_u128(85));
+        world
+            .entities
+            .insert(h, make_creature(85, (0.0, 0.0), "hunter", "H", "yellow"));
+        let mut map = test_sandbox_map();
+        map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
+        map.run_player_code(&world);
+        let markers = map.collect_all_log_markers();
+        assert!(
+            markers.contains(&0),
+            "无敌人应待机（marker 0），实际 {:?}",
+            markers
+        );
+        let handle = map.sandboxes.get_mut(&h).unwrap();
+        assert!(handle.store.data().pending_moves.is_empty(), "待机不游走");
+        assert!(
+            handle.store.data().pending_attacks.is_empty(),
+            "待机不出刀"
+        );
+    }
+
+    #[test]
+    fn hunter_blade_kills_third_party_via_two_phase_settlement() {
+        // 混战链路：H 出刀 -> 既有两阶段结算 -> 第三方被击杀 + H 掠夺 1 点
+        // （复用 process_attacks，H 的刀从真实沙箱 pending_attacks 收集，非手工构造）
+        let mut world = WorldState::new();
+        let h = EntityId(Uuid::from_u128(86));
+        let victim = EntityId(Uuid::from_u128(87));
+        world
+            .entities
+            .insert(h, make_creature(86, (0.0, 0.0), "hunter", "H", "yellow"));
+        world
+            .entities
+            .insert(victim, make_creature(87, (1.0, 0.0), "prey", "P", "gray"));
+        let mut map = test_sandbox_map();
+        map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
+        map.create(victim, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        // 阶段一：H 参战排刀
+        map.run_player_code(&world);
+        let attacks = map.collect_pending_attacks();
+        assert_eq!(attacks.len(), 1, "H 应排 1 刀");
+        // 阶段二：两阶段结算（victim 无防守 -> 被击杀 + H 掠夺）
+        process_attacks(&mut world, &mut map, &attacks);
+        assert!(
+            !world.entities.get(&victim).unwrap().is_alive(),
+            "H 的刀应击杀第三方"
+        );
+        assert_eq!(
+            world.entities.get(&h).unwrap().survival.points(),
+            4,
+            "H 应掠夺 1 点（3->4）"
+        );
+    }
+
+    // === tick 字幕接线（渲染层展示随 tick 更新）===
+
+    /// 字幕内容观测点：Renderer 保存的行字符串（tick 内 flush 会 swap buffer，
+    /// buffer current 不再持有本帧；buffer 落格行为已由 render crate 测试覆盖）
+    fn renderer_row0(renderer: &Renderer) -> String {
+        renderer.caption_line().to_string()
+    }
+
+    #[test]
+    fn tick_updates_caption_alive_and_distance() {
+        // 集成：tick 内更新字幕——开局 alive=2 / dist=10.0；A 逼近后 dist 缩小；
+        // A 被击杀后 dist=-- / alive=1（存活数变化、缺席占位）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, a, _d) =
+            battle_stage(10);
+        let run = |world: &mut WorldState,
+                       time: &mut TimeEngine,
+                       renderer: &mut Renderer,
+                       storage: &mut StorageEngine,
+                       pending: &mut Vec<PendingChange>,
+                       map: &mut EntitySandboxMap| {
+            run_ticks(world, time, &physics, renderer, storage, pending, map, 1);
+        };
+        // 开局字幕（第 1 tick 后：alive=2，dist 尚在 10 附近）
+        run(&mut world, &mut time, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(
+            renderer_row0(&renderer).contains("alive=2"),
+            "开局字幕应显示存活 2，实际 {:?}",
+            renderer_row0(&renderer)
+        );
+        assert!(
+            renderer_row0(&renderer).contains("dist=9.0"),
+            "第 1 tick A 逼近后距离应约 9.0，实际 {:?}",
+            renderer_row0(&renderer)
+        );
+        // 15 tick：A 被 D 反制击杀（默认盾 10 时间线）-> dist=-- / alive=1
+        for _ in 0..14 {
+            run(&mut world, &mut time, &mut renderer, &mut storage, &mut pending, &mut map);
+        }
+        assert!(
+            !world.entities.contains_key(&a),
+            "回归前提：15 tick 时 A 应已被击杀"
+        );
+        assert!(
+            renderer_row0(&renderer).contains("dist=--"),
+            "A 死后距离应显示占位符，实际 {:?}",
+            renderer_row0(&renderer)
+        );
+        assert!(
+            renderer_row0(&renderer).contains("alive=1"),
+            "A 死后存活数应为 1，实际 {:?}",
+            renderer_row0(&renderer)
+        );
+    }
+
+    #[test]
+    fn tick_caption_shield_counts_down_with_intercepts() {
+        // 集成：D 拦截 A 的 3 刀（tick 10/11/12），字幕盾量经 marker 上报逐次下降，
+        // A 死后停在 7（盾量=拦截配额余量，来自玩家代码自愿上报，host 不读沙箱内部）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, a, d) =
+            battle_stage(10);
+        run_ticks(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            15,
+        );
+        assert!(
+            !world.entities.contains_key(&a),
+            "回归前提：A 应已被击杀"
+        );
+        assert!(world.entities.contains_key(&d), "回归前提：D 应存活");
+        let line = renderer_row0(&renderer);
+        assert!(
+            line.contains("shield=7"),
+            "3 次拦截后字幕应显示盾余 7，实际 {:?}",
+            line
+        );
+        assert!(
+            line.contains("alive=1"),
+            "A 死后存活数应为 1，实际 {:?}",
+            line
         );
     }
 }

@@ -26,6 +26,12 @@ pub struct Config {
     pub term_cols: usize,
     /// 日志级别，默认 "info"
     pub log_level: String,
+    /// 防御者 D 的盾量（拦截配额），默认 10。
+    /// 决定默认剧本胜负时间线：10 = D 反制先杀 A；1 = A 磨穿薄盾反杀（翻盘剧本）。
+    pub d_shield: i32,
+    /// 是否登场第三只生物 H（黄"H" 搅局者），默认 true。
+    /// CODEWORLD_H_ENABLED=0/false 关闭（经典双生物对局，供翻盘剧本与冒烟对照）。
+    pub h_enabled: bool,
 }
 
 impl Default for Config {
@@ -39,6 +45,8 @@ impl Default for Config {
             term_rows: 50,
             term_cols: 80,
             log_level: "info".to_string(),
+            d_shield: 10,
+            h_enabled: true,
         }
     }
 }
@@ -70,6 +78,15 @@ impl Config {
         if let Some(h) = env_f64("CODEWORLD_VIEWPORT_HALF_HEIGHT") {
             cfg.viewport_half_height = h;
         }
+        if let Some(shield) = env_i32("CODEWORLD_D_SHIELD") {
+            cfg.d_shield = shield;
+        }
+        // 布尔类开关："0"/"false"（大小写不敏感）= 关闭，缺失或其他值 = 默认开启
+        if let Ok(v) = std::env::var("CODEWORLD_H_ENABLED") {
+            if v == "0" || v.eq_ignore_ascii_case("false") {
+                cfg.h_enabled = false;
+            }
+        }
         // 字符串类：有值即覆盖（空字符串也覆盖，符合"显式设置"语义）
         if let Ok(val) = std::env::var("CODEWORLD_DB_PATH") {
             cfg.db_path = val;
@@ -98,6 +115,11 @@ fn env_usize(key: &str) -> Option<usize> {
 
 /// 读取并解析 f64 环境变量，缺失或非法返回 None
 fn env_f64(key: &str) -> Option<f64> {
+    std::env::var(key).ok()?.parse().ok()
+}
+
+/// 读取并解析 i32 环境变量，缺失或非法返回 None
+fn env_i32(key: &str) -> Option<i32> {
     std::env::var(key).ok()?.parse().ok()
 }
 
@@ -161,5 +183,57 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(c.tick_interval(), Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn default_d_shield_is_ten_and_h_enabled_true() {
+        // 创建：D 盾量默认 10（默认剧本 D 胜的时间线由该值锁定）；H 搅局者默认登场
+        let c = Config::default();
+        assert_eq!(c.d_shield, 10, "D 盾量默认应为 10");
+        assert!(c.h_enabled, "H 搅局者默认应登场");
+    }
+
+    #[test]
+    fn load_d_shield_env_overrides_default() {
+        // 修改：CODEWORLD_D_SHIELD=1 覆盖默认（翻盘剧本：A 磨穿薄盾反杀）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_D_SHIELD", "1");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_D_SHIELD");
+        assert_eq!(c.d_shield, 1, "环境变量应覆盖 D 盾量");
+    }
+
+    #[test]
+    fn load_d_shield_invalid_value_falls_back_to_default() {
+        // 边界：CODEWORLD_D_SHIELD 非法（非整数）-> 回退默认 10（容错语义与数值类一致）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_D_SHIELD", "not-a-number");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_D_SHIELD");
+        assert_eq!(c.d_shield, 10, "非法值应回退默认盾量");
+    }
+
+    #[test]
+    fn load_h_enabled_env_can_disable() {
+        // 修改：CODEWORLD_H_ENABLED=0 关闭 H（经典双生物对局：默认/翻盘两剧本冒烟用）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_H_ENABLED", "0");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_H_ENABLED");
+        assert!(!c.h_enabled, "CODEWORLD_H_ENABLED=0 应关闭 H");
+        // "false" 同样关闭（语义别名）
+        std::env::set_var("CODEWORLD_H_ENABLED", "false");
+        let c2 = Config::load();
+        std::env::remove_var("CODEWORLD_H_ENABLED");
+        assert!(!c2.h_enabled, "CODEWORLD_H_ENABLED=false 应关闭 H");
+    }
+
+    #[test]
+    fn load_h_enabled_absent_defaults_to_enabled() {
+        // 边界：无环境变量 -> H 默认登场（start.bat 默认混战剧本）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CODEWORLD_H_ENABLED");
+        let c = Config::load();
+        assert!(c.h_enabled, "无环境变量时 H 应默认登场");
     }
 }

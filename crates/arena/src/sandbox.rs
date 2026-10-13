@@ -51,6 +51,11 @@ pub struct SandboxData {
     /// 本 tick 排队的移动请求（env.move_by 推入 PendingChange::SetPos，
     /// 阶段二收集后并入主 pending 队列统一应用，与攻击排队同模式）
     pub pending_moves: Vec<PendingChange>,
+    /// 本 tick env.log 的 marker 值序列（按调用顺序记录）。
+    /// 战况字幕的盾量上报通路：玩家代码主动 log（如 D 拦截时 log(7) 后跟 log(余量)），
+    /// host 侧解析该序列更新字幕——玩家自愿上报，不破坏沙箱隔离（架构 4.2 铁律：
+    /// 字幕=渲染层展示，只读，不写回 world）。
+    pub log_markers: Vec<i32>,
 }
 
 impl SandboxData {
@@ -104,11 +109,14 @@ impl SandboxManager {
     fn make_linker(engine: &Engine) -> Result<Linker<SandboxData>> {
         let mut linker = Linker::new(engine);
         // env.log(v)：玩家代码日志（v 为玩家自定义 marker，含义见各生物 WAT 注释）。
-        // 记 api_calls 元数据 + tracing::info 输出到 stderr（战斗节点可见性）。
+        // 记 api_calls 元数据 + marker 值序列（log_markers，host 字幕解析用）
+        // + tracing::info 输出到 stderr（战斗节点可见性）。
         linker.func_wrap("env", "log", |mut caller: Caller<SandboxData>, v: i32| {
-            caller.data_mut().api_calls.push("log".to_string());
+            let data = caller.data_mut();
+            data.api_calls.push("log".to_string());
+            data.log_markers.push(v);
             tracing::info!(
-                entity_id = %caller.data().entity_id.0,
+                entity_id = %data.entity_id.0,
                 marker = v,
                 "[player_log] 玩家代码日志"
             );
@@ -1002,6 +1010,46 @@ mod tests {
             attacks[0].payload.len(),
             crate::sandbox::MAX_PAYLOAD_LEN,
             "入队 payload 应恰为上限大小（len == 上限不超限）"
+        );
+    }
+
+    // === env.log marker 值记录（战况字幕的盾量上报通路：玩家代码 log(7) 后跟 log(余量)）===
+
+    /// 连发两个 marker 的 WAT：on_tick 调 log(7) 再 log(5)（模拟 D 拦截上报盾量 5）
+    const DOUBLE_LOG_WAT: &str = r#"(module
+  (import "env" "log" (func $log (param i32)))
+  (func (export "on_tick")
+    i32.const 7 call $log
+    i32.const 5 call $log)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn log_import_records_marker_values_in_order() {
+        // env.log：除 api_calls 元数据与 stderr 日志外，把 marker 值按序记入
+        // SandboxData.log_markers（host 侧字幕解析盾量的数据源，玩家代码零改动）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(DOUBLE_LOG_WAT), 100_000, id(601))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(
+            handle.store.data().log_markers,
+            vec![7, 5],
+            "env.log 的 marker 值应按调用顺序记录"
+        );
+    }
+
+    #[test]
+    fn log_markers_stay_empty_when_no_log_called() {
+        // 负面路径：不调 log 的模块 -> log_markers 保持为空
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(LIFE_TRUE_WAT), 100_000, id(602))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert!(
+            handle.store.data().log_markers.is_empty(),
+            "未调 env.log 时 log_markers 应为空"
         );
     }
 }
