@@ -9,6 +9,12 @@ use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
 use crate::attack::PendingAttack;
 use codeworld_core::entity::EntityId;
 
+/// attack payload 最大字节数（1MB，架构 4.2 技术保护）
+///
+/// import 层拒绝超限请求：防一次性拷贝大块线性内存（最大可到 64MB）+
+/// 超大模块编译长时间阻塞 tick（编译不受 fuel 约束）。
+pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
+
 /// 沙箱用户数据（Store data，用于被动观测，架构 4.3）
 ///
 /// `mem_read_count`/`mem_write_count` MVP 不真实统计（wasmtime 不直接暴露，
@@ -44,6 +50,7 @@ impl SandboxData {
 }
 
 /// 沙箱句柄（持有 Store + Instance）
+#[derive(Debug)]
 pub struct SandboxHandle {
     /// WASM Store（含用户数据 + fuel）
     pub store: Store<SandboxData>,
@@ -80,7 +87,9 @@ impl SandboxManager {
     ///     SandboxData.pending_attacks，实际 hit/miss 在阶段二 process_attacks 判断。
     ///   - payload 从 caller 的 memory export 读取 [ptr..ptr+len]；模块未导出 memory
     ///     或 ptr<0/len<=0/越界 -> 空 payload（空 payload 由阶段二用默认击杀 WAT）。
-    ///   - 返回 1=已排队（快速返回，不阻塞 on_tick）。
+    ///   - len 超过 MAX_PAYLOAD_LEN（1MB）直接拒绝：不入队、不拷贝内存
+    ///     （防大块拷贝 + 超大模块编译阻塞 tick，编译不受 fuel 约束）。
+    ///   - 返回 1=已排队，0=拒绝（超限）。
     fn make_linker(engine: &Engine) -> Result<Linker<SandboxData>> {
         let mut linker = Linker::new(engine);
         linker.func_wrap("env", "log", |mut caller: Caller<SandboxData>, _v: i32| {
@@ -91,7 +100,18 @@ impl SandboxManager {
             "attack_at",
             |mut caller: Caller<SandboxData>, x: f64, y: f64, ptr: i32, len: i32| -> i32 {
                 let attacker = caller.data().entity_id;
+                // 超限拒绝：在读 memory 之前拦下（避免无谓拷贝），返回 0 告知玩家代码
+                if len > 0 && len as usize > MAX_PAYLOAD_LEN {
+                    tracing::warn!(
+                        attacker = %attacker.0,
+                        actual_len = len,
+                        max = MAX_PAYLOAD_LEN,
+                        "[attack_at] payload 超限，拒绝入队"
+                    );
+                    return 0;
+                }
                 let payload = read_payload_from_caller(&mut caller, ptr, len);
+                let payload_len = payload.len(); // 实际读取到的字节数（非调用方声称的 len）
                 caller.data_mut().pending_attacks.push(PendingAttack {
                     attacker,
                     target_pos: (x, y),
@@ -101,7 +121,7 @@ impl SandboxManager {
                     attacker = %attacker.0,
                     x,
                     y,
-                    payload_len = len,
+                    payload_len,
                     "[attack_at] 攻击已排队"
                 );
                 1 // 已排队
@@ -135,21 +155,45 @@ impl SandboxManager {
         tracing::debug!("沙箱销毁");
     }
 
-    /// 替换沙箱（路线A：销毁旧 + 创建新，旧内存状态丢失）
+    /// 替换沙箱（路线A：先建新、成功才拆旧；失败时旧沙箱原样带回）
     ///
-    /// 保留旧沙箱的 entity_id 与 fuel_limit：替换的是同一实体的代码，身份不变；
-    /// fuel_limit 沿用原配额。签名不变（按值消费 handle，返回新 handle）。
+    /// P0 僵尸实体修复：旧实现先 drop(handle) 再 Module::new，payload 非法时编译失败
+    /// -> 旧沙箱已销毁、新沙箱未建，实体失去沙箱变成僵尸（永不可被攻击、代码永不运行）。
+    /// 改为先建后拆：编译/实例化失败时旧沙箱随 Err 原样返回，调用方放回映射表即可，
+    /// "存活实体必有沙箱"不变量不破。
+    /// fuel 语义：新沙箱配额由调用方传入（attack 路径传旧沙箱剩余量，防反复被攻击回满刷配额）。
     pub fn replace_sandbox(
         &self,
         handle: SandboxHandle,
         new_wasm_bytes: &[u8],
         fuel: u64,
-    ) -> Result<SandboxHandle> {
-        // drop 前读出 entity_id，传给新沙箱（攻击替换后仍是同一实体）
+    ) -> std::result::Result<SandboxHandle, (SandboxHandle, anyhow::Error)> {
+        // 建新前读出 entity_id，传给新沙箱（攻击替换后仍是同一实体）
         let entity_id = handle.store.data().entity_id;
-        tracing::debug!(entity_id = %entity_id.0, "沙箱替换（路线A）");
-        drop(handle);
-        self.create_sandbox(new_wasm_bytes, fuel, entity_id)
+        match self.create_sandbox(new_wasm_bytes, fuel, entity_id) {
+            Ok(new_handle) => {
+                // 成功才拆旧。旧沙箱若还有排队未处理的攻击请求，随替换丢弃（warn 提示）。
+                let stale = handle.store.data().pending_attacks.len();
+                if stale > 0 {
+                    tracing::warn!(
+                        entity_id = %entity_id.0,
+                        count = stale,
+                        "旧沙箱仍有未处理攻击请求，随替换丢弃"
+                    );
+                }
+                drop(handle);
+                tracing::debug!(entity_id = %entity_id.0, "沙箱替换（路线A，先建后拆）");
+                Ok(new_handle)
+            }
+            Err(e) => {
+                tracing::debug!(
+                    entity_id = %entity_id.0,
+                    error = %e,
+                    "沙箱替换失败，旧沙箱保留"
+                );
+                Err((handle, e))
+            }
+        }
     }
 
     /// 更新 fuel_consumed（fuel_limit - get_fuel）
@@ -249,7 +293,15 @@ fn read_payload_from_caller(caller: &mut Caller<SandboxData>, ptr: i32, len: i32
     };
     let data = memory.data(&*caller);
     let start = ptr as usize;
-    let end = start + len as usize;
+    // checked_add：32 位平台上 start+len 可能回绕成小值绕过越界检查（防御性修复）
+    let Some(end) = start.checked_add(len as usize) else {
+        tracing::warn!(
+            ptr,
+            len,
+            "[read_payload] payload 读取地址回绕，置空"
+        );
+        return Vec::new();
+    };
     if end > data.len() {
         tracing::warn!(
             ptr,
@@ -424,6 +476,60 @@ mod tests {
             new_handle.store.data().entity_id,
             attacker_id,
             "替换后 entity_id 应保留"
+        );
+    }
+
+    // === P0 僵尸实体修复：先建后拆 ===
+
+    #[test]
+    fn replace_sandbox_invalid_wasm_keeps_old_handle() {
+        // P0 僵尸修复：非法 WASM payload 编译失败时，旧沙箱必须原样返回（随 Err 载荷），
+        // 调用方放回映射表后"存活实体必有沙箱"不变量不破。
+        // 旧实现先 drop(handle) 再 Module::new，失败后旧沙箱已销毁 -> 僵尸实体。
+        let mgr = SandboxManager::new().unwrap();
+        let owner = id(100);
+        let handle = mgr.create_sandbox(&wasm(LIFE_TRUE_WAT), 1000, owner).unwrap();
+        // 垃圾字节：非合法 WASM 魔数，Module::new 必失败
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        let Err((mut old_handle, _err)) = mgr.replace_sandbox(handle, garbage, 1000) else {
+            panic!("非法 payload 应替换失败并带回旧沙箱");
+        };
+        // 旧沙箱原样可用：life() 仍是原模块的 true
+        assert!(
+            mgr.call_life(&mut old_handle).unwrap(),
+            "失败后旧沙箱应保留且可继续调用"
+        );
+        // 旧沙箱 entity_id 身份不变
+        assert_eq!(old_handle.store.data().entity_id, owner, "旧沙箱身份应不变");
+    }
+
+    // === P1：payload 大小上限（import 层拒绝超限）===
+
+    /// 大内存攻击方 WAT：24 页 memory（约 1.5MB），on_tick 连调两次 attack_at——
+    /// 第一次 len=上限（应排队），第二次 len=上限+1（应拒绝）
+    const OVERSIZED_ATTACKER_WAT: &str = r#"(module
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 24)
+  (func (export "on_tick")
+    f64.const 1.0 f64.const 2.0 i32.const 0 i32.const 1048576 call $attack_at drop
+    f64.const 1.0 f64.const 2.0 i32.const 0 i32.const 1048577 call $attack_at drop)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn attack_at_import_rejects_oversized_payload() {
+        // P1：len 超过 1MB 上限的攻击请求被 import 拒绝（不入队），不拷贝大块内存
+        let mgr = SandboxManager::new().unwrap();
+        let attacker_id = id(201);
+        let mut handle = mgr
+            .create_sandbox(&wasm(OVERSIZED_ATTACKER_WAT), 100_000, attacker_id)
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        let attacks = &handle.store.data().pending_attacks;
+        assert_eq!(attacks.len(), 1, "只有上限内的那一刀应入队");
+        assert_eq!(
+            attacks[0].payload.len(),
+            crate::sandbox::MAX_PAYLOAD_LEN,
+            "入队 payload 应恰为上限大小（len == 上限不超限）"
         );
     }
 }

@@ -131,73 +131,78 @@ impl EntitySandboxMap {
         all
     }
 
-    /// 对目标实体执行单次攻击（架构 4.2：on_attack 拦截 -> 路线A替换沙箱 -> 检查 life）
+    /// 收件：调目标【当前沙箱】的 on_attack 询问是否拦截（架构 4.2 两阶段-收件）
     ///
-    /// - on_attack 返回 true -> 拦截，不替换、不击杀。
-    /// - 未拦截 -> 用 payload 替换目标整个 WASM 模块（路线A）；payload 为空用 DEFAULT_KILL_WASM。
-    /// - 替换后调 life()：false=击杀成功；调用失败视为击杀（破损沙箱等同死亡）。
-    /// - 不处理掠夺：掠夺需改 world（survival），由调用方 process_attacks 在击杀后处理。
-    fn attack_target(&mut self, target_id: &EntityId, payload: &[u8]) -> Result<AttackOutcome> {
-        // 1. on_attack 拦截检查（旧沙箱）
-        let intercepted = {
-            let Some(handle) = self.sandboxes.get_mut(target_id) else {
-                anyhow::bail!("目标 {:?} 无沙箱，无法攻击代码", target_id);
-            };
-            self.manager.call_on_attack(handle, payload)?
+    /// 只问不改：不换血、不击杀；防守方 fuel 随每次调用自然消耗（围殴=磨算力）。
+    /// 返回 true=拦截。目标无沙箱 -> Err（调用方作废该刀）。
+    fn defend(&mut self, target_id: &EntityId, payload: &[u8]) -> Result<bool> {
+        let Some(handle) = self.sandboxes.get_mut(target_id) else {
+            anyhow::bail!("目标 {:?} 无沙箱，无法防守", target_id);
         };
-        if intercepted {
-            tracing::info!(target = %target_id.0, "[attack_target] 攻击被 on_attack 拦截");
-            return Ok(AttackOutcome {
-                intercepted: true,
-                killed: false,
-            });
-        }
-        // 2. 替换沙箱（路线A）：移出旧 handle -> replace（保留 entity_id）-> 插回
+        self.manager.call_on_attack(handle, payload)
+    }
+
+    /// 结算：路线A换血 + 检查 life（架构 4.2 两阶段-结算）
+    ///
+    /// - fuel 取旧沙箱【剩余量】而非配额上限：防"反复被攻击回满配额"刷算力（P1）。
+    /// - payload 非法（编译/实例化失败）：旧沙箱原样放回（P0 僵尸实体修复），
+    ///   "存活实体必有沙箱"不变量不破，返回 Err 交调用方记攻击失败。
+    /// - 返回 killed：替换后 life()=false，或 life() 调用失败（破损沙箱等同死亡）。
+    /// - 不处理掠夺：掠夺需改 world（survival），由调用方 settle_attacks 在击杀后处理。
+    fn replace_code(&mut self, target_id: &EntityId, payload: &[u8]) -> Result<bool> {
+        // fuel 剩余量在任何 remove 之前读（读失败也不能弄丢旧沙箱）
+        let fuel = {
+            let Some(handle) = self.sandboxes.get_mut(target_id) else {
+                anyhow::bail!("目标 {:?} 无沙箱，无法换血", target_id);
+            };
+            handle.store.get_fuel()?
+        };
         let old = self
             .sandboxes
             .remove(target_id)
-            .context("目标沙箱在 on_attack 后已不存在")?;
-        let fuel = old.store.data().fuel_limit; // 沿用原指令配额
+            .context("目标沙箱刚确认存在却又丢失")?;
         let wasm_bytes: &[u8] = if payload.is_empty() {
             &DEFAULT_KILL_WASM
         } else {
             payload
         };
-        let new_handle = self.manager.replace_sandbox(old, wasm_bytes, fuel)?;
-        self.sandboxes.insert(*target_id, new_handle);
-        tracing::info!(target = %target_id.0, "[attack_target] 目标沙箱已替换（路线A）");
-        // 3. 检查 life()：false=击杀成功
-        let killed = {
-            let handle = self
-                .sandboxes
-                .get_mut(target_id)
-                .context("替换后目标沙箱丢失")?;
-            match self.manager.call_life(handle) {
-                Ok(false) => true,
-                Ok(true) => false,
-                Err(e) => {
-                    tracing::warn!(
-                        target = %target_id.0,
-                        error = %e,
-                        "[attack_target] 替换后 life() 调用失败，视为击杀"
-                    );
-                    true
-                }
+        let new_handle = match self.manager.replace_sandbox(old, wasm_bytes, fuel) {
+            Ok(h) => h,
+            Err((old_handle, e)) => {
+                // P0 僵尸修复：编译/实例化失败，旧沙箱放回映射表
+                self.sandboxes.insert(*target_id, old_handle);
+                tracing::warn!(
+                    target = %target_id.0,
+                    error = %e,
+                    "[replace_code] payload 编译/实例化失败，旧沙箱已还原"
+                );
+                anyhow::bail!("换血失败：payload 非法");
             }
         };
-        Ok(AttackOutcome {
-            intercepted: false,
-            killed,
-        })
+        self.sandboxes.insert(*target_id, new_handle);
+        tracing::info!(
+            target = %target_id.0,
+            fuel_inherited = fuel,
+            "[replace_code] 目标沙箱已替换（路线A，fuel 继承剩余量）"
+        );
+        // 检查 life()：false=击杀成功；调用失败视为击杀（破损沙箱等同死亡）
+        let handle = self
+            .sandboxes
+            .get_mut(target_id)
+            .context("替换后目标沙箱丢失")?;
+        match self.manager.call_life(handle) {
+            Ok(false) => Ok(true),
+            Ok(true) => Ok(false),
+            Err(e) => {
+                tracing::warn!(
+                    target = %target_id.0,
+                    error = %e,
+                    "[replace_code] 替换后 life() 调用失败，视为击杀"
+                );
+                Ok(true)
+            }
+        }
     }
-}
-
-/// 单次攻击结果（attack_target 返回，供 process_attacks 决定是否掠夺）
-struct AttackOutcome {
-    /// 是否被 on_attack 拦截
-    intercepted: bool,
-    /// 是否击杀成功（替换后 life()=false）
-    killed: bool,
 }
 
 fn main() -> Result<()> {
@@ -343,9 +348,10 @@ fn tick(
     //   a. 应用 PendingChanges（spawn/destroy/set_pos/set_velocity，架构 4.1 a 步）
     apply_pending_changes(world, pending);
 
-    //   a2. 处理攻击（架构 4.2：阶段一 on_tick 调 env.attack_at 排队的请求在此统一执行）
+    //   a2. 处理攻击（架构 4.2 两阶段模型：阶段一 on_tick 调 env.attack_at 排队的请求在此统一执行）
     //      插在 apply_pending_changes 之后、decay_survival 之前：攻击产生的死亡先于每日衰减处理。
-    //      import 函数只排队（无 world 访问权），实际 hit/miss/击杀/掠夺在此判断。
+    //      import 函数只排队（无 world 访问权），实际 hit/miss/拦截/结算在此判断：
+    //      收件（逐刀问目标当前沙箱 on_attack，不换血不击杀）-> 结算（攻击者 id 升序逐刀执行）。
     let pending_attacks = sandbox_map.collect_pending_attacks();
     if !pending_attacks.is_empty() {
         process_attacks(world, sandbox_map, &pending_attacks);
@@ -487,75 +493,178 @@ fn decay_survival(world: &mut WorldState, current_tick: u64) {
     }
 }
 
-/// 处理阶段一排队的攻击请求（架构 4.2 + 4.1 阶段二 a2 步）
+/// 待结算攻击（收件产出 -> 结算消费）
+struct PendingStrike {
+    /// 被攻击的实体（坐标解析产物，结算时换血/击杀的对象）
+    target: EntityId,
+    /// 原始攻击请求（attacker/payload）
+    attack: PendingAttack,
+}
+
+/// 处理阶段一排队的攻击请求（架构 4.2 两阶段模型 + 4.1 阶段二 a2 步）
 ///
-/// 对每个 PendingAttack：在坐标找存活实体（attack_at 攻击坐标不是 EntityId，目标移动
-/// 可能 miss）-> attack_target（on_attack 拦截 / 路线A替换 / 检查 life）-> 击杀成功则
-/// 击杀掠夺（从死者转移 1 生存点数给攻击者，自攻自跳过）并标记死亡（清理步 d 移除实体+销毁沙箱）。
+/// 收件阶段 deliver_attacks：过滤已死攻击者 -> 坐标解析目标 -> 逐刀调目标【当前沙箱】的
+/// on_attack（不换血不击杀，防守 fuel 自然消耗）-> 未拦截的刀进入待结算列表。
+/// 结算阶段 settle_attacks：全部待结算刀【全局按攻击者 EntityId 升序】依次执行
+/// （确定序，消灭随机性）；每刀执行前再查攻防双方存活（可能被同批更早的刀击杀）；
+/// 击杀则掠夺 1 生存点数并标记死亡（清理步 d 移除实体+销毁沙箱）。
 ///
 /// 攻击在阶段二处理（不实时）：玩家代码调 import 只排队，实际击杀结果下一 tick 才能感知。
+/// 收件期间（on_attack 里）新排的攻击留在防守者沙箱里，下一 tick 的 collect 才处理。
 fn process_attacks(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, attacks: &[PendingAttack]) {
+    let strikes = deliver_attacks(world, sandbox_map, attacks);
+    settle_attacks(world, sandbox_map, &strikes);
+}
+
+/// 收件阶段：逐刀问防守、产出待结算列表（架构 4.2 两阶段-收件）
+///
+/// - 攻击者已死 -> 整刀作废（不触发防守、不结算；防死者点数蒸发，P1）。
+/// - 坐标解析命中多个存活实体时 find 取首个（HashMap 顺序随机，测试用唯一坐标避免歧义）。
+/// - 防守询问失败（如防守方 fuel 耗尽）-> 该刀作废（架构 4.2：on_attack 超时=默认行为，
+///   life 维持原值不被覆写）。
+/// - 输出全局按攻击者 EntityId 升序（结算确定序）。
+fn deliver_attacks(
+    world: &WorldState,
+    sandbox_map: &mut EntitySandboxMap,
+    attacks: &[PendingAttack],
+) -> Vec<PendingStrike> {
+    let mut strikes: Vec<PendingStrike> = Vec::new();
     for atk in attacks {
-        // 找目标：坐标上的存活实体（find 返回第一个命中；HashMap 顺序随机，测试用唯一坐标避免歧义）
-        let target_id = world
+        // 攻击者已死 -> 攻击作废
+        let attacker_alive = world
+            .entities
+            .get(&atk.attacker)
+            .map(|e| e.is_alive())
+            .unwrap_or(false);
+        if !attacker_alive {
+            tracing::info!(
+                attacker = %atk.attacker.0,
+                "[deliver_attacks] 攻击者已死，攻击作废"
+            );
+            continue;
+        }
+        // 坐标解析：找坐标上的存活实体（attack_at 攻击坐标不是 EntityId，目标移动可能 miss）
+        let Some(target_id) = world
             .entities
             .values()
             .find(|e| e.is_alive() && e.pos() == atk.target_pos)
-            .map(|e| e.id);
-        let Some(target_id) = target_id else {
+            .map(|e| e.id)
+        else {
             tracing::info!(
                 attacker = %atk.attacker.0,
                 pos = ?atk.target_pos,
-                "[process_attacks] 攻击落空（坐标无存活实体）"
+                "[deliver_attacks] 攻击落空（坐标无存活实体）"
             );
             continue;
         };
-        // 执行攻击：on_attack 拦截 -> 替换沙箱 -> 检查 life
-        let outcome = match sandbox_map.attack_target(&target_id, &atk.payload) {
-            Ok(o) => o,
+        // 收件：调目标【当前沙箱】的 on_attack（本阶段不换血不击杀）
+        let intercepted = match sandbox_map.defend(&target_id, &atk.payload) {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
                     attacker = %atk.attacker.0,
                     target = %target_id.0,
                     error = %e,
-                    "[process_attacks] 攻击执行失败"
+                    "[deliver_attacks] 防守询问失败，该刀作废"
                 );
                 continue;
             }
         };
-        if outcome.intercepted {
+        tracing::info!(
+            attacker = %atk.attacker.0,
+            target = %target_id.0,
+            intercepted,
+            "[deliver_attacks] 收件：on_attack 结果"
+        );
+        if !intercepted {
+            strikes.push(PendingStrike {
+                target: target_id,
+                attack: atk.clone(),
+            });
+        }
+    }
+    // 确定序：全局按攻击者 EntityId 升序（结算顺序，消灭遍历随机性）
+    strikes.sort_by_key(|s| s.attack.attacker.0);
+    let intercepted_count = attacks.len() - strikes.len();
+    tracing::info!(
+        total = attacks.len(),
+        intercepted = intercepted_count,
+        pending = strikes.len(),
+        "[deliver_attacks] 收件完成：待结算刀数"
+    );
+    strikes
+}
+
+/// 结算阶段：按攻击者 id 升序逐刀执行（换血/击杀/掠夺，架构 4.2 两阶段-结算）
+///
+/// 每刀执行前再查攻防双方存活：攻击者可能已被同批更早的刀击杀（其刀作废，点数不蒸发），
+/// 目标可能已被同批先执行的刀击杀（后到的刀跳过，先执行者的换血生效）。
+fn settle_attacks(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, strikes: &[PendingStrike]) {
+    for (idx, strike) in strikes.iter().enumerate() {
+        // 执行前再查攻击者存活
+        let attacker_alive = world
+            .entities
+            .get(&strike.attack.attacker)
+            .map(|e| e.is_alive())
+            .unwrap_or(false);
+        if !attacker_alive {
             tracing::info!(
-                attacker = %atk.attacker.0,
-                target = %target_id.0,
-                "[process_attacks] 攻击被拦截"
+                attacker = %strike.attack.attacker.0,
+                "[settle_attacks] 攻击者已死，该刀作废"
             );
             continue;
         }
-        if outcome.killed {
-            // 击杀掠夺：从死者转移 1 生存点数给攻击者（自攻自跳过转移但仍击杀）
-            if atk.attacker != target_id {
-                plunder_survival(world, target_id, atk.attacker, 1);
-            } else {
-                tracing::info!(
-                    entity = %target_id.0,
-                    "[process_attacks] 自攻自击杀，跳过掠夺"
+        // 执行前再查目标存活（可能已被同批先执行的刀击杀）
+        let target_alive = world.entities.get(&strike.target).map(|e| e.is_alive()).unwrap_or(false);
+        if !target_alive {
+            tracing::info!(
+                attacker = %strike.attack.attacker.0,
+                target = %strike.target.0,
+                "[settle_attacks] 目标已死，该刀跳过"
+            );
+            continue;
+        }
+        // 换血（P0：失败时旧沙箱已由 replace_code 还原）
+        match sandbox_map.replace_code(&strike.target, &strike.attack.payload) {
+            Ok(killed) => {
+                if killed {
+                    // 击杀掠夺：从死者转移 1 生存点数给攻击者（自攻自跳过转移但仍击杀）
+                    if strike.attack.attacker != strike.target {
+                        plunder_survival(world, strike.target, strike.attack.attacker, 1);
+                    } else {
+                        tracing::info!(
+                            entity = %strike.target.0,
+                            "[settle_attacks] 自攻自击杀，跳过掠夺"
+                        );
+                    }
+                    // 标记死亡（死亡清理步 d 移除实体 + 销毁沙箱）
+                    if let Some(e) = world.entities.get_mut(&strike.target) {
+                        e.kill();
+                    }
+                    tracing::info!(
+                        attacker = %strike.attack.attacker.0,
+                        target = %strike.target.0,
+                        order = idx,
+                        "[settle_attacks] 击杀成功"
+                    );
+                } else {
+                    tracing::info!(
+                        attacker = %strike.attack.attacker.0,
+                        target = %strike.target.0,
+                        order = idx,
+                        "[settle_attacks] 命中未杀（life=true，击晕）"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    attacker = %strike.attack.attacker.0,
+                    target = %strike.target.0,
+                    order = idx,
+                    error = %e,
+                    "[settle_attacks] 攻击执行失败（旧沙箱已还原）"
                 );
             }
-            // 标记死亡（死亡清理步 d 移除实体 + 销毁沙箱）
-            if let Some(e) = world.entities.get_mut(&target_id) {
-                e.kill();
-            }
-            tracing::info!(
-                attacker = %atk.attacker.0,
-                target = %target_id.0,
-                "[process_attacks] 击杀成功"
-            );
-        } else {
-            tracing::info!(
-                attacker = %atk.attacker.0,
-                target = %target_id.0,
-                "[process_attacks] 命中但未击杀（life=true）"
-            );
         }
     }
 }
@@ -1370,46 +1479,164 @@ mod tests {
   (func (export "life") (result i32) i32.const 1)
   (func (export "on_attack") (param i32) (result i32) i32.const 1))"#;
 
-    #[test]
-    fn attack_target_empty_payload_kills() {
-        // 空 payload -> 默认击杀 WAT（life=false）-> 替换后 life()=false -> 击杀成功
-        let mut map = test_sandbox_map();
-        let target_id = EntityId(Uuid::from_u128(5));
-        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
-        let outcome = map.attack_target(&target_id, &[]).unwrap();
-        assert!(!outcome.intercepted, "无 on_attack 不应拦截");
-        assert!(outcome.killed, "空 payload 默认击杀，life 应为 false");
+    /// 防守计数模块 WAT：on_attack 每被调一次全局计数 +1，返回参数==魔法值时拦截
+    /// （0x01010101：raw 字节 [1,1,1,1] payload 的 LE i32，用于区分"哪一刀"）
+    const COUNTER_DEFENSE_WAT: &str = r#"(module
+  (global $count (mut i32) (i32.const 0))
+  (func (export "on_attack") (param i32) (result i32)
+    global.get $count i32.const 1 i32.add global.set $count
+    local.get 0 i32.const 16843009 i32.eq)
+  (func (export "get_count") (result i32) global.get $count)
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "get_ver") (result i32) i32.const 111))"#;
+
+    /// 恒拦截计数 WAT：on_attack 计数 + 恒返回 1（验收#5a 两刀全拦）
+    const COUNTER_ALWAYS_INTERCEPT_WAT: &str = r#"(module
+  (global $count (mut i32) (i32.const 0))
+  (func (export "on_attack") (param i32) (result i32)
+    global.get $count i32.const 1 i32.add global.set $count
+    i32.const 1)
+  (func (export "get_count") (result i32) global.get $count)
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "get_ver") (result i32) i32.const 111))"#;
+
+    /// 带版本号的击晕模块 WAT：life()=true + get_ver()=ver（观测"谁的代码在目标里"）
+    fn ver_module(ver: i32) -> String {
+        format!(
+            r#"(module
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "get_ver") (result i32) i32.const {ver}))"#
+        )
+    }
+
+    /// 带版本号的击杀模块 WAT：life()=false + get_ver()=ver
+    fn kill_ver_module(ver: i32) -> String {
+        format!(
+            r#"(module
+  (func (export "life") (result i32) i32.const 0)
+  (func (export "get_ver") (result i32) i32.const {ver}))"#
+        )
+    }
+
+    /// 从实体当前沙箱调用无参 i32 导出（测试观测：计数器/版本号）
+    fn call_i32_export(map: &mut EntitySandboxMap, id: &EntityId, name: &str) -> i32 {
+        let handle = map.sandboxes.get_mut(id).unwrap();
+        let func = handle
+            .instance
+            .get_typed_func::<(), i32>(&mut handle.store, name)
+            .unwrap();
+        func.call(&mut handle.store, ()).unwrap()
     }
 
     #[test]
-    fn attack_target_on_attack_intercepts() {
-        // 目标导出 on_attack 返回 1 -> 拦截，不替换沙箱、不击杀
+    fn defend_intercepts() {
+        // 收件：目标当前沙箱 on_attack 返回 1 -> 拦截
         let mut map = test_sandbox_map();
         let target_id = EntityId(Uuid::from_u128(6));
         map.create(target_id, &wasm(DEFENDED_TARGET_WAT), 1_000_000).unwrap();
-        let outcome = map.attack_target(&target_id, &[]).unwrap();
-        assert!(outcome.intercepted, "on_attack 返回 1 应拦截");
-        assert!(!outcome.killed, "拦截后不应击杀");
+        assert!(
+            map.defend(&target_id, &[]).unwrap(),
+            "on_attack 返回 1 应拦截"
+        );
     }
 
     #[test]
-    fn attack_target_payload_life_true_not_killed() {
-        // payload 为 life=true 的 WASM -> 替换后 life()=true -> 命中但未击杀（如击晕）
-        let mut map = test_sandbox_map();
-        let target_id = EntityId(Uuid::from_u128(7));
-        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
-        let outcome = map.attack_target(&target_id, &wasm(TARGET_WAT)).unwrap();
-        assert!(!outcome.intercepted);
-        assert!(!outcome.killed, "life=true payload 不应击杀");
-    }
-
-    #[test]
-    fn attack_target_no_sandbox_errors() {
+    fn defend_no_sandbox_errors() {
         // 边界：目标无沙箱 -> Err（不 panic）
         let mut map = test_sandbox_map();
         let target_id = EntityId(Uuid::from_u128(8));
-        let result = map.attack_target(&target_id, &[]);
-        assert!(result.is_err(), "无沙箱目标应返回 Err");
+        assert!(map.defend(&target_id, &[]).is_err(), "无沙箱目标应返回 Err");
+    }
+
+    #[test]
+    fn replace_code_empty_payload_kills() {
+        // 结算：空 payload -> 默认击杀 WAT（life=false）-> 替换后 life()=false -> 击杀成功
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(5));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        let killed = map.replace_code(&target_id, &[]).unwrap();
+        assert!(killed, "空 payload 默认击杀，life 应为 false");
+    }
+
+    #[test]
+    fn replace_code_payload_life_true_not_killed() {
+        // 结算：payload 为 life=true 的 WASM -> 替换后 life()=true -> 命中但未击杀（如击晕）
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(7));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        let killed = map.replace_code(&target_id, &wasm(TARGET_WAT)).unwrap();
+        assert!(!killed, "life=true payload 不应击杀");
+    }
+
+    #[test]
+    fn replace_code_no_sandbox_errors() {
+        // 边界：目标无沙箱 -> Err（不 panic）
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(9));
+        assert!(
+            map.replace_code(&target_id, &[]).is_err(),
+            "无沙箱目标应返回 Err"
+        );
+    }
+
+    #[test]
+    fn replace_code_garbage_payload_keeps_target_sandbox() {
+        // P0 僵尸修复（验收#1）：垃圾字节 payload 编译失败 -> Err，但目标沙箱条目仍在
+        // 且可继续跑玩家代码（原 life()=true 模块未被破坏）
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(10));
+        world.entities.insert(id, make_entity(10, (0.0, 0.0)));
+        let mut map = test_sandbox_map();
+        map.create(id, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        let result = map.replace_code(&id, garbage);
+        assert!(result.is_err(), "垃圾 payload 应换血失败");
+        // 不变量：存活实体必有沙箱 —— 条目仍在且原代码可用
+        assert!(map.sandboxes.contains_key(&id), "失败后目标沙箱条目应仍在");
+        let to_kill = map.run_player_code(&world);
+        assert!(
+            !to_kill.contains(&id),
+            "失败后原沙箱应可继续 on_tick/life（to_kill={:?}）",
+            to_kill
+        );
+    }
+
+    #[test]
+    fn replace_code_uses_remaining_fuel_not_limit() {
+        // P1（验收#4）：换血时新沙箱 fuel 取旧沙箱剩余量而非 fuel_limit
+        // （旧实现取 fuel_limit：每次被攻击回满配额，可被刷）
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(11));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        // 模拟已消耗过半：直接把剩余量压到 500
+        {
+            let handle = map.sandboxes.get_mut(&target_id).unwrap();
+            handle.store.set_fuel(500).unwrap();
+        }
+        map.replace_code(&target_id, &wasm(TARGET_WAT)).unwrap();
+        let handle = map.sandboxes.get(&target_id).unwrap();
+        assert_eq!(
+            handle.store.data().fuel_limit, 500,
+            "新沙箱配额应等于旧沙箱剩余量（500），而非原上限 100 万"
+        );
+        let remaining = handle.store.get_fuel().unwrap();
+        assert!(remaining < 500, "新沙箱 life() 调用应消耗少量 fuel，实际剩余 {remaining}");
+    }
+
+    #[test]
+    fn replace_code_garbage_fuel_unchanged() {
+        // P0 附带：换血失败时目标 fuel 不变（旧沙箱原样保留，未被重置）
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(12));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        {
+            let handle = map.sandboxes.get_mut(&target_id).unwrap();
+            handle.store.set_fuel(777).unwrap();
+        }
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        assert!(map.replace_code(&target_id, garbage).is_err());
+        let handle = map.sandboxes.get(&target_id).unwrap();
+        assert_eq!(handle.store.get_fuel().unwrap(), 777, "失败后 fuel 应原样保留");
     }
 
     // === process_attacks（阶段二 a2：找目标 -> attack_target -> 掠夺 -> kill）===
@@ -1528,6 +1755,188 @@ mod tests {
             world.entities.get(&attacker).unwrap().survival.points(),
             3,
             "自攻自不掠夺，点数不变"
+        );
+    }
+
+    // === 两阶段攻击模型（收件：按目标分组逐刀 on_attack；结算：固定顺序执行）===
+
+    #[test]
+    fn process_attacks_dead_attacker_blade_void_after_victim_killed_first() {
+        // 验收#2：同批 A(id1) 杀 B(id2)、B 也排了刀打 A。
+        // 结算按攻击者 id 升序：A 的刀先执行杀 B；轮到 B 的刀时 B 已死 -> 作废不执行。
+        // 旧实现不查攻击者存活，B 的刀照跑会把 A 也杀了（或掠夺蒸发）。
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 1, (0.0, 0.0), PLAYER_WAT);
+        let b = make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), TARGET_WAT);
+        let attacks = vec![
+            PendingAttack {
+                attacker: a,
+                target_pos: (5.0, 0.0),
+                payload: vec![], // A -> B：默认击杀
+            },
+            PendingAttack {
+                attacker: b,
+                target_pos: (0.0, 0.0),
+                payload: vec![], // B -> A：默认击杀（B 死后应作废）
+            },
+        ];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert!(!world.entities.get(&b).unwrap().is_alive(), "B 应被 A 击杀");
+        assert!(world.entities.get(&a).unwrap().is_alive(), "B 死后其刀应作废，A 应存活");
+        assert_eq!(
+            world.entities.get(&a).unwrap().survival.points(),
+            4,
+            "A 掠夺 B 的 1 点；B 的刀作废 -> 点数不蒸发"
+        );
+        assert_eq!(world.entities.get(&b).unwrap().survival.points(), 2, "B 只被掠夺一次");
+    }
+
+    #[test]
+    fn process_attacks_voids_attack_from_predeceased_attacker() {
+        // 收件前过滤：攻击者在排队后、处理前已死（如阶段一 life()=false）->
+        // 其攻击完全作废，防守方的 on_attack 不被调用（不烧防守 fuel）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 20, (0.0, 0.0), COUNTER_ALWAYS_INTERCEPT_WAT);
+        let dead = make_entity_with_sandbox(&mut world, &mut map, 21, (5.0, 0.0), TARGET_WAT);
+        // 攻击者在排队后死亡（模拟阶段一 life()=false / Destroy）
+        world.entities.get_mut(&dead).unwrap().kill();
+        let attacks = vec![PendingAttack {
+            attacker: dead,
+            target_pos: (0.0, 0.0),
+            payload: vec![],
+        }];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert_eq!(call_i32_export(&mut map, &a, "get_count"), 0, "死者攻击不应触发防守方 on_attack");
+        assert!(world.entities.get(&a).unwrap().is_alive(), "防守方应完好");
+    }
+
+    #[test]
+    fn process_attacks_two_attackers_both_intercepted() {
+        // 验收#5a：B、C 同 tick 攻击 A，A 的 on_attack 被调用两次（同一原版沙箱），
+        // 两刀全拦 -> A 完好、代码未换、点数不变
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 30, (0.0, 0.0), COUNTER_ALWAYS_INTERCEPT_WAT);
+        let b = make_entity_with_sandbox(&mut world, &mut map, 31, (5.0, 0.0), PLAYER_WAT);
+        let c = make_entity_with_sandbox(&mut world, &mut map, 32, (6.0, 0.0), PLAYER_WAT);
+        let attacks = vec![
+            PendingAttack { attacker: b, target_pos: (0.0, 0.0), payload: vec![9] },
+            PendingAttack { attacker: c, target_pos: (0.0, 0.0), payload: vec![9] },
+        ];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert_eq!(call_i32_export(&mut map, &a, "get_count"), 2, "A 的 on_attack 应被调两次");
+        assert_eq!(call_i32_export(&mut map, &a, "get_ver"), 111, "两刀全拦 -> A 仍是原版代码");
+        assert!(world.entities.get(&a).unwrap().is_alive(), "A 应完好");
+        assert_eq!(world.entities.get(&a).unwrap().survival.points(), 3, "拦截不扣点");
+    }
+
+    #[test]
+    fn process_attacks_two_attackers_one_intercepted() {
+        // 验收#5b：只拦 B（payload 前 4 字节 == 魔法值才拦截）-> 仅 C 的攻击执行（A 换成 C 的代码）
+        // B 的 payload 用 raw 字节 [1,1,1,1]（LE i32 == 16843009）：被拦截故无需是合法 WASM
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 30, (0.0, 0.0), COUNTER_DEFENSE_WAT);
+        let b = make_entity_with_sandbox(&mut world, &mut map, 31, (5.0, 0.0), PLAYER_WAT);
+        let c = make_entity_with_sandbox(&mut world, &mut map, 32, (6.0, 0.0), PLAYER_WAT);
+        let c_payload = wasm(&ver_module(3001));
+        let attacks = vec![
+            PendingAttack { attacker: b, target_pos: (0.0, 0.0), payload: vec![1, 1, 1, 1] },
+            PendingAttack { attacker: c, target_pos: (0.0, 0.0), payload: c_payload },
+        ];
+        process_attacks(&mut world, &mut map, &attacks);
+        // 注：换血后 A 的代码已是 C 的 payload（无 get_count 导出），
+        // "两刀都问过 on_attack" 由 both_intercepted 测试的计数断言覆盖
+        assert_eq!(
+            call_i32_export(&mut map, &a, "get_ver"),
+            3001,
+            "只拦 B -> 仅 C 的换血执行，A 应是 C 的代码"
+        );
+        assert!(world.entities.get(&a).unwrap().is_alive(), "C 的 payload life=true，A 存活");
+    }
+
+    #[test]
+    fn process_attacks_two_attackers_none_intercepted_order_by_attacker_id() {
+        // 验收#5c：全不拦 -> 按攻击者 EntityId 升序执行（确定序）。
+        // 两刀都是击晕模块（life=true）：两刀都会执行，最终代码 = 后执行者。
+        // B(id31) 先执行、C(id32) 后执行 -> A 最终是 C 的代码（ver 3001）。
+        // 旧实现按 attacks 切片顺序执行：这里故意把 C 的刀排在前面 -> 旧实现最终 ver 会是 2001。
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 30, (0.0, 0.0), TARGET_WAT);
+        let b = make_entity_with_sandbox(&mut world, &mut map, 31, (5.0, 0.0), PLAYER_WAT);
+        let c = make_entity_with_sandbox(&mut world, &mut map, 32, (6.0, 0.0), PLAYER_WAT);
+        let attacks = vec![
+            PendingAttack { attacker: c, target_pos: (0.0, 0.0), payload: wasm(&ver_module(3001)) },
+            PendingAttack { attacker: b, target_pos: (0.0, 0.0), payload: wasm(&ver_module(2001)) },
+        ];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert_eq!(
+            call_i32_export(&mut map, &a, "get_ver"),
+            3001,
+            "结算按攻击者 id 升序：B(31) 先、C(32) 后 -> 最终是 C 的代码"
+        );
+        assert!(world.entities.get(&a).unwrap().is_alive(), "击晕不击杀");
+        assert_eq!(
+            world.entities.get(&a).unwrap().survival.points(),
+            3,
+            "未击杀无掠夺"
+        );
+    }
+
+    #[test]
+    fn process_attacks_first_killer_blocks_later_blades() {
+        // 验收#5c 变体：先执行的刀击杀目标 -> 后到的刀因目标已死跳过（先执行者的换血生效）
+        // B(id31) 的刀是击杀模块（life=false），C(id32) 的刀是击晕模块（ver 3001）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 30, (0.0, 0.0), TARGET_WAT);
+        let b = make_entity_with_sandbox(&mut world, &mut map, 31, (5.0, 0.0), PLAYER_WAT);
+        let c = make_entity_with_sandbox(&mut world, &mut map, 32, (6.0, 0.0), PLAYER_WAT);
+        let attacks = vec![
+            PendingAttack { attacker: c, target_pos: (0.0, 0.0), payload: wasm(&ver_module(3001)) },
+            PendingAttack { attacker: b, target_pos: (0.0, 0.0), payload: wasm(&kill_ver_module(2002)) },
+        ];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert!(!world.entities.get(&a).unwrap().is_alive(), "B 的击杀刀应生效");
+        // A 已死，后续观测其代码版本：沙箱此时仍在 map（死亡清理在 tick 步 d），读 ver 应为 2002
+        assert_eq!(
+            call_i32_export(&mut map, &a, "get_ver"),
+            2002,
+            "先执行者（B）的换血生效，C 的刀因目标已死未执行"
+        );
+        assert_eq!(
+            world.entities.get(&b).unwrap().survival.points(),
+            4,
+            "B 击杀掠夺 +1"
+        );
+        assert_eq!(
+            world.entities.get(&c).unwrap().survival.points(),
+            3,
+            "C 的刀未执行，无掠夺"
+        );
+    }
+
+    #[test]
+    fn process_attacks_defense_fuel_drains_per_blade() {
+        // C.3 防守消耗自然成立：每次 on_attack 消耗防守者 fuel（围殴=磨算力），
+        // 两刀拦截后防守方 fuel 剩余量应低于满配额
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 40, (0.0, 0.0), COUNTER_ALWAYS_INTERCEPT_WAT);
+        let b = make_entity_with_sandbox(&mut world, &mut map, 41, (5.0, 0.0), PLAYER_WAT);
+        let attacks = vec![
+            PendingAttack { attacker: b, target_pos: (0.0, 0.0), payload: vec![9] },
+        ];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert_eq!(call_i32_export(&mut map, &a, "get_count"), 1);
+        let handle = map.sandboxes.get(&a).unwrap();
+        let remaining = handle.store.get_fuel().unwrap();
+        assert!(
+            remaining < 1_000_000,
+            "on_attack 消耗防守 fuel，剩余应低于满配额，实际 {remaining}"
         );
     }
 
