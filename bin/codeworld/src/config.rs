@@ -32,6 +32,15 @@ pub struct Config {
     /// 是否登场第三只生物 H（黄"H" 搅局者），默认 true。
     /// CODEWORLD_H_ENABLED=0/false 关闭（经典双生物对局，供翻盘剧本与冒烟对照）。
     pub h_enabled: bool,
+    /// 被探测方 on_probe 的独立小 fuel 预算（架构 3.2 技术保护
+    /// probe_target_instruction_limit），默认 10_000。
+    /// probe import 在 host 侧用 set_fuel 包裹目标沙箱：探测前存剩余量、
+    /// 设小预算、调 on_probe、恢复原 fuel——恶意 on_probe 死循环最多烧
+    /// 预算值即中断（不占目标 tick 配额）。CODEWORLD_PROBE_FUEL 覆盖。
+    pub probe_fuel: u64,
+    /// 是否登场第四只生物 S（紫"S" 伪装者/间谍），默认 true。
+    /// CODEWORLD_S_ENABLED=0/false 关闭（三方混战对局，供剧本 1-3 冒烟对照）。
+    pub s_enabled: bool,
 }
 
 impl Default for Config {
@@ -47,6 +56,8 @@ impl Default for Config {
             log_level: "info".to_string(),
             d_shield: 10,
             h_enabled: true,
+            probe_fuel: 10_000,
+            s_enabled: true,
         }
     }
 }
@@ -81,10 +92,18 @@ impl Config {
         if let Some(shield) = env_i32("CODEWORLD_D_SHIELD") {
             cfg.d_shield = shield;
         }
+        if let Some(fuel) = env_u64("CODEWORLD_PROBE_FUEL") {
+            cfg.probe_fuel = fuel;
+        }
         // 布尔类开关："0"/"false"（大小写不敏感）= 关闭，缺失或其他值 = 默认开启
         if let Ok(v) = std::env::var("CODEWORLD_H_ENABLED") {
             if v == "0" || v.eq_ignore_ascii_case("false") {
                 cfg.h_enabled = false;
+            }
+        }
+        if let Ok(v) = std::env::var("CODEWORLD_S_ENABLED") {
+            if v == "0" || v.eq_ignore_ascii_case("false") {
+                cfg.s_enabled = false;
             }
         }
         // 字符串类：有值即覆盖（空字符串也覆盖，符合"显式设置"语义）
@@ -191,6 +210,58 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.d_shield, 10, "D 盾量默认应为 10");
         assert!(c.h_enabled, "H 搅局者默认应登场");
+    }
+
+    #[test]
+    fn default_probe_fuel_and_s_enabled_match_arch() {
+        // 创建：probe 预算默认 10_000（架构 3.3 probe_target_instruction_limit）；
+        // S 伪装者默认登场（剧本 4 需要它默认在局）
+        let c = Config::default();
+        assert_eq!(c.probe_fuel, 10_000, "probe 预算默认应为 10_000");
+        assert!(c.s_enabled, "S 伪装者默认应登场");
+    }
+
+    #[test]
+    fn load_probe_fuel_env_overrides_default() {
+        // 修改：CODEWORLD_PROBE_FUEL 覆盖默认预算（技术保护可调）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_PROBE_FUEL", "500");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_PROBE_FUEL");
+        assert_eq!(c.probe_fuel, 500, "环境变量应覆盖 probe 预算");
+    }
+
+    #[test]
+    fn load_probe_fuel_invalid_falls_back_to_default() {
+        // 边界：CODEWORLD_PROBE_FUEL 非法（非整数）-> 回退默认 10_000（容错语义）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_PROBE_FUEL", "not-a-number");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_PROBE_FUEL");
+        assert_eq!(c.probe_fuel, 10_000, "非法值应回退默认 probe 预算");
+    }
+
+    #[test]
+    fn load_s_enabled_env_can_disable() {
+        // 修改：CODEWORLD_S_ENABLED=0/false 关闭 S（三方对局供剧本 1-3 冒烟对照）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_S_ENABLED", "0");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_S_ENABLED");
+        assert!(!c.s_enabled, "CODEWORLD_S_ENABLED=0 应关闭 S");
+        std::env::set_var("CODEWORLD_S_ENABLED", "false");
+        let c2 = Config::load();
+        std::env::remove_var("CODEWORLD_S_ENABLED");
+        assert!(!c2.s_enabled, "CODEWORLD_S_ENABLED=false 应关闭 S");
+    }
+
+    #[test]
+    fn load_s_enabled_absent_defaults_to_enabled() {
+        // 边界：无环境变量 -> S 默认登场（剧本 4 伪装者默认在局）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CODEWORLD_S_ENABLED");
+        let c = Config::load();
+        assert!(c.s_enabled, "无环境变量时 S 应默认登场");
     }
 
     #[test]

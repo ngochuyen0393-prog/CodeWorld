@@ -422,6 +422,15 @@ import fn get_visible_entities() -> Vec<VisibleEntity>;
 // VisibleEntity { id: EntityId, pos: (f64, f64), appearance: Appearance }
 // 这是"眼睛"--你能看到远处有个人，但不知道他在想什么。
 // 要看代码层面的信息需要probe。
+//
+// 【MVP 落地差异（三层感知 Phase A，2026-10-14）】
+// MVP 把"一次拿整个列表"拆成两个 import（WASM 内存传递列表结构太重）：
+//   env.visible_count() -> i32                    -- 视口内可见敌人数（不含自己）
+//   env.visible_at(idx, x_ptr, y_ptr) -> i32      -- 第 N 个可见实体坐标写 caller memory
+// 数据通路：host 每 tick 阶段一执行玩家代码【前】按渲染同款 viewport 过滤存活实体，
+// EntityId(Uuid) 升序稳定排序、排除自己，填进 SandboxData.visible 快照
+// （import 回调拿不到 world，同 get_pos 的 pos 快照模式）。
+// 现有 env.scan 保留（"最近敌人"便捷版）；外观字段 MVP 不下发（坐标即身份）。
 
 // === 渲染接口 ===
 import fn render(request: RenderRequest) -> void;
@@ -454,6 +463,26 @@ import fn probe(target: EntityId, request: Bytes) -> ProbeResult;
 //   meta: ProbeMeta,           // 被动观测（不可伪造）
 // }
 // ProbeMeta包含: gas_consumed, mem_read_count, mem_write_count, api_calls
+//
+// 【MVP 落地差异（三层感知 Phase A，2026-10-14）】
+// - 坐标寻址代替 EntityId：env.probe(target_x, target_y, req_ptr, req_len,
+//   resp_ptr, resp_cap) -> i32。玩家代码持有坐标即可（visible_at/scan 的产物），
+//   查找范围限定可见快照（架构 3.2 通道开启条件"视距内"）。返回 >=0 实际写入
+//   字节数（超 resp_cap 截断）/ -1 坐标无实体 / -2 目标无 on_probe（响应位置
+//   已写默认被动体徵）。
+// - ProbeMeta MVP 增强为体徵尾块：response 之后追加 24 字节定长被动体徵
+//   （host 采集，玩家不可伪造）：[0..8] 目标 api_calls 计数 u64 LE、[8..16]
+//   目标 fuel 剩余 u64 LE（探测前快照）、[16..24] 本次 on_probe 消耗 u64 LE。
+//   mem_read/write_count 恒 0（Phase 2）。response 本体 MVP 为 4 字节
+//   （on_probe 签名 i32->i32，完整 Bytes 传递 Phase 2）——撒谎内容 4 字节内
+//   自定义（如 "LIE9"）。
+// - 被探测方 on_probe 用 host 侧独立小 fuel 包裹执行（存剩余 -> set
+//   probe_target_instruction_limit=10_000 默认，CODEWORLD_PROBE_FUEL 可调 ->
+//   调 -> 记消耗 -> 恢复原 fuel；probe 不扣目标手续费）。已知限制：wasmtime
+//   25 + Windows 下 fuel 耗尽 trap = 进程 abort（.cc-bugs #5 环境级问题），
+//   预算把最坏情形缩到快速中止，trap-free 中断待 wasmtime 升级/epoch 机制。
+// - 实现要点：probe import 在阶段一执行窗口内经 ProbeBridge（raw 指针桥）
+//   同步访问目标沙箱（窗口挂载/置空，坐标查找排除自己防 aliasing）。
 
 import fn attack_at(pos: (f64, f64), payload: Bytes) -> AttackResult;
 // 攻击指定坐标。不是攻击EntityId，是攻击一个位置。

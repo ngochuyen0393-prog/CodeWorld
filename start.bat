@@ -28,13 +28,17 @@ if errorlevel 1 (
 
 echo [start.bat] world starting. Melee scenario (default):
 echo   red A charges across the field, cyan D holds ground with shield 10
-echo   (counterattacks every 4 ticks), yellow H spawns mid-air at (10,8),
-echo   lands, then opportunistically joins whoever gets close (50 pct block).
+echo   (counterattacks every 4 ticks, probes the target before each strike),
+echo   yellow H spawns mid-air at (10,8), lands, then opportunistically
+echo   joins whoever gets close (50 pct block), purple S spawns on the
+echo   right plateau at (25,12): scouts every 4 ticks (visible_at + probe)
+echo   and lies when probed back ("FRIEND,life=9"), no defense - a glass spy.
 echo   Row 1 of the screen shows live battle caption: tick / A-D distance /
 echo   D shield left / alive count.
 echo   Outcomes vary: A dies to H, or slays H first then falls to D's wall.
-echo   Want the classic 1v1 duel instead? Set CODEWORLD_H_ENABLED=0.
-echo   Want A to win? See start-reversal.bat (thin shield, no H).
+echo   Want the classic 1v1 duel instead? Set CODEWORLD_H_ENABLED=0
+echo   and CODEWORLD_S_ENABLED=0.
+echo   Want A to win? See start-reversal.bat (thin shield, no H, no S).
 echo [start.bat] Battle report: battle.log   Press Enter (in this window) to close world.
 echo.
 target\debug\codeworld.exe 2>battle.log

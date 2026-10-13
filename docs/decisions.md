@@ -44,3 +44,15 @@
 - 原因：三剧本冒烟（默认 D 赢/翻盘 A 赢/混战）需要可切换的双生物模式；start-reversal.bat 关 H 保证薄盾翻盘剧情可见（H 挡在 A 冲锋路线上会先杀 A）。
 - 否决：H 固定登场不可关（混战与翻盘剧本互斥，无法分别冒烟）。
 - 落点：config.rs h_enabled；main.rs HUNTER_WAT/spawn_test_entities；start-reversal.bat。
+
+## #008 2026-10-14 · probe 坐标寻址 + ProbeBridge raw 指针桥 + 体徵尾块（三层感知 Phase A 定案）
+- 定案：MVP probe 用坐标寻址（tx,ty 代替 EntityId，查找限定可见快照）；import 闭包经 ProbeBridge（挂到 SandboxData 的 raw 指针，阶段一窗口挂载/置空）同步访问目标沙箱；被动体徵固定为 response 后 24 字节（api_calls 计数/fuel 剩余/on_probe 消耗，u64 LE）；被探测方 on_probe 用 host 侧 set_fuel 独立预算包裹后恢复。
+- 原因：import 闭包是 'static 拿不到 host 引用而 probe 必须同步回响应（排队模式玩家拿不到数据）；体徵定长尾块让玩家代码可解析、撒谎串与真实体徵同框可比对；独立预算防恶意 on_probe 烧目标 tick 配额（probe 不扣手续费，架构 3.3）。
+- 否决：EntityId 传递（MVP 玩家代码持有坐标即可，传递要跨沙箱共享 id 类型）；probe 排队延迟响应（破坏"探测后决策"玩法）；epoch interruption（MVP 改造成本大，且 fuel trap=abort 是 .cc-bugs #5 环境级已知）。
+- 落点：crates/arena/src/sandbox.rs ProbeBridge + env.probe/visible_count/visible_at；main.rs fill_visible_snapshots/run_player_code 挂桥；docs/architecture.md 3.2 MVP 落地差异。
+
+## #009 2026-10-14 · S 出生位 (25,12)（微调任务书建议 (20,5)）+ D 反制前 probe 看一眼
+- 定案：S 出生 (25,12) 右侧高台；D 的 on_tick 反制刀前对 scan 坐标 probe 一次（只读、结果不用于决策）。
+- 原因：D 的 scan 锁最近敌人，S@(20,5) 距 D 7.07 会抢在 A(10)/H(9.4) 前被反制点名，tick4 即死破坏剧本 1-3 回归；(25,12) 距 15.6 排最远不抢锁。四方里只有 S 有 on_probe，无人探测则 LIE9 撒谎串永不见天日——D probe 一次让"probe S 拿到假串+真实体徵"在实战日志可验证，probe 只读不改变 D 的打谁何时打（回归行为不变）。
+- 否决：改 A/H 的 WAT 加 probe（动作面更大）；S 侦察两目标（复杂化）；接受撒谎只存在于单元测试（剧本 4 验收要求实战日志断言）。
+- 落点：main.rs spawn_test_entities/defender_wat；[probe] 日志新增 resp_head 摘要（0x3945494C 可直接 grep）。

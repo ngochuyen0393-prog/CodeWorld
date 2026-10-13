@@ -3,7 +3,7 @@ rem ============================================================
 rem CodeWorld launcher - REVERSAL scenario (ASCII only - cmd parses bat in GBK)
 rem Same flow as start.bat but: D's shield = 1 (thin) and H disabled,
 rem so A grinds through the shield and kills D (the underdog reversal).
-rem Env vars: CODEWORLD_D_SHIELD=1  CODEWORLD_H_ENABLED=0
+rem Env vars: CODEWORLD_D_SHIELD=1  CODEWORLD_H_ENABLED=0  CODEWORLD_S_ENABLED=0
 rem ============================================================
 cd /d %~dp0
 
@@ -11,6 +11,7 @@ rem setlocal: env vars stay inside this script window (no leak to a later start.
 setlocal
 set CODEWORLD_D_SHIELD=1
 set CODEWORLD_H_ENABLED=0
+set CODEWORLD_S_ENABLED=0
 
 if not exist codeworld.db (
     echo [start-reversal.bat] no old world found, starting fresh
@@ -32,7 +33,8 @@ if errorlevel 1 (
 
 echo [start-reversal.bat] world starting. REVERSAL scenario:
 echo   red A charges cyan D. D's shield is only 1, so A's third blade
-echo   gets through and A kills D (reversal!). H is disabled for a pure duel.
+echo   gets through and A kills D (reversal!). H and S are disabled
+echo   for a pure duel.
 echo [start-reversal.bat] Battle report: battle.log   Press Enter (in this window) to close world.
 echo.
 target\debug\codeworld.exe 2>battle.log

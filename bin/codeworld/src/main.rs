@@ -15,10 +15,10 @@ mod config;
 
 use anyhow::{Context, Result};
 use codeworld_arena::attack::{PendingAttack, DEFAULT_KILL_WASM};
-use codeworld_arena::sandbox::{SandboxHandle, SandboxManager};
+use codeworld_arena::sandbox::{ProbeBridge, SandboxHandle, SandboxManager};
 use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 use codeworld_core::pending::PendingChange;
-use codeworld_core::world::WorldState;
+use codeworld_core::world::{BoundingBox, WorldState};
 use codeworld_physics::default::{CollisionPair, DefaultPhysicsEngine};
 use codeworld_render::{enter_terminal, exit_terminal, Renderer, Viewport};
 use codeworld_storage::StorageEngine;
@@ -36,6 +36,14 @@ use tracing_subscriber::filter::LevelFilter;
 struct EntitySandboxMap {
     manager: SandboxManager,
     sandboxes: HashMap<EntityId, SandboxHandle>,
+    /// 全局可见实体 id 快照（三层感知 Phase A：fill_visible_snapshots 填充，
+    /// run_player_code 挂桥用；EntityId(Uuid) 升序）
+    visible_ids: Vec<EntityId>,
+    /// 与 visible_ids 平行的坐标快照
+    visible_positions: Vec<(f64, f64)>,
+    /// on_probe 独立小 fuel 预算（架构 3.3 probe_target_instruction_limit；
+    /// main() 从 config.probe_fuel 设置，默认 10_000）
+    probe_fuel: u64,
 }
 
 impl EntitySandboxMap {
@@ -44,7 +52,39 @@ impl EntitySandboxMap {
         Ok(Self {
             manager: SandboxManager::new()?,
             sandboxes: HashMap::new(),
+            visible_ids: Vec::new(),
+            visible_positions: Vec::new(),
+            probe_fuel: 10_000,
         })
+    }
+
+    /// 填充可见实体快照（三层感知 Phase A 眼睛层，阶段一执行玩家代码【前】调用）
+    ///
+    /// - viewport 过滤 + 存活过滤（尸体不是感知目标），全局列表按 EntityId(Uuid)
+    ///   升序稳定排序（架构 3.2：可见列表稳定）
+    /// - 每个沙箱的 per-entity 快照排除自己（env.visible_count/visible_at 数据源）
+    fn fill_visible_snapshots(&mut self, world: &WorldState, viewport: &BoundingBox) {
+        let mut visible: Vec<(EntityId, (f64, f64))> = world
+            .entities
+            .values()
+            .filter(|e| e.is_alive())
+            .filter(|e| {
+                let (x, y) = e.pos();
+                viewport.contains(x, y)
+            })
+            .map(|e| (e.id, e.pos()))
+            .collect();
+        visible.sort_by_key(|a| a.0 .0);
+        self.visible_ids = visible.iter().map(|(id, _)| *id).collect();
+        self.visible_positions = visible.iter().map(|(_, p)| *p).collect();
+        for (id, handle) in self.sandboxes.iter_mut() {
+            handle.store.data_mut().visible = visible
+                .iter()
+                .filter(|(eid, _)| eid != id)
+                .map(|(_, p)| *p)
+                .collect();
+        }
+        tracing::debug!(count = visible.len(), "[visible_snapshot] 可见实体快照已填充");
     }
 
     /// 为实体创建沙箱
@@ -69,6 +109,13 @@ impl EntitySandboxMap {
         let mut to_kill = Vec::new();
         // 先收集 owned EntityId 再遍历，避免边遍历 world.entities 边改 self.sandboxes 的借用冲突
         let entity_ids: Vec<EntityId> = world.entities.keys().copied().collect();
+        // probe 桥的共享部分（循环外 cast 成 raw 指针：cast 不延长借用，
+        // 真正的可变访问只发生在 import 闭包内的窗口期，见 ProbeBridge SAFETY 契约）
+        let sandboxes_ptr: *mut HashMap<EntityId, SandboxHandle> = &mut self.sandboxes;
+        let manager_ptr: *const SandboxManager = &self.manager;
+        let bridge_ids = self.visible_ids.clone();
+        let bridge_positions = self.visible_positions.clone();
+        let probe_fuel = self.probe_fuel;
         for entity_id in entity_ids {
             // 防御：只处理存活实体（架构 4.1"把所有存活实体放进任务队列"）。
             // 正常流程死亡实体已在上一 tick 阶段二 d 步移除，此为兜底，避免对残留死者跑玩家代码。
@@ -93,6 +140,18 @@ impl EntitySandboxMap {
                 data.pos = e.pos();
                 data.nearest_enemy = nearest;
             }
+            // probe 通路桥挂载（三层感知 Phase A）：本实体的 on_tick 执行窗口内
+            // env.probe 可经桥同步探测其他实体的沙箱；窗口结束立即置空（SAFETY：
+            // bridge 是循环体局部值，指针悬垂窗口为零）。
+            let mut bridge = ProbeBridge {
+                visible_ids: bridge_ids.clone(),
+                visible_positions: bridge_positions.clone(),
+                sandboxes: sandboxes_ptr,
+                manager: manager_ptr,
+                caller_id: entity_id,
+                probe_fuel,
+            };
+            handle.store.data_mut().probe_bridge = &mut bridge;
             // 重置本 tick 指令配额（架构 4.1：每 tick 重置指令配额）。
             // MVP 指令计量靠 wasmtime fuel（consume_fuel），fuel 跨 tick 累计消耗会耗尽，
             // 导致 call_life 返回 Err 误杀实体；架构要求"超额不死亡、下次 tick 继续"，
@@ -103,12 +162,15 @@ impl EntitySandboxMap {
             let fuel_limit = handle.store.data().fuel_limit;
             if let Err(e) = handle.store.set_fuel(fuel_limit) {
                 tracing::warn!(entity_id = %entity_id.0, error = %e, "fuel 重置失败，跳过本 tick");
+                handle.store.data_mut().probe_bridge = std::ptr::null_mut();
                 continue;
             }
             // 调 on_tick（没导出则 call_on_tick 内部跳过）
             if let Err(e) = self.manager.call_on_tick(handle) {
                 tracing::warn!(entity_id = %entity_id.0, error = %e, "on_tick 执行失败");
             }
+            // 窗口关闭：置空桥指针（SAFETY 契约，防后续 life 调用期悬垂）
+            handle.store.data_mut().probe_bridge = std::ptr::null_mut();
             // 调 life()：false 或调用失败均标记死亡
             match self.manager.call_life(handle) {
                 Ok(true) => {} // 仍存活
@@ -285,10 +347,12 @@ fn main() -> Result<()> {
     // 注意：从快照恢复的实体只有元数据、无沙箱（WASM 实例不持久化），
     //       这些实体 run_player_code 会跳过；重新挂沙箱属 Phase 2 范畴。
     let mut sandbox_map = EntitySandboxMap::new()?;
+    // probe 预算装配（三层感知 Phase A：config 可调的 on_probe 独立小 fuel）
+    sandbox_map.probe_fuel = config.probe_fuel;
 
     // 新世界或恢复后无实体：放测试实体（含 WASM 沙箱）让 MVP 有东西渲染、能跑玩家代码
     if world.entities.is_empty() {
-        spawn_test_entities(&mut world, &mut sandbox_map, config.d_shield, config.h_enabled);
+        spawn_test_entities(&mut world, &mut sandbox_map, config.d_shield, config.h_enabled, config.s_enabled);
     }
 
     // 信号处理：后台线程监听 stdin，按 Enter/EOF 置退出标志（零依赖，符合 MVP 最简方案）
@@ -375,6 +439,16 @@ fn tick(
     //    玩家代码执行期间产生的变更放入 pending，阶段二 a 统一应用（架构 4.1）。
     //    run_player_code 只读 world、返回待杀 EntityId 列表；kill 在此统一做
     //    （world 在 run_player_code 中被借用，不可同时修改）。
+    //    眼睛列表快照（三层感知 Phase A）：渲染同款 viewport 过滤存活实体，
+    //    填进各沙箱 SandboxData.visible + 全局列表（probe 桥用）——玩家代码
+    //    env.visible_count/visible_at 读到的是 tick 开始时的世界。
+    {
+        let vp = renderer.viewport();
+        let (min_x, max_x) = vp.world_x_range();
+        let (min_y, max_y) = vp.world_y_range();
+        let bounds = BoundingBox::new(min_x, min_y, max_x, max_y);
+        sandbox_map.fill_visible_snapshots(world, &bounds);
+    }
     let to_kill = sandbox_map.run_player_code(world);
     for entity_id in &to_kill {
         if let Some(entity) = world.entities.get_mut(entity_id) {
@@ -891,21 +965,27 @@ fn find_nearest_enemy(world: &WorldState, target: &EntityId) -> Option<(f64, f64
 const ATTACKER_CODE: &str = "attacker";
 const DEFENDER_CODE: &str = "defender";
 const HUNTER_CODE: &str = "hunter";
+const SPY_CODE: &str = "spy";
 
-/// 生成开局布阵生物（可玩性三连版）
+/// 生成开局布阵生物（三层感知 Phase A 版）
 ///
 /// A 攻击者（红"A"）@(5,0)：直线冲锋逼近，进范围连砍空 payload 击杀刀
 /// D 防御者（青"D"）@(15,0)：原地站桩+盾 d_shield 拦截+每 4 tick 反制
 /// H 搅局者（黄"H"）@(10,8)：中场上空，落地后观望游走，敌人进 3 格参战（h_enabled 开关）
+/// S 伪装者（紫"S"）@(25,12)：右侧高台空降，每 4 tick 眼睛列表扫描+probe 最近者，
+///   on_probe 撒谎"我是友军 life=9"；无防守无攻击（间谍脆皮，s_enabled 开关）
 /// A/D 站地面 y=0：地面实体不受重力，坐标 tick 间稳定，scan/attack_at 的
 /// 坐标精确匹配（f64 相等）不被物理漂移打穿。
+/// S 出生位 (25,12) 的取舍（任务书建议 (20,5) 微调）：D 的 scan 锁"最近敌人"，
+/// S@20,5 距 D 仅 7.07 会抢在 A(10)/H(9.4) 之前被反制刀点名，tick4 即死、
+/// 破坏剧本 1-3 回归；(25,12) 距 D 15.6 排最远，落地后 (25,0) 距 10 也不抢锁。
 /// 默认参数（盾 10）双生物剧本 D 的反制先杀死 A；盾 1 则 A 磨穿防守反杀。
-/// H 登场后 A 冲锋路线上多一个变数：混战结局由结算顺序与拦截奇偶共同决定。
 fn spawn_test_entities(
     world: &mut WorldState,
     sandbox_map: &mut EntitySandboxMap,
     d_shield: i32,
     h_enabled: bool,
+    s_enabled: bool,
 ) {
     let fuel = 1_000_000; // 100 万条指令配额（fuel trap 会进程 abort，配额必须给足）
     let mut spawn = |code_id: &str, glyph: &str, color: &str, pos: (f64, f64), wat: &[u8]| -> bool {
@@ -942,14 +1022,22 @@ fn spawn_test_entities(
     } else {
         false
     };
+    // S 伪装者（可选登场）：右侧高台空降 (25,12)，落地后驻守侦察不移动
+    let s_ok = if s_enabled {
+        spawn(SPY_CODE, "S", "purple", (25.0, 12.0), &wasm(SPY_WAT))
+    } else {
+        false
+    };
     tracing::info!(
         attacker_spawned = a_ok,
         defender_spawned = d_ok,
         hunter_spawned = h_ok,
+        spy_spawned = s_ok,
         distance_a_d = 10.0,
         defender_shield = d_shield,
-        "开局布阵：A 攻击者冲锋 / D 防御者站桩（盾每拦一刀-1，每4tick反制）/ H 搅局者={}（投机者：敌人进3格参战，被攻击50%拦截）",
-        if h_enabled { "登场" } else { "缺席" }
+        "开局布阵：A 攻击者冲锋 / D 防御者站桩（盾每拦一刀-1，每4tick反制）/ H 搅局者={}（投机者：敌人进3格参战，被攻击50%拦截）/ S 伪装者={}（间谍：每4tick扫描+probe，on_probe撒谎友军，无防守）",
+        if h_enabled { "登场" } else { "缺席" },
+        if s_enabled { "登场" } else { "缺席" }
     );
 }
 
@@ -1017,7 +1105,9 @@ const ATTACKER_WAT: &str = r#"(module
 ///
 /// 策略：
 /// - on_tick：原地站立（不移动）；每 4 tick 反制一刀——扫描敌人坐标，
-///   对该坐标排空 payload 击杀刀（敌人若在移动则坐标过期落空，站定才挨打）
+///   先 probe 该坐标看一眼（三层感知 Phase A：只读侦察，结果不用于决策、
+///   打谁何时打不变），再对该坐标排空 payload 击杀刀（敌人若在移动则
+///   坐标过期落空，站定才挨打）
 /// - on_attack（有防守）：护盾有余 -> 拦截（log 7 后跟剩余盾量），盾尽 -> 放行（log 8）
 ///   "配额有限"由玩家代码自己定（盾是规则不是框架能力，架构 4 能力 vs 规则分层）
 /// - life()=true；被打穿盾后被换血击杀（默认击杀 WAT life()=false）
@@ -1029,6 +1119,7 @@ fn defender_wat(shield: i32) -> String {
   (import "env" "log" (func $log (param i32)))
   (import "env" "scan" (func $scan (param i32 i32) (result i32)))
   (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (import "env" "probe" (func $probe (param f64 f64 i32 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   ;; 护盾余量（拦截配额）：每拦一刀 -1，归零后不再拦截
   (global $shield (mut i32) (i32.const {shield}))
@@ -1059,6 +1150,9 @@ fn defender_wat(shield: i32) -> String {
     (if (i32.eqz (call $scan (i32.const 0) (i32.const 8)))
       (then (return)))
     i32.const 9 call $log
+    ;; 反制前 probe 目标看一眼（只读：探测结果不改变打谁何时打）
+    (drop (call $probe (f64.load (i32.const 0)) (f64.load (i32.const 8))
+                       (i32.const 16) (i32.const 0) (i32.const 32) (i32.const 64)))
     (drop (call $attack_at (f64.load (i32.const 0)) (f64.load (i32.const 8))
                            (i32.const 0) (i32.const 0))))
   (func (export "life") (result i32) i32.const 1)
@@ -1130,6 +1224,77 @@ const HUNTER_WAT: &str = r#"(module
       (then (drop (call $move_by (f64.const 0.5) (f64.const 0.0))))
       (else (drop (call $move_by (f64.const -0.5) (f64.const 0.0))))))
   (func (export "life") (result i32) i32.const 1))"#;
+
+/// 伪装者 S 的玩家代码 WAT（紫色，性格：间谍——高调侦察+撒谎身份）
+///
+/// 策略（on_tick 每 tick 执行，每 4 tick 侦察一轮）：
+/// 1. tick 计数非 4 倍数直接返回；侦察轮先 log 9（侦察 marker）
+/// 2. visible_count 数敌人，空则收工（全场只剩自己时不折腾）
+/// 3. visible_at 循环扫一圈（眼睛列表），记与自己的平方距最近者
+/// 4. 对最近者 probe(req=[1,2,3,4] -> resp@32 cap 64)，返回值存全局（观测导出）
+///
+/// on_probe（被探测时）：固定回 "LIE9" 假串（i32 0x3945494C，LE 字节
+/// [0x4C,0x49,0x45,0x39]——谎称"友军、life=9"。撒谎=玩家代码自由，框架只透传；
+/// 但被动体徵（api_calls 计数/fuel 剩余，host 采集）藏不住高调侦察的代价。
+///
+/// 无 on_attack 导出 = 不设防：被反制刀命中即被换血击杀（间谍脆皮）。
+/// 日志 marker：10=侦察轮开始（D 的反制已占用 9，S 用 10；probe 往返见 host 侧 [probe] 日志）
+const SPY_WAT: &str = r#"(module
+  (import "env" "log" (func $log (param i32)))
+  (import "env" "get_pos" (func $get_pos (result f64 f64)))
+  (import "env" "visible_count" (func $visible_count (result i32)))
+  (import "env" "visible_at" (func $visible_at (param i32 i32 i32) (result i32)))
+  (import "env" "probe" (func $probe (param f64 f64 i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  ;; tick 计数（4 倍数侦察）；probe 返回值（观测导出）
+  (global $ticks (mut i32) (i32.const 0))
+  (global $probe_ret (mut i32) (i32.const -999))
+  ;; 被探测：固定回撒谎假串 "LIE9"
+  (func (export "on_probe") (param i32) (result i32) i32.const 0x3945494C)
+  (func (export "on_tick")
+    (local $n i32) (local $i i32) (local $best f64) (local $bx f64) (local $by f64)
+    (local $x f64) (local $y f64) (local $mx f64) (local $my f64)
+    (local $dx f64) (local $dy f64) (local $d f64)
+    global.get $ticks i32.const 1 i32.add global.set $ticks
+    ;; 1. 每 4 tick 侦察一轮
+    (if (i32.rem_u (global.get $ticks) (i32.const 4))
+      (then (return)))
+    (call $log (i32.const 10))
+    ;; 2. 数敌人；空则收工
+    (local.set $n (call $visible_count))
+    (if (i32.eqz (local.get $n))
+      (then (return)))
+    ;; 3. 读自己坐标（循环外一次，tick 内不变）
+    (call $get_pos)
+    (local.set $my)
+    (local.set $mx)
+    ;; 循环扫一圈找平方距最近者（WAT 无 break，用 block/loop/br_if）
+    (f64.const 1e308) local.set $best
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $scan
+        (br_if $done (i32.ge_u (local.get $i) (local.get $n)))
+        (drop (call $visible_at (local.get $i) (i32.const 0) (i32.const 8)))
+        (local.set $x (f64.load (i32.const 0)))
+        (local.set $y (f64.load (i32.const 8)))
+        (local.set $dx (f64.sub (local.get $x) (local.get $mx)))
+        (local.set $dy (f64.sub (local.get $y) (local.get $my)))
+        (local.set $d (f64.add
+          (f64.mul (local.get $dx) (local.get $dx))
+          (f64.mul (local.get $dy) (local.get $dy))))
+        (if (f64.lt (local.get $d) (local.get $best))
+          (then
+            (local.set $best (local.get $d))
+            (local.set $bx (local.get $x))
+            (local.set $by (local.get $y))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $scan)))
+    ;; 4. 对最近者 probe（request=[1,2,3,4] -> resp@32 cap 64）
+    (global.set $probe_ret
+      (call $probe (local.get $bx) (local.get $by)
+                    (i32.const 16) (i32.const 4) (i32.const 32) (i32.const 64))))
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "get_probe_ret") (result i32) global.get $probe_ret))"#;
 
 #[cfg(test)]
 mod tests {
@@ -1679,7 +1844,7 @@ mod tests {
         // 都站地面 y=0（地面实体不受重力，坐标稳定，scan/attack 坐标精确匹配）。
         let mut world = WorldState::new();
         let mut sandbox_map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut sandbox_map, 10, false);
+        spawn_test_entities(&mut world, &mut sandbox_map, 10, false, false);
         assert_eq!(world.entities.len(), 2, "H 关闭时应创建两只生物");
         let attacker = world
             .entities
@@ -1710,7 +1875,7 @@ mod tests {
         // 混战布阵（H 登场）：第三只生物 H 黄"H"@(10,8) 中场上空，落地后受重力站稳
         let mut world = WorldState::new();
         let mut sandbox_map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut sandbox_map, 10, true);
+        spawn_test_entities(&mut world, &mut sandbox_map, 10, true, false);
         assert_eq!(world.entities.len(), 3, "H 登场时应创建三只生物");
         let hunter = world
             .entities
@@ -1728,7 +1893,7 @@ mod tests {
         // ② 翻盘实验：d_shield 参数透传到 D 沙箱的盾全局（观测导出 get_shield）
         let mut world = WorldState::new();
         let mut sandbox_map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut sandbox_map, 1, false);
+        spawn_test_entities(&mut world, &mut sandbox_map, 1, false, false);
         let d = world
             .entities
             .values()
@@ -2537,6 +2702,166 @@ mod tests {
             0,
             "独存实体 scan 应返回 0"
         );
+    }
+
+    // === 三层感知 Phase A：眼睛列表快照填充（fill_visible_snapshots）===
+
+    /// 测试用视口世界范围（同 test_renderer 的 50x50：世界 (-50,-25)..(50,25)）
+    fn test_viewport_bb() -> BoundingBox {
+        BoundingBox::new(-50.0, -25.0, 50.0, 25.0)
+    }
+
+    #[test]
+    fn fill_visible_snapshots_excludes_self_and_outside() {
+        // 眼睛列表：viewport 过滤 + 排除自己 + EntityId（Uuid）升序稳定排序
+        // 三个实体：a(0,0) 在视口、b(30,20) 在视口、c(90,90) 在视口外
+        let mut world = WorldState::new();
+        let a = EntityId(Uuid::from_u128(1));
+        let b = EntityId(Uuid::from_u128(2));
+        let c = EntityId(Uuid::from_u128(3));
+        world.entities.insert(a, make_entity(1, (0.0, 0.0)));
+        world.entities.insert(b, make_entity(2, (30.0, 20.0)));
+        world.entities.insert(c, make_entity(3, (90.0, 90.0)));
+        let mut map = test_sandbox_map();
+        map.create(a, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        map.create(b, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        map.create(c, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        map.fill_visible_snapshots(&world, &test_viewport_bb());
+        // A 视角：只见 B（C 在视口外、自己被排除）
+        assert_eq!(
+            map.sandboxes.get(&a).unwrap().store.data().visible,
+            vec![(30.0, 20.0)],
+            "A 的可见列表应只有 B 的坐标（不含自己、不含视口外的 C）"
+        );
+        // B 视角：只见 A
+        assert_eq!(
+            map.sandboxes.get(&b).unwrap().store.data().visible,
+            vec![(0.0, 0.0)],
+            "B 的可见列表应只有 A 的坐标"
+        );
+        // 全局列表（bridge 用）：viewport 内 2 个，按 Uuid 升序
+        assert_eq!(map.visible_ids.len(), 2, "全局可见列表应有 2 个（排除视口外）");
+        let id0 = map.visible_ids[0].0;
+        let id1 = map.visible_ids[1].0;
+        assert!(
+            id0 < id1,
+            "全局可见列表应按 EntityId(Uuid) 升序稳定排序"
+        );
+    }
+
+    #[test]
+    fn fill_visible_snapshots_excludes_dead() {
+        // 规则：尸体不是感知目标（与 scan 的 nearest_enemy 排死者一致）
+        let mut world = WorldState::new();
+        let a = EntityId(Uuid::from_u128(1));
+        let corpse = EntityId(Uuid::from_u128(2));
+        let mut corpse_e = make_entity(2, (1.0, 0.0));
+        corpse_e.kill();
+        world.entities.insert(a, make_entity(1, (0.0, 0.0)));
+        world.entities.insert(corpse, corpse_e);
+        let mut map = test_sandbox_map();
+        map.create(a, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        map.fill_visible_snapshots(&world, &test_viewport_bb());
+        assert!(
+            map.sandboxes.get(&a).unwrap().store.data().visible.is_empty(),
+            "A 的可见列表应为空（唯一邻居已死）"
+        );
+    }
+
+    // === 三层感知 Phase A：probe 全链路（bridge 挂载 -> import 同步探测）===
+
+    /// 探测者 WAT（main 侧）：on_tick 调 probe(5.0, 7.0, 0, 4, 64, 64)，
+    /// 返回值存全局；memory[0..4] 放 request 字节 [1,2,3,4]、[64..] 收响应
+    const MAIN_PROBER_WAT: &str = r#"(module
+  (import "env" "probe" (func $probe (param f64 f64 i32 i32 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -999))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "\01\02\03\04")
+  (func (export "on_tick")
+    f64.const 5.0 f64.const 7.0 i32.const 0 i32.const 4 i32.const 64 i32.const 64
+    call $probe global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "get_resp0") (result i32) (i32.load (i32.const 64)))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 被探测撒谎者 WAT（main 侧）：on_probe 回 "LIE9" 假串（同 arena 测试协议）
+    const MAIN_LIAR_WAT: &str = r#"(module
+  (func (export "on_probe") (param i32) (result i32) i32.const 0x3945494C)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn run_player_code_probe_reaches_target_and_gets_reply() {
+        // 全链路：fill_visible_snapshots -> run_player_code 挂桥 -> 玩家 on_tick 调
+        // env.probe -> host 同步调目标 on_probe -> 假串+体徵写回探测者 memory。
+        let mut world = WorldState::new();
+        let prober_id = EntityId(Uuid::from_u128(1));
+        let liar_id = EntityId(Uuid::from_u128(2));
+        world.entities.insert(prober_id, make_entity(1, (0.0, 0.0)));
+        world.entities.insert(liar_id, make_entity(2, (5.0, 7.0)));
+        let mut map = test_sandbox_map();
+        map.create(prober_id, &wasm(MAIN_PROBER_WAT), 1_000_000).unwrap();
+        map.create(liar_id, &wasm(MAIN_LIAR_WAT), 1_000_000).unwrap();
+        map.fill_visible_snapshots(&world, &test_viewport_bb());
+        map.run_player_code(&world);
+        // 响应 = 假串 4 字节 + 体徵 24 字节 = 28，resp_cap=64 不截断
+        assert_eq!(
+            call_i32_export(&mut map, &prober_id, "get_ret"),
+            28,
+            "probe 命中应返回 28（4 字节假串 + 24 字节体徵）"
+        );
+        // 假串原样到达（撒谎透传：框架只搬运，不审查内容）
+        assert_eq!(
+            call_i32_export(&mut map, &prober_id, "get_resp0"),
+            0x3945494C,
+            "探测者应收到目标 on_probe 的假串 LIE9"
+        );
+        // 探测者的 api_calls 记录了 probe
+        assert!(
+            map.sandboxes
+                .get(&prober_id)
+                .unwrap()
+                .store
+                .data()
+                .api_calls
+                .contains(&"probe".to_string()),
+            "probe 调用应记入探测者 api_calls"
+        );
+        // 被探测者的 api_calls（含 fill_visible_snapshots 不记、只有目标自身行为）
+        // 作为体徵源存在——S 间谍频繁侦察 -> api_calls 高 -> 体徵藏不住
+        let liar_data = map.sandboxes.get(&liar_id).unwrap().store.data();
+        assert!(
+            !liar_data.log_markers.is_empty() || liar_data.fuel_consumed < 1_000_000,
+            "目标沙箱应仍可用（探测不破坏目标状态）"
+        );
+    }
+
+    // === 三层感知 Phase A：伪装者 S（间谍型第四生物）===
+
+    #[test]
+    fn spawn_test_entities_spawns_spy_when_enabled() {
+        // S 登场：CODEWORLD_S_ENABLED 默认开 -> 四方布阵含紫"S"（code_hash=spy）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        spawn_test_entities(&mut world, &mut map, 10, true, true);
+        let spy = world.entities.values().find(|e| e.code_hash == SPY_CODE);
+        assert!(spy.is_some(), "s_enabled=true 应登场伪装者 S");
+        let s = spy.unwrap();
+        assert_eq!(s.pos(), (25.0, 12.0), "S 应出生在 (25,12) 右侧高台");
+        assert_eq!(s.appearance.glyph, "S", "S 的字形应为紫 S");
+        assert_eq!(world.entities.len(), 4, "S 登场时四方布阵应有 4 个实体");
+    }
+
+    #[test]
+    fn spawn_test_entities_skips_spy_when_disabled() {
+        // S 缺席：s_enabled=false -> 三方布阵（剧本 1-3 回归形态）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        spawn_test_entities(&mut world, &mut map, 10, true, false);
+        assert!(
+            !world.entities.values().any(|e| e.code_hash == SPY_CODE),
+            "s_enabled=false 不应有 S"
+        );
+        assert_eq!(world.entities.len(), 3, "S 缺席时应有 3 个实体");
     }
 
     // === move_by 全链路（import 排队 -> tick 阶段二应用）===

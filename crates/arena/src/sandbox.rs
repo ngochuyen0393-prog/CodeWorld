@@ -4,9 +4,11 @@
 //! 基于 wasmtime，启用 fuel 指令计量。spike/route_a 已验证 API。
 
 use anyhow::Result;
+use std::collections::HashMap;
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
 
 use crate::attack::PendingAttack;
+use crate::channel::ChannelManager;
 use codeworld_core::entity::EntityId;
 use codeworld_core::pending::PendingChange;
 
@@ -56,6 +58,15 @@ pub struct SandboxData {
     /// host 侧解析该序列更新字幕——玩家自愿上报，不破坏沙箱隔离（架构 4.2 铁律：
     /// 字幕=渲染层展示，只读，不写回 world）。
     pub log_markers: Vec<i32>,
+    /// 可见实体坐标快照（三层感知 Phase A 眼睛列表，架构 3.2 get_visible_entities
+    /// 的 import 数据通路）：host 每 tick 阶段一执行玩家代码【前】按 viewport 过滤
+    /// 存活实体填充，EntityId 升序稳定排序、排除自己（env.visible_count/visible_at
+    /// 的数据源；import 回调拿不到 world，同 pos/nearest_enemy 快照模式）。
+    pub visible: Vec<(f64, f64)>,
+    /// probe 通路桥指针（三层感知 Phase A，见 ProbeBridge 的 SAFETY 契约）。
+    /// 仅在主循环阶段一执行玩家代码的窗口内非空（挂载 -> call -> 置空同一循环体
+    /// 作用域），窗口外恒为 null——import 层判空作废探测。
+    pub probe_bridge: *mut ProbeBridge,
 }
 
 impl SandboxData {
@@ -63,6 +74,35 @@ impl SandboxData {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// probe 通路桥（三层感知 Phase A：import 闭包访问目标沙箱的桥接上下文）
+///
+/// 为什么需要：import 闭包是 'static 的，无法持有 host 引用；probe 又必须同步
+/// 调用目标沙箱的 on_probe（玩家代码要当场拿到响应，不能像 attack_at 那样排队）。
+/// 桥接方案：主循环阶段一执行玩家代码的窗口内，把窗口上下文挂到每个沙箱的
+/// SandboxData.probe_bridge，窗口结束置空。
+///
+/// # SAFETY 契约（挂载方必须遵守）
+/// - **悬垂**：probe_bridge 仅在 host 栈上 ProbeBridge 值存活期间非空（挂载 ->
+///   call -> 置空发生在同一循环体作用域），窗口外恒为 null，import 层判空作废。
+/// - **aliasing**：caller 自身的 `&mut SandboxHandle` 由外层循环持有；桥里的
+///   sandboxes 指针只访问**其他实体**的 entry——坐标查找已排除 caller_id，
+///   HashMap 不同 entry 的值指向互不重叠的独立分配。
+pub struct ProbeBridge {
+    /// 可见实体 id 列表（viewport 过滤 + 存活 + EntityId 升序；含 caller 自己——
+    /// probe 的坐标查找在此列表上排除自己，作为 host 快照遗漏时的第二道防线）
+    pub visible_ids: Vec<EntityId>,
+    /// 与 visible_ids 一一平行的坐标列表
+    pub visible_positions: Vec<(f64, f64)>,
+    /// 沙箱表指针（仅阶段一窗口内有效）
+    pub sandboxes: *mut HashMap<EntityId, SandboxHandle>,
+    /// 沙箱管理器指针（call_on_probe 经由它走既有 probe 通道，仅窗口内有效）
+    pub manager: *const SandboxManager,
+    /// 探测者 id（坐标查找排除自己 + 日志）
+    pub caller_id: EntityId,
+    /// on_probe 独立小 fuel 预算（架构 3.3 probe_target_instruction_limit，config 可调）
+    pub probe_fuel: u64,
 }
 
 /// 沙箱句柄（持有 Store + Instance）
@@ -263,6 +303,194 @@ impl SandboxManager {
                     "[attack_at] 攻击已排队"
                 );
                 1 // 已排队
+            },
+        )?;
+        // env.visible_count() -> i32：眼睛列表（三层感知 Phase A，架构 3.2
+        // get_visible_entities 的 import 数据通路）。返回 host 填充的可见实体
+        // 坐标快照长度（viewport 过滤 + EntityId 升序 + 排除自己）。
+        linker.func_wrap("env", "visible_count", |mut caller: Caller<SandboxData>| -> i32 {
+            caller.data_mut().api_calls.push("visible_count".to_string());
+            let n = caller.data().visible.len() as i32;
+            tracing::debug!(
+                entity_id = %caller.data().entity_id.0,
+                count = n,
+                "[visible_count] 可见敌人数"
+            );
+            n
+        })?;
+        // env.visible_at(idx, x_ptr, y_ptr) -> i32：按 idx 取第 N 个可见实体坐标
+        //（写 caller memory，同 scan 模式：x 8字节@x_ptr、y 8字节@y_ptr）。
+        // 返回 1 成功 / 0 越界（idx 非法）或写入指针非法。
+        linker.func_wrap(
+            "env",
+            "visible_at",
+            |mut caller: Caller<SandboxData>, idx: i32, x_ptr: i32, y_ptr: i32| -> i32 {
+                caller.data_mut().api_calls.push("visible_at".to_string());
+                let entity = caller.data().entity_id;
+                // idx<0 as usize 符号扩展成巨大值 -> get 返回 None，与越界同语义
+                let Some(p) = caller.data().visible.get(idx as usize).copied() else {
+                    tracing::debug!(
+                        entity_id = %entity.0,
+                        idx,
+                        "[visible_at] 越界，无该可见实体"
+                    );
+                    return 0;
+                };
+                // 原子语义预检：两个指针先全量校验（只查不写），全部合法才落笔
+                //（同 scan：避免其一非法时另一半坐标已写入的半截副作用）
+                let ptrs_ok = can_write_f64_to_caller(&mut caller, x_ptr)
+                    && can_write_f64_to_caller(&mut caller, y_ptr);
+                if !ptrs_ok {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        idx,
+                        x_ptr,
+                        y_ptr,
+                        "[visible_at] 写入指针非法，读取作废"
+                    );
+                    return 0;
+                }
+                write_f64_to_caller(&mut caller, x_ptr, p.0);
+                write_f64_to_caller(&mut caller, y_ptr, p.1);
+                tracing::info!(
+                    entity_id = %entity.0,
+                    idx,
+                    x = p.0,
+                    y = p.1,
+                    "[visible_at] 读取可见实体坐标"
+                );
+                1
+            },
+        )?;
+        // env.probe(tx, ty, req_ptr, req_len, resp_ptr, resp_cap) -> i32：探测
+        //（三层感知 Phase B，架构 3.2 probe 通道 + 4.3 被动观测）。
+        // - 按坐标在可见快照（桥）里找目标（架构 3.2 通道开启条件：视距内），
+        //   排除自己；MVP 不引入 EntityId 传递（玩家代码持有坐标即可）。
+        // - 调 channel.rs 既有 probe 通道（on_probe + meta 采集 + 容错），复用不重写。
+        // - 被探测方 on_probe 用 host 侧独立小 fuel 包裹（存剩余 -> set 预算 ->
+        //   调 -> 记消耗 -> 恢复原 fuel；已知限制：wasmtime 25 + Windows 下 fuel
+        //   耗尽 trap = 进程 abort（.cc-bugs #5），预算把最坏情形缩到快速中止）。
+        // - response 之后追加 24 字节被动体徵（host 采集，玩家不可伪造）：
+        //   [0..8] 目标 api_calls 计数 u64 LE；[8..16] 目标 fuel 剩余 u64 LE
+        //   （探测前快照）；[16..24] 本次 on_probe 消耗 u64 LE。
+        // - 返回：>=0 实际写入字节数（超 resp_cap 截断）；-1 坐标无实体/桥未挂载/
+        //   resp 不可写；-2 目标无 on_probe（响应位置已写默认被动体徵）。
+        linker.func_wrap(
+            "env",
+            "probe",
+            |mut caller: Caller<SandboxData>,
+             tx: f64,
+             ty: f64,
+             req_ptr: i32,
+             req_len: i32,
+             resp_ptr: i32,
+             resp_cap: i32|
+             -> i32 {
+                caller.data_mut().api_calls.push("probe".to_string());
+                let caller_id = caller.data().entity_id;
+                let bridge_ptr = caller.data().probe_bridge;
+                if bridge_ptr.is_null() {
+                    tracing::warn!(entity_id = %caller_id.0, "[probe] 通路桥未挂载，探测作废");
+                    return -1;
+                }
+                // SAFETY: 桥仅在 run_player_code 执行窗口内非空（挂载 -> call ->
+                // 置空同一循环体作用域），本函数只在窗口内被调，ProbeBridge 存活。
+                let bridge = unsafe { &mut *bridge_ptr };
+                // 坐标查找（可见列表内 + 排除自己：host 快照已排除，此处为第二道防线）
+                let target_id = bridge
+                    .visible_ids
+                    .iter()
+                    .zip(bridge.visible_positions.iter().copied())
+                    .find(|(id, p)| **id != caller_id && *p == (tx, ty))
+                    .map(|(id, _)| *id);
+                let Some(target_id) = target_id else {
+                    tracing::info!(entity_id = %caller_id.0, tx, ty, "[probe] 坐标无可见实体");
+                    return -1;
+                };
+                // SAFETY: sandboxes 指针窗口内有效；目标 != caller（上一步排除），
+                // 不会与外层持有的 caller 自身 &mut handle aliasing（不同 entry）。
+                let sandboxes = unsafe { &mut *bridge.sandboxes };
+                let Some(target) = sandboxes.get_mut(&target_id) else {
+                    tracing::warn!(
+                        entity_id = %caller_id.0,
+                        target = %target_id.0,
+                        "[probe] 目标无沙箱（死者或框架实体）"
+                    );
+                    return -1;
+                };
+                // SAFETY: manager 指针窗口内有效（SandboxManager 与沙箱表同生命周期）。
+                let manager = unsafe { &*bridge.manager };
+                // request 字节从 caller memory 读（同 attack_at 的 payload 模式）
+                let request = read_payload_from_caller(&mut caller, req_ptr, req_len);
+                // host 侧独立小 fuel 包裹（架构 3.3 probe_target_instruction_limit）
+                let prev_fuel = target.store.get_fuel().unwrap_or(0);
+                if let Err(e) = target.store.set_fuel(bridge.probe_fuel) {
+                    tracing::warn!(
+                        target = %target_id.0,
+                        error = %e,
+                        "[probe] 预算设置失败，探测作废"
+                    );
+                    return -1;
+                }
+                let had_on_probe = manager.has_export(target, "on_probe").unwrap_or(false);
+                let probe_result = ChannelManager::probe(manager, target, &request);
+                let fuel_left = target.store.get_fuel().unwrap_or(bridge.probe_fuel);
+                let probe_fuel_used = bridge.probe_fuel.saturating_sub(fuel_left);
+                if let Err(e) = target.store.set_fuel(prev_fuel) {
+                    tracing::warn!(target = %target_id.0, error = %e, "[probe] 目标 fuel 恢复失败");
+                }
+                // update_fuel 在包裹期间用预算尺度算过 fuel_consumed（假象），
+                // 恢复后按原尺度重算，目标元数据不被探测污染
+                let limit = target.store.data().fuel_limit;
+                target.store.data_mut().fuel_consumed = limit.saturating_sub(prev_fuel);
+                // 组装响应：目标 on_probe 返回 + 24 字节被动体徵
+                let mut body = probe_result.response.clone();
+                let api_count = probe_result.meta.api_calls.len() as u64;
+                body.extend_from_slice(&api_count.to_le_bytes());
+                body.extend_from_slice(&prev_fuel.to_le_bytes());
+                body.extend_from_slice(&probe_fuel_used.to_le_bytes());
+                if resp_cap <= 0 {
+                    tracing::warn!(entity_id = %caller_id.0, resp_cap, "[probe] resp_cap 非正，响应丢弃");
+                    return -1;
+                }
+                let written = write_bytes_to_caller(&mut caller, resp_ptr, &body, resp_cap as usize);
+                if written == 0 {
+                    tracing::warn!(
+                        entity_id = %caller_id.0,
+                        resp_ptr,
+                        "[probe] 响应写入失败（指针非法/无 memory）"
+                    );
+                    return -1;
+                }
+                // response 摘要（前 4 字节 i32 hex；玩家内容照录——框架只透传不审查，
+                // 撒谎是否成立由探测者比对 response 与体徵自行判断）
+                let resp_head = if probe_result.response.len() >= 4 {
+                    format!("0x{:08X}", i32::from_le_bytes(
+                        probe_result.response[..4].try_into().unwrap_or([0; 4]),
+                    ))
+                } else if probe_result.response.is_empty() {
+                    "-".to_string()
+                } else {
+                    format!("{} 字节", probe_result.response.len())
+                };
+                tracing::info!(
+                    prober = %caller_id.0,
+                    target = %target_id.0,
+                    resp_len = written,
+                    resp_head = %resp_head,
+                    api_calls = api_count,
+                    fuel_used = probe_fuel_used,
+                    "[probe] 探测完成（response+被动体徵）"
+                );
+                if had_on_probe {
+                    written as i32
+                } else {
+                    tracing::info!(
+                        target = %target_id.0,
+                        "[probe] 目标无 on_probe，仅返回默认被动体徵"
+                    );
+                    -2
+                }
             },
         )?;
         Ok(linker)
@@ -497,6 +725,40 @@ fn write_f64_to_caller(caller: &mut Caller<SandboxData>, ptr: i32, value: f64) -
     }
     memory.data_mut(&mut *caller)[start..end].copy_from_slice(&value.to_le_bytes());
     true
+}
+
+/// 向 caller 的 memory export 写入字节切片（env.probe 的 response+体徵输出）
+///
+/// 模块未导出 memory / ptr<0 / cap=0 / 写入范围越界 -> 0（不写，防半截数据）。
+/// bytes.len() > cap 时只写前 cap 字节（超容量截断），返回实际写入字节数。
+fn write_bytes_to_caller(
+    caller: &mut Caller<SandboxData>,
+    ptr: i32,
+    bytes: &[u8],
+    cap: usize,
+) -> usize {
+    if ptr < 0 || cap == 0 {
+        return 0;
+    }
+    let Some(memory) = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+    else {
+        tracing::debug!("[write_bytes] 模块未导出 memory，写入失败");
+        return 0;
+    };
+    let start = ptr as usize;
+    let want = bytes.len().min(cap);
+    let Some(end) = start.checked_add(want) else {
+        tracing::warn!(ptr, want, "[write_bytes] 写入地址回绕，写入失败");
+        return 0;
+    };
+    if end > memory.data(&*caller).len() {
+        tracing::warn!(ptr, want, mem_len = memory.data(&*caller).len(), "[write_bytes] 写入越界，写入失败");
+        return 0;
+    }
+    memory.data_mut(&mut *caller)[start..end].copy_from_slice(&bytes[..want]);
+    want
 }
 
 #[cfg(test)]
@@ -1051,5 +1313,403 @@ mod tests {
             handle.store.data().log_markers.is_empty(),
             "未调 env.log 时 log_markers 应为空"
         );
+    }
+
+    // === env.visible_count / env.visible_at（三层感知 Phase A：眼睛列表）===
+
+    /// 眼睛列表消费者 WAT：on_tick 先 visible_count 存全局，再对 idx=0 调
+    /// visible_at(0, 0, 8)（x 写 memory[0..8]、y 写 [8..16]）
+    const EYES_WAT: &str = r#"(module
+  (import "env" "visible_count" (func $visible_count (result i32)))
+  (import "env" "visible_at" (func $visible_at (param i32 i32 i32) (result i32)))
+  (global $count (mut i32) (i32.const -1))
+  (global $got (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    call $visible_count global.set $count
+    i32.const 0 i32.const 0 i32.const 8 call $visible_at global.set $got)
+  (func (export "get_count") (result i32) global.get $count)
+  (func (export "get_got") (result i32) global.get $got)
+  (func (export "get_x") (result f64) (f64.load (i32.const 0)))
+  (func (export "get_y") (result f64) (f64.load (i32.const 8)))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 眼睛列表越界读取 WAT：对 idx=5 调 visible_at（列表只有 1 项）
+    const EYES_OUT_OF_RANGE_WAT: &str = r#"(module
+  (import "env" "visible_at" (func $visible_at (param i32 i32 i32) (result i32)))
+  (global $got (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    i32.const 5 i32.const 0 i32.const 8 call $visible_at global.set $got)
+  (func (export "get_got") (result i32) global.get $got)
+  (func (export "get_x") (result f64) (f64.load (i32.const 0)))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 眼睛列表负索引 WAT：对 idx=-1 调 visible_at
+    const EYES_NEGATIVE_IDX_WAT: &str = r#"(module
+  (import "env" "visible_at" (func $visible_at (param i32 i32 i32) (result i32)))
+  (global $got (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    i32.const -1 i32.const 0 i32.const 8 call $visible_at global.set $got)
+  (func (export "get_got") (result i32) global.get $got)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 眼睛列表坏指针 WAT：x_ptr 越界（memory 1 页 = 64KB，ptr=65536）
+    const EYES_BAD_PTR_WAT: &str = r#"(module
+  (import "env" "visible_at" (func $visible_at (param i32 i32 i32) (result i32)))
+  (global $got (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    i32.const 0 i32.const 65536 i32.const 8 call $visible_at global.set $got)
+  (func (export "get_got") (result i32) global.get $got)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn visible_count_returns_snapshot_len() {
+        // visible_count：返回 host 填充的可见快照长度（host 侧已排除自己）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(EYES_WAT), 100_000, id(701)).unwrap();
+        handle.store.data_mut().visible = vec![(1.0, 2.0), (3.0, 4.0)];
+        mgr.call_on_tick(&mut handle).unwrap();
+        let count = call_i32_export(&mut handle, "get_count");
+        assert_eq!(count, 2, "visible_count 应返回快照长度");
+        assert!(
+            handle.store.data().api_calls.contains(&"visible_count".to_string()),
+            "visible_count 调用应记入 api_calls 元数据"
+        );
+    }
+
+    #[test]
+    fn visible_count_zero_when_list_empty() {
+        // 负面路径：可见列表为空（周围无敌人）-> 返回 0
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(EYES_WAT), 100_000, id(702)).unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        let count = call_i32_export(&mut handle, "get_count");
+        assert_eq!(count, 0, "空列表应返回 0");
+    }
+
+    #[test]
+    fn visible_at_reads_coordinates_into_memory() {
+        // visible_at：idx=0 命中 -> 坐标写 memory（x@0..8 y@8..16），返回 1
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(EYES_WAT), 100_000, id(703)).unwrap();
+        handle.store.data_mut().visible = vec![(7.5, -2.25), (100.0, 200.0)];
+        mgr.call_on_tick(&mut handle).unwrap();
+        let got = call_i32_export(&mut handle, "get_got");
+        assert_eq!(got, 1, "idx=0 应命中");
+        assert_eq!(call_f64_export(&mut handle, "get_x"), 7.5, "x 应写入 memory[0..8]");
+        assert_eq!(call_f64_export(&mut handle, "get_y"), -2.25, "y 应写入 memory[8..16]");
+        assert!(
+            handle.store.data().api_calls.contains(&"visible_at".to_string()),
+            "visible_at 调用应记入 api_calls 元数据"
+        );
+    }
+
+    #[test]
+    fn visible_at_out_of_range_returns_zero() {
+        // 负面路径：idx 越界（列表 1 项取 idx=5）-> 返回 0、不写 memory
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(EYES_OUT_OF_RANGE_WAT), 100_000, id(704))
+            .unwrap();
+        handle.store.data_mut().visible = vec![(7.5, -2.25)];
+        mgr.call_on_tick(&mut handle).unwrap();
+        let got = call_i32_export(&mut handle, "get_got");
+        assert_eq!(got, 0, "越界应返回 0");
+        let x = call_f64_export(&mut handle, "get_x");
+        assert_eq!(x, 0.0, "越界不应写 memory（保持初始 0）");
+    }
+
+    #[test]
+    fn visible_at_negative_idx_returns_zero() {
+        // 负面路径：idx 负数 -> 返回 0（负索引不是合法查询）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(EYES_NEGATIVE_IDX_WAT), 100_000, id(705))
+            .unwrap();
+        handle.store.data_mut().visible = vec![(7.5, -2.25)];
+        mgr.call_on_tick(&mut handle).unwrap();
+        let got = call_i32_export(&mut handle, "get_got");
+        assert_eq!(got, 0, "负索引应返回 0");
+    }
+
+    #[test]
+    fn visible_at_bad_ptr_returns_zero() {
+        // 负面路径：写入指针越界 -> 返回 0 不 panic（同 scan 坏指针语义）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(EYES_BAD_PTR_WAT), 100_000, id(706))
+            .unwrap();
+        handle.store.data_mut().visible = vec![(7.5, -2.25)];
+        mgr.call_on_tick(&mut handle).unwrap();
+        let got = call_i32_export(&mut handle, "get_got");
+        assert_eq!(got, 0, "指针非法应返回 0");
+    }
+
+    // === env.probe（三层感知 Phase A：探测层 + 撒谎机制 + 被动体徵）===
+
+    /// 被探测目标 WAT（撒谎者）：on_probe 固定回 "LIE9"（i32 LE 字节序列
+    /// [0x4C,0x49,0x45,0x39]——谎称友军、life=9 的可识别假串，4 字节为
+    /// on_probe i32->i32 签名的 MVP 上限，Phase 2 扩内存传递）
+    const LIAR_WAT: &str = r#"(module
+  (func (export "on_probe") (param i32) (result i32) i32.const 0x3945494C)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 无 on_probe 的目标 WAT（哑巴：被探测只能暴露默认被动体徵）
+    const NO_PROBE_WAT: &str = r#"(module
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 探测者 WAT 模板：on_tick 调 probe(tx, ty, 100, 4, 200, 64)，返回值存全局。
+    /// memory 布局：[100..104]=request 字节、[200..264]=response 缓冲（cap 64）。
+    fn prober_wat(tx: &str, ty: &str) -> String {
+        format!(
+            r#"(module
+  (import "env" "probe" (func $probe (param f64 f64 i32 i32 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -999))
+  (memory (export "memory") 1)
+  (data (i32.const 100) "\01\02\03\04")
+  (func (export "on_tick")
+    f64.const {tx} f64.const {ty} i32.const 100 i32.const 4 i32.const 200 i32.const 64
+    call $probe global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "get_resp0") (result i32) (i32.load (i32.const 200)))
+  (func (export "get_resp8") (result i32) (i32.load (i32.const 208)))
+  (func (export "get_resp12") (result i32) (i32.load (i32.const 212)))
+  (func (export "get_resp20") (result i32) (i32.load (i32.const 220)))
+  (func (export "life") (result i32) i32.const 1))"#
+        )
+    }
+
+    /// 从实体当前沙箱调用无参 i32 导出（测试观测探针全局变量）
+    fn call_i32_export(handle: &mut SandboxHandle, name: &str) -> i32 {
+        let func = handle
+            .instance
+            .get_typed_func::<(), i32>(&mut handle.store, name)
+            .unwrap();
+        func.call(&mut handle.store, ()).unwrap()
+    }
+
+    /// probe 测试挂载：目标沙箱入表 + 探测者建桥（bridge 由调用方持有保活，
+    /// 测试结束前用 null 断开，符合 ProbeBridge 的 SAFETY 契约）
+    #[test]
+    fn probe_hit_returns_liar_response_plus_vitals() {
+        // probe 命中：目标 on_probe 的假串原样透传（撒谎=玩家代码自由，框架只透传），
+        // 之后追加 24 字节被动体徵（api_count/fuel 剩余/fuel 消耗，host 采集不可伪造）。
+        // 总响应 4+24=28 字节 <= resp_cap 64，返回 28。
+        let mgr = SandboxManager::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(id(2), mgr.create_sandbox(&wasm(LIAR_WAT), 100_000, id(2)).unwrap());
+        let mut prober = mgr
+            .create_sandbox(&wasm(&prober_wat("7.0", "8.0")), 100_000, id(1))
+            .unwrap();
+        prober.store.data_mut().visible = vec![(7.0, 8.0)];
+        let mut bridge = ProbeBridge {
+            visible_ids: vec![id(1), id(2)],
+            visible_positions: vec![(0.0, 0.0), (7.0, 8.0)],
+            sandboxes: &mut map,
+            manager: &mgr,
+            caller_id: id(1),
+            probe_fuel: 10_000,
+        };
+        prober.store.data_mut().probe_bridge = &mut bridge;
+        mgr.call_on_tick(&mut prober).unwrap();
+        prober.store.data_mut().probe_bridge = std::ptr::null_mut();
+        drop(bridge);
+        let ret = call_i32_export(&mut prober, "get_ret");
+        assert_eq!(ret, 28, "命中应写入 4 字节假串 + 24 字节体徵");
+        // 假串原样到达探测者（撒谎透传）
+        let lie = call_i32_export(&mut prober, "get_resp0");
+        assert_eq!(lie, 0x3945494C, "response 前 4 字节应是目标的假串 LIE9");
+        // 体徵块：api_count（u64 LE @+4，目标没调过 api = 0）
+        // 用 +12 的 i32 读 fuel 剩余低 32 位（prev_fuel=100_000 未跑过任何调用）
+        let fuel_remaining = call_i32_export(&mut prober, "get_resp12");
+        assert_eq!(fuel_remaining, 100_000, "体徵应含目标探测前 fuel 剩余量");
+        // fuel 消耗 > 0（on_probe 至少执行了几条指令）
+        let fuel_used = call_i32_export(&mut prober, "get_resp20");
+        assert!(fuel_used > 0, "体徵应含本次 on_probe 实际消耗");
+        assert!(
+            prober.store.data().api_calls.contains(&"probe".to_string()),
+            "probe 调用应记入探测者 api_calls 元数据"
+        );
+    }
+
+    #[test]
+    fn probe_miss_returns_minus_one() {
+        // 负面路径：坐标上没有可见实体 -> 返回 -1，不写响应
+        let mgr = SandboxManager::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(id(2), mgr.create_sandbox(&wasm(LIAR_WAT), 100_000, id(2)).unwrap());
+        let mut prober = mgr
+            .create_sandbox(&wasm(&prober_wat("99.0", "99.0")), 100_000, id(1))
+            .unwrap();
+        let mut bridge = ProbeBridge {
+            visible_ids: vec![id(1), id(2)],
+            visible_positions: vec![(0.0, 0.0), (7.0, 8.0)],
+            sandboxes: &mut map,
+            manager: &mgr,
+            caller_id: id(1),
+            probe_fuel: 10_000,
+        };
+        prober.store.data_mut().probe_bridge = &mut bridge;
+        mgr.call_on_tick(&mut prober).unwrap();
+        prober.store.data_mut().probe_bridge = std::ptr::null_mut();
+        drop(bridge);
+        let ret = call_i32_export(&mut prober, "get_ret");
+        assert_eq!(ret, -1, "坐标无人应返回 -1");
+    }
+
+    #[test]
+    fn probe_self_pos_returns_minus_one() {
+        // 负面路径（防御）：bridge 被污染含 caller 自己的坐标时，probe 自己仍被拒。
+        // 正常 host 填充会排除自己，此测试锁定 import 层的第二道防线。
+        let mgr = SandboxManager::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(id(1), mgr.create_sandbox(&wasm(LIAR_WAT), 100_000, id(1)).unwrap());
+        let mut prober = mgr
+            .create_sandbox(&wasm(&prober_wat("3.0", "3.0")), 100_000, id(1))
+            .unwrap();
+        let mut bridge = ProbeBridge {
+            visible_ids: vec![id(1)],
+            visible_positions: vec![(3.0, 3.0)],
+            sandboxes: &mut map,
+            manager: &mgr,
+            caller_id: id(1),
+            probe_fuel: 10_000,
+        };
+        prober.store.data_mut().probe_bridge = &mut bridge;
+        mgr.call_on_tick(&mut prober).unwrap();
+        prober.store.data_mut().probe_bridge = std::ptr::null_mut();
+        drop(bridge);
+        let ret = call_i32_export(&mut prober, "get_ret");
+        assert_eq!(ret, -1, "probe 自己应被拒绝");
+    }
+
+    #[test]
+    fn probe_target_without_on_probe_returns_minus2_with_vitals() {
+        // 负面路径：目标无 on_probe 导出 -> 返回 -2，响应位置写默认被动体徵（24 字节）
+        let mgr = SandboxManager::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(id(3), mgr.create_sandbox(&wasm(NO_PROBE_WAT), 100_000, id(3)).unwrap());
+        let mut prober = mgr
+            .create_sandbox(&wasm(&prober_wat("7.0", "8.0")), 100_000, id(1))
+            .unwrap();
+        let mut bridge = ProbeBridge {
+            visible_ids: vec![id(1), id(3)],
+            visible_positions: vec![(0.0, 0.0), (7.0, 8.0)],
+            sandboxes: &mut map,
+            manager: &mgr,
+            caller_id: id(1),
+            probe_fuel: 10_000,
+        };
+        prober.store.data_mut().probe_bridge = &mut bridge;
+        mgr.call_on_tick(&mut prober).unwrap();
+        prober.store.data_mut().probe_bridge = std::ptr::null_mut();
+        drop(bridge);
+        let ret = call_i32_export(&mut prober, "get_ret");
+        assert_eq!(ret, -2, "目标无 on_probe 应返回 -2");
+        // 默认被动体徵仍写入：-2 时响应为空，体徵块从 offset 0 开始
+        //（api_count 在 [0..8]、fuel 在 [8..16]）——fuel 低 4 字节在 memory[208..212]
+        let fuel_remaining = call_i32_export(&mut prober, "get_resp8");
+        assert_eq!(fuel_remaining, 100_000, "-2 时也应写入默认体徵");
+    }
+
+    #[test]
+    fn probe_truncates_response_to_resp_cap() {
+        // 边界：resp_cap 小于 body（28 字节）-> 只写 cap 字节，返回 cap
+        let mgr = SandboxManager::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(id(2), mgr.create_sandbox(&wasm(LIAR_WAT), 100_000, id(2)).unwrap());
+        // cap=10：模板的 resp_ptr=200 cap=64，此测试用内联小 cap 模块
+        const PROBER_SMALL_CAP_WAT: &str = r#"(module
+  (import "env" "probe" (func $probe (param f64 f64 i32 i32 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -999))
+  (memory (export "memory") 1)
+  (data (i32.const 100) "\01\02\03\04")
+  (func (export "on_tick")
+    f64.const 7.0 f64.const 8.0 i32.const 100 i32.const 4 i32.const 200 i32.const 10
+    call $probe global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let mut prober = mgr
+            .create_sandbox(&wasm(PROBER_SMALL_CAP_WAT), 100_000, id(1))
+            .unwrap();
+        let mut bridge = ProbeBridge {
+            visible_ids: vec![id(1), id(2)],
+            visible_positions: vec![(0.0, 0.0), (7.0, 8.0)],
+            sandboxes: &mut map,
+            manager: &mgr,
+            caller_id: id(1),
+            probe_fuel: 10_000,
+        };
+        prober.store.data_mut().probe_bridge = &mut bridge;
+        mgr.call_on_tick(&mut prober).unwrap();
+        prober.store.data_mut().probe_bridge = std::ptr::null_mut();
+        drop(bridge);
+        let ret = call_i32_export(&mut prober, "get_ret");
+        assert_eq!(ret, 10, "超容量应截断为 resp_cap 字节");
+    }
+
+    #[test]
+    fn probe_restores_target_fuel_and_records_consumption() {
+        // fuel 包裹（host 侧预算控制）：探测前目标 fuel=55_555 -> 探测后必须恢复
+        // 55_555（probe 不扣目标手续费，架构 3.3）；消耗记进体徵；
+        // fuel_consumed 元数据按原尺度修正（update_fuel 在包裹期间用预算尺度算过假象）。
+        // 注：本测试不构造 on_probe 烧穿预算的场景——wasmtime 25 + Windows 下
+        // fuel 耗尽 trap = 进程 abort（.cc-bugs #5），预算中断行为由 host 侧
+        // set_fuel 包裹逻辑保证，测试只验证记账与恢复。
+        let mgr = SandboxManager::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        let mut liar = mgr.create_sandbox(&wasm(LIAR_WAT), 100_000, id(2)).unwrap();
+        liar.store.set_fuel(55_555).unwrap();
+        map.insert(id(2), liar);
+        let mut prober = mgr
+            .create_sandbox(&wasm(&prober_wat("7.0", "8.0")), 100_000, id(1))
+            .unwrap();
+        let mut bridge = ProbeBridge {
+            visible_ids: vec![id(1), id(2)],
+            visible_positions: vec![(0.0, 0.0), (7.0, 8.0)],
+            sandboxes: &mut map,
+            manager: &mgr,
+            caller_id: id(1),
+            probe_fuel: 10_000,
+        };
+        prober.store.data_mut().probe_bridge = &mut bridge;
+        mgr.call_on_tick(&mut prober).unwrap();
+        prober.store.data_mut().probe_bridge = std::ptr::null_mut();
+        let ret = call_i32_export(&mut prober, "get_ret");
+        drop(bridge);
+        assert_eq!(ret, 28, "命中应正常返回");
+        // 目标 fuel 恢复到探测前值
+        let map_handle = map.get(&id(2)).unwrap();
+        assert_eq!(
+            map_handle.store.get_fuel().unwrap(),
+            55_555,
+            "探测后目标 fuel 应恢复原值（probe 不扣手续费）"
+        );
+        // fuel_consumed 元数据按原尺度修正（limit - prev_fuel）
+        assert_eq!(
+            map_handle.store.data().fuel_consumed,
+            100_000 - 55_555,
+            "fuel_consumed 应按探测前尺度重算，不被包裹污染"
+        );
+        // 体徵记录：fuel 剩余 = 55_555（探测前快照）
+        let fuel_remaining = call_i32_export(&mut prober, "get_resp12");
+        assert_eq!(fuel_remaining, 55_555, "体徵 fuel 剩余应是探测前快照");
+        let fuel_used = call_i32_export(&mut prober, "get_resp20");
+        assert!(fuel_used > 0 && fuel_used < 10_000, "消耗应在预算内且大于 0");
+    }
+
+    #[test]
+    fn probe_with_null_bridge_returns_minus_one() {
+        // 负面路径（防御）：桥未挂载（非阶段一窗口调用）-> 返回 -1 不崩
+        let mgr = SandboxManager::new().unwrap();
+        let mut prober = mgr
+            .create_sandbox(&wasm(&prober_wat("7.0", "8.0")), 100_000, id(1))
+            .unwrap();
+        mgr.call_on_tick(&mut prober).unwrap();
+        let ret = call_i32_export(&mut prober, "get_ret");
+        assert_eq!(ret, -1, "桥未挂载应返回 -1");
     }
 }
