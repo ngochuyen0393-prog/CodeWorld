@@ -1,8 +1,11 @@
-/target
+!/Cargo.lock
+# 去掉Cargo.lock的gitignore（二进制项目需要锁版本）
 **/*.rs.bk
 *.pdb
 .Cargo.lock
-# 去掉Cargo.lock的gitignore（二进制项目需要锁版本）
-!/Cargo.lock
-.code-graph/
 .claude/settings.local.json
+.code-graph/
+/target
+battle.log
+build.log
+codeworld.db
