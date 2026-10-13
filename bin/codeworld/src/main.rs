@@ -84,6 +84,15 @@ impl EntitySandboxMap {
             let Some(handle) = self.sandboxes.get_mut(&entity_id) else {
                 continue;
             };
+            // 感知快照填充（get_pos/scan 数据通路）：import 回调拿不到 world，
+            // 阶段一执行玩家代码【前】把坐标快照写进 SandboxData——玩家代码
+            // 读到的是 tick 开始时的状态（架构 4.1 快照语义）。
+            if let Some(e) = world.entities.get(&entity_id) {
+                let nearest = find_nearest_enemy(world, &entity_id);
+                let data = handle.store.data_mut();
+                data.pos = e.pos();
+                data.nearest_enemy = nearest;
+            }
             // 重置本 tick 指令配额（架构 4.1：每 tick 重置指令配额）。
             // MVP 指令计量靠 wasmtime fuel（consume_fuel），fuel 跨 tick 累计消耗会耗尽，
             // 导致 call_life 返回 Err 误杀实体；架构要求"超额不死亡、下次 tick 继续"，
@@ -127,6 +136,22 @@ impl EntitySandboxMap {
         }
         if !all.is_empty() {
             tracing::info!(count = all.len(), "[collect_pending_attacks] 收集攻击请求");
+        }
+        all
+    }
+
+    /// 收集本 tick 所有沙箱排队的移动请求（env.move_by 推入，阶段二并入 pending 队列）
+    ///
+    /// drain 各沙箱 pending_moves 后清空，保证不跨 tick 残留。在 tick 阶段二 a 步
+    /// apply_pending_changes 之前调用（收集到的 SetPos 与主 pending 队列一起应用）。
+    fn collect_pending_moves(&mut self) -> Vec<PendingChange> {
+        let mut all = Vec::new();
+        for handle in self.sandboxes.values_mut() {
+            let data = handle.store.data_mut();
+            all.append(&mut data.pending_moves);
+        }
+        if !all.is_empty() {
+            tracing::debug!(count = all.len(), "[collect_pending_moves] 收集移动请求");
         }
         all
     }
@@ -355,6 +380,8 @@ fn tick(
 
     // ③ 阶段二：状态更新（串行）
     //   a. 应用 PendingChanges（spawn/destroy/set_pos/set_velocity，架构 4.1 a 步）
+    //      先并入阶段一排队的移动请求（env.move_by），随本步统一应用（与攻击排队同模式）
+    pending.extend(sandbox_map.collect_pending_moves());
     apply_pending_changes(world, pending);
 
     //   a2. 处理攻击（架构 4.2 两阶段模型：阶段一 on_tick 调 env.attack_at 排队的请求在此统一执行）
@@ -761,36 +788,76 @@ fn handle_collisions(pairs: &[CollisionPair], entities: &HashMap<EntityId, Entit
     count
 }
 
-/// 创建测试实体（让 MVP 有东西渲染）
-fn create_test_entity(pos: (f64, f64), tick: u64) -> Entity {
-    Entity::new(
-        EntityId::new(),
-        PlayerId::new(),
-        "test".to_string(),
-        pos,
-        Appearance::new("@".to_string(), "red".to_string(), 1.0),
-        tick,
-        1_000_000, // 指令配额
-    )
-}
-
-/// 生成测试实体塞入世界（让 MVP 有东西渲染、能跑玩家代码）
+/// 感知规则：找 target 最近的其他存活实体坐标（env.scan 的数据源，MVP 上帝视角单敌人）
 ///
-/// 两个实体分别置于 (0, 10) 与 (5, 20)，都不站地面（y=0），
-/// 这样默认重力规则下能看到下落效果，日志比实体贴在地面更有信息量。
-/// 每个实体同时创建 WASM 沙箱（PLAYER_WAT：life()=true + on_tick 调 log）。
-fn spawn_test_entities(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap) {
-    let fuel = 1_000_000; // 100 万条指令配额
-    for pos in [(0.0, 10.0), (5.0, 20.0)] {
-        let e = create_test_entity(pos, world.tick());
-        // 为实体创建沙箱；沙箱创建失败则不插入实体（避免无沙箱的孤儿实体）
-        if sandbox_map.create(e.id, &wasm(PLAYER_WAT), fuel).is_ok() {
-            tracing::info!(entity_id = %e.id.0, pos = ?e.pos(), "创建测试实体+沙箱");
-            world.entities.insert(e.id, e);
-        } else {
-            tracing::warn!(entity_id = %e.id.0, "沙箱创建失败，跳过该测试实体");
+/// - 排除自己（不能锁定自己为敌人）
+/// - 排除死亡实体（尸体不是感知目标）
+/// - None = 世界没有其他存活实体（scan 返回 0）
+/// - 架构 3.2 感知接口完整版为 get_visible_entities（可见实体列表）；MVP 单敌人取最近者
+fn find_nearest_enemy(world: &WorldState, target: &EntityId) -> Option<(f64, f64)> {
+    let me = world.entities.get(target)?;
+    let mut best: Option<(f64, (f64, f64))> = None;
+    for e in world.entities.values() {
+        if !e.is_alive() || e.id == *target {
+            continue;
+        }
+        let (dx, dy) = (e.pos().0 - me.pos().0, e.pos().1 - me.pos().1);
+        let dist2 = dx * dx + dy * dy;
+        // 严格小于：同距并列时取遍历首个（HashMap 顺序随机，测试用明确距离避免歧义）
+        if best.map(|(d, _)| dist2 < d).unwrap_or(true) {
+            best = Some((dist2, e.pos()));
         }
     }
+    let (_, pos) = best?;
+    Some(pos)
+}
+
+/// 生成两只真性格生物（最简可玩版开局布阵）
+///
+/// A 攻击者（红"A"）@(5,0)：直线冲锋逼近，进范围连砍空 payload 击杀刀
+/// D 防御者（青"D"）@(15,0)：原地站桩+盾 10 拦截+每 4 tick 反制
+/// 都站地面 y=0：地面实体不受重力，坐标 tick 间稳定，scan/attack_at 的
+/// 坐标精确匹配（f64 相等）不被物理漂移打穿。
+/// 默认参数下 D 的反制先杀死 A（盾 10 > A 进范围后的 3 刀）；把盾调小
+/// （如 defender_wat(1)）则 A 磨穿防守反杀——两种结局都由参数决定。
+fn spawn_test_entities(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap) {
+    let fuel = 1_000_000; // 100 万条指令配额（fuel trap 会进程 abort，配额必须给足）
+    let d_shield = 10;
+    let mut spawn = |code_id: &str, glyph: &str, color: &str, pos: (f64, f64), wat: &[u8]| -> bool {
+        let e = Entity::new(
+            EntityId::new(),
+            PlayerId::new(),
+            code_id.to_string(), // code_hash 字段承载生物代码标识（Entity 无 name 字段，MVP 用它区分身份）
+            pos,
+            Appearance::new(glyph.to_string(), color.to_string(), 1.0),
+            world.tick(),
+            1_000_000,
+        );
+        // 沙箱创建失败则不插入实体（避免无沙箱的孤儿实体）
+        if sandbox_map.create(e.id, wat, fuel).is_ok() {
+            tracing::info!(entity_id = %e.id.0, pos = ?e.pos(), "生物登场：{code_id}");
+            world.entities.insert(e.id, e);
+            true
+        } else {
+            tracing::warn!("沙箱创建失败，{code_id} 未登场");
+            false
+        }
+    };
+    let a_ok = spawn("attacker", "A", "red", (5.0, 0.0), &wasm(ATTACKER_WAT));
+    let d_ok = spawn(
+        "defender",
+        "D",
+        "cyan",
+        (15.0, 0.0),
+        &wasm(&defender_wat(d_shield)),
+    );
+    tracing::info!(
+        attacker_spawned = a_ok,
+        defender_spawned = d_ok,
+        distance = 10.0,
+        defender_shield = d_shield,
+        "开局布阵：A 攻击者冲锋 / D 防御者站桩（盾每拦一刀-1，每4tick反制）"
+    );
 }
 
 /// WAT 文本 -> WASM 字节码（编译玩家代码模块）
@@ -800,11 +867,112 @@ fn wasm(wat_text: &str) -> Vec<u8> {
         .into_owned()
 }
 
-/// 玩家代码 WAT：life()=true + on_tick() 调 log（测试实体默认玩家代码）
-const PLAYER_WAT: &str = r#"(module
+/// 攻击者 A 的玩家代码 WAT（红色，性格：直线冲锋莽夫）
+///
+/// 策略（on_tick 每 tick 执行）：
+/// 1. scan 找最近敌人（坐标写入自己的 memory[0..8]=x / [8..16]=y），
+///    找不到（log 0）就原地待机
+/// 2. get_pos 读自己坐标，算朝向向量与欧氏距离
+/// 3. 距离 <= 1.5：进入攻击范围（log 2），对敌人坐标排空 payload 击杀刀
+///    （attack_at 只排队，实际拦截/换血/击杀由框架两阶段结算）
+/// 4. 未进范围（log 3）：归一化方向走 1.0 步（move_by 排队，阶段二应用）
+///
+/// 无 on_attack 导出 = 不设防：被反制刀命中即被换血击杀。
+/// 日志 marker：0=无敌人待机 2=进入攻击范围 3=移动中
+const ATTACKER_WAT: &str = r#"(module
   (import "env" "log" (func $log (param i32)))
+  (import "env" "get_pos" (func $get_pos (result f64 f64)))
+  (import "env" "scan" (func $scan (param i32 i32) (result i32)))
+  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    (local $mx f64) (local $my f64) (local $ex f64) (local $ey f64)
+    (local $dx f64) (local $dy f64) (local $dist f64)
+    ;; 1. 扫描敌人；没有敌人就待机
+    (if (i32.eqz (call $scan (i32.const 0) (i32.const 8)))
+      (then
+        (call $log (i32.const 0))
+        (return)))
+    ;; 2. 读敌人坐标（scan 写入 memory）与自己坐标（多值返回先压 x 再压 y）
+    (local.set $ex (f64.load (i32.const 0)))
+    (local.set $ey (f64.load (i32.const 8)))
+    (call $get_pos)
+    (local.set $my)
+    (local.set $mx)
+    ;; 3. 朝向向量与欧氏距离
+    (local.set $dx (f64.sub (local.get $ex) (local.get $mx)))
+    (local.set $dy (f64.sub (local.get $ey) (local.get $my)))
+    (local.set $dist (f64.sqrt
+      (f64.add (f64.mul (local.get $dx) (local.get $dx))
+               (f64.mul (local.get $dy) (local.get $dy)))))
+    ;; 4. 距离 <= 1.5：进入攻击范围，排空 payload 击杀刀（默认击杀 WAT）
+    (if (f64.le (local.get $dist) (f64.const 1.5))
+      (then
+        (call $log (i32.const 2))
+        (drop (call $attack_at (local.get $ex) (local.get $ey)
+                               (i32.const 0) (i32.const 0)))
+        (return)))
+    ;; 5. 未进范围：每 tick 归一化方向走 1.0 步
+    (call $log (i32.const 3))
+    (drop (call $move_by
+      (f64.div (local.get $dx) (local.get $dist))
+      (f64.div (local.get $dy) (local.get $dist)))))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+/// 防御者 D 的玩家代码 WAT（青色，性格：塔防铁壁+定期反击）
+///
+/// 策略：
+/// - on_tick：原地站立（不移动）；每 4 tick 反制一刀——扫描敌人坐标，
+///   对该坐标排空 payload 击杀刀（敌人若在移动则坐标过期落空，站定才挨打）
+/// - on_attack（有防守）：护盾有余 -> 拦截（log 7 后跟剩余盾量），盾尽 -> 放行（log 8）
+///   "配额有限"由玩家代码自己定（盾是规则不是框架能力，架构 4 能力 vs 规则分层）
+/// - life()=true；被打穿盾后被换血击杀（默认击杀 WAT life()=false）
+///
+/// 日志 marker：7=拦截 8=盾尽放行 9=反制
+fn defender_wat(shield: i32) -> String {
+    format!(
+        r#"(module
+  (import "env" "log" (func $log (param i32)))
+  (import "env" "scan" (func $scan (param i32 i32) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  ;; 护盾余量（拦截配额）：每拦一刀 -1，归零后不再拦截
+  (global $shield (mut i32) (i32.const {shield}))
+  ;; 已拦截刀数（观测用）
+  (global $intercepts (mut i32) (i32.const 0))
+  ;; tick 计数：每 4 tick 反制一刀
+  (global $ticks (mut i32) (i32.const 0))
+  ;; 被攻击：盾有余拦截，盾尽放行
+  (func (export "on_attack") (param i32) (result i32)
+    global.get $shield
+    if (result i32)
+      global.get $shield i32.const 1 i32.sub global.set $shield
+      global.get $intercepts i32.const 1 i32.add global.set $intercepts
+      i32.const 7 call $log
+      global.get $shield call $log
+      i32.const 1
+    else
+      i32.const 8 call $log
+      i32.const 0
+    end)
+  ;; 每 tick：计数 +1；非 4 的倍数直接返回；反制刀对扫描到的敌人坐标落刀
+  (func (export "on_tick")
+    global.get $ticks i32.const 1 i32.add global.set $ticks
+    global.get $ticks i32.const 4 i32.rem_u
+    if
+      return
+    end
+    (if (i32.eqz (call $scan (i32.const 0) (i32.const 8)))
+      (then (return)))
+    i32.const 9 call $log
+    (drop (call $attack_at (f64.load (i32.const 0)) (f64.load (i32.const 8))
+                           (i32.const 0) (i32.const 0))))
   (func (export "life") (result i32) i32.const 1)
-  (func (export "on_tick") i32.const 42 call $log))"#;
+  (func (export "get_intercepts") (result i32) global.get $intercepts)
+  (func (export "get_shield") (result i32) global.get $shield))"#
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -836,6 +1004,13 @@ mod tests {
     fn test_sandbox_map() -> EntitySandboxMap {
         EntitySandboxMap::new().unwrap()
     }
+
+    /// 玩家代码 WAT：life()=true + on_tick() 调 log（测试实体默认玩家代码；
+    /// 最简可玩版后生产代码不再使用，移入测试模块）
+    const PLAYER_WAT: &str = r#"(module
+  (import "env" "log" (func $log (param i32)))
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "on_tick") i32.const 42 call $log))"#;
 
     /// 死亡玩家 WAT：life()=false
     const DEAD_PLAYER_WAT: &str = r#"(module
@@ -1322,22 +1497,33 @@ mod tests {
 
     #[test]
     fn spawn_test_entities_inserts_two_at_expected_positions() {
-        // 测试实体初始位置：一个 (0,10) 一个 (5,20)，均在空中（不站地面 y=0）
-        // 这样默认重力规则下能看到下落效果
+        // 最简可玩版开局布阵：A 攻击者红"A"@(5,0)，D 防御者青"D"@(15,0)。
+        // 都站地面 y=0（地面实体不受重力，坐标稳定，scan/attack 坐标精确匹配）。
         let mut world = WorldState::new();
         let mut sandbox_map = test_sandbox_map();
         spawn_test_entities(&mut world, &mut sandbox_map);
-        assert_eq!(world.entities.len(), 2, "应创建两个测试实体");
-        let positions: Vec<(f64, f64)> = world.entities.values().map(|e| e.pos()).collect();
+        assert_eq!(world.entities.len(), 2, "应创建两只生物");
+        let attacker = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "attacker")
+            .expect("应有攻击者 A");
+        assert_eq!(attacker.pos(), (5.0, 0.0), "A 应在 (5,0)");
+        assert_eq!(attacker.appearance.glyph, "A");
+        assert_eq!(attacker.appearance.color, "red");
+        let defender = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "defender")
+            .expect("应有防御者 D");
+        assert_eq!(defender.pos(), (15.0, 0.0), "D 应在 (15,0)");
+        assert_eq!(defender.appearance.glyph, "D");
+        assert_eq!(defender.appearance.color, "cyan");
+        // 两只都挂了沙箱（存活实体必有沙箱）
         assert!(
-            positions.contains(&(0.0, 10.0)),
-            "应有实体在 (0,10)，实际 {:?}",
-            positions
-        );
-        assert!(
-            positions.contains(&(5.0, 20.0)),
-            "应有实体在 (5,20)，实际 {:?}",
-            positions
+            sandbox_map.sandboxes.contains_key(&attacker.id)
+                && sandbox_map.sandboxes.contains_key(&defender.id),
+            "两只生物都应有沙箱"
         );
     }
 
@@ -1545,6 +1731,16 @@ mod tests {
         let func = handle
             .instance
             .get_typed_func::<(), i32>(&mut handle.store, name)
+            .unwrap();
+        func.call(&mut handle.store, ()).unwrap()
+    }
+
+    /// 从实体当前沙箱调用无参 f64 导出（测试观测：scan 写入的坐标）
+    fn call_f64_export(map: &mut EntitySandboxMap, id: &EntityId, name: &str) -> f64 {
+        let handle = map.sandboxes.get_mut(id).unwrap();
+        let func = handle
+            .instance
+            .get_typed_func::<(), f64>(&mut handle.store, name)
             .unwrap();
         func.call(&mut handle.store, ()).unwrap()
     }
@@ -2024,12 +2220,345 @@ mod tests {
     // === 攻击全链路集成（验收#1：玩家代码调 attack_at import）===
 
     /// 攻击方 WAT：导出 memory + on_tick 调 env.attack_at(5.0, 0.0, 0, 0)（空 payload 默认击杀）
-    const ATTACKER_WAT: &str = r#"(module
+    /// 命名注意：与顶层生物 ATTACKER_WAT 区分，防模块内同名遮蔽（踩坑实录见 .cc-bugs）
+    const PIPELINE_ATTACKER_WAT: &str = r#"(module
   (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (func (export "on_tick")
     f64.const 5.0 f64.const 0.0 i32.const 0 i32.const 0 call $attack_at drop)
   (func (export "life") (result i32) i32.const 1))"#;
+
+    // === find_nearest_enemy（感知规则：scan 的数据源）===
+
+    #[test]
+    fn find_nearest_enemy_picks_closest_alive_other() {
+        // 规则：最近的其他存活实体（上帝视角单敌人 MVP 感知）
+        let mut world = WorldState::new();
+        let me = EntityId(Uuid::from_u128(1));
+        let near = EntityId(Uuid::from_u128(2));
+        let far = EntityId(Uuid::from_u128(3));
+        world.entities.insert(me, make_entity(1, (0.0, 0.0)));
+        world.entities.insert(near, make_entity(2, (3.0, 4.0))); // 距离 5
+        world.entities.insert(far, make_entity(3, (30.0, 40.0))); // 距离 50
+        let found = find_nearest_enemy(&world, &me);
+        assert_eq!(found, Some((3.0, 4.0)), "应锁定距离 5 的最近实体");
+    }
+
+    #[test]
+    fn find_nearest_enemy_excludes_self() {
+        // 规则：排除自己（不能把自己当敌人锁定）
+        let mut world = WorldState::new();
+        let me = EntityId(Uuid::from_u128(1));
+        world.entities.insert(me, make_entity(1, (7.0, 8.0)));
+        let found = find_nearest_enemy(&world, &me);
+        assert_eq!(found, None, "独存实体不应锁定自己");
+    }
+
+    #[test]
+    fn find_nearest_enemy_excludes_dead() {
+        // 规则：排除死亡实体（尸体不是感知目标）
+        let mut world = WorldState::new();
+        let me = EntityId(Uuid::from_u128(1));
+        let corpse = EntityId(Uuid::from_u128(2));
+        let mut corpse_e = make_entity(2, (1.0, 0.0));
+        corpse_e.kill();
+        world.entities.insert(me, make_entity(1, (0.0, 0.0)));
+        world.entities.insert(corpse, corpse_e);
+        let found = find_nearest_enemy(&world, &me);
+        assert_eq!(found, None, "唯一邻居已死，应返回 None");
+    }
+
+    // === run_player_code 感知快照填充（get_pos/scan 的数据通路）===
+
+    /// 扫描探针 WAT（同 arena 测试）：on_tick 调 scan(0,8) 存返回值，
+    /// 导出读回函数供 host 断言快照填充是否到位
+    const SCAN_PROBE_WAT: &str = r#"(module
+  (import "env" "scan" (func $scan (param i32 i32) (result i32)))
+  (global $found (mut i32) (i32.const 0))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    i32.const 0 i32.const 8 call $scan global.set $found)
+  (func (export "get_found") (result i32) global.get $found)
+  (func (export "get_enemy_x") (result f64) (f64.load (i32.const 0)))
+  (func (export "get_enemy_y") (result f64) (f64.load (i32.const 8)))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn run_player_code_fills_perception_snapshot_for_scan() {
+        // 数据通路：run_player_code 每 tick 填充 SandboxData.pos/nearest_enemy，
+        // 玩家代码 on_tick 里 scan 拿到的是 world 当前（tick 开始时）状态。
+        let mut world = WorldState::new();
+        let a = EntityId(Uuid::from_u128(1));
+        let b = EntityId(Uuid::from_u128(2));
+        world.entities.insert(a, make_entity(1, (0.0, 0.0)));
+        world.entities.insert(b, make_entity(2, (5.0, 7.0)));
+        let mut map = test_sandbox_map();
+        map.create(a, &wasm(SCAN_PROBE_WAT), 1_000_000).unwrap();
+        map.create(b, &wasm(SCAN_PROBE_WAT), 1_000_000).unwrap();
+        map.run_player_code(&world);
+        // A 视角：最近敌人是 B (5,7)
+        assert_eq!(call_i32_export(&mut map, &a, "get_found"), 1, "A 应扫描到 B");
+        let x = call_f64_export(&mut map, &a, "get_enemy_x");
+        let y = call_f64_export(&mut map, &a, "get_enemy_y");
+        assert_eq!(x, 5.0, "scan 写入的敌人 x 应为 B 的坐标");
+        assert_eq!(y, 7.0, "scan 写入的敌人 y 应为 B 的坐标");
+        // B 视角：最近敌人是 A (0,0)
+        assert_eq!(call_i32_export(&mut map, &b, "get_found"), 1, "B 应扫描到 A");
+        let x = call_f64_export(&mut map, &b, "get_enemy_x");
+        assert_eq!(x, 0.0, "scan 写入的敌人 x 应为 A 的坐标");
+    }
+
+    #[test]
+    fn run_player_code_scan_zero_when_alone() {
+        // 负面路径：世界只有一个实体 -> scan 返回 0（找不到敌人）
+        let mut world = WorldState::new();
+        let a = EntityId(Uuid::from_u128(1));
+        world.entities.insert(a, make_entity(1, (0.0, 0.0)));
+        let mut map = test_sandbox_map();
+        map.create(a, &wasm(SCAN_PROBE_WAT), 1_000_000).unwrap();
+        map.run_player_code(&world);
+        assert_eq!(
+            call_i32_export(&mut map, &a, "get_found"),
+            0,
+            "独存实体 scan 应返回 0"
+        );
+    }
+
+    // === move_by 全链路（import 排队 -> tick 阶段二应用）===
+
+    /// 右移一步 WAT：on_tick 调 move_by(1.0, 0.0)
+    const RIGHT_MOVER_WAT: &str = r#"(module
+  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
+  (func (export "on_tick")
+    f64.const 1.0 f64.const 0.0 call $move_by drop)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn tick_applies_move_by_queued_in_phase_one() {
+        // 全链路：on_tick 调 move_by 排队 SetPos -> tick 阶段二 a 步统一应用 -> 坐标变更。
+        // 实体站地面 (0,0)：物理无干扰（地面实体不受重力），tick 后应恰在 (1.0, 0.0)。
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world.entities.insert(id, make_entity(1, (0.0, 0.0)));
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut sandbox_map = test_sandbox_map();
+        sandbox_map.create(id, &wasm(RIGHT_MOVER_WAT), 1_000_000).unwrap();
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut sandbox_map,
+        );
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (1.0, 0.0),
+            "move_by 排队的 SetPos 应在阶段二应用（右移 1 步）"
+        );
+    }
+
+    #[test]
+    fn collect_pending_moves_drains_sandboxes() {
+        // collect_pending_moves：drain 各沙箱 pending_moves 并清空（不跨 tick 残留）
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world.entities.insert(id, make_entity(1, (0.0, 0.0)));
+        let mut map = test_sandbox_map();
+        map.create(id, &wasm(RIGHT_MOVER_WAT), 1_000_000).unwrap();
+        map.run_player_code(&world);
+        let moves = map.collect_pending_moves();
+        assert_eq!(moves.len(), 1, "应收集 1 条移动请求");
+        assert!(
+            map.collect_pending_moves().is_empty(),
+            "收集后应清空（不跨调用残留）"
+        );
+    }
+
+    // === 两只真性格生物（攻击者 A / 防御者 D）：行为与胜负演进 ===
+
+    /// 构造自定义外观实体（生物测试用：A 红 / D 青，glyph 各自设定）
+    fn make_creature(id_u: u128, pos: (f64, f64), name: &str, glyph: &str, color: &str) -> Entity {
+        Entity::new(
+            EntityId(Uuid::from_u128(id_u)),
+            PlayerId(Uuid::from_u128(99)),
+            name.to_string(),
+            pos,
+            Appearance::new(glyph.to_string(), color.to_string(), 1.0),
+            0,
+            1_000_000,
+        )
+    }
+
+    /// 战场脚手架：A(攻击者)@(5,0) 红、D(防御者)@(15,0) 青，各挂玩家代码沙箱，
+    /// 返回 (world, time, physics, renderer, storage, pending, sandbox_map, a_id, d_id)
+    #[allow(clippy::type_complexity)]
+    fn battle_stage(
+        defender_shield: i32,
+    ) -> (
+        WorldState,
+        TimeEngine,
+        DefaultPhysicsEngine,
+        Renderer,
+        StorageEngine,
+        Vec<PendingChange>,
+        EntitySandboxMap,
+        EntityId,
+        EntityId,
+    ) {
+        let mut world = WorldState::new();
+        let a = EntityId(Uuid::from_u128(1));
+        let d = EntityId(Uuid::from_u128(2));
+        world
+            .entities
+            .insert(a, make_creature(1, (5.0, 0.0), "attacker", "A", "red"));
+        world
+            .entities
+            .insert(d, make_creature(2, (15.0, 0.0), "defender", "D", "cyan"));
+        let mut sandbox_map = test_sandbox_map();
+        sandbox_map
+            .create(a, &wasm(ATTACKER_WAT), 1_000_000)
+            .unwrap();
+        sandbox_map
+            .create(d, &wasm(&defender_wat(defender_shield)), 1_000_000)
+            .unwrap();
+        (
+            world,
+            TimeEngine::new(),
+            DefaultPhysicsEngine::new(),
+            test_renderer(),
+            StorageEngine::open_in_memory().unwrap(),
+            Vec::new(),
+            sandbox_map,
+            a,
+            d,
+        )
+    }
+
+    /// 跑 N 个 tick（测试内无 sleep，tick() 纯逻辑）
+    #[allow(clippy::too_many_arguments)]
+    fn run_ticks(
+        world: &mut WorldState,
+        time: &mut TimeEngine,
+        physics: &DefaultPhysicsEngine,
+        renderer: &mut Renderer,
+        storage: &mut StorageEngine,
+        pending: &mut Vec<PendingChange>,
+        sandbox_map: &mut EntitySandboxMap,
+        n: u64,
+    ) {
+        for _ in 0..n {
+            tick(world, time, physics, renderer, storage, pending, sandbox_map);
+        }
+    }
+
+    #[test]
+    fn attacker_approaches_defender_step_by_step() {
+        // A 行为：开局 scan 锁定 D，逐 tick 朝 D 走 1.0 步（10.0 -> 1.0，轨迹单调递减），
+        // 进攻击范围（<=1.5）前不动手（未发生攻击 = D 拦截计数 0）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, a, d) =
+            battle_stage(10);
+        let mut prev_dist = 10.0f64;
+        for step in 1..=9u64 {
+            run_ticks(
+                &mut world,
+                &mut time,
+                &physics,
+                &mut renderer,
+                &mut storage,
+                &mut pending,
+                &mut map,
+                1,
+            );
+            let pa = world.entities.get(&a).unwrap().pos();
+            let pd = world.entities.get(&d).unwrap().pos();
+            let dist = ((pa.0 - pd.0).powi(2) + (pa.1 - pd.1).powi(2)).sqrt();
+            assert!(
+                dist < prev_dist,
+                "第 {step} tick A 应逼近 D：{prev_dist} -> {dist}"
+            );
+            prev_dist = dist;
+        }
+        let pa = world.entities.get(&a).unwrap().pos();
+        assert_eq!(
+            pa,
+            (14.0, 0.0),
+            "9 tick 后 A 应走到 (14,0)（每 tick 恰走 1.0）"
+        );
+        assert!(prev_dist <= 1.5, "9 tick 后应进入攻击范围，实际距离 {prev_dist}");
+        assert_eq!(
+            call_i32_export(&mut map, &d, "get_intercepts"),
+            0,
+            "进范围前 A 未攻击，D 不应有拦截记录"
+        );
+    }
+
+    #[test]
+    fn battle_defender_counters_and_kills_attacker() {
+        // 结局一（默认参数，盾=10）：A 进范围连砍 3 刀（tick 10/11/12）全被 D 拦截，
+        // D 每 4 tick 反制，tick 12 的反制刀命中静止的 A（A 无 on_attack）
+        // -> A 被击杀、D 掠夺 1 点。全程走两阶段结算（拦截在收件、击杀在结算）。
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, a, d) =
+            battle_stage(10);
+        run_ticks(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            15,
+        );
+        assert!(!world.entities.contains_key(&a), "A 应被 D 的反制刀击杀");
+        assert!(world.entities.get(&d).unwrap().is_alive(), "D 应存活");
+        assert_eq!(
+            world.entities.get(&d).unwrap().survival.points(),
+            4,
+            "D 应掠夺 A 的 1 点（3->4）"
+        );
+        assert_eq!(
+            call_i32_export(&mut map, &d, "get_intercepts"),
+            3,
+            "D 应拦截 A 的 3 刀（tick 10/11/12）"
+        );
+        assert_eq!(
+            call_i32_export(&mut map, &d, "get_shield"),
+            7,
+            "盾 10 被磨掉 3，应剩 7"
+        );
+    }
+
+    #[test]
+    fn battle_attacker_breaks_thin_shield_and_kills_defender() {
+        // 结局二（参数路径，盾=1）：A 磨穿防守——tick 10 耗掉最后一格盾，
+        // tick 11 的刀不再被拦截 -> 结算换血击杀 D、A 掠夺 1 点。
+        // 盾=1 时 D 的下一轮反制（tick 12）永远等不到，结果确定非随机。
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, a, d) =
+            battle_stage(1);
+        run_ticks(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            12,
+        );
+        assert!(!world.entities.contains_key(&d), "D 应被 A 磨穿防守后击杀");
+        assert!(world.entities.get(&a).unwrap().is_alive(), "A 应存活");
+        assert_eq!(
+            world.entities.get(&a).unwrap().survival.points(),
+            4,
+            "A 应掠夺 D 的 1 点（3->4）"
+        );
+    }
 
     #[test]
     fn tick_attack_pipeline_kills_and_plunders() {
@@ -2044,7 +2573,7 @@ mod tests {
         let mut sandbox_map = test_sandbox_map();
         // 攻击方在 (0,0)，on_tick 调 attack_at(5.0, 0.0, 0, 0)（空 payload 默认击杀）
         let attacker =
-            make_entity_with_sandbox(&mut world, &mut sandbox_map, 1, (0.0, 0.0), ATTACKER_WAT);
+            make_entity_with_sandbox(&mut world, &mut sandbox_map, 1, (0.0, 0.0), PIPELINE_ATTACKER_WAT);
         // 目标在 (5.0, 0.0)，life=true 无 on_attack
         let target =
             make_entity_with_sandbox(&mut world, &mut sandbox_map, 2, (5.0, 0.0), TARGET_WAT);

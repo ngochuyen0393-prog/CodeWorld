@@ -8,6 +8,7 @@ use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
 
 use crate::attack::PendingAttack;
 use codeworld_core::entity::EntityId;
+use codeworld_core::pending::PendingChange;
 
 /// attack payload 最大字节数（1MB，架构 4.2 技术保护）
 ///
@@ -40,6 +41,16 @@ pub struct SandboxData {
     pub entity_id: EntityId,
     /// 本 tick 排队的攻击请求（env.attack_at 推入，阶段二收集后 drain 清空）
     pub pending_attacks: Vec<PendingAttack>,
+    /// 本沙箱实体的坐标快照（host 每 tick 阶段一执行玩家代码【前】填充；
+    /// import 回调拿不到 world，玩家代码经 env.get_pos 读到的是 tick 开始时的状态，
+    /// 与架构 4.1"玩家代码读取的是 tick 开始时的快照状态"一致）
+    pub pos: (f64, f64),
+    /// 最近敌人的坐标快照（host 每 tick 阶段一【前】填充；None=世界没有其他存活实体，
+    /// env.scan 返回 0）。MVP 感知=屏幕可见层上帝视角单敌人（架构 3.2 感知接口的最简版）。
+    pub nearest_enemy: Option<(f64, f64)>,
+    /// 本 tick 排队的移动请求（env.move_by 推入 PendingChange::SetPos，
+    /// 阶段二收集后并入主 pending 队列统一应用，与攻击排队同模式）
+    pub pending_moves: Vec<PendingChange>,
 }
 
 impl SandboxData {
@@ -92,9 +103,110 @@ impl SandboxManager {
     ///   - 返回 1=已排队，0=拒绝（超限）。
     fn make_linker(engine: &Engine) -> Result<Linker<SandboxData>> {
         let mut linker = Linker::new(engine);
-        linker.func_wrap("env", "log", |mut caller: Caller<SandboxData>, _v: i32| {
+        // env.log(v)：玩家代码日志（v 为玩家自定义 marker，含义见各生物 WAT 注释）。
+        // 记 api_calls 元数据 + tracing::info 输出到 stderr（战斗节点可见性）。
+        linker.func_wrap("env", "log", |mut caller: Caller<SandboxData>, v: i32| {
             caller.data_mut().api_calls.push("log".to_string());
+            tracing::info!(
+                entity_id = %caller.data().entity_id.0,
+                marker = v,
+                "[player_log] 玩家代码日志"
+            );
         })?;
+        // env.get_pos() -> (f64, f64)：读自己坐标（架构 3.2 空间接口）。
+        // 多值返回用元组（wasmtime multi-value）；数据来自 host 填充的坐标快照。
+        linker.func_wrap("env", "get_pos", |mut caller: Caller<SandboxData>| -> (f64, f64) {
+            caller.data_mut().api_calls.push("get_pos".to_string());
+            let (x, y) = caller.data().pos;
+            tracing::debug!(
+                entity_id = %caller.data().entity_id.0,
+                x,
+                y,
+                "[get_pos] 玩家代码读取自身坐标"
+            );
+            (x, y)
+        })?;
+        // env.scan(x_ptr, y_ptr) -> i32：感知接口 MVP（架构 3.2 感知接口最简版，
+        // 文档完整版为 get_visible_entities 返回可见实体列表；MVP 单敌人=最近者）。
+        // 有敌人：把最近敌人坐标写进 caller memory（x 8字节@x_ptr、y 8字节@y_ptr），
+        // 返回 1；无敌人或写入指针非法：不写 memory，返回 0（玩家代码自判）。
+        linker.func_wrap(
+            "env",
+            "scan",
+            |mut caller: Caller<SandboxData>, x_ptr: i32, y_ptr: i32| -> i32 {
+                caller.data_mut().api_calls.push("scan".to_string());
+                let entity = caller.data().entity_id;
+                let Some(enemy) = caller.data().nearest_enemy else {
+                    tracing::debug!(entity_id = %entity.0, "[scan] 无敌人（世界无其他存活实体）");
+                    return 0;
+                };
+                let x_ok = write_f64_to_caller(&mut caller, x_ptr, enemy.0);
+                let y_ok = write_f64_to_caller(&mut caller, y_ptr, enemy.1);
+                if !x_ok || !y_ok {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        x_ptr,
+                        y_ptr,
+                        "[scan] 写入指针非法，扫描作废"
+                    );
+                    return 0;
+                }
+                tracing::info!(
+                    entity_id = %entity.0,
+                    enemy_x = enemy.0,
+                    enemy_y = enemy.1,
+                    "[scan] 锁定最近敌人"
+                );
+                1
+            },
+        )?;
+        // env.move_by(dx, dy) -> i32：相对移动（任务书指定；架构 3.2 文档为绝对 set_pos，
+        // MVP 取相对语义——目标点由 host 侧用坐标快照计算，玩家代码无需自己维护位置）。
+        // 合法 -> 排队 PendingChange::SetPos 进 pending_moves（阶段二统一应用，与攻击排队
+        // 同模式，不即时改坐标）；拒绝 -> 返回 0 不入队。拒绝条件：
+        //   - dx/dy 非有限（NaN/无穷，WASM 浮点除零可产生）：防污染世界状态
+        //   - 目标 y < 0（钻地，默认物理地面 y=0）
+        linker.func_wrap(
+            "env",
+            "move_by",
+            |mut caller: Caller<SandboxData>, dx: f64, dy: f64| -> i32 {
+                caller.data_mut().api_calls.push("move_by".to_string());
+                let entity = caller.data().entity_id;
+                let (x, y) = caller.data().pos;
+                if !dx.is_finite() || !dy.is_finite() {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        dx,
+                        dy,
+                        "[move_by] 偏移量非有限，拒绝入队"
+                    );
+                    return 0;
+                }
+                let target = (x + dx, y + dy);
+                if target.1 < 0.0 {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        target_y = target.1,
+                        "[move_by] 目标钻地（y<0），拒绝入队"
+                    );
+                    return 0;
+                }
+                caller
+                    .data_mut()
+                    .pending_moves
+                    .push(PendingChange::SetPos {
+                        entity,
+                        new_pos: target,
+                    });
+                tracing::info!(
+                    entity_id = %entity.0,
+                    from = ?(x, y),
+                    to = ?target,
+                    "[move_by] 移动已排队（阶段二应用）"
+                );
+                1
+            },
+        )?;
         linker.func_wrap(
             "env",
             "attack_at",
@@ -314,6 +426,34 @@ fn read_payload_from_caller(caller: &mut Caller<SandboxData>, ptr: i32, len: i32
     data[start..end].to_vec()
 }
 
+/// 向 caller 的 memory export 写入一个 f64（8字节小端）（env.scan 的敌人坐标输出）
+///
+/// 模块未导出 memory / ptr<0 / ptr+8 越界 -> false（写入失败，调用方返回 0 作废扫描）。
+fn write_f64_to_caller(caller: &mut Caller<SandboxData>, ptr: i32, value: f64) -> bool {
+    if ptr < 0 {
+        return false;
+    }
+    let Some(memory) = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+    else {
+        tracing::debug!("[write_f64] 模块未导出 memory，写入失败");
+        return false;
+    };
+    let start = ptr as usize;
+    // checked_add：防 32 位回绕绕过越界检查（与 read_payload 同款防御）
+    let Some(end) = start.checked_add(8) else {
+        tracing::warn!(ptr, "[write_f64] 写入地址回绕，写入失败");
+        return false;
+    };
+    if end > memory.data(&*caller).len() {
+        tracing::warn!(ptr, "[write_f64] 写入越界，写入失败");
+        return false;
+    }
+    memory.data_mut(&mut *caller)[start..end].copy_from_slice(&value.to_le_bytes());
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +654,238 @@ mod tests {
     f64.const 1.0 f64.const 2.0 i32.const 0 i32.const 1048576 call $attack_at drop
     f64.const 1.0 f64.const 2.0 i32.const 0 i32.const 1048577 call $attack_at drop)
   (func (export "life") (result i32) i32.const 1))"#;
+
+    // === env.get_pos import（架构 3.2：读自己坐标）===
+
+    /// 探针 WAT：on_tick 调 get_pos（多值返回 x,y），存入全局变量供 host 观测
+    const GET_POS_PROBE_WAT: &str = r#"(module
+  (import "env" "get_pos" (func $get_pos (result f64 f64)))
+  (global $gx (mut f64) (f64.const 0))
+  (global $gy (mut f64) (f64.const 0))
+  (func (export "on_tick")
+    call $get_pos
+    global.set $gy
+    global.set $gx)
+  (func (export "get_x") (result f64) global.get $gx)
+  (func (export "get_y") (result f64) global.get $gy)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 从实体当前沙箱调用无参 f64 导出（测试观测探针全局变量）
+    fn call_f64_export(handle: &mut SandboxHandle, name: &str) -> f64 {
+        let func = handle
+            .instance
+            .get_typed_func::<(), f64>(&mut handle.store, name)
+            .unwrap();
+        func.call(&mut handle.store, ()).unwrap()
+    }
+
+    #[test]
+    fn get_pos_import_returns_sandbox_pos() {
+        // get_pos import：on_tick 调 get_pos 拿到 host 填充的自身坐标快照。
+        // host 在阶段一前把实体坐标写进 SandboxData.pos（import 回调拿不到 world，
+        // 快照模式与 attack_at 排队一致：玩家代码读 tick 开始时的状态）。
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(GET_POS_PROBE_WAT), 100_000, id(301))
+            .unwrap();
+        handle.store.data_mut().pos = (3.5, 7.25);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let x = call_f64_export(&mut handle, "get_x");
+        let y = call_f64_export(&mut handle, "get_y");
+        assert_eq!(x, 3.5, "get_pos 应返回快照坐标 x");
+        assert_eq!(y, 7.25, "get_pos 应返回快照坐标 y");
+        assert!(
+            handle.store.data().api_calls.contains(&"get_pos".to_string()),
+            "get_pos 调用应记入 api_calls 元数据"
+        );
+    }
+
+    // === env.scan import（架构 3.2 感知接口 MVP：最近敌人坐标写 memory）===
+
+    /// 扫描方 WAT：on_tick 调 scan(0, 8)（敌人 x 写 memory[0..8]、y 写 [8..16]），
+    /// 返回值存全局；导出读回函数供 host 观测
+    const SCAN_PROBE_WAT: &str = r#"(module
+  (import "env" "scan" (func $scan (param i32 i32) (result i32)))
+  (global $found (mut i32) (i32.const 0))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    i32.const 0 i32.const 8 call $scan global.set $found)
+  (func (export "get_found") (result i32) global.get $found)
+  (func (export "get_enemy_x") (result f64) (f64.load (i32.const 0)))
+  (func (export "get_enemy_y") (result f64) (f64.load (i32.const 8)))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn scan_import_writes_enemy_pos_to_memory() {
+        // scan：有敌人时把最近敌人坐标写入 caller memory（x@ptr0 8字节、y@ptr1 8字节），返回 1
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(SCAN_PROBE_WAT), 100_000, id(401))
+            .unwrap();
+        handle.store.data_mut().nearest_enemy = Some((-2.5, 9.75));
+        mgr.call_on_tick(&mut handle).unwrap();
+        let func_found = handle
+            .instance
+            .get_typed_func::<(), i32>(&mut handle.store, "get_found")
+            .unwrap();
+        assert_eq!(func_found.call(&mut handle.store, ()).unwrap(), 1, "找到敌人应返回 1");
+        let x = call_f64_export(&mut handle, "get_enemy_x");
+        let y = call_f64_export(&mut handle, "get_enemy_y");
+        assert_eq!(x, -2.5, "敌人 x 应写入 memory[0..8]");
+        assert_eq!(y, 9.75, "敌人 y 应写入 memory[8..16]");
+        assert!(
+            handle.store.data().api_calls.contains(&"scan".to_string()),
+            "scan 调用应记入 api_calls 元数据"
+        );
+    }
+
+    #[test]
+    fn scan_import_returns_zero_when_no_enemy() {
+        // 负面路径：世界没有其他存活实体（nearest_enemy=None）-> 返回 0、不写 memory
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(SCAN_PROBE_WAT), 100_000, id(402))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        let func_found = handle
+            .instance
+            .get_typed_func::<(), i32>(&mut handle.store, "get_found")
+            .unwrap();
+        assert_eq!(func_found.call(&mut handle.store, ()).unwrap(), 0, "无敌人应返回 0");
+        let x = call_f64_export(&mut handle, "get_enemy_x");
+        assert_eq!(x, 0.0, "无敌人不应写 memory（保持初始 0）");
+    }
+
+    #[test]
+    fn scan_import_rejects_out_of_bounds_ptr() {
+        // 负面路径：写入指针越界（memory 1 页=64KB，ptr=65536 越界）-> 返回 0 不 panic
+        const SCAN_BAD_PTR_WAT: &str = r#"(module
+  (import "env" "scan" (func $scan (param i32 i32) (result i32)))
+  (global $found (mut i32) (i32.const 0))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    i32.const 65536 i32.const 8 call $scan global.set $found)
+  (func (export "get_found") (result i32) global.get $found)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(SCAN_BAD_PTR_WAT), 100_000, id(403))
+            .unwrap();
+        handle.store.data_mut().nearest_enemy = Some((1.0, 2.0));
+        mgr.call_on_tick(&mut handle).unwrap();
+        let func_found = handle
+            .instance
+            .get_typed_func::<(), i32>(&mut handle.store, "get_found")
+            .unwrap();
+        assert_eq!(
+            func_found.call(&mut handle.store, ()).unwrap(),
+            0,
+            "指针越界应返回 0（扫描作废）"
+        );
+    }
+
+    // === env.move_by import（架构 3.2 空间接口 MVP：相对移动经 SetPos 队列）===
+
+    /// 移动方 WAT：on_tick 调 move_by(2.0, 3.0)，返回值存全局
+    const MOVER_WAT: &str = r#"(module
+  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (func (export "on_tick")
+    f64.const 2.0 f64.const 3.0 call $move_by global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 地下移动 WAT：on_tick 调 move_by(0.0, -100.0)（从 y>=0 出发目标必钻地）
+    const UNDERGROUND_MOVER_WAT: &str = r#"(module
+  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (func (export "on_tick")
+    f64.const 0.0 f64.const -100.0 call $move_by global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// NaN 移动 WAT：on_tick 调 move_by(NaN, 0.0)（除零/溢出可产生 NaN，防御性拒绝）
+    const NAN_MOVER_WAT: &str = r#"(module
+  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (func (export "on_tick")
+    f64.const 0.0 f64.const 0.0 f64.div f64.const 0.0 call $move_by global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn move_by_import_queues_setpos_change() {
+        // move_by：合法移动 -> 排队 PendingChange::SetPos（目标点=快照坐标+偏移），返回 1。
+        // 不即时改坐标：与攻击排队同模式，阶段二统一应用（架构 4.1 PendingChanges）。
+        let mgr = SandboxManager::new().unwrap();
+        let mover_id = id(501);
+        let mut handle = mgr
+            .create_sandbox(&wasm(MOVER_WAT), 100_000, mover_id)
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 20.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let func_ret = handle
+            .instance
+            .get_typed_func::<(), i32>(&mut handle.store, "get_ret")
+            .unwrap();
+        assert_eq!(func_ret.call(&mut handle.store, ()).unwrap(), 1, "合法移动应返回 1");
+        let moves = &handle.store.data().pending_moves;
+        assert_eq!(moves.len(), 1, "应排队 1 条移动请求");
+        match &moves[0] {
+            PendingChange::SetPos { entity, new_pos } => {
+                assert_eq!(*entity, mover_id, "SetPos 应指向沙箱绑定的实体");
+                assert_eq!(*new_pos, (12.0, 23.0), "目标点应为快照坐标+偏移");
+            }
+            other => panic!("应为 SetPos 变更，实际 {other:?}"),
+        }
+        assert!(
+            handle.store.data().api_calls.contains(&"move_by".to_string()),
+            "move_by 调用应记入 api_calls 元数据"
+        );
+    }
+
+    #[test]
+    fn move_by_import_rejects_underground_target() {
+        // 负面路径（移动越界）：目标 y < 0 钻地 -> 拒绝（返回 0，不入队）。
+        // 默认物理地面 y=0，钻地移动是非法请求。
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(UNDERGROUND_MOVER_WAT), 100_000, id(502))
+            .unwrap();
+        handle.store.data_mut().pos = (5.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let func_ret = handle
+            .instance
+            .get_typed_func::<(), i32>(&mut handle.store, "get_ret")
+            .unwrap();
+        assert_eq!(func_ret.call(&mut handle.store, ()).unwrap(), 0, "钻地移动应被拒绝");
+        assert!(
+            handle.store.data().pending_moves.is_empty(),
+            "被拒绝的移动不应入队"
+        );
+    }
+
+    #[test]
+    fn move_by_import_rejects_non_finite_delta() {
+        // 负面路径：dx/dy 非有限（NaN/无穷，WASM 除零可产生）-> 拒绝（返回 0，不入队），
+        // 防止 NaN 坐标污染世界状态。
+        // 构造：0.0/0.0 = NaN（WASM 浮点除零不 trap，产生 NaN）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(NAN_MOVER_WAT), 100_000, id(503))
+            .unwrap();
+        handle.store.data_mut().pos = (5.0, 5.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let func_ret = handle
+            .instance
+            .get_typed_func::<(), i32>(&mut handle.store, "get_ret")
+            .unwrap();
+        assert_eq!(func_ret.call(&mut handle.store, ()).unwrap(), 0, "NaN 移动应被拒绝");
+        assert!(
+            handle.store.data().pending_moves.is_empty(),
+            "被拒绝的移动不应入队"
+        );
+    }
 
     #[test]
     fn attack_at_import_rejects_oversized_payload() {
