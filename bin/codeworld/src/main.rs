@@ -150,12 +150,12 @@ impl EntitySandboxMap {
     /// - 返回 killed：替换后 life()=false，或 life() 调用失败（破损沙箱等同死亡）。
     /// - 不处理掠夺：掠夺需改 world（survival），由调用方 settle_attacks 在击杀后处理。
     fn replace_code(&mut self, target_id: &EntityId, payload: &[u8]) -> Result<bool> {
-        // fuel 剩余量在任何 remove 之前读（读失败也不能弄丢旧沙箱）
-        let fuel = {
+        // fuel 剩余量与原配额在任何 remove 之前读（读失败也不能弄丢旧沙箱）
+        let (fuel, old_limit) = {
             let Some(handle) = self.sandboxes.get_mut(target_id) else {
                 anyhow::bail!("目标 {:?} 无沙箱，无法换血", target_id);
             };
-            handle.store.get_fuel()?
+            (handle.store.get_fuel()?, handle.store.data().fuel_limit)
         };
         let old = self
             .sandboxes
@@ -166,7 +166,7 @@ impl EntitySandboxMap {
         } else {
             payload
         };
-        let new_handle = match self.manager.replace_sandbox(old, wasm_bytes, fuel) {
+        let mut new_handle = match self.manager.replace_sandbox(old, wasm_bytes, fuel) {
             Ok(h) => h,
             Err((old_handle, e)) => {
                 // P0 僵尸修复：编译/实例化失败，旧沙箱放回映射表
@@ -179,13 +179,21 @@ impl EntitySandboxMap {
                 anyhow::bail!("换血失败：payload 非法");
             }
         };
+        // P1 修复（审查第二轮）：fuel_limit 恢复原配额——fuel 继承只继承【当 tick 剩余量】
+        //（防吃刀回满刷配额），上限不缩水（防反复被攻击单调递减磨死，绕过架构 4.1
+        // "超额不死亡、下次 tick 继续"保护）
+        new_handle.store.data_mut().fuel_limit = old_limit;
         self.sandboxes.insert(*target_id, new_handle);
         tracing::info!(
             target = %target_id.0,
             fuel_inherited = fuel,
-            "[replace_code] 目标沙箱已替换（路线A，fuel 继承剩余量）"
+            fuel_limit_restored = old_limit,
+            "[replace_code] 目标沙箱已替换（路线A，fuel 继承剩余量，配额恢复原值）"
         );
-        // 检查 life()：false=击杀成功；调用失败视为击杀（破损沙箱等同死亡）
+        // 检查 life()：false=击杀成功。
+        // P1 修复（审查第一轮）：life() 无法执行（Err）= 攻击结果未知，按架构 4.2 默认行为
+        // 处理（life 维持原值，不被覆写）-> 不判死。防止防守 fuel 被磨穿的边界下
+        // 良性刀（击晕/绑架）被误收割"击杀+掠夺"（铁律 4：无击杀=无掠夺）。
         let handle = self
             .sandboxes
             .get_mut(target_id)
@@ -197,9 +205,9 @@ impl EntitySandboxMap {
                 tracing::warn!(
                     target = %target_id.0,
                     error = %e,
-                    "[replace_code] 替换后 life() 调用失败，视为击杀"
+                    "[replace_code] 替换后 life() 调用失败，life 维持原值不判死"
                 );
-                Ok(true)
+                Ok(false)
             }
         }
     }
@@ -529,6 +537,10 @@ fn deliver_attacks(
     attacks: &[PendingAttack],
 ) -> Vec<PendingStrike> {
     let mut strikes: Vec<PendingStrike> = Vec::new();
+    let mut voided = 0usize; // 攻击者已死作废
+    let mut missed = 0usize; // 坐标落空
+    let mut defense_failed = 0usize; // 防守询问失败作废
+    let mut intercepted_count = 0usize; // on_attack 拦截
     for atk in attacks {
         // 攻击者已死 -> 攻击作废
         let attacker_alive = world
@@ -537,6 +549,7 @@ fn deliver_attacks(
             .map(|e| e.is_alive())
             .unwrap_or(false);
         if !attacker_alive {
+            voided += 1;
             tracing::info!(
                 attacker = %atk.attacker.0,
                 "[deliver_attacks] 攻击者已死，攻击作废"
@@ -550,6 +563,7 @@ fn deliver_attacks(
             .find(|e| e.is_alive() && e.pos() == atk.target_pos)
             .map(|e| e.id)
         else {
+            missed += 1;
             tracing::info!(
                 attacker = %atk.attacker.0,
                 pos = ?atk.target_pos,
@@ -561,6 +575,7 @@ fn deliver_attacks(
         let intercepted = match sandbox_map.defend(&target_id, &atk.payload) {
             Ok(v) => v,
             Err(e) => {
+                defense_failed += 1;
                 tracing::warn!(
                     attacker = %atk.attacker.0,
                     target = %target_id.0,
@@ -570,6 +585,9 @@ fn deliver_attacks(
                 continue;
             }
         };
+        if intercepted {
+            intercepted_count += 1;
+        }
         tracing::info!(
             attacker = %atk.attacker.0,
             target = %target_id.0,
@@ -585,12 +603,14 @@ fn deliver_attacks(
     }
     // 确定序：全局按攻击者 EntityId 升序（结算顺序，消灭遍历随机性）
     strikes.sort_by_key(|s| s.attack.attacker.0);
-    let intercepted_count = attacks.len() - strikes.len();
     tracing::info!(
         total = attacks.len(),
+        voided,
+        missed,
+        defense_failed,
         intercepted = intercepted_count,
         pending = strikes.len(),
-        "[deliver_attacks] 收件完成：待结算刀数"
+        "[deliver_attacks] 收件完成：作废/落空/防守失败/拦截/待结算"
     );
     strikes
 }
@@ -1603,8 +1623,8 @@ mod tests {
 
     #[test]
     fn replace_code_uses_remaining_fuel_not_limit() {
-        // P1（验收#4）：换血时新沙箱 fuel 取旧沙箱剩余量而非 fuel_limit
-        // （旧实现取 fuel_limit：每次被攻击回满配额，可被刷）
+        // P1（验收#4）+ 审查 P1-2：换血继承旧沙箱【当 tick 剩余量】（防吃刀回满刷配额），
+        // 但 fuel_limit 恢复原配额（防反复被攻击单调递减磨死，绕过"超额不死亡"保护）
         let mut map = test_sandbox_map();
         let target_id = EntityId(Uuid::from_u128(11));
         map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
@@ -1616,11 +1636,71 @@ mod tests {
         map.replace_code(&target_id, &wasm(TARGET_WAT)).unwrap();
         let handle = map.sandboxes.get(&target_id).unwrap();
         assert_eq!(
-            handle.store.data().fuel_limit, 500,
-            "新沙箱配额应等于旧沙箱剩余量（500），而非原上限 100 万"
+            handle.store.data().fuel_limit,
+            1_000_000,
+            "新沙箱配额上限应恢复原配额，不随换血缩水"
         );
         let remaining = handle.store.get_fuel().unwrap();
-        assert!(remaining < 500, "新沙箱 life() 调用应消耗少量 fuel，实际剩余 {remaining}");
+        assert!(
+            remaining < 500,
+            "新沙箱应从剩余量 500 起步（life() 消耗后 <500），实际 {remaining}"
+        );
+    }
+
+    /// 缺 life 导出的模块（换血后 call_life 无法执行 -> Err，无 wasm trap 的干净构造）
+    const NO_LIFE_WAT: &str = r#"(module (func (export "on_tick")))"#;
+
+    /// on_attack 签名不匹配的模块（defend 询问失败 -> Err，无 wasm trap 的干净构造）
+    const BAD_SIGNATURE_ON_ATTACK_WAT: &str = r#"(module
+  (func (export "on_attack") (param i64) (result i64) i64.const 1)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn replace_code_life_unavailable_not_killed() {
+        // 审查 P1-1：换血后 life() 无法执行（Err）-> 按"life 维持原值"处理不判死，
+        // 防止良性刀在防守 fuel 被磨穿的边界下误收割"击杀+掠夺"
+        // （架构 4.2 默认行为延伸：配额耗尽/结果未知时 life 不被覆写）。
+        // 构造用"缺 life 导出"（host 侧 Err）：wasm 内 out-of-fuel trap 在 Windows +
+        // wasmtime 25.0.3 下会 nounwind abort 进程，无法安全构造真实 fuel-trap 路径，
+        // Err 分支行为二者等价（fuel 磨穿到 instantiate 都烧不起时走 P0 路径同样不判死）。
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(13));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        let killed = map
+            .replace_code(&target_id, &wasm(NO_LIFE_WAT))
+            .unwrap();
+        assert!(!killed, "life() 无法执行时不应判死");
+        // 沙箱条目仍在（新模块已挂上，但本刀未达成击杀效果）
+        assert!(map.sandboxes.contains_key(&target_id), "换血后沙箱条目应仍在");
+    }
+
+    #[test]
+    fn process_attacks_defense_exhausted_blade_void() {
+        // 需求审查 P1（补覆盖）：防守询问失败 -> 该刀作废，目标不被换血、存活。
+        // 构造用"on_attack 签名不匹配"（host 侧 Err）：wasm 内 out-of-fuel trap 在
+        // Windows + wasmtime 25.0.3 下会 nounwind abort 进程（见 .cc-bugs #5），
+        // 无法在测试中安全构造真实 fuel-trap 路径，Err 处理行为二者等价。
+        // "未被换血"用 api_calls 哨兵判定：换血=新 store 会清空哨兵。
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 50, (0.0, 0.0), BAD_SIGNATURE_ON_ATTACK_WAT);
+        let b = make_entity_with_sandbox(&mut world, &mut map, 51, (5.0, 0.0), PLAYER_WAT);
+        {
+            let handle = map.sandboxes.get_mut(&a).unwrap();
+            handle.store.data_mut().api_calls.push("sentinel".to_string());
+        }
+        let attacks = vec![PendingAttack {
+            attacker: b,
+            target_pos: (0.0, 0.0),
+            payload: vec![9],
+        }];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert!(world.entities.get(&a).unwrap().is_alive(), "防守失败 -> 刀作废，A 应存活");
+        let handle = map.sandboxes.get(&a).unwrap();
+        assert!(
+            handle.store.data().api_calls.contains(&"sentinel".to_string()),
+            "A 应仍是原沙箱（未被换血，哨兵应保留）"
+        );
     }
 
     #[test]
