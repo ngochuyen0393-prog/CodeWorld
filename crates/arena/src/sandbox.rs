@@ -140,9 +140,11 @@ impl SandboxManager {
                     tracing::debug!(entity_id = %entity.0, "[scan] 无敌人（世界无其他存活实体）");
                     return 0;
                 };
-                let x_ok = write_f64_to_caller(&mut caller, x_ptr, enemy.0);
-                let y_ok = write_f64_to_caller(&mut caller, y_ptr, enemy.1);
-                if !x_ok || !y_ok {
+                // 原子语义预检：两个指针先全量校验（只查不写），全部合法才落笔，
+                // 避免其一非法时另一半坐标已写入 memory 的半截副作用
+                let ptrs_ok = can_write_f64_to_caller(&mut caller, x_ptr)
+                    && can_write_f64_to_caller(&mut caller, y_ptr);
+                if !ptrs_ok {
                     tracing::warn!(
                         entity_id = %entity.0,
                         x_ptr,
@@ -151,6 +153,8 @@ impl SandboxManager {
                     );
                     return 0;
                 }
+                write_f64_to_caller(&mut caller, x_ptr, enemy.0);
+                write_f64_to_caller(&mut caller, y_ptr, enemy.1);
                 tracing::info!(
                     entity_id = %entity.0,
                     enemy_x = enemy.0,
@@ -165,7 +169,9 @@ impl SandboxManager {
         // 合法 -> 排队 PendingChange::SetPos 进 pending_moves（阶段二统一应用，与攻击排队
         // 同模式，不即时改坐标）；拒绝 -> 返回 0 不入队。拒绝条件：
         //   - dx/dy 非有限（NaN/无穷，WASM 浮点除零可产生）：防污染世界状态
-        //   - 目标 y < 0（钻地，默认物理地面 y=0）
+        //   - 目标点非有限（有限+有限可上溢为无穷）或 y < 0（钻地，默认物理地面 y=0）
+        // 注：同 tick 多次 move_by 各自从同一快照算绝对目标，阶段二按序应用后
+        // 仅最后一次生效（非增量累加）；正常用法每 tick 只 move 一次。
         linker.func_wrap(
             "env",
             "move_by",
@@ -183,6 +189,18 @@ impl SandboxManager {
                     return 0;
                 }
                 let target = (x + dx, y + dy);
+                // 目标点有限性守卫：dx/dy 各自有限不代表和有限——有限+有限按 IEEE 754
+                // 可上溢为无穷（如 x=1e308 再 +1e308），非有限坐标入队会污染世界状态
+                //（感知算出 NaN、attack_at 坐标相等判定永失配）
+                if !target.0.is_finite() || !target.1.is_finite() {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        target_x = target.0,
+                        target_y = target.1,
+                        "[move_by] 目标点非有限，拒绝入队"
+                    );
+                    return 0;
+                }
                 if target.1 < 0.0 {
                     tracing::warn!(
                         entity_id = %entity.0,
@@ -424,6 +442,25 @@ fn read_payload_from_caller(caller: &mut Caller<SandboxData>, ptr: i32, len: i32
         return Vec::new();
     }
     data[start..end].to_vec()
+}
+
+/// 检查向 caller 的 memory export 写入一个 f64 是否合法（只查不写）
+///
+/// env.scan 的双指针原子预检用：两个指针全部合法才落笔，避免半写入副作用。
+fn can_write_f64_to_caller(caller: &mut Caller<SandboxData>, ptr: i32) -> bool {
+    if ptr < 0 {
+        return false;
+    }
+    let Some(memory) = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+    else {
+        return false;
+    };
+    let Some(end) = (ptr as usize).checked_add(8) else {
+        return false;
+    };
+    end <= memory.data(&*caller).len()
 }
 
 /// 向 caller 的 memory export 写入一个 f64（8字节小端）（env.scan 的敌人坐标输出）
@@ -885,6 +922,69 @@ mod tests {
             handle.store.data().pending_moves.is_empty(),
             "被拒绝的移动不应入队"
         );
+    }
+
+    /// 大坐标移动 WAT：on_tick 调 move_by(1e308, 0.0)——host 侧 pos.x=1e308 时
+    /// x+dx 按 IEEE 754 上溢为 +inf（有限+有限可上溢）
+    const BIG_MOVER_WAT: &str = r#"(module
+  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (func (export "on_tick")
+    f64.const 1e308 f64.const 0.0 call $move_by global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn move_by_import_rejects_overflowed_target() {
+        // P1（审查 1 轮）：dx/dy 各自有限，但 x+dx 上溢为 +inf -> 目标点非有限，
+        // 必须拒绝（入队 SetPos(inf) 会污染世界状态：感知 NaN/攻击坐标永失配）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(BIG_MOVER_WAT), 100_000, id(504))
+            .unwrap();
+        handle.store.data_mut().pos = (1e308, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let func_ret = handle
+            .instance
+            .get_typed_func::<(), i32>(&mut handle.store, "get_ret")
+            .unwrap();
+        assert_eq!(
+            func_ret.call(&mut handle.store, ()).unwrap(),
+            0,
+            "上溢目标点应被拒绝"
+        );
+        assert!(
+            handle.store.data().pending_moves.is_empty(),
+            "上溢移动不应入队"
+        );
+    }
+
+    #[test]
+    fn scan_import_writes_nothing_when_y_ptr_invalid() {
+        // P2（审查 1 轮）：y 指针非法时 x 也不应被写入（原子语义：全写或全不写），
+        // 与注释"写入指针非法：不写 memory"一致
+        const SCAN_BAD_Y_PTR_WAT: &str = r#"(module
+  (import "env" "scan" (func $scan (param i32 i32) (result i32)))
+  (global $found (mut i32) (i32.const 0))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    i32.const 0 i32.const 65536 call $scan global.set $found)
+  (func (export "get_found") (result i32) global.get $found)
+  (func (export "get_enemy_x") (result f64) (f64.load (i32.const 0)))
+  (func (export "life") (result i32) i32.const 1))"#;
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(SCAN_BAD_Y_PTR_WAT), 100_000, id(404))
+            .unwrap();
+        handle.store.data_mut().nearest_enemy = Some((9.5, 2.5));
+        mgr.call_on_tick(&mut handle).unwrap();
+        let func_found = handle
+            .instance
+            .get_typed_func::<(), i32>(&mut handle.store, "get_found")
+            .unwrap();
+        assert_eq!(func_found.call(&mut handle.store, ()).unwrap(), 0, "y 指针非法应返回 0");
+        let x = call_f64_export(&mut handle, "get_enemy_x");
+        assert_eq!(x, 0.0, "y 指针非法时 x 不应被写入（保持初始 0）");
     }
 
     #[test]

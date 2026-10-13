@@ -479,8 +479,10 @@ fn apply_pending_changes(world: &mut WorldState, pending: &mut Vec<PendingChange
                 }
             }
             PendingChange::SetPos { entity, new_pos } => {
-                tracing::debug!(entity_id = %entity.0, ?new_pos, "应用 SetPos");
-                if let Some(e) = world.entities.get_mut(&entity) {
+                // 死亡实体不应用移动：同 tick 内 life()=false 实体排队的移动作废
+                //（死亡清理步随后移除实体，尸体位移属无人消费的顺序耦合，应用侧直接拦）
+                if let Some(e) = world.entities.get_mut(&entity).filter(|e| e.is_alive()) {
+                    tracing::debug!(entity_id = %entity.0, ?new_pos, "应用 SetPos");
                     e.set_pos(new_pos);
                 }
             }
@@ -1144,6 +1146,27 @@ mod tests {
         ];
         apply_pending_changes(&mut world, &mut pending);
         assert!(pending.is_empty(), "apply 后 pending 应清空");
+    }
+
+    #[test]
+    fn apply_pending_changes_skips_setpos_for_dead_entity() {
+        // P2（审查 1 轮）：同 tick 内 life()=false 实体排队的移动不应用（尸体不位移），
+        // 死亡清理步随后移除实体，SetPos 目标无人消费属顺序耦合，直接在应用侧作废
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(5));
+        let mut e = make_entity(5, (2.0, 3.0));
+        e.kill(); // 预先标记死亡（模拟同 tick life()=false）
+        world.entities.insert(id, e);
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id,
+            new_pos: (9.0, 9.0),
+        }];
+        apply_pending_changes(&mut world, &mut pending);
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (2.0, 3.0),
+            "死亡实体的 SetPos 不应应用"
+        );
     }
 
     #[test]
