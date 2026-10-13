@@ -147,7 +147,8 @@ impl EntitySandboxMap {
     /// - fuel 取旧沙箱【剩余量】而非配额上限：防"反复被攻击回满配额"刷算力（P1）。
     /// - payload 非法（编译/实例化失败）：旧沙箱原样放回（P0 僵尸实体修复），
     ///   "存活实体必有沙箱"不变量不破，返回 Err 交调用方记攻击失败。
-    /// - 返回 killed：替换后 life()=false，或 life() 调用失败（破损沙箱等同死亡）。
+    /// - 返回 killed：替换后 life()=false。life() 无法执行（Err）= 结果未知，
+    ///   按架构 4.2 默认行为 life 维持原值，不判死。
     /// - 不处理掠夺：掠夺需改 world（survival），由调用方 settle_attacks 在击杀后处理。
     fn replace_code(&mut self, target_id: &EntityId, payload: &[u8]) -> Result<bool> {
         // fuel 剩余量与原配额在任何 remove 之前读（读失败也不能弄丢旧沙箱）
