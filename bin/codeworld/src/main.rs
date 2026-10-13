@@ -840,6 +840,10 @@ fn handle_collisions(pairs: &[CollisionPair], entities: &HashMap<EntityId, Entit
 /// - `log(8)`（盾尽放行）—— 盾 0，其后无配对值
 /// - 其他 marker（A 的 0/2/3、D 的 9 反制、H 的 4/5/6）不携带盾信息，忽略
 ///
+/// 协议前提（审查 P2 记录）：①当前只有 D 的代码会发 7/8；②7+盾值在同一次
+/// on_attack 内原子成对发出。未来多玩家 marker 值域可能撞 7/8，届时应按沙箱
+/// 分组解析（各沙箱独立跑本函数再合并），Phase 2 议题。
+///
 /// 返回最新一次上报的盾量；流中无上报（或截断对）返回 None（字幕显示占位符）。
 fn parse_shield_markers(markers: &[i32]) -> Option<i32> {
     let mut shield = None;
@@ -1071,8 +1075,9 @@ fn defender_wat(shield: i32) -> String {
 ///    - 距离 <= 3.0：参战（log 5），对敌人坐标排空 payload 击杀刀，站定不出游
 ///    - 距离 > 3.0：观望（log 4），原地小幅游走（x 方向 ±0.5，方向按 tick 奇偶
 ///      ——WAT 无随机源，用 tick 奇偶当伪随机）
-/// 3. on_attack（被攻击时）：50% 拦截（tick 奇偶伪随机，log 6），否则放行
-///    （$ticks 在 on_tick 里自增，被攻击时机的奇偶不可预测 -> 效果等价随机）
+/// 3. on_attack（被攻击时）：50% 拦截（奇数 tick 拦，log 6），否则放行
+///    （$ticks 只在 on_tick 自增：拦截答案按 tick 确定性奇偶交替，WAT 无随机源，
+///    "50%"指跨 tick 的长期频率，不是不可预测）
 ///
 /// 日志 marker：0=无敌待机 4=观望游走 5=参战攻击 6=拦截成功
 const HUNTER_WAT: &str = r#"(module
@@ -1124,8 +1129,7 @@ const HUNTER_WAT: &str = r#"(module
     (if (i32.eqz (i32.and (global.get $ticks) (i32.const 1)))
       (then (drop (call $move_by (f64.const 0.5) (f64.const 0.0))))
       (else (drop (call $move_by (f64.const -0.5) (f64.const 0.0))))))
-  (func (export "life") (result i32) i32.const 1)
-  (func (export "get_ticks") (result i32) global.get $ticks))"#;
+  (func (export "life") (result i32) i32.const 1))"#;
 
 #[cfg(test)]
 mod tests {

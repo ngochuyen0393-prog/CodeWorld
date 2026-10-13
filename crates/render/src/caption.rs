@@ -6,9 +6,9 @@
 //! 字幕写 TerminalBuffer 第 0 行：真实视口（half_height=25）下 row 0 对应
 //! 世界 y=-25 的地下空白区，永不与地面生物（y>=0 -> row>=25）抢格子。
 
-/// 计算字幕行内容（纯函数，MVP 格式）：实现待 RED 驱动
+/// 计算字幕行内容（纯函数，MVP 格式）
 ///
-/// 目标格式（全 ASCII，理由见 git 历史）：`tick=12 | A->D dist=2.4 | D shield=7 | alive=3`
+/// 格式（全 ASCII，理由见决策 #006）：`tick=12 | A->D dist=2.4 | D shield=7 | alive=3`
 /// - dist=None（A 或 D 不在场/已死）-> `dist=--`
 /// - shield=None（D 不在场或本局尚未上报）-> `shield=?`
 /// - 距离保留 1 位小数

@@ -14,6 +14,8 @@ if not exist codeworld.db (
     echo [start.bat] deleting old world codeworld.db ...
     del /q codeworld.db
 )
+rem also clear stale journal sidecars from a previous crash (delete-mode journal)
+del /q codeworld.db-journal codeworld.db-wal codeworld.db-shm 2>nul
 
 echo [start.bat] building (first build takes 1-3 min, progress in build.log) ...
 cargo build -p codeworld 2>build.log

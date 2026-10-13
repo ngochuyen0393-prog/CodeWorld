@@ -7,6 +7,8 @@ rem Env vars: CODEWORLD_D_SHIELD=1  CODEWORLD_H_ENABLED=0
 rem ============================================================
 cd /d %~dp0
 
+rem setlocal: env vars stay inside this script window (no leak to a later start.bat run)
+setlocal
 set CODEWORLD_D_SHIELD=1
 set CODEWORLD_H_ENABLED=0
 
@@ -16,6 +18,8 @@ if not exist codeworld.db (
     echo [start-reversal.bat] deleting old world codeworld.db ...
     del /q codeworld.db
 )
+rem also clear stale journal sidecars from a previous crash (delete-mode journal)
+del /q codeworld.db-journal codeworld.db-wal codeworld.db-shm 2>nul
 
 echo [start-reversal.bat] building (first build takes 1-3 min, progress in build.log) ...
 cargo build -p codeworld 2>build.log
