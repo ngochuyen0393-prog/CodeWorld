@@ -75,6 +75,8 @@ pub(crate) struct PlayerDirectory {
     enabled: bool,
     /// 在线玩家：玩家名 -> 角色实体 ID
     online: HashMap<String, EntityId>,
+    /// 在线进场序（操控目标"第一个进场"依据，#022；与 online 表键同步维护）
+    online_order: Vec<String>,
     /// 残影中：实体 ID -> 消散 tick（到期拍阶段二标记死亡，走死亡清理通路）
     ghosts: HashMap<EntityId, u64>,
     /// 最近参战 tick：实体 ID -> tick（战斗残影期计算；#013）
@@ -92,6 +94,7 @@ impl PlayerDirectory {
             dir: dir.into(),
             enabled: true,
             online: HashMap::new(),
+            online_order: Vec::new(),
             ghosts: HashMap::new(),
             combat: HashMap::new(),
             failed: HashSet::new(),
@@ -106,6 +109,7 @@ impl PlayerDirectory {
             dir: PathBuf::from("./players"),
             enabled: false,
             online: HashMap::new(),
+            online_order: Vec::new(),
             ghosts: HashMap::new(),
             combat: HashMap::new(),
             failed: HashSet::new(),
@@ -162,6 +166,17 @@ impl PlayerDirectory {
     pub(crate) fn register_online(&mut self, name: &str, entity_id: EntityId) {
         tracing::debug!(name, entity_id = %entity_id.0, "[players] 玩家登记上线");
         self.online.insert(name.to_string(), entity_id);
+        if !self.online_order.iter().any(|n| n == name) {
+            self.online_order.push(name.to_string());
+        }
+    }
+
+    /// 操控目标（#022 操控层）：第一个进场且仍在线的玩家（进场序，MVP 单玩家假设）。
+    /// 返回 (名字, 实体ID)；无人在线返回 None（按键仅 Quit 生效）。
+    pub(crate) fn first_online(&self) -> Option<(String, EntityId)> {
+        let name = self.online_order.first()?;
+        let id = self.online.get(name).copied()?;
+        Some((name.clone(), id))
     }
 
     /// 登记编译失败（不再逐拍重试）
@@ -189,6 +204,7 @@ impl PlayerDirectory {
     /// 返回 None 表示名字不在在线表（不该发生，防御）。
     pub(crate) fn note_offline(&mut self, name: &str, now: u64) -> Option<OfflineEvent> {
         let entity_id = self.online.remove(name)?;
+        self.online_order.retain(|n| n != name);
         let last_combat = self.combat.get(&entity_id).copied();
         let in_combat = last_combat
             .map(|t| now.saturating_sub(t) < COMBAT_WINDOW_TICKS)
@@ -448,5 +464,33 @@ mod tests {
         // 规则：默认禁用（既有测试跑 tick 零文件系统副作用）；new() 为启用
         assert!(!PlayerDirectory::disabled().is_enabled());
         assert!(PlayerDirectory::new("any").is_enabled());
+    }
+
+    // === 操控目标（#022 操控层：第一个进场且仍在线的玩家）===
+
+    #[test]
+    fn first_online_returns_earliest_registered_player() {
+        // 规则：操控目标 = 第一个进场且仍在线的玩家（进场序，非 HashMap 随机序）
+        let mut dir = PlayerDirectory::new("unused");
+        assert!(dir.first_online().is_none(), "无人在线无操控目标");
+        dir.register_online("pioneer", eid(1));
+        dir.register_online("second", eid(2));
+        let (name, id) = dir.first_online().expect("有人在线应有目标");
+        assert_eq!(name, "pioneer", "先进场者优先");
+        assert_eq!(id, eid(1));
+    }
+
+    #[test]
+    fn first_online_skips_offline_players() {
+        // 先进场者下线 -> 操控目标轮到下一个在线玩家
+        let mut dir = PlayerDirectory::new("unused");
+        dir.register_online("pioneer", eid(1));
+        dir.register_online("second", eid(2));
+        let _ = dir.note_offline("pioneer", 0);
+        assert_eq!(
+            dir.first_online().map(|(n, _)| n),
+            Some("second".to_string()),
+            "pioneer 下线后操控目标轮到 second"
+        );
     }
 }

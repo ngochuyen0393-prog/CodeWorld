@@ -47,3 +47,6 @@ thiserror = "1"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }
+
+# 终端操控（操控层 v0：raw mode 裸键输入 + alternate screen，roguelike 事实标准）
+crossterm = "0.28"

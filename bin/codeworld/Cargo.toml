@@ -21,6 +21,8 @@ anyhow = { workspace = true }
 # 日志
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# 终端操控（操控层 v0：raw mode + 事件轮询 + alternate screen）
+crossterm = { workspace = true }
 
 [dev-dependencies]
 # 测试构造固定 EntityId

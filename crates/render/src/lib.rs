@@ -20,6 +20,7 @@ pub use graph::{RenderGraph, RenderNode};
 pub use module::{AsciiRenderModule, RenderModule};
 pub use viewport::Viewport;
 
+use codeworld_core::entity::EntityId;
 use codeworld_core::world::WorldState;
 use std::io::Write;
 
@@ -35,6 +36,9 @@ pub struct Renderer {
     last_diff: Vec<(usize, usize)>,
     /// 战况字幕状态（第 0 行，渲染层展示，非游戏状态）
     caption: CaptionState,
+    /// 操控目标（#022 操控层 v0：被操控实体渲染白色高亮；渲染层特判，
+    /// 不改 core 数据结构；None = 无玩家在线不高亮）
+    controlled: Option<EntityId>,
 }
 
 impl Renderer {
@@ -48,7 +52,16 @@ impl Renderer {
             module: AsciiRenderModule::new(),
             last_diff: Vec::new(),
             caption: CaptionState::new(),
+            controlled: None,
         }
+    }
+
+    /// 设置操控目标（#022：host 每 tick 从操控路由喂入；None = 无玩家在线）
+    ///
+    /// 高亮跟随"在线的操控目标"而非"正在按键"——回合制下按高亮闪现会让玩家
+    /// 丢失自己角色（roguelike 惯例：你的 @ 始终视觉可辨）。
+    pub fn set_controlled(&mut self, controlled: Option<EntityId>) {
+        self.controlled = controlled;
     }
 
     /// 更新战况字幕（host 每 tick 喂入只读战况快照）
@@ -56,7 +69,8 @@ impl Renderer {
     /// - tick/距离/存活数来自 world；盾量来自玩家代码 env.log marker 上报（host 解析）。
     /// - `d_present`：防御者是否在场（不在场则盾显示占位符）。
     /// - `shield_report`：本 tick 的盾量上报，None = 无新上报（保持上次值）。
-    /// - 战况值（距离 0.1 精度/盾量/存活数）变化时打一条 info 日志，不每 tick 刷屏。
+    /// - `ctrl`：操控目标字形（操控层 v0；None = 无玩家在线，不显示 ctrl 段）。
+    /// - 战况值（距离 0.1 精度/盾量/存活数/操控状态）变化时打一条 info 日志，不每 tick 刷屏。
     /// - 实际写 buffer 发生在 render()（本帧 diff 计算之前，保证变化进 diff）。
     pub fn update_caption(
         &mut self,
@@ -65,8 +79,10 @@ impl Renderer {
         d_present: bool,
         shield_report: Option<i32>,
         alive: usize,
+        ctrl: Option<&str>,
     ) {
-        self.caption.update(tick, dist, d_present, shield_report, alive);
+        self.caption
+            .update(tick, dist, d_present, shield_report, alive, ctrl);
     }
 
     /// 完整渲染流程（三阶段），返回本帧与上帧的差异格子坐标列表
@@ -85,6 +101,15 @@ impl Renderer {
         self.graph.compile(&self.viewport);
         // ④ 执行：按序写入 buffer（画家算法：后写覆盖先写）
         self.graph.execute(&mut self.buffer);
+        // ④5 操控高亮（#022 操控层 v0）：被操控实体 glyph 白色渲染（渲染层特判，
+        //    不改 core 数据结构）。目标不在场/不在视口 = 无高亮；后写覆盖实体原色。
+        if let Some(id) = self.controlled {
+            if let Some(e) = world.entities.get(&id).filter(|e| e.is_alive()) {
+                if let Some((row, col)) = self.viewport.world_to_screen(e.pos()) {
+                    self.buffer.write(row, col, &e.appearance.glyph, "white");
+                }
+            }
+        }
         // ⑤ 字幕写第 0 行（UI 层语义，后写覆盖战场格子；真实视口下 row 0 = 世界
         //    y=-25 的地下空白区，正常布局不与生物重叠）
         for (col, ch) in self.caption.line().chars().take(self.viewport.term_cols).enumerate() {
@@ -345,7 +370,7 @@ mod tests {
         // 读写：update_caption 存字幕行，render 后第 0 行显示字幕；diff 含 row 0 格子
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(12, Some(2.44), true, Some(7), 3);
+        r.update_caption(12, Some(2.44), true, Some(7), 3, None);
         let diff = r.render(&world);
         assert_eq!(
             row0_line(&r),
@@ -360,11 +385,11 @@ mod tests {
         // 修改：字幕内容变化 -> 下帧 diff 含 row 0（随 tick 更新的依据：换行即重绘）
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(1, Some(9.0), true, None, 2);
+        r.update_caption(1, Some(9.0), true, None, 2, None);
         r.render(&world);
         let mut out = Vec::new();
         r.flush_to(&mut out).unwrap(); // swap
-        r.update_caption(2, Some(8.0), true, None, 2);
+        r.update_caption(2, Some(8.0), true, None, 2, None);
         let diff = r.render(&world);
         assert!(
             diff.iter().any(|&(row, _)| row == 0),
@@ -379,11 +404,11 @@ mod tests {
         // 语义段（col>=10，"| A->D..." 起）不产生 diff（画面不闪烁，日志不刷屏同理）
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(1, Some(9.0), true, None, 2);
+        r.update_caption(1, Some(9.0), true, None, 2, None);
         r.render(&world);
         let mut out = Vec::new();
         r.flush_to(&mut out).unwrap(); // swap
-        r.update_caption(2, Some(9.0), true, None, 2); // 仅 tick 变化
+        r.update_caption(2, Some(9.0), true, None, 2, None); // 仅 tick 变化
         let diff = r.render(&world);
         assert!(
             diff.iter().all(|&(_, col)| col < 10),
@@ -397,7 +422,7 @@ mod tests {
         // 边界：字幕行超过终端列数 -> 截断到 cols，不越界、不影响其他行
         let mut r = Renderer::new(Viewport::new((5.0, 5.0), 5.0, 5.0, 10, 10));
         let world = WorldState::new();
-        r.update_caption(1, Some(1.0), true, Some(1), 1);
+        r.update_caption(1, Some(1.0), true, Some(1), 1, None);
         r.render(&world);
         let line = row0_line(&r);
         assert!(
@@ -417,7 +442,7 @@ mod tests {
             EntityId(Uuid::from_u128(1)),
             make_entity(1, (5.0, 0.0), "@", true), // y=0 -> row 0
         );
-        r.update_caption(1, Some(1.0), true, None, 1);
+        r.update_caption(1, Some(1.0), true, None, 1, None);
         r.render(&world);
         assert_eq!(
             r.buffer().get(0, 0).unwrap().glyph,
@@ -431,11 +456,11 @@ mod tests {
         // 读写：盾量只在 D 上报时更新，两次上报之间保持上次值（不闪回占位符）
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(1, Some(9.0), true, Some(9), 2);
+        r.update_caption(1, Some(9.0), true, Some(9), 2, None);
         r.render(&world);
         assert!(row0_line(&r).contains("shield=9"), "上报后应显示盾 9");
         // 下一 tick 无新上报（report=None）-> 保持 9
-        r.update_caption(2, Some(8.0), true, None, 2);
+        r.update_caption(2, Some(8.0), true, None, 2, None);
         r.render(&world);
         assert!(
             row0_line(&r).contains("shield=9"),
@@ -449,14 +474,97 @@ mod tests {
         // 负面路径：D 已死（d_present=false）-> 盾显示占位符（死人不报盾）
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(1, Some(9.0), true, Some(9), 2);
+        r.update_caption(1, Some(9.0), true, Some(9), 2, None);
         r.render(&world);
-        r.update_caption(2, None, false, None, 1); // D 不在场
+        r.update_caption(2, None, false, None, 1, None); // D 不在场
         r.render(&world);
         assert!(
             row0_line(&r).contains("shield=?"),
             "D 不在场时盾应显示占位符，实际 {:?}",
             row0_line(&r)
+        );
+    }
+
+    #[test]
+    fn update_caption_ctrl_online_appends_ctrl_segment() {
+        // 操控层 v0：操控目标在线 -> 字幕尾部 ctrl:字形
+        let mut r = renderer_80cols();
+        let world = WorldState::new();
+        r.update_caption(5, Some(2.4), true, None, 3, Some("P"));
+        r.render(&world);
+        assert!(
+            row0_line(&r).ends_with("ctrl:P"),
+            "字幕应含 ctrl:P，实际 {:?}",
+            row0_line(&r)
+        );
+    }
+
+    // === 操控高亮（#022 操控层 v0）：被操控实体 glyph 白色渲染（渲染层特判）===
+
+    #[test]
+    fn controlled_entity_rendered_white() {
+        // 读写：set_controlled(Some(id)) 后 render -> 该实体格子颜色覆盖为 white（字形不变）
+        let mut r = renderer_80cols();
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world
+            .entities
+            .insert(id, make_entity(1, (25.0, 12.0), "@", true));
+        r.set_controlled(Some(id));
+        r.render(&world);
+        let (row, col) = r.viewport().world_to_screen((25.0, 12.0)).unwrap();
+        let cell = r.buffer().get(row, col).unwrap();
+        assert_eq!(cell.glyph, "@", "字形不变");
+        assert_eq!(
+            cell.color, "white",
+            "被操控实体应白色高亮（原色 red 被覆盖）"
+        );
+    }
+
+    #[test]
+    fn uncontrolled_entity_keeps_original_color() {
+        // 反向护栏：未设置操控目标 -> 渲染色保持实体原色
+        let mut r = renderer_80cols();
+        let mut world = WorldState::new();
+        world
+            .entities
+            .insert(EntityId(Uuid::from_u128(1)), make_entity(1, (25.0, 12.0), "@", true));
+        r.render(&world);
+        let (row, col) = r.viewport().world_to_screen((25.0, 12.0)).unwrap();
+        assert_eq!(
+            r.buffer().get(row, col).unwrap().color, "red",
+            "无操控目标保持原色"
+        );
+    }
+
+    #[test]
+    fn controlled_entity_outside_viewport_no_panic() {
+        // 边界：操控目标在视口外（world_to_screen=None）-> 忽略高亮不 panic
+        let mut r = renderer_80cols();
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world
+            .entities
+            .insert(id, make_entity(1, (500.0, 500.0), "@", true));
+        r.set_controlled(Some(id));
+        let _ = r.render(&world); // 不 panic 即通过
+    }
+
+    #[test]
+    fn controlled_dead_entity_not_highlighted() {
+        // 边界：操控目标已死 -> 不高亮（尸体不是玩家的在场角色）
+        let mut r = renderer_80cols();
+        let mut world = WorldState::new();
+        let mut e = make_entity(1, (25.0, 12.0), "@", true);
+        e.kill();
+        let id = e.id;
+        world.entities.insert(id, e);
+        r.set_controlled(Some(id));
+        r.render(&world);
+        let (row, col) = r.viewport().world_to_screen((25.0, 12.0)).unwrap();
+        assert_eq!(
+            r.buffer().get(row, col).unwrap().glyph, " ",
+            "死者不渲染也不高亮"
         );
     }
 }

@@ -2,12 +2,13 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-14 实体占位制收工更新）
-- 在做：无（#021 实体占位制落地：一格一物——移动被挡+接触记双方+spawn 出生预检+推挤退役，pioneer.wat 塔 +5+立塔拍不移动修复连体事故，495 测试）
+## 现在（2026-10-15 操控层v0收工更新）
+- 在做：无（#023 操控层 v0 落地：crossterm raw mode 键盘意图流 + 操控覆盖自主 + 操控零豁免物理，529 测试）
 - 卡在：无
-- 下一步：① wasmtime 25.0.3 Windows out-of-fuel trap 进程 abort 仍是生产化阻断项（.cc-bugs #5）；② 已知 MVP 缺口：probe 残影实体仍会答 on_probe（桥不感知残影，#016）；③ 接触开通道（#021 已记双方接触对日志，通道未开）；④ 门二后续：destroy 的"攻杀式销毁"通路、产权链转让/继承、造物重生（快照恢复不带回沙箱）；⑤ 半径制将来路线：体型开放时四件套（上下限/面积付费/总预算/半径判定）同天上线（#021）；⑥ Phase 2 议题同前（排刀上限、并行执行、multi-value 列表式 get_visible_entities）
+- 下一步：① 操控层人工冒烟（真终端按 WASD/空格/q，步骤见收工报告——CC 沙箱不能起交互进程）；② 期四候选：WebSocket 意图流（route_intents 已独立成层，只换生产者）；③ wasmtime 25.0.3 Windows out-of-fuel trap 进程 abort 仍是生产化阻断项（.cc-bugs #5）；④ 已知 MVP 缺口：probe 残影实体仍会答 on_probe（桥不感知残影，#016）；⑤ 接触开通道（#021 已记双方接触对日志，通道未开）；⑥ 门二后续：destroy 的"攻杀式销毁"通路、产权链转让/继承、造物重生；⑦ Phase 2 议题同前（排刀上限、并行执行、multi-value 列表式 get_visible_entities）
 
 ## 已完成
+- 操控层 v0 #023（2026-10-15）：input.rs 意图层（Intent 枚举/key_to_intent 键位全表 WASD+方向键双支持/空格攻击/q+Enter+Ctrl+C 退出/route_intents 纯函数路由同拍多键后到覆盖）+ crossterm 输入线程（raw mode + 50ms 事件轮询 + mpsc 队列 + Quit/EOF 置退出标志）+ 终端模式（alternate screen 进/出 + panic hook 全路径恢复 + setup 失败降级普通输出）+ tick_with_intents 路由接线（操控目标=第一个进场玩家 first_online 进场序；按键拍抑制该实体 on_tick 完全接管 life() 照常；操控移动 SetPos 排队过占位裁决；操控攻击空 payload 并入两阶段结算；无玩家按键安全+no player online 日志一次）+ 视觉反馈（caption ctrl:字形段 + 被操控实体白色高亮渲染层特判 + color_to_ansi white=97）；TDD 红绿全程 34 新测试，四生物剧本/无人按键自主行为回归不变，529 测试（2026-10-15）
 - 实体占位制 #021（2026-10-14）：core 占位判定 cell_occupied_by（floor 格键/排除自己/只算存活/多占据返最低 id）+ physics step 占位重力（落被占格悬停上一格，id 升序确定序）+ 移动占位裁决（SetPos 抽出按 EntityId 升序先到先得，被挡留原位+记接触对）+ 接触记双方（ContactPair 两类来源 same_cell/move_blocked 汇入 handle_collisions 逐对 info 日志）+ spawn 出生预检（被占失败可重试，含创造者自己的格）+ 推挤退役（resolve_collision 标 deprecated 留档，同格只 warn 不推挤）+ pioneer.wat 修复（塔 +5/立塔拍 return 不移动，冒烟实测 P 东移至塔前被挡、T 全程站岗）；TDD 红绿全程，21 新测试，四生物剧本时间线回归不变（tick4 H 死/tick12 A 死照旧），495 测试（2026-10-14）
 - 门二开放 #020（2026-10-14，commit fd9ff89）：env.spawn/env.destroy 给玩家代码 + 产权链 owner + examples/sentinel.wat 哨塔示例，474 测试；世界里第一个玩家造物已诞生——冒烟测试进程内可复现
 - Phase 1 MVP 全部 8 crate（333 测试基线，见项目 CLAUDE.md 开发顺序）

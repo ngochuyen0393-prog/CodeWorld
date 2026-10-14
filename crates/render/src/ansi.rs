@@ -19,6 +19,7 @@ pub fn color_to_ansi(color: &str) -> u8 {
         "magenta" => 35,
         "cyan" => 36,
         "gray" => 90,
+        "white" => 97, // 亮白前景（操控层 v0：被操控实体高亮）
         "default" => 0,
         _ => 0, // 未知颜色当 default
     };
@@ -72,6 +73,12 @@ mod tests {
         assert_eq!(color_to_ansi("purple"), 0);
         assert_eq!(color_to_ansi(""), 0);
         assert_eq!(color_to_ansi("RED"), 0); // 大小写敏感，未知
+    }
+
+    #[test]
+    fn color_to_ansi_maps_white_for_control_highlight() {
+        // 操控层 v0：white = 亮白前景（被操控实体高亮）
+        assert_eq!(color_to_ansi("white"), 97);
     }
 
     // === enter_terminal ===

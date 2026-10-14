@@ -12,6 +12,7 @@
 //! 4. sleep 到下一个 tick
 
 mod config;
+mod input;
 mod players;
 
 use anyhow::{Context, Result};
@@ -23,7 +24,7 @@ use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 use codeworld_core::pending::PendingChange;
 use codeworld_core::world::{BoundingBox, WorldState};
 use codeworld_physics::default::DefaultPhysicsEngine;
-use codeworld_render::{enter_terminal, exit_terminal, Renderer, Viewport};
+use codeworld_render::{Renderer, Viewport};
 use codeworld_storage::StorageEngine;
 use codeworld_time::clock::TimeEngine;
 use config::Config;
@@ -53,6 +54,8 @@ struct EntitySandboxMap {
     /// 玩家目录（门一进场 + 在线锚 + 残影期，players.rs）。
     /// 默认禁用：既有测试跑 tick 零文件系统副作用；main() 按配置装配启用实例
     players: PlayerDirectory,
+    /// "no player online" 提示已打过一次（操控层 v0：无玩家按键只提示一次不刷屏）
+    warned_no_player: bool,
 }
 
 impl EntitySandboxMap {
@@ -66,6 +69,7 @@ impl EntitySandboxMap {
             probe_fuel: 10_000,
             max_entities: 64,
             players: PlayerDirectory::disabled(),
+            warned_no_player: false,
         })
     }
 
@@ -114,11 +118,21 @@ impl EntitySandboxMap {
         }
     }
 
-    /// 执行阶段一：逐个实体调 on_tick() + life()（MVP 单线程）
-    /// 返回需要标记死亡的 EntityId 列表（world 借用中不可同时改，由 tick 统一 kill）
-    /// viewport：本 tick 的世界视野（与 fill_visible_snapshots 同一个 BoundingBox 实例，
-    /// scan 的最近敌人锁定用它过滤——同源口径，架构 4.2"视距内"前置条件）
+    /// 执行阶段一（无操控版，等价 run_player_code_with_control(None)）。
+    /// 生产路径走 run_player_code_with_control；本包装供既有测试基线调用。
+    #[cfg(test)]
     fn run_player_code(&mut self, world: &WorldState, viewport: &BoundingBox) -> Vec<EntityId> {
+        self.run_player_code_with_control(world, viewport, None)
+    }
+
+    /// 带操控接管的阶段一（#022 操控层 v0）：control_override 指定的实体本拍跳过
+    /// on_tick（自主移动/攻击都不跑，玩家按键=这拍听我的），life() 照常。
+    fn run_player_code_with_control(
+        &mut self,
+        world: &WorldState,
+        viewport: &BoundingBox,
+        control_override: Option<EntityId>,
+    ) -> Vec<EntityId> {
         let mut to_kill = Vec::new();
         // 先收集 owned EntityId 再遍历，避免边遍历 world.entities 边改 self.sandboxes 的借用冲突
         let entity_ids: Vec<EntityId> = world.entities.keys().copied().collect();
@@ -183,9 +197,17 @@ impl EntitySandboxMap {
                 handle.store.data_mut().probe_bridge = std::ptr::null_mut();
                 continue;
             }
-            // 调 on_tick（没导出则 call_on_tick 内部跳过）
-            if let Err(e) = self.manager.call_on_tick(handle) {
-                tracing::warn!(entity_id = %entity_id.0, error = %e, "on_tick 执行失败");
+            // 调 on_tick（没导出则 call_on_tick 内部跳过）。
+            // 操控接管本拍（#022 操控优先于自主）：跳过被操控实体的 on_tick——自主
+            // 移动/攻击都不跑。取舍：MVP 完全接管（语义清晰"按键=这拍听我的"、实现
+            // 最简），细粒度"仅抑制移动副作用"待挂机AI需要持续输出时再做。
+            // life() 照常调用（存在合同不受操控影响——操控停，代码层心跳不停）。
+            if control_override != Some(entity_id) {
+                if let Err(e) = self.manager.call_on_tick(handle) {
+                    tracing::warn!(entity_id = %entity_id.0, error = %e, "on_tick 执行失败");
+                }
+            } else {
+                tracing::debug!(entity_id = %entity_id.0, "[control] 本拍操控接管，跳过自主 on_tick");
             }
             // 窗口关闭：置空桥指针（SAFETY 契约，防后续 life 调用期悬垂）
             handle.store.data_mut().probe_bridge = std::ptr::null_mut();
@@ -530,33 +552,30 @@ fn main() -> Result<()> {
         tracing::warn!(error = %e, "players/ 目录初始加载失败，进场门暂不可用（世界继续）");
     }
 
-    // 信号处理：后台线程监听 stdin，按 Enter/EOF 置退出标志（零依赖，符合 MVP 最简方案）
+    // 操控层 v0（#022）：raw mode 裸键输入 + 意图队列；旧 stdin read_line 线程退役
+    //（read_line 等 Enter/EOF 的退出语义由 crossterm 事件循环接管：Quit 键/EOF 路等价）
     let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let _ = std::io::stdin().read_line(&mut line);
-        r.store(false, Ordering::SeqCst);
-    });
+    let (intent_sink, intent_queue) = input::intent_channel();
+    let input_thread = input::spawn_input_thread(intent_sink, running.clone());
 
     // 延迟变更队列（架构文档 4.1 节阶段一产出、阶段二 a 统一应用）
     // 玩家代码执行期间产生的变更放入 pending，本 tick 阶段二统一应用后清空
     let mut pending: Vec<PendingChange> = Vec::new();
 
-    tracing::info!("tick 循环开始（按 Enter 退出）");
-    // 进入终端渲染模式：清屏 + 隐藏光标
-    // stdout 专供 ANSI 画面，日志已走 stderr，进入后画面由 tick 第 e 步 flush 维护
-    if let Err(e) = enter_terminal(&mut std::io::stdout().lock()) {
-        tracing::warn!(error = %e, "进入终端渲染模式失败，继续以普通输出运行");
+    // 进入终端操控模式：raw mode + 备用屏 + 清屏 + 隐光标
+    // stdout 专供 ANSI 画面，日志已走 stderr；setup 失败降级普通输出运行（键控不可用但不崩）
+    if let Err(e) = input::setup_terminal() {
+        tracing::warn!(error = %e, "进入终端操控模式失败（raw mode/备用屏），继续以普通输出运行");
     }
-    // panic 时尽力恢复终端（隐藏光标/颜色状态不能残留砖化终端），再交回默认 hook 打印 panic 信息
-    let default_panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = exit_terminal(&mut std::io::stdout().lock());
-        default_panic_hook(info);
-    }));
+    // panic 时尽力恢复终端（raw mode + 备用屏 + 颜色/光标全恢复，不砖化终端），
+    // 再交回默认 hook 打印 panic 信息
+    input::install_panic_hook();
+
+    tracing::info!("tick 循环开始（WASD/方向键操控，空格攻击，q/Enter/Ctrl+C 退出）");
     while running.load(Ordering::SeqCst) {
-        tick(
+        // 操控层 v0：每拍开头 drain 意图队列（输入线程生产 -> tick 主线程消费）
+        let intents = intent_queue.drain();
+        tick_with_intents(
             &mut world,
             &mut time_engine,
             &physics,
@@ -564,17 +583,18 @@ fn main() -> Result<()> {
             &mut storage,
             &mut pending,
             &mut sandbox_map,
+            &intents,
         );
         std::thread::sleep(config.tick_interval());
     }
 
-    // 关闭：恢复终端 + 强制存快照（架构文档 4.1 收尾）
+    // 关闭：恢复终端（raw mode + 备用屏 + 颜色/光标全路径）+ 强制存快照（架构文档 4.1 收尾）
     tracing::info!("收到退出信号，正在保存世界快照...");
     let save_result = storage.force_save(&world);
-    // 无论保存结果如何都恢复终端（避免残留隐藏光标/颜色状态）
-    if let Err(e) = exit_terminal(&mut std::io::stdout().lock()) {
-        tracing::warn!(error = %e, "恢复终端失败");
-    }
+    // 无论保存结果如何都恢复终端（避免残留裸键模式/备用屏/隐藏光标状态）
+    input::restore_terminal();
+    // 输入线程随 running 标志退出（≤50ms），收尸防悬线程
+    let _ = input_thread.join();
     save_result?;
     tracing::info!(tick = world.tick(), entities = world.entities.len(), "主程序已关闭");
     Ok(())
@@ -595,6 +615,9 @@ fn init_tracing(log_level: &str) {
 /// 单 tick 串行状态更新（架构文档 4.1 节 MVP 简化版）
 ///
 /// 拆为独立函数以便单元测试（main() 含无限循环与信号处理不可测）。
+/// 无操控意图版 = 空意图的 tick_with_intents；生产路径走 tick_with_intents，
+/// 本包装供既有测试基线调用（无人按键语义锚）。
+#[cfg(test)]
 fn tick(
     world: &mut WorldState,
     time_engine: &mut TimeEngine,
@@ -603,6 +626,33 @@ fn tick(
     storage: &mut StorageEngine,
     pending: &mut Vec<PendingChange>,
     sandbox_map: &mut EntitySandboxMap,
+) {
+    tick_with_intents(
+        world,
+        time_engine,
+        physics,
+        renderer,
+        storage,
+        pending,
+        sandbox_map,
+        &[],
+    );
+}
+
+/// 带操控意图的单 tick（#022 操控层 v0 主入口）
+///
+/// intents：本拍积压的按键意图（main 循环每拍开头 drain 输入队列传入）。
+/// 期四 WebSocket 意图流复用本入口，只换来源不换路由（input.rs route_intents）。
+#[allow(clippy::too_many_arguments)] // 与既有 tick/run_ticks 同签名家族，8 参为 tick 管线固有形状
+fn tick_with_intents(
+    world: &mut WorldState,
+    time_engine: &mut TimeEngine,
+    physics: &DefaultPhysicsEngine,
+    renderer: &mut Renderer,
+    storage: &mut StorageEngine,
+    pending: &mut Vec<PendingChange>,
+    sandbox_map: &mut EntitySandboxMap,
+    intents: &[input::Intent],
 ) {
     // ① 时间推进（time-engine 计数 + 世界 tick 同步推进）
     let should_snapshot = time_engine.advance_tick();
@@ -626,7 +676,49 @@ fn tick(
         BoundingBox::new(min_x, min_y, max_x, max_y)
     };
     sandbox_map.fill_visible_snapshots(world, &bounds);
-    let to_kill = sandbox_map.run_player_code(world, &bounds);
+
+    // ②5 操控路由（#022 双层模型：操控优先于自主，代码层回落挂机AI）
+    //    - 操控目标 = 第一个进场且仍在线的玩家实体（MVP 单玩家假设）
+    //    - 意图在拍首路由（坐标取拍首快照），本拍行动立即定案
+    let online = sandbox_map.players.first_online();
+    let control_target = online
+        .as_ref()
+        .map(|(_, id)| *id)
+        .filter(|id| world.entities.get(id).map(|e| e.is_alive()).unwrap_or(false));
+    if !intents.is_empty() && control_target.is_none() && !sandbox_map.warned_no_player {
+        tracing::info!("[input] 按键收到但无玩家在线，操控无目标（no player online）");
+        sandbox_map.warned_no_player = true;
+    }
+    let nearest = control_target.and_then(|id| find_nearest_enemy(world, &id, &bounds));
+    let action = input::route_intents(intents, control_target, nearest);
+    // 字幕 ctrl 状态（操控目标在线即显示，与是否按键无关；字形=玩家名首字符大写）
+    let ctrl = control_target
+        .and(online.as_ref())
+        .map(|(name, _)| players::glyph_for(name));
+    if let (Some((name, _)), Some((id, act))) = (&online, &action) {
+        match act {
+            input::ControlledAction::Move(dx, dy) => {
+                // 操控移动 = 排队 SetPos（占位裁决照常，一格一物不豁免）；
+                // 自主 on_tick 本拍被抑制（run_player_code_with_control），无坐标冲突
+                if let Some(e) = world.entities.get(id) {
+                    let (x, y) = e.pos();
+                    pending.push(PendingChange::SetPos {
+                        entity: *id,
+                        new_pos: (x + dx, y + dy),
+                    });
+                }
+                tracing::info!("[input] 操控意图 Move({dx},{dy}) player={name}（覆盖自主移动）");
+            }
+            input::ControlledAction::Attack(tpos) => {
+                tracing::info!("[input] 操控意图 Attack target={tpos:?} player={name}（操控刀优先）");
+            }
+        }
+    }
+    let to_kill = sandbox_map.run_player_code_with_control(
+        world,
+        &bounds,
+        action.as_ref().map(|(id, _)| *id),
+    );
     for entity_id in &to_kill {
         if let Some(entity) = world.entities.get_mut(entity_id) {
             entity.kill();
@@ -659,7 +751,16 @@ fn tick(
     //      插在 apply_pending_changes 之后、decay_survival 之前：攻击产生的死亡先于每日衰减处理。
     //      import 函数只排队（无 world 访问权），实际 hit/miss/拦截/结算在此判断：
     //      收件（逐刀问目标当前沙箱 on_attack，不换血不击杀）-> 结算（攻击者 id 升序逐刀执行）。
-    let pending_attacks = sandbox_map.collect_pending_attacks();
+    //      操控攻击（空格）并入同一队列走既有两阶段结算（操控不豁免物理，宪法）；
+    //      无可见目标 = 挥空不出刀（但操控仍接管了本拍）。
+    let mut pending_attacks = sandbox_map.collect_pending_attacks();
+    if let Some((id, input::ControlledAction::Attack(Some(tpos)))) = &action {
+        pending_attacks.push(PendingAttack {
+            attacker: *id,
+            target_pos: *tpos,
+            payload: Vec::new(),
+        });
+    }
     if !pending_attacks.is_empty() {
         process_attacks(world, sandbox_map, &pending_attacks);
     }
@@ -744,9 +845,12 @@ fn tick(
         defender.is_some(),
         if defender.is_some() { shield_report } else { None },
         world.entities.len(),
+        ctrl.as_deref(),
     );
 
     //   e. 渲染输出（架构 4.1 e 步；有差异才 flush）
+    //      操控高亮：被操控实体 glyph 白色渲染（渲染层特判，#022 操控层 v0）
+    renderer.set_controlled(control_target);
     let diffs = renderer.render(world);
     if !diffs.is_empty() {
         renderer.flush();
@@ -2664,6 +2768,187 @@ mod tests {
         let contacts = apply_pending_changes(&mut world, &mut pending);
         assert!(contacts.is_empty(), "空格移动不产生接触");
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.0));
+    }
+
+    // === 操控层 v0：tick 级意图路由（#022 操控优先于自主）===
+
+    /// 自主东行者 WAT：每拍 move_by(+1,0)（模拟 pioneer 的挂机AI自主移动）
+    const AUTO_MOVER_WAT: &str = r#"(module
+  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "on_tick") (drop (call $move_by (f64.const 1.0) (f64.const 0.0))))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 操控测试舞台：玩家 p1@(30,0) 挂指定 WAT 沙箱并登记为第一个在线玩家，
+    /// 返回 (world, time, physics, renderer, storage, pending, sandbox_map, pid)
+    #[allow(clippy::type_complexity)]
+    fn control_stage(
+        player_wat: &str,
+    ) -> (
+        WorldState,
+        TimeEngine,
+        DefaultPhysicsEngine,
+        Renderer,
+        StorageEngine,
+        Vec<PendingChange>,
+        EntitySandboxMap,
+        EntityId,
+    ) {
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let pid = make_entity_with_sandbox(&mut world, &mut map, 1, (30.0, 0.0), player_wat);
+        map.players.register_online("p1", pid);
+        (
+            world,
+            TimeEngine::new(),
+            DefaultPhysicsEngine::new(),
+            test_renderer(),
+            StorageEngine::open_in_memory().unwrap(),
+            Vec::new(),
+            map,
+            pid,
+        )
+    }
+
+    #[test]
+    fn control_move_overrides_autonomous_move() {
+        // #022 操控优先于自主：注入 Move(-1,0) -> 本拍自主 move_by(+1,0) 被抑制
+        //（on_tick 跳过），实体按操控方向西移 30 -> 29（自主则是 31）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid) =
+            control_stage(AUTO_MOVER_WAT);
+        let intents = vec![input::Intent::Move { dx: -1.0, dy: 0.0 }];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (29.0, 0.0),
+            "操控移动覆盖自主移动"
+        );
+    }
+
+    #[test]
+    fn no_intent_keeps_autonomous_move() {
+        // 无人按键 = 代码自主照常（#022 离线回落语义；pioneer 挂机行为回归锚）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid) =
+            control_stage(AUTO_MOVER_WAT);
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (31.0, 0.0),
+            "无按键自主东行一步"
+        );
+    }
+
+    #[test]
+    fn control_move_blocked_by_occupancy_stays_in_place() {
+        // 操控不豁免物理（宪法）：目标格被占 -> 操控移动被占位裁决挡下，实体留原位
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid) =
+            control_stage(AUTO_MOVER_WAT);
+        // 占据者：无沙箱普通实体（非玩家）放在西邻格
+        world.entities.insert(
+            EntityId(Uuid::from_u128(9)),
+            make_entity(9, (29.0, 0.0)),
+        );
+        let intents = vec![input::Intent::Move { dx: -1.0, dy: 0.0 }];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (30.0, 0.0),
+            "操控移动被占位裁决挡下（塔前停）"
+        );
+        assert_eq!(
+            world.entities.get(&EntityId(Uuid::from_u128(9))).unwrap().pos(),
+            (29.0, 0.0),
+            "占据者不受影响"
+        );
+    }
+
+    #[test]
+    fn control_attack_kills_nearest_visible_enemy() {
+        // 空格 = 对最近可见敌人出刀（复用 scan 语义与 find_nearest_enemy 同源）；
+        // 操控刀走既有两阶段结算 -> 击杀 + 掠夺 1 生存点数（操控不豁免物理）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid) =
+            control_stage(AUTO_MOVER_WAT);
+        let victim = make_entity_with_sandbox(&mut world, &mut map, 2, (32.0, 0.0), TARGET_WAT);
+        let intents = vec![input::Intent::Attack];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert!(
+            !world.entities.contains_key(&victim),
+            "操控刀击杀最近可见敌人（TARGET_WAT 无防守）"
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().survival.points(),
+            4,
+            "击杀掠夺：攻击者 3 -> 4"
+        );
+    }
+
+    #[test]
+    fn keys_without_player_online_are_safe() {
+        // 无玩家在线按键：不崩、不操控任何实体（实体自主照常）、记一次 no player online
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        // 实体带自主移动沙箱但从未登记玩家（无操控目标）
+        let lone = make_entity_with_sandbox(&mut world, &mut map, 1, (30.0, 0.0), AUTO_MOVER_WAT);
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let intents = vec![
+            input::Intent::Move { dx: -1.0, dy: 0.0 },
+            input::Intent::Attack,
+        ];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            world.entities.get(&lone).unwrap().pos(),
+            (31.0, 0.0),
+            "无玩家在线时按键不操控实体（自主照常）"
+        );
+        assert!(map.warned_no_player, "应记一次 no player online 提示");
     }
 
     // === attack_target（架构 4.2：on_attack 拦截 -> 替换沙箱 -> 检查 life）===
