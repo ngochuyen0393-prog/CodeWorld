@@ -56,6 +56,12 @@ struct EntitySandboxMap {
     players: PlayerDirectory,
     /// "no player online" 提示已打过一次（操控层 v0：无玩家按键只提示一次不刷屏）
     warned_no_player: bool,
+    /// me 声明无效提示已打过一次（#024：拼错/未进场/已下线 warn 不刷屏）
+    warned_invalid_me: bool,
+    /// 上一拍操控的玩家名（#024 下线 latch 检测依据）
+    last_controlled: Option<String>,
+    /// 操控目标下线 latch（#024：下线后本局锁定观战，重新进场不自动恢复，重启重开）
+    controlled_offline_latched: bool,
 }
 
 impl EntitySandboxMap {
@@ -70,6 +76,9 @@ impl EntitySandboxMap {
             max_entities: 64,
             players: PlayerDirectory::disabled(),
             warned_no_player: false,
+            warned_invalid_me: false,
+            last_controlled: None,
+            controlled_offline_latched: false,
         })
     }
 
@@ -678,23 +687,65 @@ fn tick_with_intents(
     sandbox_map.fill_visible_snapshots(world, &bounds);
 
     // ②5 操控路由（#022 双层模型：操控优先于自主，代码层回落挂机AI）
-    //    - 操控目标 = 第一个进场且仍在线的玩家实体（MVP 单玩家假设）
+    //    - 操控目标 = me 声明（CODEWORLD_ME 优先，其次 players/me.txt）且在线的玩家
+    //      （#024 身份绑定，修正 #023 进场序；每拍解析，中途声明/修改即生效）
     //    - 意图在拍首路由（坐标取拍首快照），本拍行动立即定案
-    let online = sandbox_map.players.first_online();
+    let env_me = std::env::var("CODEWORLD_ME").ok();
+    let me = players::read_me_declaration(env_me.as_deref(), sandbox_map.players.dir());
+    // 上一拍操控的目标本拍不在线 = 操控目标下线（#024：warn 一次 + latch；
+    // me.txt 中途改声明他人不触发——那是显式换人，不是断线）
+    if let Some(prev) = sandbox_map.last_controlled.clone() {
+        if !sandbox_map.controlled_offline_latched
+            && me.as_deref() == Some(prev.as_str())
+            && !sandbox_map.players.is_online(&prev)
+        {
+            tracing::warn!(
+                player = %prev,
+                "[players] 操控目标下线，转观战（重新进场不自动恢复，重启后生效）"
+            );
+            sandbox_map.controlled_offline_latched = true;
+        }
+    }
+    let online = if sandbox_map.controlled_offline_latched {
+        None
+    } else {
+        sandbox_map.players.controlled_target(me.as_deref())
+    };
+    sandbox_map.last_controlled = online.as_ref().map(|(name, _)| name.clone());
     let control_target = online
         .as_ref()
         .map(|(_, id)| *id)
         .filter(|id| world.entities.get(id).map(|e| e.is_alive()).unwrap_or(false));
+    // me 声明了但名字无效（拼错/未进场/已下线）：warn 一次 + 观战
+    if me.is_some()
+        && online.is_none()
+        && !sandbox_map.warned_invalid_me
+        && !sandbox_map.controlled_offline_latched
+    {
+        tracing::warn!(
+            name = ?me,
+            "[players] me 声明的玩家名无效（拼错/未进场/已下线），观战模式"
+        );
+        sandbox_map.warned_invalid_me = true;
+    }
     if !intents.is_empty() && control_target.is_none() && !sandbox_map.warned_no_player {
-        tracing::info!("[input] 按键收到但无玩家在线，操控无目标（no player online）");
+        tracing::debug!("[input] 观战模式无操控目标，按键仅 Quit 生效（no control target）");
         sandbox_map.warned_no_player = true;
     }
     let nearest = control_target.and_then(|id| find_nearest_enemy(world, &id, &bounds));
     let action = input::route_intents(intents, control_target, nearest);
-    // 字幕 ctrl 状态（操控目标在线即显示，与是否按键无关；字形=玩家名首字符大写）
-    let ctrl = control_target
-        .and(online.as_ref())
-        .map(|(name, _)| players::glyph_for(name));
+    // 字幕 ctrl 段（#024 三态）：操控中 = ctrl:字形；观战（有人但不是你 / 操控目标
+    // 下线 latch）= ctrl:--；无玩家在线且从未 latch（四生物基线）= 不显示 ctrl 段
+    let ctrl = if sandbox_map.players.has_online() || sandbox_map.controlled_offline_latched {
+        Some(
+            control_target
+                .and(online.as_ref())
+                .map(|(name, _)| players::glyph_for(name))
+                .unwrap_or_else(|| "--".to_string()),
+        )
+    } else {
+        None
+    };
     if let (Some((name, _)), Some((id, act))) = (&online, &action) {
         match act {
             input::ControlledAction::Move(dx, dy) => {
@@ -2779,8 +2830,9 @@ mod tests {
   (func (export "on_tick") (drop (call $move_by (f64.const 1.0) (f64.const 0.0))))
   (func (export "life") (result i32) i32.const 1))"#;
 
-    /// 操控测试舞台：玩家 p1@(30,0) 挂指定 WAT 沙箱并登记为第一个在线玩家，
-    /// 返回 (world, time, physics, renderer, storage, pending, sandbox_map, pid)
+    /// 操控测试舞台：玩家 p1@(30,0) 挂指定 WAT 沙箱并登记为 me 声明的操控目标（#024），
+    /// 返回 (world, time, physics, renderer, storage, pending, sandbox_map, pid, me 目录)。
+    /// me 目录 = 临时 players/ 目录（p1.wat 在场 + me.txt="p1"），测试可改文件模拟声明变化。
     #[allow(clippy::type_complexity)]
     fn control_stage(
         player_wat: &str,
@@ -2793,10 +2845,15 @@ mod tests {
         Vec<PendingChange>,
         EntitySandboxMap,
         EntityId,
+        PathBuf,
     ) {
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         let pid = make_entity_with_sandbox(&mut world, &mut map, 1, (30.0, 0.0), player_wat);
+        let dir = temp_players_dir("control");
+        std::fs::write(dir.join("p1.wat"), player_wat).unwrap();
+        std::fs::write(dir.join("me.txt"), "p1").unwrap();
+        map.players = PlayerDirectory::new(&dir);
         map.players.register_online("p1", pid);
         (
             world,
@@ -2807,6 +2864,7 @@ mod tests {
             Vec::new(),
             map,
             pid,
+            dir,
         )
     }
 
@@ -2814,7 +2872,7 @@ mod tests {
     fn control_move_overrides_autonomous_move() {
         // #022 操控优先于自主：注入 Move(-1,0) -> 本拍自主 move_by(+1,0) 被抑制
         //（on_tick 跳过），实体按操控方向西移 30 -> 29（自主则是 31）
-        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid) =
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
         let intents = vec![input::Intent::Move { dx: -1.0, dy: 0.0 }];
         tick_with_intents(
@@ -2837,7 +2895,7 @@ mod tests {
     #[test]
     fn no_intent_keeps_autonomous_move() {
         // 无人按键 = 代码自主照常（#022 离线回落语义；pioneer 挂机行为回归锚）
-        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid) =
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
         tick(
             &mut world,
@@ -2858,7 +2916,7 @@ mod tests {
     #[test]
     fn control_move_blocked_by_occupancy_stays_in_place() {
         // 操控不豁免物理（宪法）：目标格被占 -> 操控移动被占位裁决挡下，实体留原位
-        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid) =
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
         // 占据者：无沙箱普通实体（非玩家）放在西邻格
         world.entities.insert(
@@ -2892,7 +2950,7 @@ mod tests {
     fn control_attack_kills_nearest_visible_enemy() {
         // 空格 = 对最近可见敌人出刀（复用 scan 语义与 find_nearest_enemy 同源）；
         // 操控刀走既有两阶段结算 -> 击杀 + 掠夺 1 生存点数（操控不豁免物理）
-        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid) =
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
         let victim = make_entity_with_sandbox(&mut world, &mut map, 2, (32.0, 0.0), TARGET_WAT);
         let intents = vec![input::Intent::Attack];
@@ -2949,6 +3007,207 @@ mod tests {
             "无玩家在线时按键不操控实体（自主照常）"
         );
         assert!(map.warned_no_player, "应记一次 no player online 提示");
+        assert!(
+            !renderer.caption_line().contains("ctrl:"),
+            "无玩家在线无 ctrl 段（区分“无人”与“有人但不是你”），实际 {}",
+            renderer.caption_line()
+        );
+    }
+
+    #[test]
+    fn me_declaration_controls_declared_player_not_first_joined() {
+        // #024 核心语义（修正 #023）：操控目标 = me 声明的名字，与进场顺序无关——
+        // p1 先登记（进程序第一）、me.txt 声明 p2：西移键操控 p2，p1 走代码自主
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let pid2 = make_entity_with_sandbox(&mut world, &mut map, 2, (35.0, 0.0), AUTO_MOVER_WAT);
+        std::fs::write(me_dir.join("p2.wat"), AUTO_MOVER_WAT).unwrap();
+        std::fs::write(me_dir.join("me.txt"), "p2").unwrap();
+        map.players.register_online("p2", pid2);
+        let intents = vec![input::Intent::Move { dx: -1.0, dy: 0.0 }];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            world.entities.get(&pid2).unwrap().pos(),
+            (34.0, 0.0),
+            "声明的 p2 被操控西移（on_tick 被抑制，仅操控位移）"
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (31.0, 0.0),
+            "未声明的 p1 不受操控，代码自主东移"
+        );
+    }
+
+    #[test]
+    fn no_me_declaration_spectator_keys_safe_and_ctrl_dashes() {
+        // #024 观战：玩家在线但无 me 声明 -> 无操控目标（按键安全，自主照常），
+        // 字幕 ctrl:--（有人但不是你），观战按键提示一次
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        std::fs::remove_file(me_dir.join("me.txt")).unwrap();
+        let intents = vec![
+            input::Intent::Move { dx: -1.0, dy: 0.0 },
+            input::Intent::Attack,
+        ];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (31.0, 0.0),
+            "观战模式按键不操控实体（代码自主照常）"
+        );
+        assert!(map.warned_no_player, "观战模式按键应提示一次");
+        assert!(
+            renderer.caption_line().contains("ctrl:--"),
+            "有人但不是你 -> ctrl:--，实际 {}",
+            renderer.caption_line()
+        );
+    }
+
+    #[test]
+    fn invalid_me_declaration_spectates_and_warns_once() {
+        // #024 声明无效（拼错/未进场）：warn 一次 + 回落观战（ctrl:--，按键安全）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        std::fs::write(me_dir.join("me.txt"), "ghost").unwrap();
+        let intents = vec![input::Intent::Move { dx: -1.0, dy: 0.0 }];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (31.0, 0.0),
+            "声明无效 -> 观战，代码自主照常"
+        );
+        assert!(map.warned_invalid_me, "无效声明应 warn 一次");
+        assert!(
+            renderer.caption_line().contains("ctrl:--"),
+            "声明无效 -> ctrl:--，实际 {}",
+            renderer.caption_line()
+        );
+    }
+
+    #[test]
+    fn controlled_offline_latches_spectator_no_auto_restore() {
+        // #024 下线回落：操控中的目标下线（删玩家文件）-> warn 一次 + latch 观战；
+        // 重新进场（文件回来，新实体）不自动恢复操控——重启重开（MVP 从简）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let intents = vec![input::Intent::Move { dx: -1.0, dy: 0.0 }];
+        let no_intents: Vec<input::Intent> = vec![];
+        // tick1：正常操控西移 30 -> 29
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (29.0, 0.0), "操控中");
+        // 删玩家文件 = 下线信号（在线锚本拍 d0 检测）；tick2 下线进残影
+        std::fs::remove_file(me_dir.join("p1.wat")).unwrap();
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &no_intents,
+        );
+        // tick3：声明仍指向 p1 但已不在线 -> latch 观战，西移键无效（残影 30 不动）
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert!(
+            map.controlled_offline_latched,
+            "操控目标下线应 latch 观战（本局不自动恢复）"
+        );
+        assert!(
+            !map.warned_invalid_me,
+            "latch 路径只打“下线”warn，不重复打“声明无效”warn"
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (30.0, 0.0),
+            "latch 后操控无效（残影不执行代码也不受操控位移）"
+        );
+        assert!(
+            renderer.caption_line().contains("ctrl:--"),
+            "操控目标下线后回落 ctrl:--，实际 {}",
+            renderer.caption_line()
+        );
+        // 玩家文件回来：新实体重新进场（新 EntityId），本局不恢复操控——新实体走代码自主
+        std::fs::write(me_dir.join("p1.wat"), AUTO_MOVER_WAT).unwrap();
+        // tick4：spawn 拍（新实体进场，本拍不跑玩家代码，出生在 (30,0)）
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &no_intents,
+        );
+        let new_id = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "p1")
+            .expect("重新进场的 p1 实体应存在")
+            .id;
+        assert_ne!(new_id, pid, "重新进场是新实体（新 EntityId）");
+        // tick5：西移键无效（latch 观战），新实体走代码自主东移 30 -> 31
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            world.entities.get(&new_id).unwrap().pos(),
+            (31.0, 0.0),
+            "不自动恢复操控：新实体走代码自主东移（操控西移无效）"
+        );
     }
 
     // === attack_target（架构 4.2：on_attack 拦截 -> 替换沙箱 -> 检查 life）===
@@ -4085,7 +4344,7 @@ mod tests {
     #[test]
     fn smoke_default_viewport_four_bio_timeline_unchanged() {
         // 冒烟（scan 视野化回归验收点）：默认视口 50x25（对齐真实 Config），四生物
-        // + E 类玩家 @(35,5)（PLAYER_WAT 同 example.wat：只 log 不动不 scan）。
+        // + E 类玩家 @(35,5)（PLAYER_WAT 同 players/_template.wat.txt：只 log 不动不 scan）。
         // 全员都在 [-50,50]x[-25,25] 内，视口过滤是 no-op——剧本时间线必须不变：
         // tick4 D 反制杀 H、tick12 杀 A；E 距离最远无人锁定，全程存活。
         let mut world = WorldState::new();
@@ -4620,7 +4879,7 @@ mod tests {
 
     // === 玩家目录（门一进场 + 在线锚 + 残影期）===
 
-    /// 示例玩家 WAT（与 players/example.wat、api.md 示例一致：life()=true + on_tick 调 log(1)）
+    /// 示例玩家 WAT（与 players/_template.wat.txt、api.md 示例一致：life()=true + on_tick 调 log(1)）
     pub(crate) const EXAMPLE_PLAYER_WAT: &str = r#"(module
   (import "env" "log" (func $log (param i32)))
   (func (export "life") (result i32) i32.const 1)

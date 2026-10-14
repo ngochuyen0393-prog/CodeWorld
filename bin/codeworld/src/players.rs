@@ -57,6 +57,35 @@ pub(crate) fn ghost_duration_ticks(last_combat: Option<u64>, now: u64) -> u64 {
     }
 }
 
+/// me 声明解析（#024 身份绑定）：操控者声明的玩家名。
+///
+/// - 环境变量 `CODEWORLD_ME` 优先（trim 后非空才生效，空串=未通过 env 声明，回落文件）
+/// - 其次 `<dir>/me.txt` 一行内容（trim；空文件/文件缺失 = 未声明）
+/// - 返回 None = 未声明（观战模式）；名字是否对应在线玩家由 [`PlayerDirectory::controlled_target`] 校验
+pub(crate) fn read_me_declaration(env_value: Option<&str>, dir: &Path) -> Option<String> {
+    if let Some(v) = env_value {
+        let t = v.trim();
+        if !t.is_empty() {
+            tracing::debug!(source = "env", name = t, "[players] me 声明来自 CODEWORLD_ME");
+            return Some(t.to_string());
+        }
+    }
+    let path = dir.join("me.txt");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let t = content.trim();
+            if t.is_empty() {
+                tracing::debug!(path = %path.display(), "[players] me.txt 为空，未声明操控者");
+                None
+            } else {
+                tracing::debug!(path = %path.display(), name = t, "[players] me 声明来自 me.txt");
+                Some(t.to_string())
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 /// 下线事件（玩家删文件产出，供日志与接线）
 pub(crate) struct OfflineEvent {
     pub(crate) entity_id: EntityId,
@@ -75,8 +104,6 @@ pub(crate) struct PlayerDirectory {
     enabled: bool,
     /// 在线玩家：玩家名 -> 角色实体 ID
     online: HashMap<String, EntityId>,
-    /// 在线进场序（操控目标"第一个进场"依据，#022；与 online 表键同步维护）
-    online_order: Vec<String>,
     /// 残影中：实体 ID -> 消散 tick（到期拍阶段二标记死亡，走死亡清理通路）
     ghosts: HashMap<EntityId, u64>,
     /// 最近参战 tick：实体 ID -> tick（战斗残影期计算；#013）
@@ -94,7 +121,6 @@ impl PlayerDirectory {
             dir: dir.into(),
             enabled: true,
             online: HashMap::new(),
-            online_order: Vec::new(),
             ghosts: HashMap::new(),
             combat: HashMap::new(),
             failed: HashSet::new(),
@@ -109,7 +135,6 @@ impl PlayerDirectory {
             dir: PathBuf::from("./players"),
             enabled: false,
             online: HashMap::new(),
-            online_order: Vec::new(),
             ghosts: HashMap::new(),
             combat: HashMap::new(),
             failed: HashSet::new(),
@@ -166,17 +191,19 @@ impl PlayerDirectory {
     pub(crate) fn register_online(&mut self, name: &str, entity_id: EntityId) {
         tracing::debug!(name, entity_id = %entity_id.0, "[players] 玩家登记上线");
         self.online.insert(name.to_string(), entity_id);
-        if !self.online_order.iter().any(|n| n == name) {
-            self.online_order.push(name.to_string());
-        }
     }
 
-    /// 操控目标（#022 操控层）：第一个进场且仍在线的玩家（进场序，MVP 单玩家假设）。
-    /// 返回 (名字, 实体ID)；无人在线返回 None（按键仅 Quit 生效）。
-    pub(crate) fn first_online(&self) -> Option<(String, EntityId)> {
-        let name = self.online_order.first()?;
+    /// 操控目标（#024 身份绑定，修正 #023 进场序语义）：me 声明的玩家名 -> 校验已进场在线
+    /// -> (名字, 实体ID)。无声明/名字无效（拼错/未进场/已下线）返回 None = 观战模式。
+    pub(crate) fn controlled_target(&self, me: Option<&str>) -> Option<(String, EntityId)> {
+        let name = me?;
         let id = self.online.get(name).copied()?;
-        Some((name.clone(), id))
+        Some((name.to_string(), id))
+    }
+
+    /// 是否有玩家在线（字幕 ctrl 段显示依据：有人但非你 -> ctrl:--；无人 -> 不显示段）
+    pub(crate) fn has_online(&self) -> bool {
+        !self.online.is_empty()
     }
 
     /// 登记编译失败（不再逐拍重试）
@@ -204,7 +231,6 @@ impl PlayerDirectory {
     /// 返回 None 表示名字不在在线表（不该发生，防御）。
     pub(crate) fn note_offline(&mut self, name: &str, now: u64) -> Option<OfflineEvent> {
         let entity_id = self.online.remove(name)?;
-        self.online_order.retain(|n| n != name);
         let last_combat = self.combat.get(&entity_id).copied();
         let in_combat = last_combat
             .map(|t| now.saturating_sub(t) < COMBAT_WINDOW_TICKS)
@@ -424,9 +450,15 @@ mod tests {
         std::fs::write(dir_path.join("a.wat"), "(module)").unwrap();
         std::fs::write(dir_path.join("notes.txt"), "not a player").unwrap();
         std::fs::write(dir_path.join("c.wat.bak"), "(module)").unwrap();
+        std::fs::write(dir_path.join("_template.wat.txt"), "(module)").unwrap();
+        std::fs::write(dir_path.join("me.txt"), "a").unwrap();
         let dir = PlayerDirectory::new(&dir_path);
         let stems = dir.scan_dir().unwrap();
-        assert_eq!(stems, vec!["a".to_string(), "b".to_string()], "只收 .wat 且排序");
+        assert_eq!(
+            stems,
+            vec!["a".to_string(), "b".to_string()],
+            "只收 .wat 且排序；.wat.txt 模板与 me.txt 不进场（#024）"
+        );
         let _ = std::fs::remove_dir_all(&dir_path);
     }
 
@@ -466,31 +498,82 @@ mod tests {
         assert!(PlayerDirectory::new("any").is_enabled());
     }
 
-    // === 操控目标（#022 操控层：第一个进场且仍在线的玩家）===
+    // === 操控目标（#024 身份绑定：me 声明 -> 校验在线，非进场序）===
 
     #[test]
-    fn first_online_returns_earliest_registered_player() {
-        // 规则：操控目标 = 第一个进场且仍在线的玩家（进场序，非 HashMap 随机序）
+    fn controlled_target_follows_me_declaration_not_join_order() {
+        // 规则（#024，修正 #023）：操控目标 = me 声明的名字，与进场顺序无关；
+        // 两个玩家在册时声明后进场者 -> 操控后进场者
         let mut dir = PlayerDirectory::new("unused");
-        assert!(dir.first_online().is_none(), "无人在线无操控目标");
+        assert!(
+            dir.controlled_target(None).is_none(),
+            "无声明 = 无操控目标（观战模式）"
+        );
         dir.register_online("pioneer", eid(1));
         dir.register_online("second", eid(2));
-        let (name, id) = dir.first_online().expect("有人在线应有目标");
-        assert_eq!(name, "pioneer", "先进场者优先");
-        assert_eq!(id, eid(1));
+        let (name, id) = dir
+            .controlled_target(Some("second"))
+            .expect("声明的名字在线应有操控目标");
+        assert_eq!(name, "second");
+        assert_eq!(id, eid(2), "操控目标=声明的 second，不是先进场的 pioneer");
     }
 
     #[test]
-    fn first_online_skips_offline_players() {
-        // 先进场者下线 -> 操控目标轮到下一个在线玩家
+    fn controlled_target_none_when_declared_name_not_online() {
+        // 名字无效（拼错/未进场/已下线）-> None（观战模式；warn 由调用方负责）
         let mut dir = PlayerDirectory::new("unused");
         dir.register_online("pioneer", eid(1));
-        dir.register_online("second", eid(2));
-        let _ = dir.note_offline("pioneer", 0);
-        assert_eq!(
-            dir.first_online().map(|(n, _)| n),
-            Some("second".to_string()),
-            "pioneer 下线后操控目标轮到 second"
+        assert!(
+            dir.controlled_target(Some("pioner")).is_none(),
+            "拼错的名字不对应任何在线玩家"
         );
+        let _ = dir.note_offline("pioneer", 0);
+        assert!(
+            dir.controlled_target(Some("pioneer")).is_none(),
+            "已下线的名字无效（观战）"
+        );
+    }
+
+    // === me 声明解析（#024：CODEWORLD_ME 环境变量优先 -> players/me.txt -> 未声明）===
+
+    #[test]
+    fn me_env_beats_file() {
+        // env 有值（trim 后非空）-> 优先于 me.txt，文件内容被忽略
+        assert_eq!(
+            read_me_declaration(Some("beta"), Path::new("unused")).as_deref(),
+            Some("beta")
+        );
+    }
+
+    #[test]
+    fn me_env_empty_falls_to_file() {
+        // env 空串/纯空白 = 未通过 env 声明 -> 回落 me.txt
+        assert_eq!(
+            read_me_declaration(Some("  "), Path::new("unused")).as_deref(),
+            None,
+            "env 空且无 me.txt -> 未声明"
+        );
+    }
+
+    #[test]
+    fn me_file_trimmed_empty_or_missing_is_none() {
+        // me.txt 内容 trim 后生效；空白文件/文件缺失 = 未声明
+        let dir_path = temp_dir("me-file");
+        assert!(
+            read_me_declaration(None, &dir_path).is_none(),
+            "无 me.txt = 未声明"
+        );
+        std::fs::write(dir_path.join("me.txt"), "  pioneer \n").unwrap();
+        assert_eq!(
+            read_me_declaration(None, &dir_path).as_deref(),
+            Some("pioneer"),
+            "文件内容 trim 后生效"
+        );
+        std::fs::write(dir_path.join("me.txt"), "   \n").unwrap();
+        assert!(
+            read_me_declaration(None, &dir_path).is_none(),
+            "空白 me.txt = 未声明"
+        );
+        let _ = std::fs::remove_dir_all(&dir_path);
     }
 }

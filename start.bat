@@ -39,6 +39,9 @@ echo   Outcomes vary: A dies to H, or slays H first then falls to D's wall.
 echo   Want the classic 1v1 duel instead? Set CODEWORLD_H_ENABLED=0
 echo   and CODEWORLD_S_ENABLED=0.
 echo   Want A to win? See start-reversal.bat (thin shield, no H, no S).
+echo   Want to control a character? Put players/me.txt containing the
+echo   player name (e.g. pioneer) - WASD to move, Space to attack,
+echo   q to quit. No me.txt = spectate (caption shows ctrl:--).
 echo [start.bat] Battle report: battle.log   Press Enter (in this window) to close world.
 echo.
 target\debug\codeworld.exe 2>battle.log

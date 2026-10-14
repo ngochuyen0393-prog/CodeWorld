@@ -118,3 +118,9 @@
 - 原因：键位/回合排队/视野攻击抄 roguelike 成熟语义不发明新规则；"按键拍完全接管"是最简可证语义（部分接管需标注 on_tick 哪些副作用豁免，复杂且挂机AI收益未证实）；入口独立是为 #014 外部通道三位一体（键盘/WS/未来端点同构）留的形状。
 - 否决：坐标直写（违 #022 意图流定案）；操控期间保留自主移动（双移动源同拍冲突，裁决复杂化）；高亮跟随按键瞬闪（回合制下高亮闪现丢角色，roguelike 惯例=常驻可辨）。
 - 落点：bin/codeworld/src/input.rs（Intent/key_to_intent/route_intents/输入线程/终端进出恢复+panic hook）；main.rs tick_with_intents；render caption ctrl 段+white 高亮；api.md 操控层 v0 节。
+
+## #024 2026-10-15 · 操控身份绑定定案：操控权=me声明非进场序；下线latch观战不自动恢复
+- 定案：操控目标=CODEWORLD_ME（优先）或 players/me.txt 声明的名字且已进场在线（每拍解析，中途声明/修改即生效）；未声明/声明无效=观战（按键仅 Quit，字幕 ctrl:--，无高亮）；操控目标下线 warn 一次并 latch 观战，重新进场不自动恢复（重启重开）；example.wat 归位 _template.wat.txt（下划线前缀+非 .wat 扩展名不进场）。修正 #023"第一个进场玩家"偷懒语义——操控权=身份绑定（终态句式"输入→我的角色"），期四凭证升级（文件声明→账号认证）只换声明来源，路由不变。
+- 原因：进程序自动轮替会把键盘送给"碰巧先进场的陌生人"；下线=会话断开，自动重连恢复操控给"断线抢尸"留歧义，MVP 从简显式重启。
+- 否决：保留 first_online 进场序语义（#023 修正对象）；下线后同拍自动恢复操控（会话语义模糊，动态恢复留下个任务）；me.txt 加 mtime 缓存（一行文件每拍读成本可忽略，缓存是无谓状态）。
+- 落点：players.rs read_me_declaration/controlled_target（first_online+online_order 退役）；main.rs tick ②5 三态解析+下线 latch+ctrl:--；players/_template.wat.txt；start.bat/players/README.md/api.md 同步。
