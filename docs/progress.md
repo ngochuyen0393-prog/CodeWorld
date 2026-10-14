@@ -2,8 +2,8 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-14 三层感知 Phase A 收工更新）
-- 在做：无（三层感知 Phase A 已收工）
+## 现在（2026-10-14 悬浮间谍收工更新）
+- 在做：无（悬浮间谍轻装挡已收工：S 每拍 move_by(+9.8) 抵消重力悬停 y≈12，反制刀坐标过期落空，426 测试）
 - 卡在：无
 - 下一步：① wasmtime 25.0.3 Windows out-of-fuel trap 进程 abort 仍是生产化阻断项（.cc-bugs #5；probe 预算机制已在其约束下落地，trap-free 待升级）；② 三层感知 Phase B（如 call 通道/伪装深化：体徵比对辅助、response 完整 Bytes 传递）；③ Phase 2 议题同前（同坐标多实体、排刀上限、并行执行、multi-value 列表式 get_visible_entities）
 

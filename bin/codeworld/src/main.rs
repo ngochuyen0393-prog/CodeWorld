@@ -972,13 +972,15 @@ const SPY_CODE: &str = "spy";
 /// A 攻击者（红"A"）@(5,0)：直线冲锋逼近，进范围连砍空 payload 击杀刀
 /// D 防御者（青"D"）@(15,0)：原地站桩+盾 d_shield 拦截+每 4 tick 反制
 /// H 搅局者（黄"H"）@(10,8)：中场上空，落地后观望游走，敌人进 3 格参战（h_enabled 开关）
-/// S 伪装者（紫"S"）@(25,12)：右侧高台空降，每 4 tick 眼睛列表扫描+probe 最近者，
-///   on_probe 撒谎"我是友军 life=9"；无防守无攻击（间谍脆皮，s_enabled 开关）
+/// S 伪装者（紫"S"）@(25,12)：右侧高空悬停（每拍 move_by 抵消重力，永不落地），
+///   每 4 tick 眼睛列表扫描+probe 最近者，on_probe 撒谎"我是友军 life=9"；
+///   无防守无攻击（间谍脆皮，s_enabled 开关）
 /// A/D 站地面 y=0：地面实体不受重力，坐标 tick 间稳定，scan/attack_at 的
 /// 坐标精确匹配（f64 相等）不被物理漂移打穿。
 /// S 出生位 (25,12) 的取舍（任务书建议 (20,5) 微调）：D 的 scan 锁"最近敌人"，
 /// S@20,5 距 D 仅 7.07 会抢在 A(10)/H(9.4) 之前被反制刀点名，tick4 即死、
-/// 破坏剧本 1-3 回归；(25,12) 距 D 15.6 排最远，落地后 (25,0) 距 10 也不抢锁。
+/// 破坏剧本 1-3 回归；(25,12) 距 D 15.6 排最远也不抢锁；且每拍悬浮位移
+/// 使 S 的结算坐标恒差快照 9.8，反制刀坐标过期落空（打不到悬停者）。
 /// 默认参数（盾 10）双生物剧本 D 的反制先杀死 A；盾 1 则 A 磨穿防守反杀。
 fn spawn_test_entities(
     world: &mut WorldState,
@@ -1022,7 +1024,7 @@ fn spawn_test_entities(
     } else {
         false
     };
-    // S 伪装者（可选登场）：右侧高台空降 (25,12)，落地后驻守侦察不移动
+    // S 伪装者（可选登场）：右侧高空悬停 (25,12)（玩家代码每拍抵消重力），驻守侦察不移动
     let s_ok = if s_enabled {
         spawn(SPY_CODE, "S", "purple", (25.0, 12.0), &wasm(SPY_WAT))
     } else {
@@ -1035,7 +1037,7 @@ fn spawn_test_entities(
         spy_spawned = s_ok,
         distance_a_d = 10.0,
         defender_shield = d_shield,
-        "开局布阵：A 攻击者冲锋 / D 防御者站桩（盾每拦一刀-1，每4tick反制）/ H 搅局者={}（投机者：敌人进3格参战，被攻击50%拦截）/ S 伪装者={}（间谍：每4tick扫描+probe，on_probe撒谎友军，无防守）",
+        "开局布阵：A 攻击者冲锋 / D 防御者站桩（盾每拦一刀-1，每4tick反制）/ H 搅局者={}（投机者：敌人进3格参战，被攻击50%拦截）/ S 伪装者={}（间谍：悬停高空+每4tick扫描+probe，on_probe撒谎友军，无防守）",
         if h_enabled { "登场" } else { "缺席" },
         if s_enabled { "登场" } else { "缺席" }
     );
@@ -1225,10 +1227,15 @@ const HUNTER_WAT: &str = r#"(module
       (else (drop (call $move_by (f64.const -0.5) (f64.const 0.0))))))
   (func (export "life") (result i32) i32.const 1))"#;
 
-/// 伪装者 S 的玩家代码 WAT（紫色，性格：间谍——高调侦察+撒谎身份）
+/// 伪装者 S 的玩家代码 WAT（紫色，性格：间谍——悬浮高空+高调侦察+撒谎身份）
 ///
-/// 策略（on_tick 每 tick 执行，每 4 tick 侦察一轮）：
-/// 1. tick 计数非 4 倍数直接返回；侦察轮先 log 9（侦察 marker）
+/// 策略（on_tick 每 tick 执行）：
+/// 0. 每拍先悬浮：move_by(0,+9.8) 抵消当拍重力（DefaultPhysicsEngine 默认
+///    gravity=-9.8；阶段二 a 先应用悬浮位移、物理步再扣重力，净高度不变，
+///    S 稳定悬停 y≈12 永不落地）。悬浮在侦察节奏判断之前，每拍都执行，
+///    且位移让阶段一快照坐标与阶段二 a2 攻击结算坐标恒差 9.8——反制刀
+///    坐标过期落空，"够不着+打不中"就是间谍唯一的自卫
+/// 1. tick 计数非 4 倍数直接返回；侦察轮先 log 10（侦察 marker）
 /// 2. visible_count 数敌人，空则收工（全场只剩自己时不折腾）
 /// 3. visible_at 循环扫一圈（眼睛列表），记与自己的平方距最近者
 /// 4. 对最近者 probe(req=[1,2,3,4] -> resp@32 cap 64)，返回值存全局（观测导出）
@@ -1242,6 +1249,7 @@ const HUNTER_WAT: &str = r#"(module
 const SPY_WAT: &str = r#"(module
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
+  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
   (import "env" "visible_count" (func $visible_count (result i32)))
   (import "env" "visible_at" (func $visible_at (param i32 i32 i32) (result i32)))
   (import "env" "probe" (func $probe (param f64 f64 i32 i32 i32 i32) (result i32)))
@@ -1256,6 +1264,8 @@ const SPY_WAT: &str = r#"(module
     (local $x f64) (local $y f64) (local $mx f64) (local $my f64)
     (local $dx f64) (local $dy f64) (local $d f64)
     global.get $ticks i32.const 1 i32.add global.set $ticks
+    ;; 0. 每拍悬浮：先 +9.8 抵消物理步的 -9.8，净悬停（不受侦察节奏影响）
+    (drop (call $move_by (f64.const 0.0) (f64.const 9.8)))
     ;; 1. 每 4 tick 侦察一轮
     (if (i32.rem_u (global.get $ticks) (i32.const 4))
       (then (return)))
@@ -2846,7 +2856,7 @@ mod tests {
         let spy = world.entities.values().find(|e| e.code_hash == SPY_CODE);
         assert!(spy.is_some(), "s_enabled=true 应登场伪装者 S");
         let s = spy.unwrap();
-        assert_eq!(s.pos(), (25.0, 12.0), "S 应出生在 (25,12) 右侧高台");
+        assert_eq!(s.pos(), (25.0, 12.0), "S 应出生在 (25,12) 右侧高空悬停位");
         assert_eq!(s.appearance.glyph, "S", "S 的字形应为紫 S");
         assert_eq!(world.entities.len(), 4, "S 登场时四方布阵应有 4 个实体");
     }
@@ -2862,6 +2872,46 @@ mod tests {
             "s_enabled=false 不应有 S"
         );
         assert_eq!(world.entities.len(), 3, "S 缺席时应有 3 个实体");
+    }
+
+    // === 悬浮间谍（S 每拍抵消重力，悬停高空）===
+
+    #[test]
+    fn spy_hovers_above_ground_every_tick() {
+        // 悬浮间谍：S 出生 (25,12) 空中，每拍 move_by(0,+9.8) 抵消重力
+        // （DefaultPhysicsEngine::new() 默认 gravity=-9.8）——跑 8 拍
+        // （含侦察 4 倍数拍与 1/2/3 非侦察拍），S 的 y 全程 > 5、永不落地。
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(7));
+        world.entities.insert(id, make_entity(7, (25.0, 12.0)));
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut sandbox_map = test_sandbox_map();
+        sandbox_map.create(id, &wasm(SPY_WAT), 1_000_000).unwrap();
+        for tick_n in 1..=8 {
+            tick(
+                &mut world,
+                &mut time,
+                &physics,
+                &mut renderer,
+                &mut storage,
+                &mut pending,
+                &mut sandbox_map,
+            );
+            let y = world
+                .entities
+                .get(&id)
+                .unwrap_or_else(|| panic!("第 {tick_n} 拍 S 应存活"))
+                .pos()
+                .1;
+            assert!(
+                y > 5.0,
+                "第 {tick_n} 拍 S 应悬空（悬浮不受侦察节奏影响），实际 y={y}"
+            );
+        }
     }
 
     // === move_by 全链路（import 排队 -> tick 阶段二应用）===
