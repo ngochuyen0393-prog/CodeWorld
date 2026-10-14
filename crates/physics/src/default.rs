@@ -1,7 +1,9 @@
 //! 默认物理规则：DefaultPhysicsEngine 每 tick 执行基础物理计算
 //!
 //! 架构文档 4.1 节 b 步 + 8.1 节（厚版本）。
-//! 流程：重力 -> 地面约束 -> 速度限制 -> 碰撞检测 -> 碰撞解决。
+//! 流程：重力 -> 地面约束 -> 速度限制（#021 推挤退役，同格只检不推）。
+//! 占位制：重力/地面约束落被占格 → 悬停上一格（占位判定与移动/spawn 同源，
+//! codeworld_core::occupancy）。
 
 use codeworld_core::entity::{Entity, EntityId};
 use codeworld_core::physics::{DefaultPhysics, PhysicsChange, PhysicsReason};
@@ -132,6 +134,16 @@ impl DefaultPhysicsEngine {
     /// 解决碰撞（MVP 策略：后创建的实体挤到旁边一格 (x+1, y)）
     ///
     /// 注意：MVP 不处理级联碰撞（挤到新位置后若与第三实体重叠，本 tick 不重新检测）。
+    ///
+    /// #021 已退役：本函数不再被 tick 流程调用（物理步与主程序均不再调用）。
+    /// 退役原因：挤压式解决产生"永久连体推挤"——两个实体同格后每拍被推 x+1
+    /// 环游世界（实测 P/T 连体 bug 实锤）。占位制（移动被挡+spawn 预检+占位重力）
+    /// 让同格在正常路径下不可能发生，挤压失去存在意义。函数保留仅作历史记录，
+    /// 旧测试 resolve_collision_moves_later_created 保留其行为文档价值。
+    #[deprecated(
+        since = "0.1.0",
+        note = "#021 推挤退役：占位制取代挤压，tick 流程不再调用"
+    )]
     pub fn resolve_collision(
         &self,
         pair: CollisionPair,
@@ -167,28 +179,95 @@ impl DefaultPhysicsEngine {
         changes
     }
 
-    /// 执行完整默认物理步骤：重力 -> 地面约束 -> 速度限制 -> 碰撞检测 -> 碰撞解决
+    /// 执行完整默认物理步骤：重力 -> 地面约束 -> 速度限制（#021 推挤已退役）
+    ///
+    /// #021 实体占位制：重力/地面约束产生的 y 变更同样过占位检查——落到被占格
+    /// → 停在上一格（本拍不动，下拍重试）。实体按 EntityId 升序处理（占位裁决
+    /// 确定序，与主程序移动裁决同源）。
+    ///
+    /// 碰撞检测保留为防御性观测：占位三闸（移动被挡/spawn 预检/占位重力）之下
+    /// 同格理论不可能发生；若仍检出属异常路径，记 warn 让世界状态可见，不推挤。
     pub fn step(&self, world: &mut WorldState) -> Vec<PhysicsChange> {
         let mut changes = Vec::new();
-        // 重力 + 地面 + 速度（逐实体）
-        for entity in world.entities.values_mut() {
-            if !entity.is_alive() {
-                continue; // 死亡实体不受物理影响
+        // 实体 id 升序（占位裁决确定序）
+        let mut ids: Vec<EntityId> = world.entities.keys().copied().collect();
+        ids.sort_by_key(|id| id.0);
+        for id in ids {
+            // 重力意图：先算后查占位，被挡则回滚坐标（本拍不动，下拍重试）
+            let gravity_intent = {
+                let Some(entity) = world.entities.get_mut(&id) else {
+                    continue;
+                };
+                if !entity.is_alive() {
+                    continue; // 死亡实体不受物理影响
+                }
+                let before = entity.pos();
+                self.apply_gravity(entity).map(|c| (before, c))
+            };
+            if let Some((before, c)) = gravity_intent {
+                if let Some(occupant) =
+                    codeworld_core::occupancy::cell_occupied_by(&world.entities, c.new_pos, id)
+                {
+                    tracing::warn!(
+                        entity_id = %id.0,
+                        occupant = %occupant.0,
+                        from = ?before,
+                        target = ?c.new_pos,
+                        "[step] 重力下落被挡（目标格被占，悬停上一格）"
+                    );
+                    if let Some(entity) = world.entities.get_mut(&id) {
+                        entity.set_pos(before); // 回滚：apply_gravity 已改坐标
+                    }
+                } else {
+                    changes.push(c);
+                }
             }
-            if let Some(c) = self.apply_gravity(entity) {
-                changes.push(c);
+            // 地面约束意图：同理过占位检查（回拉目标格被占 → 本拍不回拉）
+            let ground_intent = {
+                let Some(entity) = world.entities.get_mut(&id) else {
+                    continue;
+                };
+                if !entity.is_alive() {
+                    continue;
+                }
+                let before = entity.pos();
+                self.apply_ground_constraint(entity).map(|c| (before, c))
+            };
+            if let Some((before, c)) = ground_intent {
+                if let Some(occupant) =
+                    codeworld_core::occupancy::cell_occupied_by(&world.entities, c.new_pos, id)
+                {
+                    tracing::warn!(
+                        entity_id = %id.0,
+                        occupant = %occupant.0,
+                        from = ?before,
+                        target = ?c.new_pos,
+                        "[step] 地面回拉被挡（目标格被占）"
+                    );
+                    if let Some(entity) = world.entities.get_mut(&id) {
+                        entity.set_pos(before); // 回滚：apply_ground_constraint 已改坐标
+                    }
+                } else {
+                    changes.push(c);
+                }
             }
-            if let Some(c) = self.apply_ground_constraint(entity) {
-                changes.push(c);
+            // 速度限制（改速度不改坐标，无占位问题）
+            if let Some(entity) = world.entities.get_mut(&id) {
+                if entity.is_alive() {
+                    self.apply_velocity_limit(entity);
+                }
             }
-            self.apply_velocity_limit(entity);
         }
-        // 碰撞检测 + 解决
+        // 防御性同格观测（#021 推挤退役：只检不推）
         if self.params.collision_enabled {
             let pairs = self.detect_collisions(&world.entities);
             for pair in pairs {
-                let mut cs = self.resolve_collision(pair, &mut world.entities);
-                changes.append(&mut cs);
+                tracing::warn!(
+                    a = ?pair.a,
+                    b = ?pair.b,
+                    pos = ?pair.pos,
+                    "[step] 异常：仍检出同格重叠（占位制下不应发生，不推挤）"
+                );
             }
         }
         tracing::info!(change_count = changes.len(), "默认物理 step 完成");
@@ -337,8 +416,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn resolve_collision_moves_later_created() {
-        // 修改：后创建的实体被挤到旁边一格 (x+1, y)
+        // #021 已退役的行为文档：后创建的实体被挤到旁边一格 (x+1, y)。
+        // 函数不再被 tick 流程调用；本测试保留记录历史挤压语义（退役原因见
+        // resolve_collision 文档注释——永久连体推挤 bug）。
         let engine = DefaultPhysicsEngine::new();
         let mut entities = HashMap::new();
         let e1 = make_entity(1, 5.0, 5.0, 0); // 先创建
@@ -414,5 +496,95 @@ mod tests {
         // 实体 y 应减少（重力）
         let entity = world.entities.values().next().unwrap();
         assert!(entity.pos().1 < 100.0);
+    }
+
+    // === #021 实体占位制：物理步占位检查 + 推挤退役 ===
+
+    #[test]
+    fn step_gravity_stops_above_occupied_cell() {
+        // 占位重力：下落目标格被占 → 悬停上一格（本拍不动，下拍重试）
+        // E2@(5,10) 重力落点 y=10-9.8=0.2，格 (5,0) 被 E1 占据 → 本拍不动
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, 5.0, 0.0, 0);
+        let e2 = make_entity(2, 5.0, 10.0, 1);
+        let id1 = e1.id;
+        let id2 = e2.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(id2, e2);
+        let changes = engine.step(&mut world);
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (5.0, 10.0), "目标格被占应悬停原位");
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "占据者不受影响");
+        assert!(
+            !changes.iter().any(|c| c.entity == id2),
+            "被挡实体不应产生物理变更"
+        );
+    }
+
+    #[test]
+    fn step_gravity_falls_freely_when_cell_free() {
+        // 反向护栏：目标格空闲 → 照常下落（占位检查不过度拦截）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let e = make_entity(1, 5.0, 10.0, 0);
+        let id = e.id;
+        world.entities.insert(id, e);
+        engine.step(&mut world);
+        assert_eq!(world.entities.get(&id).unwrap().pos(), (5.0, 10.0 - 9.8), "空格应照常下落");
+    }
+
+    #[test]
+    fn step_ground_constraint_blocked_when_ground_cell_occupied() {
+        // 占位地面约束：穿地回拉目标格被占 → 本拍不回拉（停在重力后的位置，下拍重试）
+        // E2@(5,0.5)：重力落到 -9.3（格 (5,-10) 空闲放行），地面约束目标 (5,0) 被 E1 占 → 不回拉
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, 5.0, 0.0, 0);
+        let e2 = make_entity(2, 5.0, 0.5, 1);
+        let id1 = e1.id;
+        let id2 = e2.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(id2, e2);
+        engine.step(&mut world);
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (5.0, 0.5 - 9.8), "地面格被占不回拉");
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "占据者不受影响");
+    }
+
+    #[test]
+    fn step_no_shove_on_same_cell_anomaly() {
+        // #021 推挤退役：同格重叠（异常路径）→ 只记 warn 不推挤，坐标原样保留
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, 5.0, 0.0, 0);
+        let e2 = make_entity(2, 5.0, 0.0, 1);
+        let id1 = e1.id;
+        let id2 = e2.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(id2, e2);
+        let changes = engine.step(&mut world);
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "异常同格不推挤");
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (5.0, 0.0), "异常同格不推挤");
+        assert!(
+            changes.iter().all(|c| c.reason != PhysicsReason::Collision),
+            "退役后不应再有 Collision 变更"
+        );
+    }
+
+    #[test]
+    fn step_falling_adjudication_order_deterministic_by_id() {
+        // 占位裁决确定序：两个下落实体同抢一格，EntityId 小者先落（先到先得）
+        // E1@(6,10.5) 落点 0.7 / E2@(6,10.0) 落点 0.2，同格 (6,0)：
+        // E1(id 小) 先落成功 → E2 目标格被占 → 悬停 10.0
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, 6.0, 10.5, 0);
+        let e2 = make_entity(2, 6.0, 10.0, 1);
+        let id1 = e1.id;
+        let id2 = e2.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(id2, e2);
+        engine.step(&mut world);
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 10.5 - 9.8), "id 小者先落成功");
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 10.0), "id 大者被挡悬停");
     }
 }

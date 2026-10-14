@@ -101,3 +101,9 @@
 - 原因：±10 用 host 填充的快照坐标在 import 层校验（同 move_by 模式），玩家伪造不了；上限/编译失败放阶段二（import 拿不到 world）。destroy 与攻击分流：掠夺语义只属于击杀（铁律 #001），产权销毁是所有权处分不是战斗。
 - 否决：EntityId 传 spawn（造物 id 由框架生成）；import 层做 owner 校验（沙箱拿不到 world）；造物继承创造者坐标而非自选（削弱玩法面，±10 已够防刷）。
 - 落点：crates/arena/src/sandbox.rs env.spawn/env.destroy + PendingSpawn/PendingDestroy；bin/codeworld/src/main.rs process_spawns/process_destroys/tick a 与 a1 步；config.max_entities；examples/sentinel.wat；docs/api.md 门二两节。
+
+## #021 2026-10-14 · 实体占位制定案：一格一物（Screeps 阻挡制起步，半径制留路线）；推挤机制退役
+- 定案：占位判定=格子口径（floor(x),floor(y)，一格一物），移动/重力地面/spawn 三处同源过 codeworld_core::occupancy::cell_occupied_by（本拍移动按 EntityId 升序先到先得，确定序）。出生格被占（含创造者自己的格，无自豁免）→ spawn 失败可重试；落被占格 → 悬停上一格下拍重试。推挤（resolve_collision）退役：tick 流程不再调用，同格只记 warn 不推挤（异常可见不自动修复）。接触语义扩为两类：物理同格+移动被挡，逐对 info 日志（为接触开通道铺路）。
+- 原因：实测 P/T 连体推挤 bug 实锤（挤压式解决=永久连体环游世界，Factorio/EVE 社区公认反面模式）。调研四流派：Minecraft/Wurm 证明格子制撑得起 3D；EVE 证明半径+服务器裁决；Screeps 阻挡制最简可玩（MVP 起步）；原神互穿模型不适用（玩家非对抗，身体阻挡是世界乐趣的一部分）。半径制留作将来路线：体型开放时四件套（上下限/面积付费/总预算/半径判定）同天上线，接口形状已按格键隔离预留。
+- 否决：推挤+分级体量（连体 bug 反面模式）；方向禁入（进格后才回弹，闪烁难看且裁决仍需排序）；spawn 落占格时自动找邻格（世界擅自改玩家意图，应失败让玩家自选）。
+- 落点：crates/core/src/occupancy.rs cell_occupied_by；crates/physics/src/default.rs step 占位重力+推挤退役（resolve_collision 标 deprecated 留档）；bin/codeworld/src/main.rs apply_pending_changes 移动裁决+ContactPair/handle_collisions 逐对日志+process_spawns 出生预检；players/pioneer.wat 塔改 +5+立塔拍不移动。

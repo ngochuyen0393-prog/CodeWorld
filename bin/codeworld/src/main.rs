@@ -22,7 +22,7 @@ use codeworld_arena::sandbox::{
 use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 use codeworld_core::pending::PendingChange;
 use codeworld_core::world::{BoundingBox, WorldState};
-use codeworld_physics::default::{CollisionPair, DefaultPhysicsEngine};
+use codeworld_physics::default::DefaultPhysicsEngine;
 use codeworld_render::{enter_terminal, exit_terminal, Renderer, Viewport};
 use codeworld_storage::StorageEngine;
 use codeworld_time::clock::TimeEngine;
@@ -647,7 +647,8 @@ fn tick(
     //      再并入产权校验通过的销毁请求（env.destroy，门二）一起应用
     pending.extend(sandbox_map.collect_pending_moves());
     process_destroys(world, sandbox_map, pending);
-    apply_pending_changes(world, pending);
+    // #021：占位制下移动被挡产生的接触对在此收集，阶段二 c 步与物理同格对合并
+    let move_blocked_contacts = apply_pending_changes(world, pending);
 
     //   a1. 造物处理（门二：env.spawn 排队的请求在此编译/建实体/建沙箱/插入世界）。
     //       放在 destroy 应用之后：本拍自毁的创造者不再造物；上限按应用后世界实况算。
@@ -666,19 +667,28 @@ fn tick(
     //   b. 生存点数扣减（架构 4.1：每 86400 tick 扣 1 点，归零标记死亡）
     decay_survival(world, current_tick);
 
-    //   c. 物理规则（重力/地面/速度/碰撞，架构 4.1 b 步）
-    //      先检测碰撞（接触事件），再执行物理步骤（含碰撞解决），最后处理接触事件。
-    //      在 step 之前检测：step 内部的 resolve_collision 会把重叠实体挤到 x+1，
-    //      挤完坐标变了再检测就测不到接触，故接触事件必须在 step 之前捕获。
-    //      （step 内部也会再 detect 一次用于 resolve，MVP 实体少可接受重复调用。）
+    //   c. 物理规则（重力/地面/速度，架构 4.1 b 步；#021 推挤退役——step 只检不推）
+    //      接触事件在 step 之前捕获（物理同格检测）：step 内占位重力被挡的实体
+    //      坐标不变，检测时序不再敏感（旧推挤"挤完测不到"的时序约束已随退役消失）。
     let collision_pairs = physics.detect_collisions(&world.entities);
     let changes = physics.step(world);
     if !changes.is_empty() {
         tracing::debug!(tick = current_tick, change_count = changes.len(), "物理变更");
     }
-    //      接触触发沙箱通道（架构 4.1 b 步）：记录碰撞双方信息，MVP 仅日志
-    //      TODO(Phase2)：让 step() 返回碰撞对，消除此处与 step 内部的重复 detect_collisions 调用
-    let contact_count = handle_collisions(&collision_pairs, &world.entities);
+    //      接触触发沙箱通道（架构 4.1 b 步）：两类接触合并（#021 B 项）——
+    //      ①物理同格检测（same_cell）②移动被挡（move_blocked，阶段二 a 步产生）。
+    //      MVP 仅逐对日志；Phase 2：经 sandbox_map 为双方开启 probe/attack 通道。
+    let mut contacts: Vec<ContactPair> = collision_pairs
+        .into_iter()
+        .map(|p| ContactPair {
+            a: p.a,
+            b: p.b,
+            pos: p.pos,
+            source: "same_cell",
+        })
+        .collect();
+    contacts.extend(move_blocked_contacts);
+    let contact_count = handle_collisions(&contacts, &world.entities);
     if contact_count > 0 {
         tracing::info!(tick = current_tick, contact_count, "接触事件处理");
     }
@@ -766,11 +776,22 @@ fn tick(
     }
 }
 
-/// 应用延迟变更队列（架构文档 4.1 节阶段二 a 步）
+/// 应用延迟变更队列（架构文档 4.1 节阶段二 a 步 + #021 实体占位制）
 ///
 /// 阶段一玩家代码执行期间产生的变更（spawn/destroy/set_pos/set_velocity）
 /// 放入 pending 队列，此处统一应用到 WorldState。应用后队列清空。
-fn apply_pending_changes(world: &mut WorldState, pending: &mut Vec<PendingChange>) {
+///
+/// #021 占位制：SetPos 应用前过占位检查（一格一物，Screeps 阻挡制）——
+/// 目标格被其他存活实体占据 → 移动被拒（留原位）+ 记接触对。本 tick 所有移动
+/// 按 EntityId 升序统一裁决（先到先得，确定序，与 physics.step 同源口径）。
+///
+/// 返回移动被挡产生的接触对（汇入 handle_collisions 的接触语义，#021 B 项）。
+fn apply_pending_changes(
+    world: &mut WorldState,
+    pending: &mut Vec<PendingChange>,
+) -> Vec<ContactPair> {
+    let mut contacts: Vec<ContactPair> = Vec::new();
+    let mut moves: Vec<(EntityId, (f64, f64))> = Vec::new();
     for change in pending.drain(..) {
         match change {
             PendingChange::Spawn { entity } => {
@@ -784,12 +805,8 @@ fn apply_pending_changes(world: &mut WorldState, pending: &mut Vec<PendingChange
                 }
             }
             PendingChange::SetPos { entity, new_pos } => {
-                // 死亡实体不应用移动：同 tick 内 life()=false 实体排队的移动作废
-                //（死亡清理步随后移除实体，尸体位移属无人消费的顺序耦合，应用侧直接拦）
-                if let Some(e) = world.entities.get_mut(&entity).filter(|e| e.is_alive()) {
-                    tracing::debug!(entity_id = %entity.0, ?new_pos, "应用 SetPos");
-                    e.set_pos(new_pos);
-                }
+                // 移动抽出统一裁决：先收件后按 id 升序应用（与攻击两阶段同模式）
+                moves.push((entity, new_pos));
             }
             PendingChange::SetVelocity {
                 entity,
@@ -802,6 +819,44 @@ fn apply_pending_changes(world: &mut WorldState, pending: &mut Vec<PendingChange
             }
         }
     }
+    // 移动统一裁决：EntityId 升序（先到先得，确定序）
+    moves.sort_by_key(|(id, _)| id.0);
+    for (entity, new_pos) in moves {
+        // 死亡实体不应用移动：同 tick 内 life()=false 实体排队的移动作废
+        //（死亡清理步随后移除实体，尸体位移属无人消费的顺序耦合，应用侧直接拦）
+        let alive = world
+            .entities
+            .get(&entity)
+            .map(|e| e.is_alive())
+            .unwrap_or(false);
+        if !alive {
+            continue;
+        }
+        match codeworld_core::occupancy::cell_occupied_by(&world.entities, new_pos, entity) {
+            Some(occupant) => {
+                // 目标格被占：移动被拒，实体留在原坐标 + 记接触对（双方 EntityId）
+                tracing::info!(
+                    entity_id = %entity.0,
+                    occupant = %occupant.0,
+                    target = ?new_pos,
+                    "[move] 移动被挡（目标格被占），实体留在原位"
+                );
+                contacts.push(ContactPair {
+                    a: entity,
+                    b: occupant,
+                    pos: new_pos,
+                    source: "move_blocked",
+                });
+            }
+            None => {
+                tracing::debug!(entity_id = %entity.0, ?new_pos, "应用 SetPos");
+                if let Some(e) = world.entities.get_mut(&entity) {
+                    e.set_pos(new_pos);
+                }
+            }
+        }
+    }
+    contacts
 }
 
 /// 门二销毁处理（架构 4.1 阶段二 + world-foundation 门二 + decisions.md #015）
@@ -909,6 +964,19 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
             continue;
         };
         let entity_id = EntityId::new();
+        // #021 出生预检（Factorio 放置检查）：出生格被占 → 该次 spawn 失败。
+        // 放在编译之后、建沙箱之前（防沙箱泄漏）；不诞生、不占世界名额，下拍可重试。
+        if let Some(occupant) =
+            codeworld_core::occupancy::cell_occupied_by(&world.entities, req.pos, entity_id)
+        {
+            tracing::warn!(
+                creator = %req.creator.0,
+                occupant = %occupant.0,
+                pos = ?req.pos,
+                "[process_spawns] 出生格被占，该次 spawn 失败（下拍可重试）"
+            );
+            continue;
+        }
         let entity = Entity::new(
             entity_id,
             owner,
@@ -1214,32 +1282,49 @@ fn plunder_survival(world: &mut WorldState, donor_id: EntityId, recipient_id: En
     }
 }
 
-/// 处理碰撞事件（架构文档 4.1 节 b 步：接触触发沙箱通道）
+/// 接触对（#021 B 项：接触语义 = ①物理同格检测 ②移动被挡，两类都算"接触"，
+/// 为将来"接触开通道"铺路；本阶段只记日志不开通道）
+#[derive(Debug, Clone, PartialEq)]
+struct ContactPair {
+    /// 接触方（移动被挡时 = 被挡的移动者）
+    a: EntityId,
+    /// 被接触方（移动被挡时 = 占据者）
+    b: EntityId,
+    /// 接触坐标（同格检测 = 重叠坐标；移动被挡 = 被挡的目标格坐标）
+    pos: (f64, f64),
+    /// 来源标记："same_cell"（物理同格检测）/ "move_blocked"（移动被挡）
+    source: &'static str,
+}
+
+/// 处理接触事件（架构文档 4.1 节 b 步：接触触发沙箱通道）
 ///
-/// 架构 4.1：物理碰撞后，框架自动为碰撞双方开启沙箱通道，双方获得对方的
+/// 架构 4.1：物理接触后，框架自动为接触双方开启沙箱通道，双方获得对方的
 /// EntityId 和坐标；是否 probe/attack 由玩家代码决定，框架只负责开通道。
 ///
-/// MVP：只记录日志（接触双方 EntityId + 重叠坐标），返回接触对数量便于测试断言。
-/// 跳过含死亡实体的碰撞对：死亡实体本 tick 会被死亡清理步移除，不应为其开通道/
+/// MVP：逐对记录日志（双方 EntityId + 坐标 + 来源，info 级），返回接触对数量
+/// 便于测试断言。#021 起接触来源两类：物理同格检测（same_cell）+ 移动被挡
+/// （move_blocked），由 tick 合并后汇入本函数。
+/// 跳过含死亡实体的接触对：死亡实体本 tick 会被死亡清理步移除，不应为其开通道/
 /// 记接触（阶段一 life()=false 或 decay_survival 归零 kill 的实体此时仍在
-/// world.entities 中，detect_collisions 会扫到，需在此按 is_alive 过滤）。
+/// world.entities 中，需在此按 is_alive 过滤）。
 /// Phase 2：通过 sandbox_map 为双方开启 probe/attack 通道，让玩家代码在下一 tick
-/// 的 on_tick 中可以 probe/attack 对方（当前 MVP 的 on_tick 是空操作 WAT，无此能力）。
-fn handle_collisions(pairs: &[CollisionPair], entities: &HashMap<EntityId, Entity>) -> usize {
+/// 的 on_tick 中可以 probe/attack 对方。
+fn handle_collisions(pairs: &[ContactPair], entities: &HashMap<EntityId, Entity>) -> usize {
     let mut count = 0;
     for pair in pairs {
-        // 跳过含死亡实体的碰撞对（架构 4.1 接触触发针对存活实体间交互）
+        // 跳过含死亡实体的接触对（架构 4.1 接触触发针对存活实体间交互）
         let a_alive = entities.get(&pair.a).map(|e| e.is_alive()).unwrap_or(false);
         let b_alive = entities.get(&pair.b).map(|e| e.is_alive()).unwrap_or(false);
         if !a_alive || !b_alive {
-            tracing::debug!(a = %pair.a.0, b = %pair.b.0, "跳过含死亡实体的碰撞对");
+            tracing::debug!(a = %pair.a.0, b = %pair.b.0, "跳过含死亡实体的接触对");
             continue;
         }
-        tracing::debug!(
+        tracing::info!(
             a = %pair.a.0,
             b = %pair.b.0,
             pos = ?pair.pos,
-            "接触事件：框架为碰撞双方开启沙箱通道"
+            source = pair.source,
+            "[contact] 接触事件：框架为接触双方开启沙箱通道"
         );
         count += 1;
     }
@@ -1836,6 +1921,86 @@ mod tests {
         assert!(pending.is_empty(), "apply 后 pending 应清空");
     }
 
+    // === #021 实体占位制：移动占位裁决 ===
+
+    #[test]
+    fn setpos_blocked_stays_at_origin() {
+        // 占位移动：目标格被其他存活实体占据 → 移动被拒，实体留在原坐标
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, (5.0, 0.0));
+        let e2 = make_entity(2, (6.0, 0.0));
+        let id1 = e1.id;
+        let id2 = e2.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(id2, e2);
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id1,
+            new_pos: (6.0, 0.0),
+        }];
+        apply_pending_changes(&mut world, &mut pending);
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "目标格被占应留原位");
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 0.0), "占据者不受影响");
+    }
+
+    #[test]
+    fn setpos_two_movers_same_target_lower_id_wins() {
+        // 占位裁决确定序：两实体同抢一格，EntityId 小者先到先得（与排队顺序无关）
+        // E2 的请求先入队、E1 的后入队：按队序应用则 E2 赢；按 id 升序裁决则 E1 赢
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, (5.0, 0.0));
+        let e2 = make_entity(2, (7.0, 0.0));
+        let id1 = e1.id;
+        let id2 = e2.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(id2, e2);
+        let mut pending: Vec<PendingChange> = vec![
+            PendingChange::SetPos { entity: id2, new_pos: (6.0, 0.0) }, // 先入队
+            PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.0) }, // 后入队
+        ];
+        apply_pending_changes(&mut world, &mut pending);
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.0), "id 小者先到先得");
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (7.0, 0.0), "id 大者被挡留原位");
+    }
+
+    #[test]
+    fn setpos_dead_occupant_does_not_block() {
+        // 反向护栏：占据者已死（待清理）→ 不挡移动
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, (5.0, 0.0));
+        let mut e2 = make_entity(2, (6.0, 0.0));
+        e2.kill();
+        let id1 = e1.id;
+        let id2 = e2.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(id2, e2);
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id1,
+            new_pos: (6.0, 0.0),
+        }];
+        apply_pending_changes(&mut world, &mut pending);
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.0), "死者不占格，移动放行");
+    }
+
+    #[test]
+    fn setpos_sequential_vacated_cell_blocked_for_lower_id() {
+        // 先到先得语义边界：低 id 先裁决——E1 想进 E2 的格、E2 同拍搬走：
+        // E1 裁决时 E2 还在原格 → E1 被挡（Screeps 顺序移动语义，下拍 E1 可进）
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, (5.0, 0.0));
+        let e2 = make_entity(2, (6.0, 0.0));
+        let id1 = e1.id;
+        let id2 = e2.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(id2, e2);
+        let mut pending: Vec<PendingChange> = vec![
+            PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.0) },
+            PendingChange::SetPos { entity: id2, new_pos: (9.0, 0.0) },
+        ];
+        apply_pending_changes(&mut world, &mut pending);
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "E1 裁决时目标格仍被 E2 占 → 被挡");
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (9.0, 0.0), "E2 照常搬走");
+    }
+
     #[test]
     fn apply_pending_changes_skips_setpos_for_dead_entity() {
         // P2（审查 1 轮）：同 tick 内 life()=false 实体排队的移动不应用（尸体不位移），
@@ -2300,18 +2465,19 @@ mod tests {
         assert_eq!(loaded.entities.get(&id).unwrap().pos(), (3.0, 0.0));
     }
 
-    // === handle_collisions（阶段二 c 步：接触触发沙箱通道）===
+    // === handle_collisions（阶段二 c 步：接触触发沙箱通道，#021 接触记双方）===
 
-    /// 构造碰撞对（测试辅助，固定 EntityId 便于断言）
-    fn make_collision_pair(a: u128, b: u128, pos: (f64, f64)) -> CollisionPair {
-        CollisionPair {
+    /// 构造接触对（测试辅助，固定 EntityId 便于断言；默认来源 same_cell）
+    fn make_contact_pair(a: u128, b: u128, pos: (f64, f64)) -> ContactPair {
+        ContactPair {
             a: EntityId(Uuid::from_u128(a)),
             b: EntityId(Uuid::from_u128(b)),
             pos,
+            source: "same_cell",
         }
     }
 
-    /// 构造存活实体表（测试辅助，id 与 make_collision_pair 的 a/b 对齐）
+    /// 构造存活实体表（测试辅助，id 与 make_contact_pair 的 a/b 对齐）
     fn make_entities(ids: &[u128]) -> HashMap<EntityId, Entity> {
         ids.iter()
             .map(|&id| {
@@ -2323,33 +2489,33 @@ mod tests {
 
     #[test]
     fn handle_collisions_returns_zero_when_no_collision() {
-        // 无碰撞对：返回 0，不 panic（架构 4.1 b 步：无接触则不开通道）
-        let pairs: Vec<CollisionPair> = Vec::new();
+        // 无接触对：返回 0，不 panic（架构 4.1 b 步：无接触则不开通道）
+        let pairs: Vec<ContactPair> = Vec::new();
         let entities = HashMap::new();
         let count = handle_collisions(&pairs, &entities);
-        assert_eq!(count, 0, "无碰撞对应返回 0");
+        assert_eq!(count, 0, "无接触对应返回 0");
     }
 
     #[test]
     fn handle_collisions_returns_one_for_single_pair() {
-        // 单个存活碰撞对：返回 1（两个实体同坐标 -> 1 对接触）
+        // 单个存活接触对：返回 1（两个实体同坐标 -> 1 对接触）
         let entities = make_entities(&[1, 2]);
-        let pairs = vec![make_collision_pair(1, 2, (5.0, 5.0))];
+        let pairs = vec![make_contact_pair(1, 2, (5.0, 5.0))];
         let count = handle_collisions(&pairs, &entities);
-        assert_eq!(count, 1, "单个存活碰撞对应返回 1");
+        assert_eq!(count, 1, "单个存活接触对应返回 1");
     }
 
     #[test]
     fn handle_collisions_returns_three_for_three_pairs() {
-        // 三个存活碰撞对（三个实体两两同坐标，C(3,2)=3）：返回 3
+        // 三个存活接触对（三个实体两两同坐标，C(3,2)=3）：返回 3
         let entities = make_entities(&[1, 2, 3]);
         let pairs = vec![
-            make_collision_pair(1, 2, (5.0, 5.0)),
-            make_collision_pair(1, 3, (5.0, 5.0)),
-            make_collision_pair(2, 3, (5.0, 5.0)),
+            make_contact_pair(1, 2, (5.0, 5.0)),
+            make_contact_pair(1, 3, (5.0, 5.0)),
+            make_contact_pair(2, 3, (5.0, 5.0)),
         ];
         let count = handle_collisions(&pairs, &entities);
-        assert_eq!(count, 3, "三个存活碰撞对应返回 3");
+        assert_eq!(count, 3, "三个存活接触对应返回 3");
     }
 
     #[test]
@@ -2364,7 +2530,17 @@ mod tests {
         entities.insert(e2.id, e2);
         let pairs = engine.detect_collisions(&entities);
         assert_eq!(pairs.len(), 1, "同坐标应检测到 1 对碰撞");
-        let count = handle_collisions(&pairs, &entities);
+        // #021：物理同格对转 ContactPair（same_cell 来源）后汇入 handle_collisions
+        let contacts: Vec<ContactPair> = pairs
+            .into_iter()
+            .map(|p| ContactPair {
+                a: p.a,
+                b: p.b,
+                pos: p.pos,
+                source: "same_cell",
+            })
+            .collect();
+        let count = handle_collisions(&contacts, &entities);
         assert_eq!(count, 1, "handle_collisions 应返回 1");
     }
 
@@ -2381,21 +2557,18 @@ mod tests {
         dead_e.kill();
         entities.insert(alive_e.id, alive_e);
         entities.insert(dead_e.id, dead_e);
-        let pairs = vec![make_collision_pair(1, 2, (5.0, 5.0))];
+        let pairs = vec![make_contact_pair(1, 2, (5.0, 5.0))];
         let count = handle_collisions(&pairs, &entities);
-        assert_eq!(count, 0, "含死亡实体的碰撞对应被跳过，返回 0");
+        assert_eq!(count, 0, "含死亡实体的接触对应被跳过，返回 0");
     }
 
     #[test]
-    fn tick_resolves_overlapping_entities_after_detect_reorder() {
-        // 回归测试（架构 4.1 b 步）：两实体同坐标 -> tick 在 physics.step 之前检测
-        // 接触事件，step 解决碰撞（后创建的挤到 x+1），tick 后两实体坐标不再相同。
-        //
-        // 本测试只断言"碰撞解决后坐标不同"——这是 physics.step 的既有能力，并非
-        // handle_collisions 的新行为。保留它的意义是回归保护：验证 tick 内
-        // "先 detect 再 step 再 handle" 的重排没有破坏既有碰撞解决流程。
-        // handle_collisions 本身（含死亡实体跳过）由其单元测试覆盖；
-        // tick() 返回 ()，无法在此断言接触计数（已知测试缺口，见报告）。
+    fn tick_retires_shove_no_displacement_on_same_cell() {
+        // #021 推挤退役回归：两实体同坐标（异常路径）→ tick 后坐标原样保留，
+        // 不再出现旧挤压的 x+1 连环位移（P/T 连体环游世界 bug 的退役验证）。
+        // 旧断言"坐标应不同（一方被挤开）"随推挤机制一并退役，本测试取而代之。
+        // （占位制下正常路径不会再产生同格：移动被挡/spawn 预检/占位重力三闸，
+        //   本测试直接构造异常同格，验证即使发生也无推挤。）
         let mut world = WorldState::new();
         let id1 = EntityId(Uuid::from_u128(1));
         let id2 = EntityId(Uuid::from_u128(2));
@@ -2418,10 +2591,79 @@ mod tests {
         );
         let pos1 = world.entities.get(&id1).unwrap().pos();
         let pos2 = world.entities.get(&id2).unwrap().pos();
-        assert_ne!(
-            pos1, pos2,
-            "碰撞解决后两实体坐标应不同（一方被挤开），实际 {pos1:?} 与 {pos2:?}"
+        assert_eq!(pos1, (5.0, 0.0), "退役后不推挤：实体1坐标不变");
+        assert_eq!(pos2, (5.0, 0.0), "退役后不推挤：实体2坐标不变");
+    }
+
+    #[test]
+    fn tick_move_blocked_records_contact_and_stays() {
+        // tick 级集成（#021 A+B）：移动者试图走进占据格 → 留原位；
+        // 移动被挡接触对与物理同格对一样汇入 handle_collisions
+        // （返回值为 usize 无法从 tick 断言，这里验证坐标行为；接触计数由
+        // apply_pending_changes/handle_collisions 单元测试覆盖）
+        let mut world = WorldState::new();
+        let id1 = EntityId(Uuid::from_u128(1));
+        let id2 = EntityId(Uuid::from_u128(2));
+        world.entities.insert(id1, make_entity(1, (5.0, 0.0)));
+        world.entities.insert(id2, make_entity(2, (6.0, 0.0)));
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id1,
+            new_pos: (6.0, 0.0),
+        }];
+        let mut sandbox_map = test_sandbox_map();
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut sandbox_map,
         );
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "目标格被占应留原位");
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 0.0), "占据者不受影响");
+    }
+
+    #[test]
+    fn apply_blocked_move_returns_contact_pair() {
+        // #021 B 项：apply_pending_changes 返回移动被挡接触对（双方 EntityId + 目标格 + 来源）
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, (5.0, 0.0));
+        let e2 = make_entity(2, (6.0, 0.0));
+        let id1 = e1.id;
+        let id2 = e2.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(id2, e2);
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id1,
+            new_pos: (6.5, 0.2),
+        }];
+        let contacts = apply_pending_changes(&mut world, &mut pending);
+        assert_eq!(contacts.len(), 1, "移动被挡应产生 1 对接触");
+        assert_eq!(contacts[0].a, id1, "a = 被挡的移动者");
+        assert_eq!(contacts[0].b, id2, "b = 占据者");
+        assert_eq!(contacts[0].pos, (6.5, 0.2), "接触坐标 = 被挡的目标格坐标");
+        assert_eq!(contacts[0].source, "move_blocked", "来源 = 移动被挡");
+    }
+
+    #[test]
+    fn apply_free_move_returns_no_contacts() {
+        // 反向护栏：正常移动不产生接触对
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, (5.0, 0.0));
+        let id1 = e1.id;
+        world.entities.insert(id1, e1);
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id1,
+            new_pos: (6.0, 0.0),
+        }];
+        let contacts = apply_pending_changes(&mut world, &mut pending);
+        assert!(contacts.is_empty(), "空格移动不产生接触");
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.0));
     }
 
     // === attack_target（架构 4.2：on_attack 拦截 -> 替换沙箱 -> 检查 life）===
@@ -3647,6 +3889,57 @@ mod tests {
     }
 
     #[test]
+    fn smoke_pioneer_tower_plus5_no_move_on_tower_tick_then_walk_blocked() {
+        // 冒烟（#021 F 验收）：真实 players/pioneer.wat 进场（镜像 main() 启动流程：
+        // 四生物布阵 + load_players_initial），验证三件事：
+        // ① 立塔拍：塔立在 +5 格 (35,0)，P 本拍不移动（留 (30,0)）
+        // ② 之后每拍东移一步（31→32→33→34）
+        // ③ T 全程留在原地站岗；P 走到塔前 (34,0) 被占位制挡下（移动被挡，不再连体推挤）
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../../players/pioneer.wat");
+        let wat_text = std::fs::read_to_string(src).expect("应能读到 players/pioneer.wat");
+        let dir = temp_players_dir("pioneer-smoke");
+        std::fs::write(dir.join("pioneer.wat"), wat_text).unwrap();
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        spawn_test_entities(&mut world, &mut map, 10, true, true);
+        map.players = PlayerDirectory::new(&dir);
+        map.load_players_initial(&mut world).unwrap();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = Renderer::new(Viewport::new((0.0, 0.0), 50.0, 25.0, 50, 80));
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let p_id = find_player_id(&world, "pioneer");
+        fn tower(w: &WorldState) -> Option<&Entity> {
+            w.entities
+                .values()
+                .find(|e| e.code_hash == "creation" && e.appearance.glyph == "T")
+        }
+        // tick 1：立塔拍——塔在 +5，P 不动
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (30.0, 0.0), "立塔拍 P 不应移动");
+        let t = tower(&world).expect("立塔拍应有塔诞生");
+        assert_eq!(t.pos(), (35.0, 0.0), "塔应立在 P 的 +5 格 (35,0)");
+        assert!(map.sandboxes.contains_key(&t.id), "塔应有自己的沙箱（活造物）");
+        // tick 2-5：每拍东移一步
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 4);
+        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (34.0, 0.0), "4 拍后 P 应走到塔前 (34,0)");
+        assert_eq!(tower(&world).unwrap().pos(), (35.0, 0.0), "塔应原地站岗");
+        // tick 6：P 试图进塔的格 → 占位制挡下（留原位，不推挤不穿塔）
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (34.0, 0.0), "P 走进塔格应被挡在 (34,0)");
+        assert_eq!(tower(&world).unwrap().pos(), (35.0, 0.0), "被挡后塔不位移（推挤已退役）");
+        // 再跑 2 拍：P 持续被挡（每拍记移动被挡接触），塔纹丝不动
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
+        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (34.0, 0.0), "持续被挡");
+        assert_eq!(tower(&world).unwrap().pos(), (35.0, 0.0), "塔持续站岗");
+        // 四生物不受 P/T 影响：D 站桩存活（H 在 tick4 已被 D 反制清理，属既有时间线）
+        assert!(glyph_alive(&world, "D"), "D 应存活");
+        assert!(!glyph_alive(&world, "H"), "H 应按既有时间线在 tick4 被 D 反制清理");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn battle_attacker_breaks_thin_shield_and_kills_defender() {
         // 结局二（参数路径，盾=1）：A 磨穿防守——tick 10 耗掉最后一格盾，
         // tick 11 的刀不再被拦截 -> 结算换血击杀 D、A 掠夺 1 点。
@@ -4571,6 +4864,51 @@ mod tests {
             markers.contains(&9),
             "造物的 on_tick 应在下一拍执行（心跳 log(9)），实际 markers {markers:?}"
         );
+    }
+
+    #[test]
+    fn process_spawns_fails_when_birth_cell_occupied() {
+        // #021 C 项（Factorio 放置检查）：出生格被占 → 该次 spawn 失败
+        // （不诞生、不崩世界、占据者不受影响；下拍玩家可重试）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(3));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(3, 52, (10.0, 0.0)));
+        // 出生格 (12,0) 被占据者霸占（别的 owner 的实体）
+        let occupant = make_entity_of_owner(4, 53, (12.0, 0.0));
+        let occupant_id = occupant.id;
+        world.entities.insert(occupant_id, occupant);
+        let mut map = test_sandbox_map();
+        let spawner = birth_spawner_wat(CREATION_LOG_WAT, "12.0", "0.0");
+        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+        map.run_player_code(&world, &unbounded_bb());
+        process_spawns(&mut world, &mut map, 7);
+        assert_eq!(world.entities.len(), 2, "出生格被占不应诞生（1 创造者 + 1 占据者）");
+        assert!(
+            !world.entities.values().any(|e| e.code_hash == "creation"),
+            "不应有造物诞生"
+        );
+        assert!(world.entities.get(&occupant_id).unwrap().is_alive(), "占据者不受影响");
+        assert!(world.entities.get(&creator).unwrap().is_alive(), "创造者不受影响");
+    }
+
+    #[test]
+    fn process_spawns_birth_on_creator_cell_also_blocked() {
+        // 一格一物语义钉死：出生格=创造者自己的格 → 也算被占，失败。
+        // （移动的 exclude 自己是"原地移动=无操作"；spawn 是造新物，造物若与
+        //   创造者同格即产生重叠，正是占位制要防的事，无自豁免。）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(5));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(5, 54, (10.0, 0.0)));
+        let mut map = test_sandbox_map();
+        let spawner = birth_spawner_wat(CREATION_LOG_WAT, "10.0", "0.0");
+        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+        map.run_player_code(&world, &unbounded_bb());
+        process_spawns(&mut world, &mut map, 7);
+        assert_eq!(world.entities.len(), 1, "出生格=创造者的格算被占，不诞生");
     }
 
     #[test]

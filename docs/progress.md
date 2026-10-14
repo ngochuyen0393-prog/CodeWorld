@@ -2,12 +2,14 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-14 门二开放收工更新）
-- 在做：无（门二已开放：env.spawn/env.destroy 给玩家代码 + 产权链 owner + examples/sentinel.wat 哨塔示例，#020 入档，474 测试；世界里第一个玩家造物已诞生——冒烟测试进程内可复现）
+## 现在（2026-10-14 实体占位制收工更新）
+- 在做：无（#021 实体占位制落地：一格一物——移动被挡+接触记双方+spawn 出生预检+推挤退役，pioneer.wat 塔 +5+立塔拍不移动修复连体事故，495 测试）
 - 卡在：无
-- 下一步：① wasmtime 25.0.3 Windows out-of-fuel trap 进程 abort 仍是生产化阻断项（.cc-bugs #5）；② 已知 MVP 缺口：probe 残影实体仍会答 on_probe（桥不感知残影，#016）；③ 门二后续：destroy 的"攻杀式销毁"通路、产权链转让/继承、造物重生（快照恢复不带回沙箱，恢复的世界里造物成无沙箱框架实体）；④ Phase 2 议题同前（同坐标多实体、排刀上限、并行执行、multi-value 列表式 get_visible_entities）
+- 下一步：① wasmtime 25.0.3 Windows out-of-fuel trap 进程 abort 仍是生产化阻断项（.cc-bugs #5）；② 已知 MVP 缺口：probe 残影实体仍会答 on_probe（桥不感知残影，#016）；③ 接触开通道（#021 已记双方接触对日志，通道未开）；④ 门二后续：destroy 的"攻杀式销毁"通路、产权链转让/继承、造物重生（快照恢复不带回沙箱）；⑤ 半径制将来路线：体型开放时四件套（上下限/面积付费/总预算/半径判定）同天上线（#021）；⑥ Phase 2 议题同前（排刀上限、并行执行、multi-value 列表式 get_visible_entities）
 
 ## 已完成
+- 实体占位制 #021（2026-10-14）：core 占位判定 cell_occupied_by（floor 格键/排除自己/只算存活/多占据返最低 id）+ physics step 占位重力（落被占格悬停上一格，id 升序确定序）+ 移动占位裁决（SetPos 抽出按 EntityId 升序先到先得，被挡留原位+记接触对）+ 接触记双方（ContactPair 两类来源 same_cell/move_blocked 汇入 handle_collisions 逐对 info 日志）+ spawn 出生预检（被占失败可重试，含创造者自己的格）+ 推挤退役（resolve_collision 标 deprecated 留档，同格只 warn 不推挤）+ pioneer.wat 修复（塔 +5/立塔拍 return 不移动，冒烟实测 P 东移至塔前被挡、T 全程站岗）；TDD 红绿全程，21 新测试，四生物剧本时间线回归不变（tick4 H 死/tick12 A 死照旧），495 测试（2026-10-14）
+- 门二开放 #020（2026-10-14，commit fd9ff89）：env.spawn/env.destroy 给玩家代码 + 产权链 owner + examples/sentinel.wat 哨塔示例，474 测试；世界里第一个玩家造物已诞生——冒烟测试进程内可复现
 - Phase 1 MVP 全部 8 crate（333 测试基线，见项目 CLAUDE.md 开发顺序）
 - MVP 核心缺口 P0/P1（2026-07-23/24）
 - 击杀掠夺 Phase 2 攻击流程（2026-07-24，commit 99673cc）
