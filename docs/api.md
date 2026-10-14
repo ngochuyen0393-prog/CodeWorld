@@ -29,7 +29,7 @@
   (func (export "on_tick") i32.const 1 call $log))
 ```
 
-## 二、已开放 import（8 个）
+## 二、已开放 import（10 个）
 
 所有 import 挂在 `"env"` 命名空间下。玩家代码读到的世界状态是**本拍开始时的快照**（你动、别人也动，实际结果下一拍才感知）。
 
@@ -107,6 +107,66 @@
 
 比对对方的话（response）和它的体徵（尾块），是识破伪装的路子。目标 `on_probe` 跑在独立小 fuel 预算上，恶意死循环烧不动你的 tick。
 
+### `spawn(code_ptr: i32, code_len: i32, x: f64, y: f64, glyph_ptr: i32, color_ptr: i32) -> i32`
+
+造物（门二）：提交一段 WAT 源码 + 出生坐标 + 外观，请求造一个新实体。**造物是活实体，不是装饰**——从下一拍开始跑自己的代码，生死由它自己的 `life()` 决定（自治锚合同，存续与你的在线状态无关）。
+
+参数都从你的 memory 读：
+
+| 参数 | 含义 |
+|---|---|
+| `[code_ptr, code_len)` | 造物 WAT 源码（UTF-8 文本，≤ 1MB） |
+| `(x, y)` | 出生坐标（绝对坐标） |
+| `[glyph_ptr, ...)` | 字形：NUL 结尾字符串，**恰好 1 个字符** |
+| `[color_ptr, ...)` | 颜色：NUL 结尾字符串，非空 |
+
+返回 `1` = 已排队；`0` = 拒绝（限流/参数非法，当场知道）。排队后的请求在阶段二统一处理，以下情形作废（返回值已经是 1，**以运行日志为准**）：
+
+- **位置起点限制**：出生点必须在你本拍快照坐标 **±10 格**内（每轴），防远程投射刷屏。y < 0（钻地）与 NaN 坐标同样拒绝。
+- **限流**：每实体每拍最多 1 个 spawn 请求。
+- **你已死**：本拍 `life()=false` 的创造者请求作废。
+- **世界实体上限**：默认 64（`CODEWORLD_MAX_ENTITIES` 可调），达上限拒绝。
+- **编译失败**：造物 WAT 编不合法 → 该次作废 + 警告，世界不崩。
+
+造物属性（框架定，改不了）：owner 继承你的 owner（**产权链**，见 `destroy`）；fuel 配额继承你；出生即存活。
+
+```wat
+(import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+(import "env" "get_pos" (func $get_pos (result f64 f64)))
+(memory (export "memory") 1)
+;; [0..56) 造物 WAT 源码 + NUL；[8192] 字形 + NUL；[8256] 颜色 + NUL
+;; 外观段放远处：防大体积造物源码与外观 data 段重叠相互覆盖
+(data (i32.const 0) "(module (func (export \"life\") (result i32) i32.const 1))\00")
+(data (i32.const 8192) "T\00")
+(data (i32.const 8256) "cyan\00")
+(global $done (mut i32) (i32.const 0))
+(func (export "on_tick")
+  (if (i32.eqz (global.get $done))          ;; 只造一次
+    (then
+      (global.set $done (i32.const 1))
+      (i32.const 0) (i32.const 56)          ;; 56 = 造物代码字节数，改代码记得同步改
+      (call $get_pos)                       ;; 栈顶: x, y
+      (f64.const 3.0) (f64.add)             ;; y+3（自己旁边，±10 格内）
+      (i32.const 8192) (i32.const 8256)
+      (call $spawn) (drop))))
+```
+
+最简活体没什么用。真哨塔（有人过境发观察信号，超视距情报的哨兵网络正解，decisions.md #018）见 `examples/sentinel.wat`——把它的文件内容整个填进 data 段即可（非 ASCII 字节逐字节 `\XX` 转义、换行 `\0a`）。
+
+### `destroy(id_lo: i64, id_hi: i64) -> i32`
+
+销毁（门二）：把目标 EntityId（128 位 Uuid 拆成两半，`id_lo` 为低 64 位、`id_hi` 为高 64 位；WAT 侧负 i64 会按位恢复成 u64，写 `-1` 就是 `0xFFFFFFFFFFFFFFFF`）提交销毁请求。
+
+**产权约束**：只能销毁**自家造物**——框架在阶段二比对目标 owner 与你的 owner，不匹配拒绝 + 警告（MVP 规则；"击杀掠夺式"销毁走 `attack_at` 攻击通路，不归 destroy）。**destroy 不触发掠夺**——它不是击杀（铁律：掠夺只属于击杀）。想自尽走 `life()` 返回 0。
+
+返回 `1` = 已排队；产权校验结果在阶段二，拒绝以运行日志为准。销毁的实体随后按死亡流程清理（下一拍从世界移除）。
+
+```wat
+(import "env" "destroy" (func $destroy (param i64 i64) (result i32)))
+;; 销毁 id 高半 = -1（即 0xFFFF...）、低半 = 0x0102030405060708 的自家造物
+(i64.const 0x0102030405060708) (i64.const -1) (call $destroy) (drop)
+```
+
 ## 三、进场：players/ 目录（门一）
 
 - **一个 `.wat` 文件 = 一名玩家。** 把文件放进 `players/` 目录（默认 `./players`，`CODEWORLD_PLAYERS_DIR` 环境变量可改）即进场，删除文件即下线。
@@ -142,7 +202,6 @@
 
 | 接口 | 归属 | 状态 |
 |---|---|---|
-| `spawn` / `destroy` | 门二（代码造物，受产权链约束：只能造/毁自己的） | 未开放 |
 | `register_endpoint` / `on_external_event` | 连接锚（外部通道，超时自动降级本体逻辑） | 未开放 |
-| 产权链转让/继承 | 攻占城池 / 服务挂载 | 未开放 |
+| 产权链转让/继承 | 攻占城池 / 服务挂载（destroy 只开放了"毁自家造物"，攻杀与继承未开放） | 未开放 |
 | 网络登录进场 | 门一升级版（连接替代文件信号） | 未开放 |

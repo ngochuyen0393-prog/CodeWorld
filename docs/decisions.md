@@ -95,3 +95,9 @@
 - 定案：find_nearest_enemy 加 viewport（BoundingBox）过滤，与 fill_visible_snapshots 共用 tick 内同一个渲染视口实例（同源口径）；视野内无目标 scan 返 0。D/A/H 的 WAT 本就有 scan=0 跳刀/待机分支，无 WAT 改动。屏幕内=看得见=合法目标（D@15 距玩家出生带 15-30 格仍在默认视口 [-50,50]x[-25,25] 内照常点杀，这是边界效应不是缺陷）。
 - 原因：scan 原是"上帝视角单敌人"（代码注释自认），违背架构 4.2 攻击前置条件三条路（视距内/接触式/超视距）——眼睛层 visible_count 已 viewport 过滤而 scan 没有，两套口径；#018 铁律定了框架零供给，scan 供给超视距坐标直接违宪。
 - 落点：main.rs find_nearest_enemy/run_player_code/tick；sandbox.rs nearest_enemy 注释与 scan 无目标日志；api.md scan 条目。
+
+## #020 2026-10-14 · 门二开放定案：spawn ±10 格 / 64 上限 / 产权链 owner；destroy 仅限自家造物 MVP
+- 定案：env.spawn 出生点限创造者快照 ±10 格（每轴，MVP 一刀切防远程投射刷屏，玩法化留宪法）；世界实体上限 64（CODEWORLD_MAX_ENTITIES）；每实体每拍限 1 个请求；造物 owner 继承创造者 owner（产权链 #015）、fuel 继承、code_hash="creation"、自治锚存续。env.destroy 只开放"毁自家造物"（阶段二比对 owner 匹配），无掠夺（不是击杀）；击杀式销毁走攻击通路。
+- 原因：±10 用 host 填充的快照坐标在 import 层校验（同 move_by 模式），玩家伪造不了；上限/编译失败放阶段二（import 拿不到 world）。destroy 与攻击分流：掠夺语义只属于击杀（铁律 #001），产权销毁是所有权处分不是战斗。
+- 否决：EntityId 传 spawn（造物 id 由框架生成）；import 层做 owner 校验（沙箱拿不到 world）；造物继承创造者坐标而非自选（削弱玩法面，±10 已够防刷）。
+- 落点：crates/arena/src/sandbox.rs env.spawn/env.destroy + PendingSpawn/PendingDestroy；bin/codeworld/src/main.rs process_spawns/process_destroys/tick a 与 a1 步；config.max_entities；examples/sentinel.wat；docs/api.md 门二两节。

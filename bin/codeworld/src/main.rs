@@ -16,7 +16,9 @@ mod players;
 
 use anyhow::{Context, Result};
 use codeworld_arena::attack::{PendingAttack, DEFAULT_KILL_WASM};
-use codeworld_arena::sandbox::{ProbeBridge, SandboxHandle, SandboxManager};
+use codeworld_arena::sandbox::{
+    PendingDestroy, PendingSpawn, ProbeBridge, SandboxHandle, SandboxManager,
+};
 use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 use codeworld_core::pending::PendingChange;
 use codeworld_core::world::{BoundingBox, WorldState};
@@ -46,6 +48,8 @@ struct EntitySandboxMap {
     /// on_probe 独立小 fuel 预算（架构 3.3 probe_target_instruction_limit；
     /// main() 从 config.probe_fuel 设置，默认 10_000）
     probe_fuel: u64,
+    /// 世界实体总数上限（门二 spawn 配套；main() 从 config.max_entities 设置，默认 64）
+    max_entities: usize,
     /// 玩家目录（门一进场 + 在线锚 + 残影期，players.rs）。
     /// 默认禁用：既有测试跑 tick 零文件系统副作用；main() 按配置装配启用实例
     players: PlayerDirectory,
@@ -60,6 +64,7 @@ impl EntitySandboxMap {
             visible_ids: Vec::new(),
             visible_positions: Vec::new(),
             probe_fuel: 10_000,
+            max_entities: 64,
             players: PlayerDirectory::disabled(),
         })
     }
@@ -239,6 +244,36 @@ impl EntitySandboxMap {
         let mut all = Vec::new();
         for handle in self.sandboxes.values_mut() {
             all.append(&mut handle.store.data_mut().log_markers);
+        }
+        all
+    }
+
+    /// 收集本 tick 所有沙箱排队的造物请求（env.spawn 推入，门二）
+    ///
+    /// drain 各沙箱 pending_spawns 后清空，保证不跨 tick 残留。在 tick 阶段二
+    /// process_spawns 调用。
+    fn collect_pending_spawns(&mut self) -> Vec<PendingSpawn> {
+        let mut all = Vec::new();
+        for handle in self.sandboxes.values_mut() {
+            all.append(&mut handle.store.data_mut().pending_spawns);
+        }
+        if !all.is_empty() {
+            tracing::info!(count = all.len(), "[collect_pending_spawns] 收集造物请求");
+        }
+        all
+    }
+
+    /// 收集本 tick 所有沙箱排队的销毁请求（env.destroy 推入，门二）
+    ///
+    /// drain 各沙箱 pending_destroys 后清空，保证不跨 tick 残留。在 tick 阶段二
+    /// process_destroys 调用。
+    fn collect_pending_destroys(&mut self) -> Vec<PendingDestroy> {
+        let mut all = Vec::new();
+        for handle in self.sandboxes.values_mut() {
+            all.append(&mut handle.store.data_mut().pending_destroys);
+        }
+        if !all.is_empty() {
+            tracing::info!(count = all.len(), "[collect_pending_destroys] 收集销毁请求");
         }
         all
     }
@@ -480,6 +515,8 @@ fn main() -> Result<()> {
     let mut sandbox_map = EntitySandboxMap::new()?;
     // probe 预算装配（三层感知 Phase A：config 可调的 on_probe 独立小 fuel）
     sandbox_map.probe_fuel = config.probe_fuel;
+    // 世界实体上限装配（门二 spawn 配套，decisions.md #020）
+    sandbox_map.max_entities = config.max_entities;
 
     // 新世界或恢复后无实体：放测试实体（含 WASM 沙箱）让 MVP 有东西渲染、能跑玩家代码
     if world.entities.is_empty() {
@@ -606,9 +643,16 @@ fn tick(
 
     // ③ 阶段二：状态更新（串行）
     //   a. 应用 PendingChanges（spawn/destroy/set_pos/set_velocity，架构 4.1 a 步）
-    //      先并入阶段一排队的移动请求（env.move_by），随本步统一应用（与攻击排队同模式）
+    //      先并入阶段一排队的移动请求（env.move_by），随本步统一应用（与攻击排队同模式）；
+    //      再并入产权校验通过的销毁请求（env.destroy，门二）一起应用
     pending.extend(sandbox_map.collect_pending_moves());
+    process_destroys(world, sandbox_map, pending);
     apply_pending_changes(world, pending);
+
+    //   a1. 造物处理（门二：env.spawn 排队的请求在此编译/建实体/建沙箱/插入世界）。
+    //       放在 destroy 应用之后：本拍自毁的创造者不再造物；上限按应用后世界实况算。
+    //       放在攻击处理之前：造物出生即进入世界（本拍攻击队列已定，下拍才会与之交互）
+    process_spawns(world, sandbox_map, current_tick);
 
     //   a2. 处理攻击（架构 4.2 两阶段模型：阶段一 on_tick 调 env.attack_at 排队的请求在此统一执行）
     //      插在 apply_pending_changes 之后、decay_survival 之前：攻击产生的死亡先于每日衰减处理。
@@ -757,6 +801,141 @@ fn apply_pending_changes(world: &mut WorldState, pending: &mut Vec<PendingChange
                 }
             }
         }
+    }
+}
+
+/// 门二销毁处理（架构 4.1 阶段二 + world-foundation 门二 + decisions.md #015）
+///
+/// 产权校验（在 apply_pending_changes 之前）：只能销毁 ①自家造物——MVP 只实现①，
+/// world 里查目标 owner 是否等于发起者 owner，不匹配拒绝 + warn。校验通过的请求
+/// 转 PendingChange::Destroy 进 pending 队列随本步统一应用（标记死亡走死亡清理，
+/// **不触发掠夺**——destroy 不是击杀，铁律"掠夺只属于击杀"）。
+/// 击杀掠夺式销毁走攻击通路（attack_at），与 destroy 职责分离。
+/// 同拍校验基准：发起者与目标都须存活（本拍 life()=false 的发起者请求作废，
+/// 与 deliver_attacks 对死攻击者作废同语义）。
+fn process_destroys(
+    world: &WorldState,
+    sandbox_map: &mut EntitySandboxMap,
+    pending: &mut Vec<PendingChange>,
+) {
+    let requests = sandbox_map.collect_pending_destroys();
+    for req in requests {
+        // 发起者存活（死者请求作废，防"临死带人"）
+        let destroyer_ok = world
+            .entities
+            .get(&req.destroyer)
+            .map(|e| e.is_alive())
+            .unwrap_or(false);
+        // 目标存在且存活（尸体不可再销毁）
+        let target_ok = world
+            .entities
+            .get(&req.target)
+            .map(|e| e.is_alive())
+            .unwrap_or(false);
+        // 产权链校验：发起者 owner == 目标 owner（只能毁自家造物，#015）
+        let owner_match = match (
+            world.entities.get(&req.destroyer),
+            world.entities.get(&req.target),
+        ) {
+            (Some(d), Some(t)) => d.owner == t.owner,
+            _ => false,
+        };
+        if !destroyer_ok || !target_ok || !owner_match {
+            tracing::warn!(
+                destroyer = %req.destroyer.0,
+                target = %req.target.0,
+                destroyer_alive = destroyer_ok,
+                target_alive = target_ok,
+                owner_match,
+                "[process_destroys] 销毁请求被拒绝（产权不匹配或发起者/目标已死）"
+            );
+            continue;
+        }
+        tracing::info!(
+            destroyer = %req.destroyer.0,
+            target = %req.target.0,
+            "[process_destroys] 产权匹配，销毁已排队（无掠夺）"
+        );
+        pending.push(PendingChange::Destroy {
+            entity: req.target,
+        });
+    }
+}
+
+/// 门二造物处理（架构 4.1 阶段二 + world-foundation 门二 + decisions.md #012）
+///
+/// 阶段一 env.spawn 排队的请求在此统一处理（import 层已做零 world 校验：
+/// 限流/有限性/钻地/±10 格/外观格式）。本函数按序判：
+///   1. 创造者存活（本拍 life()=false 的创造者请求作废）
+///   2. 世界实体上限（max_entities，默认 64）——达上限拒绝 + warn
+///   3. WAT 编译（wat::parse_str）——失败该次 spawn 作废 + warn（不崩世界，
+///      参照玩家进场容错）
+///   4. 构造造物：新 EntityId、owner=创造者 owner（产权链 #015）、
+///      code_hash="creation"、Appearance(glyph,color)、出生点、created_tick、
+///      fuel 配额继承创造者
+///   5. 创建沙箱（成功才插入世界——"存活实体必有沙箱"不变量）
+///
+/// 造物从下一 tick 开始跑自己的代码——**造物是活实体，不是装饰**（自治锚合同：
+/// 存续独立于创造者在线状态）。
+fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, current_tick: u64) {
+    let requests = sandbox_map.collect_pending_spawns();
+    for req in requests {
+        // 创造者必须存活（死者不造物）
+        let Some(creator) = world.entities.get(&req.creator).filter(|e| e.is_alive()) else {
+            tracing::warn!(
+                creator = %req.creator.0,
+                "[process_spawns] 创造者已死，造物请求作废"
+            );
+            continue;
+        };
+        let owner = creator.owner;
+        // 世界实体总数上限
+        if world.entities.len() >= sandbox_map.max_entities {
+            tracing::warn!(
+                creator = %req.creator.0,
+                entities = world.entities.len(),
+                cap = sandbox_map.max_entities,
+                "[process_spawns] 达世界实体上限，造物请求作废"
+            );
+            continue;
+        }
+        // 造物 WAT 编译（失败作废不崩世界）
+        let Ok(wasm_bytes) = wat::parse_str(&req.code) else {
+            tracing::warn!(
+                creator = %req.creator.0,
+                code_len = req.code.len(),
+                "[process_spawns] 造物 WAT 编译失败，该次 spawn 作废"
+            );
+            continue;
+        };
+        let entity_id = EntityId::new();
+        let entity = Entity::new(
+            entity_id,
+            owner,
+            "creation".to_string(),
+            req.pos,
+            Appearance::new(req.glyph.clone(), req.color.clone(), 1.0),
+            current_tick,
+            req.fuel_limit,
+        );
+        // 沙箱创建成功才插入世界（失败则实体不落世界，不留无沙箱活体）
+        if let Err(e) = sandbox_map.create(entity_id, &wasm_bytes, req.fuel_limit) {
+            tracing::warn!(
+                creator = %req.creator.0,
+                error = %e,
+                "[process_spawns] 造物沙箱创建失败，该次 spawn 作废"
+            );
+            continue;
+        }
+        world.entities.insert(entity_id, entity);
+        tracing::info!(
+            entity_id = %entity_id.0,
+            creator = %req.creator.0,
+            owner = %owner.0,
+            pos = ?req.pos,
+            glyph = %req.glyph,
+            "造物诞生：玩家造物进场（门二，产权链归属创造者 owner）"
+        );
     }
 }
 
@@ -4282,5 +4461,368 @@ mod tests {
             "删了重放合法文件后应可进场"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // === 门二：spawn/destroy 阶段二处理（world-foundation 门二 + #012/#015）===
+
+    /// 造物可观测代码：on_tick 每拍 log(9)（心跳 marker，验证造物沙箱真的在跑）
+    const CREATION_LOG_WAT: &str = r#"(module
+  (import "env" "log" (func $log (param i32)))
+  (func (export "on_tick") i32.const 9 call $log)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// WAT 字符串字面量转义（按字节）：\ 与 " 转义、换行转 \0a（WAT 禁裸换行）、
+    /// 非 ASCII 字节逐字节转 \XX（中文注释等 UTF-8 多字节必须显式转义，
+    /// 裸高字节 wat crate 会错误解码导致造物代码非 UTF-8）。
+    /// 转义后每字节仍解码回 1 字节，len 与原文本字节数一致。
+    fn wat_escape(s: &str) -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            match b {
+                b'\\' => out.push_str("\\\\"),
+                b'"' => out.push_str("\\\""),
+                b'\n' => out.push_str("\\0a"),
+                0x20..=0x7E => out.push(b as char),
+                _ => out.push_str(&format!("\\{b:02x}")),
+            }
+        }
+        out
+    }
+
+    /// 造物方 WAT 生成器（main 侧）：data 段放造物源码 + 字形/颜色，
+    /// on_tick 调 spawn(0, len, x, y, 256, 300)。code_len 由 Rust 计算（手数必错）。
+    fn birth_spawner_wat(code: &str, x: &str, y: &str) -> String {
+        let escaped = wat_escape(code);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const {x} f64.const {y}
+    i32.const 8192 i32.const 8256
+    call $spawn drop)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = code.len(),
+            x = x,
+            y = y,
+        )
+    }
+
+    /// 构造指定 owner 的实体（产权链测试用：不同玩家造不同实体）
+    fn make_entity_of_owner(id_u: u128, owner_u: u128, pos: (f64, f64)) -> Entity {
+        Entity::new(
+            EntityId(Uuid::from_u128(id_u)),
+            PlayerId(Uuid::from_u128(owner_u)),
+            "test".to_string(),
+            pos,
+            Appearance::new("@".to_string(), "red".to_string(), 1.0),
+            0,
+            1_000_000,
+        )
+    }
+
+    #[test]
+    fn process_spawns_births_creation_with_inherited_owner_and_sandbox() {
+        // 全链路：创造者 on_tick 调 env.spawn 排队 -> process_spawns 阶段二造物：
+        // owner 继承创造者（产权链）、出生坐标、code_hash="creation"、外观生效、
+        // 沙箱创建、下一拍造物自己的 on_tick 真的在跑（造物是活实体不是装饰）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(1));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(1, 50, (10.0, 0.0)));
+        let mut map = test_sandbox_map();
+        let spawner = birth_spawner_wat(CREATION_LOG_WAT, "12.0", "0.0");
+        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+        // 阶段一：创造者跑代码，排队 spawn 请求
+        map.run_player_code(&world, &unbounded_bb());
+        // 阶段二：造物诞生
+        process_spawns(&mut world, &mut map, 7);
+        assert_eq!(world.entities.len(), 2, "造物应插入世界（1 创造者 + 1 造物）");
+        let creation = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .unwrap_or_else(|| panic!("应有 code_hash=creation 的造物"));
+        assert_eq!(
+            creation.owner,
+            PlayerId(Uuid::from_u128(50)),
+            "造物 owner 应继承创造者的 owner（产权链 #015）"
+        );
+        assert_eq!(creation.pos(), (12.0, 0.0), "造物应出生在请求坐标");
+        assert_eq!(creation.appearance.glyph, "T", "造物字形应来自请求");
+        assert_eq!(creation.appearance.color, "cyan", "造物颜色应来自请求");
+        assert!(creation.is_alive(), "造物出生即存活");
+        assert_eq!(creation.created_tick, 7, "created_tick 应为造物诞生拍");
+        // 沙箱已创建：造物下一拍自己跑 on_tick（log 心跳 9 可观测）
+        let creation_id = creation.id;
+        assert!(
+            map.sandboxes.contains_key(&creation_id),
+            "造物沙箱应已创建"
+        );
+        map.run_player_code(&world, &unbounded_bb());
+        let markers = map.collect_all_log_markers();
+        assert!(
+            markers.contains(&9),
+            "造物的 on_tick 应在下一拍执行（心跳 log(9)），实际 markers {markers:?}"
+        );
+    }
+
+    #[test]
+    fn process_spawns_skips_request_when_creator_dead() {
+        // 创造者本拍 life()=false 标记死亡 -> 其 spawn 请求作废（死者不造物）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(2));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(2, 51, (0.0, 0.0)));
+        let mut map = test_sandbox_map();
+        let spawner = birth_spawner_wat(CREATION_LOG_WAT, "1.0", "0.0");
+        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+        // 模拟阶段一 life()=false：先跑代码排上请求，再标记死亡
+        map.run_player_code(&world, &unbounded_bb());
+        world.entities.get_mut(&creator).unwrap().kill();
+        process_spawns(&mut world, &mut map, 1);
+        assert!(
+            !world.entities.values().any(|e| e.code_hash == "creation"),
+            "已死创造者的造物请求应作废"
+        );
+    }
+
+    #[test]
+    fn process_spawns_rejects_at_world_entity_cap() {
+        // 世界实体总数上限（Config.max_entities，默认 64）：达上限拒绝 + 日志，不崩
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(3));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(3, 52, (0.0, 0.0)));
+        let mut map = test_sandbox_map();
+        map.max_entities = 1; // 上限=1，世界已有 1 个实体
+        let spawner = birth_spawner_wat(CREATION_LOG_WAT, "1.0", "0.0");
+        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+        map.run_player_code(&world, &unbounded_bb());
+        process_spawns(&mut world, &mut map, 1);
+        assert_eq!(
+            world.entities.len(),
+            1,
+            "达实体上限时 spawn 应被拒绝"
+        );
+    }
+
+    #[test]
+    fn process_spawns_drops_uncompilable_code_without_crash() {
+        // WAT 编译失败 -> 该次 spawn 作废 + warn，不崩世界（参照玩家进场容错）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(4));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(4, 53, (0.0, 0.0)));
+        let mut map = test_sandbox_map();
+        map.create(creator, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        // 直接往创造者沙箱塞一条非法代码的请求（绕过 import 的排队路径，直测阶段二容错）
+        map.sandboxes
+            .get_mut(&creator)
+            .unwrap()
+            .store
+            .data_mut()
+            .pending_spawns
+            .push(codeworld_arena::sandbox::PendingSpawn {
+                creator,
+                pos: (1.0, 0.0),
+                code: "this is not wat ((".to_string(),
+                glyph: "T".to_string(),
+                color: "cyan".to_string(),
+                fuel_limit: 1_000_000,
+            });
+        process_spawns(&mut world, &mut map, 1);
+        assert_eq!(world.entities.len(), 1, "编译失败作废，世界不崩");
+        assert!(
+            !world.entities.values().any(|e| e.code_hash == "creation"),
+            "非法代码不应造物"
+        );
+    }
+
+    #[test]
+    fn process_destroys_kills_own_creation_without_plunder() {
+        // destroy 自家造物（owner 匹配）-> 排队销毁 + 应用后死亡；无掠夺（不是击杀，
+        // 宪法铁律：掠夺只属于击杀）——创造者生存点数不变
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(5));
+        let creation = EntityId(Uuid::from_u128(6));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(5, 60, (0.0, 0.0)));
+        world
+            .entities
+            .insert(creation, make_entity_of_owner(6, 60, (2.0, 0.0))); // 同 owner=60
+        let mut map = test_sandbox_map();
+        map.create(creator, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        map.sandboxes
+            .get_mut(&creator)
+            .unwrap()
+            .store
+            .data_mut()
+            .pending_destroys
+            .push(codeworld_arena::sandbox::PendingDestroy {
+                destroyer: creator,
+                target: creation,
+            });
+        let mut pending: Vec<PendingChange> = Vec::new();
+        process_destroys(&world, &mut map, &mut pending);
+        assert_eq!(
+            pending.len(),
+            1,
+            "产权匹配的销毁应排队 PendingChange::Destroy"
+        );
+        apply_pending_changes(&mut world, &mut pending);
+        assert!(
+            !world.entities.get(&creation).unwrap().is_alive(),
+            "自家造物应被标记死亡"
+        );
+        assert_eq!(
+            world.entities.get(&creator).unwrap().survival.points(),
+            3,
+            "destroy 无掠夺：创造者生存点数不变"
+        );
+    }
+
+    #[test]
+    fn process_destroys_rejects_foreign_creation() {
+        // 产权校验：他人造物（owner 不匹配）-> 拒绝 + 不入队，目标安然无恙
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(7));
+        let foreign = EntityId(Uuid::from_u128(8));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(7, 70, (0.0, 0.0)));
+        world
+            .entities
+            .insert(foreign, make_entity_of_owner(8, 99, (2.0, 0.0))); // owner 99 != 70
+        let mut map = test_sandbox_map();
+        map.create(creator, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        map.sandboxes
+            .get_mut(&creator)
+            .unwrap()
+            .store
+            .data_mut()
+            .pending_destroys
+            .push(codeworld_arena::sandbox::PendingDestroy {
+                destroyer: creator,
+                target: foreign,
+            });
+        let mut pending: Vec<PendingChange> = Vec::new();
+        process_destroys(&world, &mut map, &mut pending);
+        assert!(pending.is_empty(), "产权不匹配的销毁应被拒绝（不入队）");
+        assert!(
+            world.entities.get(&foreign).unwrap().is_alive(),
+            "他人造物不应被销毁"
+        );
+    }
+
+    // === 门二冒烟：哨塔造物（examples/sentinel.wat 真文件，验收#3）===
+
+    /// 哨塔造物源码：examples/ 目录真文件（不放 players/ 免被当玩家自动进场）。
+    /// 文档示例与测试同源：这文件语法坏了/逻辑改了，冒烟立刻红。
+    const SENTINEL_WAT: &str = include_str!("../../../examples/sentinel.wat");
+
+    /// 只 spawn 一次的玩家进场代码（$done 全局节流，README 示例同款模式）：
+    /// 第一拍把哨塔造到身边 (x,y)，之后不再造（防逐拍刷造物撞上限）
+    fn once_spawner_wat(code: &str, x: &str, y: &str) -> String {
+        let escaped = wat_escape(code);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (global $done (mut i32) (i32.const 0))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (func (export "on_tick")
+    (if (i32.eqz (global.get $done))
+      (then
+        (global.set $done (i32.const 1))
+        (i32.const 0)
+        (i32.const {len})
+        f64.const {x}
+        f64.const {y}
+        (i32.const 8192)
+        (i32.const 8256)
+        (call $spawn)
+        (drop))))
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = code.len(),
+            x = x,
+            y = y,
+        )
+    }
+
+    #[test]
+    fn smoke_spawner_births_sentinel_that_reports_sighting() {
+        // 验收#3 冒烟（进程内 tick，等价可重复）：玩家代码第一拍 spawn 哨塔造物
+        // -> 阶段二"造物诞生"（owner 继承/坐标正确）-> 下一拍哨塔自己的 on_tick
+        // 跑起来：视野内有人过境 -> 观察信号 log(2)（#018 哨兵网络正解落地）
+        let mut world = WorldState::new();
+        let player = EntityId(Uuid::from_u128(1));
+        let passerby = EntityId(Uuid::from_u128(2));
+        world
+            .entities
+            .insert(player, make_entity_of_owner(1, 80, (10.0, 0.0)));
+        world
+            .entities
+            .insert(passerby, make_entity_of_owner(2, 81, (30.0, 0.0)));
+        let mut map = test_sandbox_map();
+        let spawner = once_spawner_wat(SENTINEL_WAT, "13.0", "0.0");
+        map.create(player, &wasm(&spawner), 1_000_000).unwrap();
+        map.create(passerby, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        // 第 1 拍：玩家排队 spawn -> 阶段二造物诞生
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert_eq!(world.entities.len(), 3, "哨塔造物应诞生（2 起始 + 1 造物）");
+        let sentinel = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .unwrap_or_else(|| panic!("应有哨塔造物诞生"));
+        assert_eq!(sentinel.pos(), (13.0, 0.0), "哨塔应出生在玩家请求的坐标");
+        assert_eq!(
+            sentinel.owner,
+            PlayerId(Uuid::from_u128(80)),
+            "哨塔 owner 应继承玩家 owner（产权链）"
+        );
+        let sentinel_id = sentinel.id; // 拷贝 id（world 后续可变借用）
+        // 第 2 拍：哨塔自己跑代码——视野内有玩家/路人 -> 观察信号 log(2)
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        // 观测口用 api_calls（永不清空）：log_markers 会被 tick 内字幕步（d2）每拍
+        // drain（哨塔的 log(2) 与路人的 42 都进了字幕管线），api_calls 才是留存证据
+        let sentinel_calls = map
+            .sandboxes
+            .get(&sentinel_id)
+            .unwrap()
+            .store
+            .data()
+            .api_calls
+            .clone();
+        assert!(
+            sentinel_calls.contains(&"log".to_string()),
+            "哨塔应在有人过境时调 log 发观察信号，实际 api_calls {sentinel_calls:?}"
+        );
+        assert!(
+            sentinel_calls.contains(&"visible_count".to_string()),
+            "哨塔 on_tick 应在查视野（visible_count）"
+        );
+        // 第 3 拍：once 节流生效——不再刷造物（世界稳定在 3 个实体）
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert_eq!(world.entities.len(), 3, "once 节流下不应再诞生新造物");
     }
 }

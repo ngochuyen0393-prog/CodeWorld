@@ -44,6 +44,9 @@ pub struct Config {
     /// 玩家目录路径（门一进场：一个 .wat 文件 = 一名玩家），默认 "./players"。
     /// CODEWORLD_PLAYERS_DIR 覆盖；目录不存在自动创建。
     pub players_dir: String,
+    /// 世界实体总数上限（门二 spawn 配套，decisions.md #020），默认 64。
+    /// 达上限时 env.spawn 请求在阶段二拒绝。CODEWORLD_MAX_ENTITIES 覆盖。
+    pub max_entities: usize,
 }
 
 impl Default for Config {
@@ -62,6 +65,7 @@ impl Default for Config {
             probe_fuel: 10_000,
             s_enabled: true,
             players_dir: "./players".to_string(),
+            max_entities: 64,
         }
     }
 }
@@ -98,6 +102,9 @@ impl Config {
         }
         if let Some(fuel) = env_u64("CODEWORLD_PROBE_FUEL") {
             cfg.probe_fuel = fuel;
+        }
+        if let Some(n) = env_usize("CODEWORLD_MAX_ENTITIES") {
+            cfg.max_entities = n;
         }
         // 布尔类开关："0"/"false"（大小写不敏感）= 关闭，缺失或其他值 = 默认开启
         if let Ok(v) = std::env::var("CODEWORLD_H_ENABLED") {
@@ -330,5 +337,22 @@ mod tests {
         let c = Config::load();
         std::env::remove_var("CODEWORLD_PLAYERS_DIR");
         assert_eq!(c.players_dir, "D:/tmp/my-players");
+    }
+
+    #[test]
+    fn default_max_entities_is_64() {
+        // 创建：世界实体总数上限默认 64（门二 spawn 配套，decisions.md #020）
+        let c = Config::default();
+        assert_eq!(c.max_entities, 64, "实体上限默认应为 64");
+    }
+
+    #[test]
+    fn load_max_entities_env_overrides_default() {
+        // 修改：CODEWORLD_MAX_ENTITIES 覆盖默认上限
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_MAX_ENTITIES", "32");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_MAX_ENTITIES");
+        assert_eq!(c.max_entities, 32, "环境变量应覆盖实体上限");
     }
 }

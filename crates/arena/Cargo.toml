@@ -19,7 +19,5 @@ anyhow = { workspace = true }
 # 序列化（数据结构 derive）
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-# 测试构造固定 EntityId
+# EntityId 的 Uuid 载体（env.destroy 的 i64 两半重建）
 uuid = { workspace = true }

@@ -2,10 +2,10 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-14 scan 视野化收工更新）
-- 在做：无（scan 视野化已收工：find_nearest_enemy 加 viewport 过滤与眼睛层同源口径，架构 4.2 三路前置兑现，#019 入档，457 测试）
+## 现在（2026-10-14 门二开放收工更新）
+- 在做：无（门二已开放：env.spawn/env.destroy 给玩家代码 + 产权链 owner + examples/sentinel.wat 哨塔示例，#020 入档，474 测试；世界里第一个玩家造物已诞生——冒烟测试进程内可复现）
 - 卡在：无
-- 下一步：① 期二门二开放（spawn/destroy 给玩家代码 + 产权链字段，完成标志：世界里第一个玩家造物诞生）；② wasmtime 25.0.3 Windows out-of-fuel trap 进程 abort 仍是生产化阻断项（.cc-bugs #5）；③ 已知 MVP 缺口：probe 残影实体仍会答 on_probe（桥不感知残影，#016）；④ Phase 2 议题同前（同坐标多实体、排刀上限、并行执行、multi-value 列表式 get_visible_entities）
+- 下一步：① wasmtime 25.0.3 Windows out-of-fuel trap 进程 abort 仍是生产化阻断项（.cc-bugs #5）；② 已知 MVP 缺口：probe 残影实体仍会答 on_probe（桥不感知残影，#016）；③ 门二后续：destroy 的"攻杀式销毁"通路、产权链转让/继承、造物重生（快照恢复不带回沙箱，恢复的世界里造物成无沙箱框架实体）；④ Phase 2 议题同前（同坐标多实体、排刀上限、并行执行、multi-value 列表式 get_visible_entities）
 
 ## 已完成
 - Phase 1 MVP 全部 8 crate（333 测试基线，见项目 CLAUDE.md 开发顺序）

@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use uuid::Uuid;
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
 
 use crate::attack::PendingAttack;
@@ -17,6 +18,50 @@ use codeworld_core::pending::PendingChange;
 /// import 层拒绝超限请求：防一次性拷贝大块线性内存（最大可到 64MB）+
 /// 超大模块编译长时间阻塞 tick（编译不受 fuel 约束）。
 pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
+
+/// 造物出生点相对创造者的最大偏移（门二 spawn 位置起点限制）
+///
+/// 出生坐标必须在创造者快照坐标 ±10 格（每轴盒式判定）内——防远程投射刷屏。
+/// MVP 一刀切的简单规则；规则由宪法允许后续玩法化（decisions.md #012）。
+pub const SPAWN_RANGE: f64 = 10.0;
+
+/// spawn 外观字符串（glyph/color，NUL 结尾）最大字节数
+///
+/// import 层扫描上限：内存里没有 NUL 时最多读这么多字节就拒绝，
+/// 防无界扫描线性内存。
+pub const MAX_META_LEN: usize = 64;
+
+/// 本 tick 排队的 spawn 请求（env.spawn 推入，阶段二收集统一处理）
+///
+/// import 层只做零 world 校验（限流/有限性/钻地/±10 格/外观格式），
+/// 产权链 owner 继承与世界实体上限在阶段二判（import 拿不到 world）。
+#[derive(Debug, Clone)]
+pub struct PendingSpawn {
+    /// 创造者（沙箱所属实体）
+    pub creator: EntityId,
+    /// 造物出生坐标（import 层已校验：有限、y>=0、创造者快照 ±10 格内）
+    pub pos: (f64, f64),
+    /// 造物 WAT 源码文本（阶段二编译；编译失败作废不崩世界）
+    pub code: String,
+    /// 造物外观字形（import 层已校验：恰好 1 个字符）
+    pub glyph: String,
+    /// 造物外观颜色（import 层已校验：非空）
+    pub color: String,
+    /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
+    pub fuel_limit: u64,
+}
+
+/// 本 tick 排队的 destroy 请求（env.destroy 推入，阶段二产权校验后应用）
+///
+/// 产权约束（宪法 #015）：MVP 只允许销毁自家造物（owner 匹配，阶段二用 world 判）；
+/// 击杀掠夺式的销毁走攻击通路，不归 destroy（destroy 无掠夺）。
+#[derive(Debug, Clone)]
+pub struct PendingDestroy {
+    /// 销毁发起者
+    pub destroyer: EntityId,
+    /// 目标实体（i64 两半重建）
+    pub target: EntityId,
+}
 
 /// 沙箱用户数据（Store data，用于被动观测，架构 4.3）
 ///
@@ -65,6 +110,11 @@ pub struct SandboxData {
     /// 存活实体填充，EntityId 升序稳定排序、排除自己（env.visible_count/visible_at
     /// 的数据源；import 回调拿不到 world，同 pos/nearest_enemy 快照模式）。
     pub visible: Vec<(f64, f64)>,
+    /// 本 tick 排队的造物请求（env.spawn 推入，阶段二收集后 drain 清空；
+    /// 每实体每 tick 限流 1 个在 import 层保证）
+    pub pending_spawns: Vec<PendingSpawn>,
+    /// 本 tick 排队的销毁请求（env.destroy 推入，阶段二产权校验后 drain 清空）
+    pub pending_destroys: Vec<PendingDestroy>,
     /// probe 通路桥指针（三层感知 Phase A，见 ProbeBridge 的 SAFETY 契约）。
     /// 仅在主循环阶段一执行玩家代码的窗口内非空（挂载 -> call -> 置空同一循环体
     /// 作用域），窗口外恒为 null——import 层判空作废探测。
@@ -495,6 +545,160 @@ impl SandboxManager {
                 }
             },
         )?;
+        // env.spawn(code_ptr, code_len, x, y, glyph_ptr, color_ptr) -> i32：造物
+        //（门二开放，world-foundation 门二 + decisions.md #012 能力统一：造物再造造物合法）。
+        // 玩家代码提交一段 WAT 文本 + 出生坐标 + 外观，请求造一个新实体。
+        // import 层只做零 world 校验（同 move_by 模式：快照坐标 host 填充，玩家伪造不了）：
+        //   - 限流：每实体每 tick 最多 1 个请求，多余拒绝
+        //   - 代码：len>0 且 <= MAX_PAYLOAD_LEN（编译不受 fuel 约束，防超大模块阻塞 tick），
+        //     从 memory [ptr..ptr+len) 读 UTF-8 文本
+        //   - 出生点：x/y 有限、y>=0（不钻地）、创造者快照 ±10 格内（SPAWN_RANGE，
+        //     防远程投射刷屏；规则由宪法允许后续玩法化）
+        //   - 外观：glyph/color 从 memory 读 NUL 结尾字符串（≤ MAX_META_LEN），
+        //     glyph 恰 1 字符、color 非空
+        // 产权链 owner 继承、世界实体上限、WAT 编译都在阶段二判（返回 1=已排队，
+        // 阶段二拒绝以日志为准，api.md 载明）。
+        linker.func_wrap(
+            "env",
+            "spawn",
+            |mut caller: Caller<SandboxData>,
+             code_ptr: i32,
+             code_len: i32,
+             x: f64,
+             y: f64,
+             glyph_ptr: i32,
+             color_ptr: i32|
+             -> i32 {
+                caller.data_mut().api_calls.push("spawn".to_string());
+                let creator = caller.data().entity_id;
+                // 限流：每实体每 tick 最多 1 个造物请求
+                if !caller.data().pending_spawns.is_empty() {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        "[spawn] 本 tick 已有造物请求，限流拒绝（1 个/tick）"
+                    );
+                    return 0;
+                }
+                // 代码长度预检：在读 memory 前拦下超限/非法长度（同 attack_at）
+                if code_len <= 0 || code_len as usize > MAX_PAYLOAD_LEN {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        code_len,
+                        max = MAX_PAYLOAD_LEN,
+                        "[spawn] 造物代码长度非法，拒绝"
+                    );
+                    return 0;
+                }
+                let code_bytes = read_payload_from_caller(&mut caller, code_ptr, code_len);
+                let Ok(code) = String::from_utf8(code_bytes) else {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        "[spawn] 造物代码非 UTF-8 文本，拒绝"
+                    );
+                    return 0;
+                };
+                // 出生点校验：有限 + 不钻地 + 创造者快照 ±10 格内
+                if !x.is_finite() || !y.is_finite() {
+                    tracing::warn!(entity_id = %creator.0, x, y, "[spawn] 出生点非有限，拒绝");
+                    return 0;
+                }
+                if y < 0.0 {
+                    tracing::warn!(entity_id = %creator.0, y, "[spawn] 出生点钻地（y<0），拒绝");
+                    return 0;
+                }
+                let (px, py) = caller.data().pos;
+                if (x - px).abs() > SPAWN_RANGE || (y - py).abs() > SPAWN_RANGE {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        creator_pos = ?(px, py),
+                        birth = ?(x, y),
+                        range = SPAWN_RANGE,
+                        "[spawn] 出生点超出创造者 ±10 格，拒绝"
+                    );
+                    return 0;
+                }
+                // 外观校验：glyph 恰 1 字符、color 非空（NUL 结尾字符串从 memory 读）
+                let Some(glyph) = read_cstring_from_caller(&mut caller, glyph_ptr, MAX_META_LEN)
+                else {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        glyph_ptr,
+                        "[spawn] 字形读取失败（指针非法/无 NUL/非 UTF-8），拒绝"
+                    );
+                    return 0;
+                };
+                if glyph.chars().count() != 1 {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        glyph = %glyph,
+                        "[spawn] 字形必须是单字符，拒绝"
+                    );
+                    return 0;
+                }
+                let Some(color) = read_cstring_from_caller(&mut caller, color_ptr, MAX_META_LEN)
+                else {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        color_ptr,
+                        "[spawn] 颜色读取失败（指针非法/无 NUL/非 UTF-8），拒绝"
+                    );
+                    return 0;
+                };
+                if color.is_empty() {
+                    tracing::warn!(entity_id = %creator.0, "[spawn] 颜色为空，拒绝");
+                    return 0;
+                }
+                // fuel 配额继承创造者（造物与创造者同算力档）
+                let fuel_limit = caller.data().fuel_limit;
+                tracing::info!(
+                    creator = %creator.0,
+                    birth = ?(x, y),
+                    glyph = %glyph,
+                    color = %color,
+                    code_len = code.len(),
+                    "[spawn] 造物请求已排队（阶段二统一处理）"
+                );
+                caller
+                    .data_mut()
+                    .pending_spawns
+                    .push(PendingSpawn {
+                        creator,
+                        pos: (x, y),
+                        code,
+                        glyph,
+                        color,
+                        fuel_limit,
+                    });
+                1
+            },
+        )?;
+        // env.destroy(id_lo: i64, id_hi: i64) -> i32：销毁（门二开放，产权链 #015）。
+        // EntityId(Uuid u128) 拆 lo/hi 两个 i64 传（WAT 侧负 i64 经 as u64 恢复位型）。
+        // import 只排队：产权校验（只能销毁自家造物，owner 匹配）需要 world，
+        // 在阶段二 process_destroys 判；destroy 不触发掠夺（不是击杀，宪法铁律）。
+        // 自毁走 life()=0，本接口对自家实体同样放行（owner 恒匹配，语义等价无掠夺）。
+        linker.func_wrap(
+            "env",
+            "destroy",
+            |mut caller: Caller<SandboxData>, id_lo: i64, id_hi: i64| -> i32 {
+                caller.data_mut().api_calls.push("destroy".to_string());
+                let destroyer = caller.data().entity_id;
+                // i64 -> u64 用 as 截断恢复位型（符号扩展陷阱：WAT 侧 -1 = u64::MAX），
+                // 拼回 u128 再转 Uuid
+                let id_u = ((id_hi as u64 as u128) << 64) | (id_lo as u64 as u128);
+                let target = EntityId(Uuid::from_u128(id_u));
+                caller
+                    .data_mut()
+                    .pending_destroys
+                    .push(PendingDestroy { destroyer, target });
+                tracing::info!(
+                    destroyer = %destroyer.0,
+                    target = %target.0,
+                    "[destroy] 销毁请求已排队（阶段二产权校验）"
+                );
+                1
+            },
+        )?;
         Ok(linker)
     }
 
@@ -761,6 +965,28 @@ fn write_bytes_to_caller(
     }
     memory.data_mut(&mut *caller)[start..end].copy_from_slice(&bytes[..want]);
     want
+}
+
+/// 从 caller 的 memory export 读取 NUL 结尾字符串（env.spawn 的 glyph/color 参数）
+///
+/// 从 ptr 起扫描到首个 NUL（最多扫 max_len 字节，防无界扫描线性内存），
+/// UTF-8 解码失败 / ptr<0 / 无 memory / max_len 内无 NUL -> None。
+fn read_cstring_from_caller(
+    caller: &mut Caller<SandboxData>,
+    ptr: i32,
+    max_len: usize,
+) -> Option<String> {
+    if ptr < 0 {
+        return None;
+    }
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())?;
+    let data = memory.data(&*caller);
+    let start = ptr as usize;
+    let window = data.get(start..)?.get(..max_len)?;
+    let nul = window.iter().position(|&b| b == 0)?;
+    String::from_utf8(window[..nul].to_vec()).ok()
 }
 
 #[cfg(test)]
@@ -1713,5 +1939,277 @@ mod tests {
         mgr.call_on_tick(&mut prober).unwrap();
         let ret = call_i32_export(&mut prober, "get_ret");
         assert_eq!(ret, -1, "桥未挂载应返回 -1");
+    }
+
+    // === env.spawn / env.destroy（门二：代码造物，decisions.md #012/#015）===
+
+    /// WAT 字符串字面量转义（按字节）：\ 与 " 转义、换行转 \0a（WAT 禁裸换行）、
+    /// 非 ASCII 字节逐字节转 \XX（裸高字节 wat crate 会错误解码）。
+    /// 转义后每字节仍解码回 1 字节，len 与原文本字节数一致。
+    fn wat_escape(s: &str) -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            match b {
+                b'\\' => out.push_str("\\\\"),
+                b'"' => out.push_str("\\\""),
+                b'\n' => out.push_str("\\0a"),
+                0x20..=0x7E => out.push(b as char),
+                _ => out.push_str(&format!("\\{b:02x}")),
+            }
+        }
+        out
+    }
+
+    /// 造物方 WAT 生成器：data 段放造物源码（[0..)）+ 字形 T（[8192]）+ 颜色 cyan（[8256]
+    /// ——外观段远离代码段，防大体积造物源码与外观 data 段重叠相互覆盖），
+    /// on_tick 调 spawn(0, code.len(), x, y, 256, 300)，返回值存全局 get_ret。
+    /// code_len 用 Rust 侧 code.len() 计算——手数 WAT 字符串长度天然易错（截断坑）。
+    fn spawner_wat(code: &str, x: &str, y: &str) -> String {
+        let escaped = wat_escape(code);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    {x} {y}
+    i32.const 8192 i32.const 8256
+    call $spawn global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = code.len(),
+            x = x,
+            y = y,
+        )
+    }
+
+    /// 连发两次 spawn 的 WAT：同 tick 第二次应被限流拒绝（每实体每 tick 最多 1 个）
+    fn double_spawner_wat(code: &str) -> String {
+        let escaped = wat_escape(code);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (global $r1 (mut i32) (i32.const -1))
+  (global $r2 (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const 1.0 f64.const 1.0
+    i32.const 8192 i32.const 8256
+    call $spawn global.set $r1
+    i32.const 0 i32.const {len}
+    f64.const 4.0 f64.const 4.0
+    i32.const 8192 i32.const 8256
+    call $spawn global.set $r2)
+  (func (export "get_r1") (result i32) global.get $r1)
+  (func (export "get_r2") (result i32) global.get $r2)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = code.len(),
+        )
+    }
+
+    /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
+    const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const 0
+    f64.const 1.0 f64.const 1.0
+    i32.const 8192 i32.const 8256
+    call $spawn global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 坏字形 WAT：glyph 两个字符 "TT" 应拒绝（渲染层一字形一实体）
+    fn bad_glyph_spawner_wat(code: &str) -> String {
+        let escaped = wat_escape(code);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "TT\00")
+  (data (i32.const 8256) "cyan\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const 1.0 f64.const 1.0
+    i32.const 8192 i32.const 8256
+    call $spawn global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = code.len(),
+        )
+    }
+
+    /// 造物方 WAT 的合法造物源码（最简 life 模块，data 段内容与此一致）
+    const SPAWNED_CODE: &str = r#"(module (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn spawn_import_queues_pending_spawn() {
+        // env.spawn：合法请求（±10 内、限流未满、代码/外观合法）-> 排队 PendingSpawn，
+        // 返回 1。owner 不在 import 层解析（import 拿不到 world），阶段二按产权链继承。
+        let mgr = SandboxManager::new().unwrap();
+        let creator = id(801);
+        let wat_text = spawner_wat(SPAWNED_CODE, "f64.const 2.0", "f64.const 3.0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, creator)
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let ret = call_i32_export(&mut handle, "get_ret");
+        assert_eq!(ret, 1, "合法 spawn 应返回 1（已排队）");
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns.len(), 1, "应排队 1 个造物请求");
+        let s = &spawns[0];
+        assert_eq!(s.creator, creator, "creator 应为沙箱绑定实体");
+        assert_eq!(s.pos, (2.0, 3.0), "出生点应保存请求传入的绝对坐标");
+        assert_eq!(s.code, SPAWNED_CODE, "造物代码应从 memory data 段读取（NUL 截断）");
+        assert_eq!(s.glyph, "T", "字形应从 memory 读取");
+        assert_eq!(s.color, "cyan", "颜色应从 memory 读取");
+        assert_eq!(s.fuel_limit, 100_000, "fuel 配额应继承创造者沙箱的 fuel_limit");
+        assert!(
+            handle.store.data().api_calls.contains(&"spawn".to_string()),
+            "spawn 调用应记入 api_calls 元数据"
+        );
+    }
+
+    #[test]
+    fn spawn_import_rejects_second_request_same_tick() {
+        // 限流：每实体每 tick 最多 1 个 spawn 请求，第二次调用返回 0 不入队
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = double_spawner_wat(SPAWNED_CODE);
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(802))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_r1"), 1, "第一次应排队成功");
+        assert_eq!(call_i32_export(&mut handle, "get_r2"), 0, "第二次应被限流拒绝");
+        assert_eq!(
+            handle.store.data().pending_spawns.len(),
+            1,
+            "同 tick 只应有 1 个请求入队"
+        );
+    }
+
+    #[test]
+    fn spawn_import_rejects_birth_out_of_creator_range() {
+        // 位置起点限制：出生点超出创造者快照 ±10 格 -> 拒绝（防远程投射刷屏，
+        // MVP 一刀切简单规则；规则由宪法允许后续玩法化，#012）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = spawner_wat(SPAWNED_CODE, "f64.const 21.0", "f64.const 10.0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(803))
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "越界出生点应被拒绝");
+        assert!(
+            handle.store.data().pending_spawns.is_empty(),
+            "被拒绝的造物请求不应入队"
+        );
+    }
+
+    #[test]
+    fn spawn_import_rejects_underground_birth() {
+        // 出生点 y<0 钻地 -> 拒绝（默认物理地面 y=0，与 move_by 同语义）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = spawner_wat(SPAWNED_CODE, "f64.const 12.0", "f64.const -1.0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(804))
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "钻地出生点应被拒绝");
+    }
+
+    #[test]
+    fn spawn_import_rejects_non_finite_birth() {
+        // 出生点非有限（NaN）-> 拒绝，防污染世界状态（与 move_by NaN 同款防御）。
+        // WAT 无 NaN 字面量直接写法缺口：0.0/0.0 产生 NaN（浮点除零不 trap）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = spawner_wat(SPAWNED_CODE, "f64.const 0.0 f64.const 0.0 f64.div", "f64.const 0.0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(805))
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "NaN 出生点应被拒绝");
+        assert!(handle.store.data().pending_spawns.is_empty(), "NaN 请求不应入队");
+    }
+
+    #[test]
+    fn spawn_import_rejects_empty_code() {
+        // code_len=0（没有代码）-> 拒绝：造物是活实体，必须有可编译的代码
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(EMPTY_CODE_SPAWNER_WAT), 100_000, id(806))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "空代码应被拒绝");
+        assert!(handle.store.data().pending_spawns.is_empty(), "空代码请求不应入队");
+    }
+
+    #[test]
+    fn spawn_import_rejects_multi_char_glyph() {
+        // 字形必须是单字符（渲染层一实体一字符），"TT" -> 拒绝
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = bad_glyph_spawner_wat(SPAWNED_CODE);
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(807))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "多字符字形应被拒绝");
+        assert!(handle.store.data().pending_spawns.is_empty(), "坏字形请求不应入队");
+    }
+
+    /// 销毁方 WAT：on_tick 调 destroy(id_lo, id_hi)，返回值存全局。
+    /// 目标 id = 0x0102030405060708_FFFFFFFFFFFFFFFF（hi 半含全 1 低半，
+    /// 锁定 i64 -> u64 的 as 截断语义：WAT 侧 -1 表示 u64::MAX）。
+    const DESTROYER_WAT: &str = r#"(module
+  (import "env" "destroy" (func $destroy (param i64 i64) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (func (export "on_tick")
+    i64.const -1 i64.const 0x0102030405060708 call $destroy global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn destroy_import_queues_pending_destroy() {
+        // env.destroy：EntityId 以 i64 两半传递（u128 拆 lo/hi；WAT 侧负 i64 经 as
+        // 恢复位型）。import 只排队（产权校验在阶段二，import 拿不到 world）。
+        let mgr = SandboxManager::new().unwrap();
+        let destroyer = id(808);
+        let mut handle = mgr.create_sandbox(&wasm(DESTROYER_WAT), 100_000, destroyer).unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "合法 destroy 应返回 1");
+        let destroys = &handle.store.data().pending_destroys;
+        assert_eq!(destroys.len(), 1, "应排队 1 个销毁请求");
+        assert_eq!(destroys[0].destroyer, destroyer, "发起者应为沙箱绑定实体");
+        assert_eq!(
+            destroys[0].target,
+            EntityId(Uuid::from_u128(0x0102_0304_0506_0708_FFFF_FFFF_FFFF_FFFF)),
+            "目标 id 应由 i64 两半无失真重建"
+        );
+        assert!(
+            handle.store.data().api_calls.contains(&"destroy".to_string()),
+            "destroy 调用应记入 api_calls 元数据"
+        );
     }
 }
