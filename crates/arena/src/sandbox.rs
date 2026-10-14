@@ -47,8 +47,10 @@ pub struct SandboxData {
     /// import 回调拿不到 world，玩家代码经 env.get_pos 读到的是 tick 开始时的状态，
     /// 与架构 4.1"玩家代码读取的是 tick 开始时的快照状态"一致）
     pub pos: (f64, f64),
-    /// 最近敌人的坐标快照（host 每 tick 阶段一【前】填充；None=世界没有其他存活实体，
-    /// env.scan 返回 0）。MVP 感知=屏幕可见层上帝视角单敌人（架构 3.2 感知接口的最简版）。
+    /// 最近敌人的坐标快照（host 每 tick 阶段一【前】填充；None=视野内没有其他存活实体，
+    /// env.scan 返回 0）。填充按渲染同款 viewport 过滤（架构 4.2"视距内"前置条件：
+    /// 屏幕外不可锁定；超视距手段玩家自行构建，#018），单敌人取最近者
+    /// （架构 3.2 感知接口的最简版）。
     pub nearest_enemy: Option<(f64, f64)>,
     /// 本 tick 排队的移动请求（env.move_by 推入 PendingChange::SetPos，
     /// 阶段二收集后并入主 pending 队列统一应用，与攻击排队同模式）
@@ -185,7 +187,7 @@ impl SandboxManager {
                 caller.data_mut().api_calls.push("scan".to_string());
                 let entity = caller.data().entity_id;
                 let Some(enemy) = caller.data().nearest_enemy else {
-                    tracing::debug!(entity_id = %entity.0, "[scan] 无敌人（世界无其他存活实体）");
+                    tracing::debug!(entity_id = %entity.0, "[scan] 视野内无目标");
                     return 0;
                 };
                 // 原子语义预检：两个指针先全量校验（只查不写），全部合法才落笔，

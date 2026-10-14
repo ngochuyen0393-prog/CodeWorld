@@ -111,7 +111,9 @@ impl EntitySandboxMap {
 
     /// 执行阶段一：逐个实体调 on_tick() + life()（MVP 单线程）
     /// 返回需要标记死亡的 EntityId 列表（world 借用中不可同时改，由 tick 统一 kill）
-    fn run_player_code(&mut self, world: &WorldState) -> Vec<EntityId> {
+    /// viewport：本 tick 的世界视野（与 fill_visible_snapshots 同一个 BoundingBox 实例，
+    /// scan 的最近敌人锁定用它过滤——同源口径，架构 4.2"视距内"前置条件）
+    fn run_player_code(&mut self, world: &WorldState, viewport: &BoundingBox) -> Vec<EntityId> {
         let mut to_kill = Vec::new();
         // 先收集 owned EntityId 再遍历，避免边遍历 world.entities 边改 self.sandboxes 的借用冲突
         let entity_ids: Vec<EntityId> = world.entities.keys().copied().collect();
@@ -146,7 +148,7 @@ impl EntitySandboxMap {
             // 阶段一执行玩家代码【前】把坐标快照写进 SandboxData——玩家代码
             // 读到的是 tick 开始时的状态（架构 4.1 快照语义）。
             if let Some(e) = world.entities.get(&entity_id) {
-                let nearest = find_nearest_enemy(world, &entity_id);
+                let nearest = find_nearest_enemy(world, &entity_id, viewport);
                 let data = handle.store.data_mut();
                 data.pos = e.pos();
                 data.nearest_enemy = nearest;
@@ -578,14 +580,16 @@ fn tick(
     //    眼睛列表快照（三层感知 Phase A）：渲染同款 viewport 过滤存活实体，
     //    填进各沙箱 SandboxData.visible + 全局列表（probe 桥用）——玩家代码
     //    env.visible_count/visible_at 读到的是 tick 开始时的世界。
-    {
+    // 视野边界（渲染同款 viewport）：眼睛列表与 scan 锁敌共用同一个 BoundingBox
+    // 实例（同源口径，别造两套"什么算看得见"——架构 4.2 攻击前置条件三路之一）
+    let bounds = {
         let vp = renderer.viewport();
         let (min_x, max_x) = vp.world_x_range();
         let (min_y, max_y) = vp.world_y_range();
-        let bounds = BoundingBox::new(min_x, min_y, max_x, max_y);
-        sandbox_map.fill_visible_snapshots(world, &bounds);
-    }
-    let to_kill = sandbox_map.run_player_code(world);
+        BoundingBox::new(min_x, min_y, max_x, max_y)
+    };
+    sandbox_map.fill_visible_snapshots(world, &bounds);
+    let to_kill = sandbox_map.run_player_code(world, &bounds);
     for entity_id in &to_kill {
         if let Some(entity) = world.entities.get_mut(entity_id) {
             entity.kill();
@@ -1093,20 +1097,32 @@ fn parse_shield_markers(markers: &[i32]) -> Option<i32> {
     shield
 }
 
-/// 感知规则：找 target 最近的其他存活实体坐标（env.scan 的数据源，MVP 上帝视角单敌人）
+/// 感知规则：找 target 最近的**视野内**其他存活实体坐标（env.scan 的数据源）
 ///
 /// - 排除自己（不能锁定自己为敌人）
 /// - 排除死亡实体（尸体不是感知目标）
-/// - None = 世界没有其他存活实体（scan 返回 0）
+/// - 排除视口外实体（架构 4.2 攻击前置条件"视距内"：眼睛诚实，屏幕外不可锁定，
+///   超视距手段由玩家自行构建——decisions.md #018 框架零供给）
+/// - None = 视野内没有其他存活实体（scan 返回 0）
 /// - 架构 3.2 感知接口完整版为 get_visible_entities（可见实体列表）；MVP 单敌人取最近者
-fn find_nearest_enemy(world: &WorldState, target: &EntityId) -> Option<(f64, f64)> {
+fn find_nearest_enemy(
+    world: &WorldState,
+    target: &EntityId,
+    viewport: &BoundingBox,
+) -> Option<(f64, f64)> {
     let me = world.entities.get(target)?;
     let mut best: Option<(f64, (f64, f64))> = None;
     for e in world.entities.values() {
         if !e.is_alive() || e.id == *target {
             continue;
         }
-        let (dx, dy) = (e.pos().0 - me.pos().0, e.pos().1 - me.pos().1);
+        // 视口过滤（架构 4.2"视距内"前置）：屏幕外不可锁定，与 fill_visible_snapshots
+        // 同一个 BoundingBox（tick 同源传入），超视距由玩家自行构建（#018）
+        let (ex, ey) = e.pos();
+        if !viewport.contains(ex, ey) {
+            continue;
+        }
+        let (dx, dy) = (ex - me.pos().0, ey - me.pos().1);
         let dist2 = dx * dx + dy * dy;
         // 严格小于：同距并列时取遍历首个（HashMap 顺序随机，测试用明确距离避免歧义）
         if best.map(|(d, _)| dist2 < d).unwrap_or(true) {
@@ -1494,6 +1510,12 @@ mod tests {
         EntitySandboxMap::new().unwrap()
     }
 
+    /// 测试用无界视口：覆盖全地图，等价旧"上帝视角"语义——既有测试不关心视口过滤，
+    /// 用它保持原行为；视口过滤本身的测试单独构造有界视口
+    fn unbounded_bb() -> BoundingBox {
+        BoundingBox::new(-1_000_000.0, -1_000_000.0, 1_000_000.0, 1_000_000.0)
+    }
+
     /// 玩家代码 WAT：life()=true + on_tick() 调 log（测试实体默认玩家代码；
     /// 最简可玩版后生产代码不再使用，移入测试模块）
     const PLAYER_WAT: &str = r#"(module
@@ -1513,7 +1535,7 @@ mod tests {
         world.entities.insert(id, make_entity(1, (0.0, 0.0)));
         let mut map = test_sandbox_map();
         map.create(id, &wasm(DEAD_PLAYER_WAT), 1_000_000).unwrap();
-        let to_kill = map.run_player_code(&world);
+        let to_kill = map.run_player_code(&world, &unbounded_bb());
         assert!(
             to_kill.contains(&id),
             "life()=false 的实体应在 to_kill 列表，实际 {:?}",
@@ -1529,7 +1551,7 @@ mod tests {
         world.entities.insert(id, make_entity(2, (0.0, 0.0)));
         let mut map = test_sandbox_map();
         map.create(id, &wasm(PLAYER_WAT), 1_000_000).unwrap();
-        let to_kill = map.run_player_code(&world);
+        let to_kill = map.run_player_code(&world, &unbounded_bb());
         assert!(
             !to_kill.contains(&id),
             "life()=true 的实体不应在 to_kill 列表，实际 {:?}",
@@ -1546,7 +1568,7 @@ mod tests {
         let mut map = test_sandbox_map();
         map.create(id, &wasm(DEAD_PLAYER_WAT), 1_000_000).unwrap();
         // 创建后：DEAD_PLAYER_WAT 的 life()=false -> 应进 to_kill
-        let to_kill_before = map.run_player_code(&world);
+        let to_kill_before = map.run_player_code(&world, &unbounded_bb());
         assert!(
             to_kill_before.contains(&id),
             "create 后沙箱应生效，实体应进 to_kill，实际 {:?}",
@@ -1554,7 +1576,7 @@ mod tests {
         );
         // 移除后：无沙箱 -> run_player_code 跳过，不进 to_kill
         map.remove(&id);
-        let to_kill_after = map.run_player_code(&world);
+        let to_kill_after = map.run_player_code(&world, &unbounded_bb());
         assert!(
             !to_kill_after.contains(&id),
             "remove 后实体不应进 to_kill，实际 {:?}",
@@ -1928,7 +1950,7 @@ mod tests {
         world.entities.insert(id, e);
         let mut map = test_sandbox_map();
         map.create(id, &wasm(DEAD_PLAYER_WAT), 1_000_000).unwrap();
-        let to_kill = map.run_player_code(&world);
+        let to_kill = map.run_player_code(&world, &unbounded_bb());
         assert!(
             !to_kill.contains(&id),
             "已死亡实体应被跳过，实际 to_kill={:?}",
@@ -1944,7 +1966,7 @@ mod tests {
         world.entities.insert(id, make_entity(1, (0.0, 0.0)));
         let mut map = test_sandbox_map();
         // 故意不为实体创建沙箱
-        let to_kill = map.run_player_code(&world);
+        let to_kill = map.run_player_code(&world, &unbounded_bb());
         assert!(!to_kill.contains(&id), "无沙箱实体应被跳过");
         assert!(to_kill.is_empty(), "to_kill 应为空，实际 {:?}", to_kill);
     }
@@ -1976,7 +1998,7 @@ mod tests {
         // 验证沙箱已销毁：同 id 实体放回 world，run_player_code 应跳过（沙箱不存在）。
         // 若沙箱未销毁，会调到 life()=false -> 进 to_kill。
         world.entities.insert(id, make_entity(1, (0.0, 0.0)));
-        let to_kill = sandbox_map.run_player_code(&world);
+        let to_kill = sandbox_map.run_player_code(&world, &unbounded_bb());
         assert!(
             !to_kill.contains(&id),
             "死亡实体沙箱应已销毁，实际仍能调到 life()（to_kill={:?}）",
@@ -2357,7 +2379,7 @@ mod tests {
         assert!(result.is_err(), "垃圾 payload 应换血失败");
         // 不变量：存活实体必有沙箱 —— 条目仍在且原代码可用
         assert!(map.sandboxes.contains_key(&id), "失败后目标沙箱条目应仍在");
-        let to_kill = map.run_player_code(&world);
+        let to_kill = map.run_player_code(&world, &unbounded_bb());
         assert!(
             !to_kill.contains(&id),
             "失败后原沙箱应可继续 on_tick/life（to_kill={:?}）",
@@ -2787,7 +2809,7 @@ mod tests {
         world.entities.insert(me, make_entity(1, (0.0, 0.0)));
         world.entities.insert(near, make_entity(2, (3.0, 4.0))); // 距离 5
         world.entities.insert(far, make_entity(3, (30.0, 40.0))); // 距离 50
-        let found = find_nearest_enemy(&world, &me);
+        let found = find_nearest_enemy(&world, &me, &unbounded_bb());
         assert_eq!(found, Some((3.0, 4.0)), "应锁定距离 5 的最近实体");
     }
 
@@ -2797,7 +2819,7 @@ mod tests {
         let mut world = WorldState::new();
         let me = EntityId(Uuid::from_u128(1));
         world.entities.insert(me, make_entity(1, (7.0, 8.0)));
-        let found = find_nearest_enemy(&world, &me);
+        let found = find_nearest_enemy(&world, &me, &unbounded_bb());
         assert_eq!(found, None, "独存实体不应锁定自己");
     }
 
@@ -2811,8 +2833,46 @@ mod tests {
         corpse_e.kill();
         world.entities.insert(me, make_entity(1, (0.0, 0.0)));
         world.entities.insert(corpse, corpse_e);
-        let found = find_nearest_enemy(&world, &me);
+        let found = find_nearest_enemy(&world, &me, &unbounded_bb());
         assert_eq!(found, None, "唯一邻居已死，应返回 None");
+    }
+
+    #[test]
+    fn find_nearest_enemy_skips_enemy_outside_viewport() {
+        // 视口过滤：视野外有更近实体时不选中，锁定视野内的较远者
+        //（架构 4.2 攻击前置条件"视距内"；眼睛诚实，decisions.md #018）
+        let mut world = WorldState::new();
+        let me = EntityId(Uuid::from_u128(10));
+        let near_outside = EntityId(Uuid::from_u128(11)); // (2,0) 距离 2，但视野外
+        let far_inside = EntityId(Uuid::from_u128(12)); // (10,0) 距离 10，视野内
+        world.entities.insert(me, make_entity(10, (0.0, 0.0)));
+        world
+            .entities
+            .insert(near_outside, make_entity(11, (2.0, 0.0)));
+        world
+            .entities
+            .insert(far_inside, make_entity(12, (10.0, 0.0)));
+        // 视口 [5,-5]..[25,5]：含 far_inside(10,0)，不含 near_outside(2,0)
+        let viewport = BoundingBox::new(5.0, -5.0, 25.0, 5.0);
+        let found = find_nearest_enemy(&world, &me, &viewport);
+        assert_eq!(
+            found,
+            Some((10.0, 0.0)),
+            "视野外更近实体不得锁定，应选视野内的较远者"
+        );
+    }
+
+    #[test]
+    fn find_nearest_enemy_none_when_all_enemies_outside_viewport() {
+        // 视口过滤：只有视野外实体 -> None（scan 返回 0，视野内无目标语义）
+        let mut world = WorldState::new();
+        let me = EntityId(Uuid::from_u128(13));
+        let outside = EntityId(Uuid::from_u128(14)); // (2,0) 视野外
+        world.entities.insert(me, make_entity(13, (0.0, 0.0)));
+        world.entities.insert(outside, make_entity(14, (2.0, 0.0)));
+        let viewport = BoundingBox::new(5.0, -5.0, 25.0, 5.0);
+        let found = find_nearest_enemy(&world, &me, &viewport);
+        assert_eq!(found, None, "视野内没有存活实体，应返回 None");
     }
 
     // === run_player_code 感知快照填充（get_pos/scan 的数据通路）===
@@ -2842,7 +2902,7 @@ mod tests {
         let mut map = test_sandbox_map();
         map.create(a, &wasm(SCAN_PROBE_WAT), 1_000_000).unwrap();
         map.create(b, &wasm(SCAN_PROBE_WAT), 1_000_000).unwrap();
-        map.run_player_code(&world);
+        map.run_player_code(&world, &unbounded_bb());
         // A 视角：最近敌人是 B (5,7)
         assert_eq!(call_i32_export(&mut map, &a, "get_found"), 1, "A 应扫描到 B");
         let x = call_f64_export(&mut map, &a, "get_enemy_x");
@@ -2863,11 +2923,40 @@ mod tests {
         world.entities.insert(a, make_entity(1, (0.0, 0.0)));
         let mut map = test_sandbox_map();
         map.create(a, &wasm(SCAN_PROBE_WAT), 1_000_000).unwrap();
-        map.run_player_code(&world);
+        map.run_player_code(&world, &unbounded_bb());
         assert_eq!(
             call_i32_export(&mut map, &a, "get_found"),
             0,
             "独存实体 scan 应返回 0"
+        );
+    }
+
+    #[test]
+    fn scan_returns_zero_when_enemy_outside_viewport() {
+        // 视口过滤端到端：敌人在视野外时 scan 返回 0（不写坐标）——
+        // run_player_code 用 tick 同款视口填 nearest_enemy，视野外不可锁定
+        let mut world = WorldState::new();
+        let me = EntityId(Uuid::from_u128(15));
+        let enemy = EntityId(Uuid::from_u128(16));
+        world.entities.insert(me, make_entity(15, (10.0, 0.0))); // 视野内
+        world.entities.insert(enemy, make_entity(16, (2.0, 0.0))); // 视野外
+        let mut map = test_sandbox_map();
+        map.create(me, &wasm(SCAN_PROBE_WAT), 1_000_000).unwrap();
+        map.create(enemy, &wasm(SCAN_PROBE_WAT), 1_000_000).unwrap();
+        // 视口 [5,-5]..[25,5]：含 me(10,0)，不含 enemy(2,0)
+        let viewport = BoundingBox::new(5.0, -5.0, 25.0, 5.0);
+        map.run_player_code(&world, &viewport);
+        assert_eq!(
+            call_i32_export(&mut map, &me, "get_found"),
+            0,
+            "敌人在视野外时 scan 应返回 0（视野内无目标）"
+        );
+        let x = call_f64_export(&mut map, &me, "get_enemy_x");
+        let y = call_f64_export(&mut map, &me, "get_enemy_y");
+        assert_eq!(
+            (x, y),
+            (0.0, 0.0),
+            "视野外目标坐标不得写入 memory（scan 未写指针区）"
         );
     }
 
@@ -2969,7 +3058,7 @@ mod tests {
         map.create(prober_id, &wasm(MAIN_PROBER_WAT), 1_000_000).unwrap();
         map.create(liar_id, &wasm(MAIN_LIAR_WAT), 1_000_000).unwrap();
         map.fill_visible_snapshots(&world, &test_viewport_bb());
-        map.run_player_code(&world);
+        map.run_player_code(&world, &unbounded_bb());
         // 响应 = 假串 4 字节 + 体徵 24 字节 = 28，resp_cap=64 不截断
         assert_eq!(
             call_i32_export(&mut map, &prober_id, "get_ret"),
@@ -3118,7 +3207,7 @@ mod tests {
         world.entities.insert(id, make_entity(1, (0.0, 0.0)));
         let mut map = test_sandbox_map();
         map.create(id, &wasm(RIGHT_MOVER_WAT), 1_000_000).unwrap();
-        map.run_player_code(&world);
+        map.run_player_code(&world, &unbounded_bb());
         let moves = map.collect_pending_moves();
         assert_eq!(moves.len(), 1, "应收集 1 条移动请求");
         assert!(
@@ -3282,6 +3371,102 @@ mod tests {
         );
     }
 
+    /// 冒烟辅助：世界里是否还有指定字形的实体
+    fn glyph_alive(world: &WorldState, glyph: &str) -> bool {
+        world.entities.values().any(|e| e.appearance.glyph == glyph)
+    }
+
+    #[test]
+    fn smoke_default_viewport_four_bio_timeline_unchanged() {
+        // 冒烟（scan 视野化回归验收点）：默认视口 50x25（对齐真实 Config），四生物
+        // + E 类玩家 @(35,5)（PLAYER_WAT 同 example.wat：只 log 不动不 scan）。
+        // 全员都在 [-50,50]x[-25,25] 内，视口过滤是 no-op——剧本时间线必须不变：
+        // tick4 D 反制杀 H、tick12 杀 A；E 距离最远无人锁定，全程存活。
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        spawn_test_entities(&mut world, &mut map, 10, true, true);
+        let e = EntityId(Uuid::from_u128(200));
+        world
+            .entities
+            .insert(e, make_creature(200, (35.0, 5.0), "example", "E", "green"));
+        map.create(e, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = Renderer::new(Viewport::new((0.0, 0.0), 50.0, 25.0, 50, 80));
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        run_ticks(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage,
+            &mut pending, &mut map, 3,
+        );
+        assert!(glyph_alive(&world, "H"), "tick3 H 应还活着");
+        run_ticks(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage,
+            &mut pending, &mut map, 1,
+        );
+        assert!(!glyph_alive(&world, "H"), "tick4 D 反制应杀 H（时间线回归点一）");
+        assert!(glyph_alive(&world, "A"), "tick4 A 应还活着");
+        run_ticks(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage,
+            &mut pending, &mut map, 7,
+        );
+        assert!(glyph_alive(&world, "A"), "tick11 A 应还活着");
+        run_ticks(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage,
+            &mut pending, &mut map, 1,
+        );
+        assert!(!glyph_alive(&world, "A"), "tick12 D 反制应杀 A（时间线回归点二）");
+        assert!(glyph_alive(&world, "D"), "D 应存活");
+        assert!(glyph_alive(&world, "S"), "S 应存活（悬浮躲刀）");
+        assert!(glyph_alive(&world, "E"), "E 无人锁定应全程存活");
+    }
+
+    #[test]
+    fn smoke_shrunken_viewport_out_of_screen_unreachable() {
+        // 冒烟（边界效应）：视口缩到 [-10,10]x[-10,10]，经典双生物 A@5/D@15
+        // + E 类玩家 @(35,0)。感知诚实三路前置的屏幕语义：
+        // - A 看不到屏外 D（@15 在 x>10）-> scan 返 0 站桩不动、永不出刀（D 盾不掉）
+        // - D 能锁屏内 A@5 -> tick4 反制杀 A（屏内=看得见=合法目标，D 自己在屏外不妨碍）
+        // - E@35 屏外 -> 无人能锁，全程存活（屏外才打不到，本次清算的目标语义）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        spawn_test_entities(&mut world, &mut map, 10, false, false);
+        let e = EntityId(Uuid::from_u128(201));
+        // E 出生在地面 y=0：空中出生会被重力拉到地面，坐标断言要求出生位稳定
+        world
+            .entities
+            .insert(e, make_creature(201, (35.0, 0.0), "example", "E", "green"));
+        map.create(e, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = Renderer::new(Viewport::new((0.0, 0.0), 10.0, 10.0, 50, 80));
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        run_ticks(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage,
+            &mut pending, &mut map, 15,
+        );
+        assert!(!glyph_alive(&world, "A"), "A 应被 D 的 tick4 反制刀击杀（屏内目标照常锁定）");
+        assert!(glyph_alive(&world, "D"), "D 应存活（A 锁不到屏外的 D）");
+        assert!(glyph_alive(&world, "E"), "E@35 屏外应全程存活（屏外不可锁定）");
+        let d_id = world
+            .entities
+            .values()
+            .find(|en| en.appearance.glyph == "D")
+            .map(|en| en.id)
+            .unwrap();
+        assert_eq!(
+            call_i32_export(&mut map, &d_id, "get_shield"),
+            10,
+            "D 盾应原封不动（A 看不到屏外 D，一刀未出）"
+        );
+        assert_eq!(
+            world.entities.get(&e).unwrap().pos(),
+            (35.0, 0.0),
+            "E 应原地未动（无人锁定无人接触）"
+        );
+    }
+
     #[test]
     fn battle_attacker_breaks_thin_shield_and_kills_defender() {
         // 结局二（参数路径，盾=1）：A 磨穿防守——tick 10 耗掉最后一格盾，
@@ -3401,7 +3586,7 @@ mod tests {
         map.create(a, &wasm(CAPTION_LOG_WAT), 1_000_000).unwrap();
         map.create(b, &wasm(CAPTION_LOG_WAT), 1_000_000).unwrap();
         // 触发两个沙箱各 log 两次（marker 7,5）
-        map.run_player_code(&world);
+        map.run_player_code(&world, &unbounded_bb());
         let markers = map.collect_all_log_markers();
         assert_eq!(markers.len(), 4, "两个沙箱各 2 条 marker 应共 4 条");
         assert!(
@@ -3432,7 +3617,7 @@ mod tests {
         let mut map = test_sandbox_map();
         map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
         map.create(enemy, &wasm(PLAYER_WAT), 1_000_000).unwrap();
-        map.run_player_code(&world);
+        map.run_player_code(&world, &unbounded_bb());
         let markers = map.collect_all_log_markers();
         assert!(
             markers.contains(&4),
@@ -3474,7 +3659,7 @@ mod tests {
         let mut map = test_sandbox_map();
         map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
         map.create(enemy, &wasm(TARGET_WAT), 1_000_000).unwrap();
-        map.run_player_code(&world);
+        map.run_player_code(&world, &unbounded_bb());
         let markers = map.collect_all_log_markers();
         assert!(
             markers.contains(&5),
@@ -3540,7 +3725,7 @@ mod tests {
             .insert(h, make_creature(85, (0.0, 0.0), "hunter", "H", "yellow"));
         let mut map = test_sandbox_map();
         map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
-        map.run_player_code(&world);
+        map.run_player_code(&world, &unbounded_bb());
         let markers = map.collect_all_log_markers();
         assert!(
             markers.contains(&0),
@@ -3572,7 +3757,7 @@ mod tests {
         map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
         map.create(victim, &wasm(TARGET_WAT), 1_000_000).unwrap();
         // 阶段一：H 参战排刀
-        map.run_player_code(&world);
+        map.run_player_code(&world, &unbounded_bb());
         let attacks = map.collect_pending_attacks();
         assert_eq!(attacks.len(), 1, "H 应排 1 刀");
         // 阶段二：两阶段结算（victim 无防守 -> 被击杀 + H 掠夺）
