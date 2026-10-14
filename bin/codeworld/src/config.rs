@@ -41,6 +41,9 @@ pub struct Config {
     /// 是否登场第四只生物 S（紫"S" 伪装者/间谍），默认 true。
     /// CODEWORLD_S_ENABLED=0/false 关闭（三方混战对局，供剧本 1-3 冒烟对照）。
     pub s_enabled: bool,
+    /// 玩家目录路径（门一进场：一个 .wat 文件 = 一名玩家），默认 "./players"。
+    /// CODEWORLD_PLAYERS_DIR 覆盖；目录不存在自动创建。
+    pub players_dir: String,
 }
 
 impl Default for Config {
@@ -58,6 +61,7 @@ impl Default for Config {
             h_enabled: true,
             probe_fuel: 10_000,
             s_enabled: true,
+            players_dir: "./players".to_string(),
         }
     }
 }
@@ -112,6 +116,9 @@ impl Config {
         }
         if let Ok(val) = std::env::var("CODEWORLD_LOG_LEVEL") {
             cfg.log_level = val;
+        }
+        if let Ok(val) = std::env::var("CODEWORLD_PLAYERS_DIR") {
+            cfg.players_dir = val;
         }
         cfg
     }
@@ -306,5 +313,22 @@ mod tests {
         std::env::remove_var("CODEWORLD_H_ENABLED");
         let c = Config::load();
         assert!(c.h_enabled, "无环境变量时 H 应默认登场");
+    }
+
+    #[test]
+    fn default_players_dir_is_local_players() {
+        // 创建：玩家目录默认 "./players"（门一进场，world-foundation 二）
+        let c = Config::default();
+        assert_eq!(c.players_dir, "./players");
+    }
+
+    #[test]
+    fn load_players_dir_env_overrides_default() {
+        // 修改：CODEWORLD_PLAYERS_DIR 覆盖玩家目录路径
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_PLAYERS_DIR", "D:/tmp/my-players");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_PLAYERS_DIR");
+        assert_eq!(c.players_dir, "D:/tmp/my-players");
     }
 }

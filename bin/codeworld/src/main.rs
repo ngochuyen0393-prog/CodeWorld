@@ -12,6 +12,7 @@
 //! 4. sleep 到下一个 tick
 
 mod config;
+mod players;
 
 use anyhow::{Context, Result};
 use codeworld_arena::attack::{PendingAttack, DEFAULT_KILL_WASM};
@@ -24,6 +25,7 @@ use codeworld_render::{enter_terminal, exit_terminal, Renderer, Viewport};
 use codeworld_storage::StorageEngine;
 use codeworld_time::clock::TimeEngine;
 use config::Config;
+use players::PlayerDirectory;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -44,6 +46,9 @@ struct EntitySandboxMap {
     /// on_probe 独立小 fuel 预算（架构 3.3 probe_target_instruction_limit；
     /// main() 从 config.probe_fuel 设置，默认 10_000）
     probe_fuel: u64,
+    /// 玩家目录（门一进场 + 在线锚 + 残影期，players.rs）。
+    /// 默认禁用：既有测试跑 tick 零文件系统副作用；main() 按配置装配启用实例
+    players: PlayerDirectory,
 }
 
 impl EntitySandboxMap {
@@ -55,6 +60,7 @@ impl EntitySandboxMap {
             visible_ids: Vec::new(),
             visible_positions: Vec::new(),
             probe_fuel: 10_000,
+            players: PlayerDirectory::disabled(),
         })
     }
 
@@ -125,6 +131,11 @@ impl EntitySandboxMap {
                 .map(|e| e.is_alive())
                 .unwrap_or(false);
             if !is_alive {
+                continue;
+            }
+            // 残影期实体跳过（在线锚下线合同，world-foundation 三章）：不执行玩家代码
+            //（on_tick/life 都不调），沙箱保留（残影仍可被攻击/掠夺，消散时才销毁）
+            if self.players.is_ghost(&entity_id) {
                 continue;
             }
             // 无沙箱的实体（如框架测试实体）跳过，不参与玩家代码执行
@@ -311,6 +322,124 @@ impl EntitySandboxMap {
             }
         }
     }
+
+    // === 玩家目录（门一进场，players.rs 状态机 + 本处编排）===
+
+    /// 单个玩家进场：读 .wat -> 编译（失败 warn + 黑名单）-> 建实体 + 沙箱 -> 登记在线。
+    /// 返回 false = 进场失败（调用方记黑名单）。
+    fn spawn_player(&mut self, world: &mut WorldState, name: &str, current_tick: u64) -> bool {
+        let path = self.players.dir().join(format!("{name}.wat"));
+        let wat_text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(player = name, error = %e, "[players] 玩家文件读取失败");
+                return false;
+            }
+        };
+        // 玩家代码编译（不用 wasm()：它遇非法 WAT 会 panic，玩家文件必须容错跳过）
+        let wasm_bytes = match wat::parse_bytes(wat_text.as_bytes()) {
+            Ok(b) => b.into_owned(),
+            Err(e) => {
+                tracing::warn!(
+                    player = name,
+                    error = %e,
+                    "[players] 玩家代码编译失败，跳过（删除文件重放可重试）"
+                );
+                return false;
+            }
+        };
+        let join_index = self.players.next_join_index();
+        let entity_id = EntityId::new();
+        let entity = Entity::new(
+            entity_id,
+            PlayerId::new(),
+            name.to_string(), // 玩家名 = code_hash 身份承载（同 A/D/H/S 模式）
+            (players::spawn_x_for(join_index), 0.0),
+            Appearance::new(
+                players::glyph_for(name),
+                players::color_for(join_index).to_string(),
+                1.0,
+            ),
+            current_tick,
+            1_000_000,
+        );
+        if let Err(e) = self.create(entity_id, &wasm_bytes, 1_000_000) {
+            tracing::warn!(player = name, error = %e, "[players] 玩家沙箱创建失败，未进场");
+            return false;
+        }
+        world.entities.insert(entity_id, entity);
+        self.players.register_online(name, entity_id);
+        tracing::info!(
+            player = name,
+            glyph = players::glyph_for(name),
+            color = players::color_for(join_index),
+            pos = ?(players::spawn_x_for(join_index), 0.0),
+            "玩家进场：{name}"
+        );
+        true
+    }
+
+    /// 启动初始化：扫描 players/ 目录加载全部玩家（目录不存在自动创建，空目录 = 无玩家）
+    fn load_players_initial(&mut self, world: &mut WorldState) -> Result<()> {
+        let stems = self.players.scan_dir().context("players 目录扫描失败")?;
+        tracing::info!(count = stems.len(), "players/ 目录初始加载");
+        let current_tick = world.tick();
+        for name in &stems {
+            if !self.spawn_player(world, name, current_tick) {
+                self.players.mark_failed(name);
+            }
+        }
+        Ok(())
+    }
+
+    /// tick 阶段二 d0 步：目录轮询（新 .wat 进场 / 删除下线进残影）+ 残影到期消散 + 记录打扫。
+    /// disabled 时 no-op（零文件系统开销）。
+    fn step_online_anchor(&mut self, world: &mut WorldState, current_tick: u64) {
+        if !self.players.is_enabled() {
+            return;
+        }
+        // 1. 目录轮询：新 .wat 进场 / 消失的文件名下线进残影 / 黑名单解除
+        match self.players.scan_dir() {
+            Ok(stems) => {
+                for name in &stems {
+                    if !self.players.is_online(name)
+                        && !self.players.is_failed(name)
+                        && !self.spawn_player(world, name, current_tick)
+                    {
+                        self.players.mark_failed(name);
+                    }
+                }
+                for name in self.players.offline_names(&stems) {
+                    if let Some(ev) = self.players.note_offline(&name, current_tick) {
+                        let kind = if ev.in_combat { "战斗" } else { "普通" };
+                        tracing::info!(
+                            player = %name,
+                            entity_id = %ev.entity_id.0,
+                            ghost_ticks = ev.ghost_ticks,
+                            in_combat = ev.in_combat,
+                            "玩家下线：{name}（{kind}残影 {} 拍）",
+                            ev.ghost_ticks
+                        );
+                    }
+                }
+                // 文件消失的失败名解除黑名单（"删了再放"可重试）
+                self.players.clear_failed_not_in(&stems);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "[players] 目录扫描失败，本拍跳过在线锚检测");
+            }
+        }
+        // 2. 残影到期消散：标记死亡，本拍死亡清理步移除实体+销毁沙箱
+        //    （不算击杀：无掠夺对象，只是消散——在线锚合同下线语义）
+        for entity_id in self.players.expire_due_ghosts(current_tick) {
+            if let Some(entity) = world.entities.get_mut(&entity_id) {
+                tracing::info!(entity_id = %entity_id.0, "[players] 残影消散（非击杀，无掠夺）");
+                entity.kill();
+            }
+        }
+        // 3. 记录打扫：残影期被击杀等已不在世界的实体，清残影/参战记录（防无界增长）
+        self.players.prune(&world.entities);
+    }
 }
 
 fn main() -> Result<()> {
@@ -353,6 +482,13 @@ fn main() -> Result<()> {
     // 新世界或恢复后无实体：放测试实体（含 WASM 沙箱）让 MVP 有东西渲染、能跑玩家代码
     if world.entities.is_empty() {
         spawn_test_entities(&mut world, &mut sandbox_map, config.d_shield, config.h_enabled, config.s_enabled);
+    }
+
+    // 门一进场（world-foundation 二）：装配玩家目录（启动扫描 + 每 tick 在线锚轮询）。
+    // 目录不存在自动创建；空目录 = 无玩家进场，原四生物剧本照跑。
+    sandbox_map.players = PlayerDirectory::new(&config.players_dir);
+    if let Err(e) = sandbox_map.load_players_initial(&mut world) {
+        tracing::warn!(error = %e, "players/ 目录初始加载失败，进场门暂不可用（世界继续）");
     }
 
     // 信号处理：后台线程监听 stdin，按 Enter/EOF 置退出标志（零依赖，符合 MVP 最简方案）
@@ -498,6 +634,10 @@ fn tick(
     if contact_count > 0 {
         tracing::info!(tick = current_tick, contact_count, "接触事件处理");
     }
+
+    //   d0. 玩家目录在线锚（门一进场/下线/残影消散；disabled 时 no-op 零开销）。
+    //       攻击结算（a2）之后：本拍参战记录已入册，#013 战斗残影时长计算才完整。
+    sandbox_map.step_online_anchor(world, current_tick);
 
     //   d. 死亡清理：移除死亡实体 + 销毁对应沙箱（释放 WASM 实例内存）
     //      先收集死亡 EntityId 并销毁沙箱，再 retain 移除实体（retain 后无法再遍历死者）
@@ -703,6 +843,9 @@ fn deliver_attacks(
             );
             continue;
         }
+        // 参战记录-攻击者（#013 战斗残影期）：出刀即战斗——落空/拦截/命中都算，
+        // 堵"打空再拔线"绕过战斗残影的漏洞。world.tick() 即当前 tick（tick 开头已 advance）。
+        sandbox_map.players.record_combat_id(atk.attacker, world.tick());
         // 坐标解析：找坐标上的存活实体（attack_at 攻击坐标不是 EntityId，目标移动可能 miss）
         let Some(target_id) = world
             .entities
@@ -718,18 +861,31 @@ fn deliver_attacks(
             );
             continue;
         };
-        // 收件：调目标【当前沙箱】的 on_attack（本阶段不换血不击杀）
-        let intercepted = match sandbox_map.defend(&target_id, &atk.payload) {
-            Ok(v) => v,
-            Err(e) => {
-                defense_failed += 1;
-                tracing::warn!(
-                    attacker = %atk.attacker.0,
-                    target = %target_id.0,
-                    error = %e,
-                    "[deliver_attacks] 防守询问失败，该刀作废"
-                );
-                continue;
+        // 参战记录-目标（#013）：被攻击即参战（含被拦截的收件）
+        sandbox_map.players.record_combat_id(target_id, world.tick());
+        // 收件：调目标【当前沙箱】的 on_attack（本阶段不换血不击杀）。
+        // 残影实体不执行任何玩家代码（在线锚下线合同）：跳过防守询问直接结算——
+        // 残影躯壳无人操控，不能继续享受原代码的拦截防守
+        let intercepted = if sandbox_map.players.is_ghost(&target_id) {
+            tracing::info!(
+                attacker = %atk.attacker.0,
+                target = %target_id.0,
+                "[deliver_attacks] 目标残影期，跳过防守询问直接结算"
+            );
+            false
+        } else {
+            match sandbox_map.defend(&target_id, &atk.payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    defense_failed += 1;
+                    tracing::warn!(
+                        attacker = %atk.attacker.0,
+                        target = %target_id.0,
+                        error = %e,
+                        "[deliver_attacks] 防守询问失败，该刀作废"
+                    );
+                    continue;
+                }
             }
         };
         if intercepted {
@@ -1310,6 +1466,7 @@ const SPY_WAT: &str = r#"(module
 mod tests {
     use super::*;
     use codeworld_core::entity::{EntityId, PlayerId};
+    use std::path::PathBuf;
     use uuid::Uuid;
 
     /// 测试用视口（中心 0,0，半宽半高 50，30x30 终端）
@@ -3517,5 +3674,428 @@ mod tests {
             "A 死后存活数应为 1，实际 {:?}",
             line
         );
+    }
+
+    // === 玩家目录（门一进场 + 在线锚 + 残影期）===
+
+    /// 示例玩家 WAT（与 players/example.wat、api.md 示例一致：life()=true + on_tick 调 log(1)）
+    pub(crate) const EXAMPLE_PLAYER_WAT: &str = r#"(module
+  (import "env" "log" (func $log (param i32)))
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "on_tick") i32.const 1 call $log))"#;
+
+    /// 移动+日志玩家 WAT（残影惰性测试：每拍 log(1) + 右移 1.0）
+    const GHOST_MOVER_WAT: &str = r#"(module
+  (import "env" "log" (func $log (param i32)))
+  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "on_tick")
+    i32.const 1 call $log
+    f64.const 1.0 f64.const 0.0 call $move_by drop))"#;
+
+    /// 测试用临时玩家目录（进程号 + 随机后缀防并行冲突）
+    fn temp_players_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "cw-players-it-{}-{}-{}",
+            tag,
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 按玩家名找角色实体 ID
+    fn find_player_id(world: &WorldState, name: &str) -> EntityId {
+        world
+            .entities
+            .values()
+            .find(|e| e.code_hash == name)
+            .expect("玩家实体应存在")
+            .id
+    }
+
+    #[test]
+    fn online_anchor_disabled_by_default() {
+        // 规则：默认禁用（既有测试跑 tick 零文件系统副作用）——
+        // 仓库 players/ 目录存在示例文件也不进场
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        map.step_online_anchor(&mut world, 1);
+        assert!(world.entities.is_empty(), "禁用状态不应进场任何玩家");
+    }
+
+    #[test]
+    fn load_players_initial_creates_dir_and_spawns_players() {
+        // 启动加载：目录不存在自动创建；两个 .wat 按文件名序分配颜色/出生点
+        let dir = temp_players_dir("initial");
+        std::fs::write(dir.join("beta.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        std::fs::write(dir.join("alpha.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        map.load_players_initial(&mut world).unwrap();
+        assert_eq!(world.entities.len(), 2, "两个玩家文件应都进场");
+        let alpha = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "alpha")
+            .expect("alpha 应进场");
+        assert_eq!(alpha.pos(), (30.0, 0.0), "第 1 名玩家出生点 (30,0)");
+        assert_eq!(alpha.appearance.glyph, "A", "alpha 字形取首字符大写");
+        assert_eq!(alpha.appearance.color, "green", "第 1 名玩家从 green 起");
+        let beta = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "beta")
+            .expect("beta 应进场");
+        assert_eq!(beta.pos(), (35.0, 0.0), "第 2 名玩家出生点 (35,0)");
+        assert_eq!(beta.appearance.color, "magenta", "第 2 名玩家 magenta");
+        assert!(map.sandboxes.contains_key(&alpha.id), "进场玩家必有沙箱");
+        // 空目录分支：全新目录自动创建、无玩家进场
+        let empty_dir = temp_players_dir("initial-empty");
+        let mut world2 = WorldState::new();
+        let mut map2 = test_sandbox_map();
+        map2.players = PlayerDirectory::new(&empty_dir);
+        map2.load_players_initial(&mut world2).unwrap();
+        assert!(empty_dir.is_dir(), "目录应自动创建");
+        assert!(world2.entities.is_empty(), "空目录 = 无玩家进场");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty_dir);
+    }
+
+    #[test]
+    fn player_joins_from_directory_file() {
+        // 全链路（验收#1）：players/ 放入 .wat -> tick 检测进场 ->
+        // 名字/字形/颜色/出生点正确 + 沙箱建立 + 下一拍 on_tick 真实执行。
+        // on_tick 执行用移动行为证明（tick 内 d2 步已 drain log markers，
+        // tick 后收集恒为空；log(1) 的可见性由冒烟 stderr [player_log] 验证）
+        let dir = temp_players_dir("join");
+        std::fs::write(dir.join("example.wat"), GHOST_MOVER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        // tick 1：d0 步扫描目录，example 进场
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let p = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "example")
+            .expect("玩家 example 应进场");
+        assert_eq!(p.pos(), (30.0, 0.0), "第 1 名玩家出生点 (30,0)");
+        assert_eq!(p.appearance.glyph, "E");
+        assert_eq!(p.appearance.color, "green");
+        assert!(map.sandboxes.contains_key(&p.id), "进场玩家必有沙箱");
+        let pid = p.id;
+        // tick 2：玩家代码第一次执行（on_tick 右移 1.0）
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (31.0, 0.0),
+            "玩家 on_tick 应真实执行（每拍右移 1.0）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn player_offline_ghost_dissipates_after_five_ticks() {
+        // 残影状态机（验收#2）：tick1 进场 -> 删文件 -> tick2 检测下线进残影
+        // （到期拍 = 2+5 = 7）-> 拍 3..6 实体仍在 -> 拍 7 消散，无残留
+        let dir = temp_players_dir("offline");
+        std::fs::write(dir.join("example.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let pid = find_player_id(&world, "example");
+        std::fs::remove_file(dir.join("example.wat")).unwrap();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(world.entities.contains_key(&pid), "下线当拍实体仍在（残影开始）");
+        assert!(map.players.is_ghost(&pid), "下线实体应登记残影");
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 4);
+        assert!(
+            world.entities.contains_key(&pid),
+            "残影第 4 拍末（拍 6）实体仍应在世界"
+        );
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(
+            !world.entities.contains_key(&pid),
+            "拍 7（下线+5）残影应消散"
+        );
+        assert!(
+            !map.sandboxes.contains_key(&pid),
+            "消散后沙箱应随死亡清理通路销毁"
+        );
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(!map.players.is_ghost(&pid), "消散后残影记录应被打扫");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ghost_does_not_execute_player_code() {
+        // 残影惰性：不执行玩家代码（位置冻结、无新 log marker），沙箱保留不销毁
+        let dir = temp_players_dir("ghost-inert");
+        std::fs::write(dir.join("mover.wat"), GHOST_MOVER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let pid = find_player_id(&world, "mover");
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (31.0, 0.0),
+            "存活期玩家代码应每拍右移 1.0"
+        );
+        std::fs::remove_file(dir.join("mover.wat")).unwrap();
+        // tick 3：阶段一仍执行玩家代码（残影下拍才生效）-> (32,0)，随后 d0 检测下线
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(map.players.is_ghost(&pid), "tick 3 应检测下线进残影");
+        let frozen = world.entities.get(&pid).unwrap().pos();
+        let _ = map.collect_all_log_markers(); // 清空存活期 marker
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            frozen,
+            "残影期位置应冻结（不执行玩家代码）"
+        );
+        assert!(
+            map.collect_all_log_markers().is_empty(),
+            "残影期不应有新 log marker"
+        );
+        assert!(
+            map.sandboxes.contains_key(&pid),
+            "残影期沙箱应保留（消散时才销毁）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // === 战斗残影期（#013：最近 30 拍参战者下线，残影期延长，防拔线逃课）===
+
+    /// 恒拦截防守玩家 WAT（残影防守跳过测试：若防守被问会拦截，换血不发生）
+    const GHOST_DEFENDER_WAT: &str = r#"(module
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "on_attack") (param i32) (result i32) i32.const 1)
+  (func (export "get_ver") (result i32) i32.const 111))"#;
+
+    /// 带版本号的击晕模块（观测"谁的代码在目标里"，同既有 ver_module 模式）
+    fn ghost_ver_module(ver: i32) -> String {
+        format!(
+            r#"(module
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "get_ver") (result i32) i32.const {ver}))"#
+        )
+    }
+
+    #[test]
+    fn combat_participation_extends_offline_ghost_to_exact_ticks() {
+        // #013 全链路（验收#3）：玩家 tick1 参战（被击晕刀命中，收件记参战）->
+        // tick2 下线 -> 残影期 = 30-(2-1) = 29 拍（>5），到期拍 = 2+29 = 31：
+        // 拍 30 仍在，拍 31 消散——具体拍数断言
+        let dir = temp_players_dir("combat-ghost");
+        std::fs::write(dir.join("example.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let pid = find_player_id(&world, "example");
+        // 敌人排击晕刀打玩家（world.tick()==1）：收件记参战，玩家存活
+        let enemy = make_entity_with_sandbox(&mut world, &mut map, 200, (29.0, 0.0), TARGET_WAT);
+        let stun = wasm(&ghost_ver_module(777));
+        process_attacks(
+            &mut world,
+            &mut map,
+            &[PendingAttack { attacker: enemy, target_pos: (30.0, 0.0), payload: stun }],
+        );
+        assert!(world.entities.get(&pid).unwrap().is_alive(), "击晕刀不应击杀");
+        std::fs::remove_file(dir.join("example.wat")).unwrap();
+        // tick 2：检测下线，战斗残影 29 拍
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(map.players.is_ghost(&pid), "下线应进残影");
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 28);
+        assert!(
+            world.entities.contains_key(&pid),
+            "拍 30（参战后 29 拍内）残影应仍在——普通残影 5 拍早该消散，此即战斗延长"
+        );
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(
+            !world.entities.contains_key(&pid),
+            "拍 31（下线+29）战斗残影应消散"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ghost_killed_during_ghost_plunders_normally() {
+        // 验收#3：残影可被正常攻击/击杀，击杀掠夺合法（残影身份不影响掠夺）
+        let dir = temp_players_dir("ghost-kill");
+        std::fs::write(dir.join("example.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let pid = find_player_id(&world, "example");
+        std::fs::remove_file(dir.join("example.wat")).unwrap();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(map.players.is_ghost(&pid), "前置：残影已建立");
+        // 击杀刀打残影（空 payload = 默认击杀）
+        let enemy = make_entity_with_sandbox(&mut world, &mut map, 201, (29.0, 0.0), TARGET_WAT);
+        process_attacks(
+            &mut world,
+            &mut map,
+            &[PendingAttack { attacker: enemy, target_pos: (30.0, 0.0), payload: vec![] }],
+        );
+        assert!(
+            !world.entities.get(&pid).unwrap().is_alive(),
+            "残影应被击杀"
+        );
+        assert_eq!(
+            world.entities.get(&enemy).unwrap().survival.points(),
+            4,
+            "击杀掠夺正常发生（3->4），残影身份不影响掠夺合法性"
+        );
+        // 下一拍：死亡清理移除实体+销毁沙箱；再下拍打扫清残影记录
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
+        assert!(!world.entities.contains_key(&pid), "被杀残影应被清理");
+        assert!(!map.sandboxes.contains_key(&pid), "被杀残影沙箱应销毁");
+        assert!(!map.players.is_ghost(&pid), "被杀残影记录应被打扫");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blade_miss_still_counts_as_combat_for_ghost() {
+        // #013 防拔线逃课：出刀即战斗（含落空刀）。玩家对空坐标出刀（落空）后拔线
+        // -> 仍按战斗残影计算（30 拍窗内），不能靠"打空再删文件"缩到普通 5 拍
+        let dir = temp_players_dir("miss-combat");
+        std::fs::write(dir.join("example.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let pid = find_player_id(&world, "example");
+        // 玩家对空坐标 (99,99) 出刀（落空，无目标）；world.tick()==1
+        process_attacks(
+            &mut world,
+            &mut map,
+            &[PendingAttack { attacker: pid, target_pos: (99.0, 99.0), payload: vec![] }],
+        );
+        assert!(world.entities.get(&pid).unwrap().is_alive(), "落空刀不伤人");
+        std::fs::remove_file(dir.join("example.wat")).unwrap();
+        // tick 2：下线检测——参战记录应在（落空刀也算战斗），残影 29 拍
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(map.players.is_ghost(&pid), "下线应进残影");
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 28);
+        assert!(
+            world.entities.contains_key(&pid),
+            "落空刀参战应触发战斗残影延长（拍 30 仍在，普通残影 5 拍早消散）"
+        );
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(!world.entities.contains_key(&pid), "拍 31 战斗残影到期消散");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ghost_skips_defense_inquiry() {
+        // 残影不执行任何玩家代码（含 on_attack 防守）：带恒拦截防守的残影被击晕刀命中
+        // -> 跳过防守询问直接结算，换血发生（ver 111 -> 888）
+        let dir = temp_players_dir("ghost-defense");
+        std::fs::write(dir.join("tanky.wat"), GHOST_DEFENDER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let pid = find_player_id(&world, "tanky");
+        std::fs::remove_file(dir.join("tanky.wat")).unwrap();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(map.players.is_ghost(&pid), "前置：残影已建立");
+        let enemy = make_entity_with_sandbox(&mut world, &mut map, 202, (29.0, 0.0), TARGET_WAT);
+        let stun = wasm(&ghost_ver_module(888));
+        process_attacks(
+            &mut world,
+            &mut map,
+            &[PendingAttack { attacker: enemy, target_pos: (30.0, 0.0), payload: stun }],
+        );
+        assert_eq!(
+            call_i32_export(&mut map, &pid, "get_ver"),
+            888,
+            "残影应跳过防守询问：击晕刀换血生效"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compile_failure_player_skipped_and_blacklisted() {
+        // 验收#4：编译失败的 .wat -> warn 跳过，世界不崩；黑名单不逐拍重试；
+        // 同名重写内容不热更新（黑名单维持）；删了再放 -> 黑名单解除可进场
+        let dir = temp_players_dir("broken");
+        std::fs::write(dir.join("broken.wat"), "this is not wat ((").unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        // tick 1：编译失败 -> 无实体、世界正常
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(
+            !world.entities.values().any(|e| e.code_hash == "broken"),
+            "编译失败玩家不应进场"
+        );
+        assert_eq!(world.entities.len(), 0, "世界不崩");
+        // 同名重写合法内容（不删文件）-> 黑名单维持，不进场（MVP 无热更新）
+        std::fs::write(dir.join("broken.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(
+            !world.entities.values().any(|e| e.code_hash == "broken"),
+            "黑名单内的名字不应逐拍重试"
+        );
+        // 删了再放 -> 黑名单解除，进场
+        std::fs::remove_file(dir.join("broken.wat")).unwrap();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        std::fs::write(dir.join("broken.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(
+            world.entities.values().any(|e| e.code_hash == "broken"),
+            "删了重放合法文件后应可进场"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
