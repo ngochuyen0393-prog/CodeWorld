@@ -17,6 +17,14 @@ if not exist codeworld.db (
 rem also clear stale journal sidecars from a previous crash (delete-mode journal)
 del /q codeworld.db-journal codeworld.db-wal codeworld.db-shm 2>nul
 
+rem block: an old world process locks codeworld.exe and breaks the build below
+tasklist /FI "IMAGENAME eq codeworld.exe" 2>nul | find /I "codeworld.exe" >nul && (
+    echo [start.bat] OLD WORLD IS STILL RUNNING - close it first ^(press q in its window^),
+    echo [start.bat] otherwise it blocks the build and you keep playing the OLD version.
+    pause
+    exit /b 1
+)
+
 echo [start.bat] building (first build takes 1-3 min, progress in build.log) ...
 cargo build -p codeworld 2>build.log
 if errorlevel 1 (
