@@ -28,6 +28,11 @@
   刀光线；实体从相邻快照消失时在最后坐标留 1.5s 渐隐 ✕。镜头默认跟随 P
   （lerp 平滑 + viewport 域 clamp，贴边画出界线），F 键或底栏按钮切全景。
 
+  操控飞行（期四第五刀，#029 无税版）：点击空中位置 = 飞行目标——P 垂直优先
+  爬升（每拍净 1 格）到目标高度再水平推进，到位悬停（服务器每拍喷气抵消重力，
+  本地预测位置冻结）；stop 在空中 = 悬停不坠；点地面 = 受控降落（净 -1/拍）落
+  地后照旧走位。空中目标标记带垂直投影线 + 地面落点十字（高度感）。
+
   手写零依赖声明：无框架、无 CDN、无构建工具、无 script src，
   单文件原生 JS + Canvas 2D（项目零前端工具链宪法）。
 -->
@@ -302,27 +307,43 @@
 
   // ==== [PURE-BEGIN] 纯逻辑区（node 机器验证覆盖；不碰 DOM/WS/Canvas）====
 
-  // ⚠️ 镜像规则声明：applyMoveSteps 与 bin/codeworld/src/input.rs 的
-  // next_move_step（169-181 行）是同一规则的 JS/Rust 双实现——逐拍一步、
-  // 先横后竖、格距平方 ≤0.25（格距 ≤0.5）到达即停、显式符号函数
-  // （Rust f64::signum(+0.0)=1.0 的坑两边都避开）。改一处必须同步另一处，
-  // 协议契约见 docs/net-protocol.md「客户端预测与和解」节。
+  // ⚠️ 镜像规则声明（v1.4）：applyMoveSteps 与 bin/codeworld/src/input.rs 的
+  // next_move_step 是同一规则的 JS/Rust 双实现——
+  // 地面目标+地面实体：逐拍一步、先横后竖、格距平方 ≤0.25（格距 ≤0.5）到达
+  // 即停清目标（v1.2 语义不变）；
+  // 空中目标或空中实体：垂直优先每拍净 ±1 格（爬升/降落），高度到位后水平推进，
+  // 到位悬停位置冻结（服务器悬停=每拍喷气净零，本地无需建模）；
+  // 空中降落触地钳 0（镜像服务器地面约束）。
+  // 本函数建模"净位移"——服务器 SetPos 内含 +9.8 重力补偿、阶段二物理扣回，
+  // 净效果与本镜像一致（对账阈值 0.25 格覆盖浮点噪声）。显式符号函数两边都避开
+  // （Rust f64::signum(+0.0)=1.0 的坑）。改一处必须同步另一处，
+  // 协议契约见 docs/net-protocol.md v1.4「客户端预测与和解」节。
+  var FLY_GROUND = 0.5; // 地面线阈值（与服务器 input.rs GROUND_EPS 同步）
+
   function signStep(v) {
     return v > 0 ? 1.0 : (v < 0 ? -1.0 : 0.0);
   }
 
-  // 从 (px,py) 向目标连走 steps 步（每步 1 格，到达即停）；镜像 next_move_step 的
-  // 循环展开版——每次迭代等价于 Rust 侧调用一次 next_move_step 走一步
+  // 从 (px,py) 向目标连走 steps 步（每步净 1 格，到达即停）；镜像 next_move_step 的
+  // 循环展开版——每次迭代等价于 Rust 侧调用一次 next_move_step 的净效果
   function applyMoveSteps(px, py, tx, ty, steps) {
     var x = px, y = py;
     var k = steps;
+    var aerialTarget = ty > FLY_GROUND;
     while (k > 0) {
       var dx = tx - x, dy = ty - y;
-      if (dx * dx + dy * dy <= 0.25) break; // 已到达（格距 ≤0.5，含边界防振荡）
-      if (dx !== 0) {
-        x += signStep(dx);                  // 先横：横轴还有差距
+      if (dx * dx + dy * dy <= 0.25) break; // 已到达：地面站住清目标 / 空中悬停（位置冻结）
+      if (y > FLY_GROUND || aerialTarget) {
+        if (Math.abs(dy) > 0.5) {
+          y += signStep(dy);                  // 垂直优先：净 ±1/拍（爬升/降落）
+          if (y < 0) y = 0;                   // 落地钳 0（镜像服务器地面约束）
+        } else {
+          x += signStep(dx);                  // 高度到位：水平推进（喷气维持，净横 ±1/拍）
+        }
+      } else if (dx !== 0) {
+        x += signStep(dx);                    // 地面走位：先横
       } else {
-        y += signStep(dy);                  // 横已到位 -> 竖
+        y += signStep(dy);                    // 横已到位 -> 竖
       }
       k--;
     }
@@ -560,12 +581,32 @@
     });
 
     // 点击走位可视化（#027）：操控实体 -> 目标 虚线 + 目标点标记（本地提示，服务器权威；
-    // 操控实体取的是预测后的渲染位置，虚线跟着预测走）
+    // 操控实体取的是预测后的渲染位置，虚线跟着预测走）。
+    // 空中目标（第五刀）：目标向地面投影一条垂直参考线 + 地面落点小十字——高度感，
+    // 玩家由此看出"这是往天上飞"以及悬停点相对地面的位置
     if (moveTarget && lastState) {
       var meEnt = findControlled(lastState.ents);
       if (meEnt) {
         var pa = worldToScreen(meEnt.x, meEnt.y);
         var pb = worldToScreen(moveTarget.x, moveTarget.y);
+        if (moveTarget.y > FLY_GROUND) {
+          var pg = worldToScreen(moveTarget.x, 0);
+          ctx.strokeStyle = 'rgba(63,185,80,0.45)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 4]);
+          ctx.beginPath();
+          ctx.moveTo(pb.x, pb.y);
+          ctx.lineTo(pg.x, pg.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          var cs = 5;
+          ctx.beginPath();
+          ctx.moveTo(pg.x - cs, pg.y - cs);
+          ctx.lineTo(pg.x + cs, pg.y + cs);
+          ctx.moveTo(pg.x + cs, pg.y - cs);
+          ctx.lineTo(pg.x - cs, pg.y + cs);
+          ctx.stroke();
+        }
         ctx.strokeStyle = '#3fb950';
         ctx.lineWidth = 1.5;
         ctx.setLineDash([5, 5]);

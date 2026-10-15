@@ -67,6 +67,9 @@ struct EntitySandboxMap {
     ws_move_target: Option<(EntityId, (f64, f64))>,
     /// 操控独占是否生效中（#025：me 在线=true；状态翻转沿打生命周期日志）
     ctrl_exclusive_active: bool,
+    /// 操控飞行相位（期四第五刀）：Some(p)=飞行中（相位翻转沿打日志，悬停不刷）；
+    /// None=地面/非飞行。操控死亡/下线/落地清零（喷气停止，重力接管）
+    flight_phase: Option<input::FlightPhase>,
 }
 
 impl EntitySandboxMap {
@@ -86,6 +89,7 @@ impl EntitySandboxMap {
             controlled_offline_latched: false,
             ws_move_target: None,
             ctrl_exclusive_active: false,
+            flight_phase: None,
         })
     }
 
@@ -772,9 +776,11 @@ fn tick_with_intents(
     let entity_pos = control_target
         .and_then(|id| world.entities.get(&id))
         .map(|e| e.pos());
-    // 观战/无操控拍：点击走位目标不滞留（换角不交接由 route_intents 兜底，这里清根）
+    // 观战/无操控拍：点击走位目标不滞留（换角不交接由 route_intents 兜底，这里清根）；
+    // 飞行相位一并清零（操控死亡/下线 = 喷气停止，重力接管）
     if control_target.is_none() {
         sandbox_map.ws_move_target = None;
+        sandbox_map.flight_phase = None;
     }
     let action = input::route_intents(
         intents,
@@ -809,10 +815,47 @@ fn tick_with_intents(
                 }
                 tracing::info!("[input] 操控意图 Move({dx},{dy}) player={name}（覆盖自主移动）");
             }
+            input::ControlledAction::Fly { dx, dy, phase } => {
+                // 操控飞行 = 排队 SetPos（占位裁决照常；dy 内含重力补偿，阶段二 a
+                // 先应用位移、c 步重力扣回，净位移 = 意图步长。#029 无税：喷气是
+                // 意图层动作非 on_tick，操控独占不抑制——独占只抑制自主代码）
+                if let Some(e) = world.entities.get(id) {
+                    let (x, y) = e.pos();
+                    pending.push(PendingChange::SetPos {
+                        entity: *id,
+                        new_pos: (x + dx, y + dy),
+                    });
+                }
+                // 相位沿日志（任务 A.4：起飞/平飞/悬停状态切换才打，悬停维持不逐拍刷）
+                if sandbox_map.flight_phase != Some(*phase) {
+                    let tgt = sandbox_map
+                        .ws_move_target
+                        .map(|(_, p)| p)
+                        .unwrap_or((0.0, 0.0));
+                    tracing::info!(
+                        "[ctrl] 操控飞行 move→({},{}) player={name}（{}）",
+                        tgt.0,
+                        tgt.1,
+                        phase.name()
+                    );
+                    sandbox_map.flight_phase = Some(*phase);
+                }
+            }
             input::ControlledAction::Attack(tpos) => {
                 tracing::info!("[input] 操控意图 Attack target={tpos:?} player={name}（操控刀优先）");
             }
         }
+    }
+    // 离开飞行（落地到达/键盘接管/出刀分心）：相位清零打结束沿——重力接管，
+    // 摔落伤害物理照常（#029：中断即坠落，无人为税）
+    if sandbox_map.flight_phase.is_some()
+        && !matches!(&action, Some((_, input::ControlledAction::Fly { .. })))
+    {
+        tracing::info!(
+            "[ctrl] 操控飞行结束（重力接管）player={}",
+            online.as_ref().map(|(n, _)| n.as_str()).unwrap_or("?")
+        );
+        sandbox_map.flight_phase = None;
     }
     // #025 操控独占：me 在线（control_target 存在）即全程抑制该实体 on_tick——
     // 不按键角色就站着，代码自主被完全抑制；不存在"无意图拍回落自主"。
@@ -3272,6 +3315,119 @@ mod tests {
         assert!(map.ws_move_target.is_none(), "Stop 清除持续目标");
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
         assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.0), "目标已清，不复活走位");
+    }
+
+    /// 飞行测试便捷：连跑 n 拍空意图（爬升/悬停/降落的延续拍）
+    #[allow(clippy::too_many_arguments)]
+    fn fly_ticks(
+        world: &mut WorldState,
+        time: &mut TimeEngine,
+        physics: &DefaultPhysicsEngine,
+        renderer: &mut Renderer,
+        storage: &mut StorageEngine,
+        pending: &mut Vec<PendingChange>,
+        map: &mut EntitySandboxMap,
+        n: u32,
+    ) {
+        let none: Vec<input::Intent> = vec![];
+        for _ in 0..n {
+            tick_with_intents(world, time, physics, renderer, storage, pending, map, &none);
+        }
+    }
+
+    // === 期四第五刀：操控飞行（#029 无税版）===
+
+    #[test]
+    fn controlled_flight_click_aerial_point_climbs_and_hovers() {
+        // 第五刀主链路：点空中 (30,3) -> 每拍净 +1 爬升（喷气步+重力扣回）-> 到位
+        // 悬停（y 稳定）-> 目标保留；悬停中 x 不动（独占抑制自主 on_tick）而 y 稳定
+        //（喷气在跑）——即"喷气是意图层动作非 on_tick"的分层证明（审查 A.3）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let fly = vec![input::Intent::WsMove { x: 30.0, y: 3.0 }];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &fly);
+        let y1 = world.entities.get(&pid).unwrap().pos().1;
+        assert!((y1 - 1.0).abs() < 1e-9, "首拍净爬升 1 格，实际 {y1}");
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
+        let y3 = world.entities.get(&pid).unwrap().pos().1;
+        assert!((y3 - 3.0).abs() < 1e-9, "三拍到位 y=3（净 +1/拍），实际 {y3}");
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert_eq!(
+            map.flight_phase,
+            Some(input::FlightPhase::Hover),
+            "到位转悬停相位（状态沿）"
+        );
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 3);
+        let (px, py) = world.entities.get(&pid).unwrap().pos();
+        assert!((py - 3.0).abs() < 1e-6, "悬停维持：喷气抵消重力位置稳定，实际 {py}");
+        assert_eq!(px, 30.0, "独占抑制自主 on_tick（AUTO_MOVER 的 +1 东移没跑）");
+        assert!(map.ws_move_target.is_some(), "悬停目标保留（新意图才改变）");
+    }
+
+    #[test]
+    fn controlled_death_stops_hover_jet_and_clears_flight_state() {
+        // 操控死亡：意图侧状态清理（flight_phase/ws_move_target 清零 = 喷气停止），
+        // 实体移除；坠落/尸体由物理与渲染既有路径接管（#029 中断即坠落）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let fly = vec![input::Intent::WsMove { x: 30.0, y: 3.0 }];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &fly);
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 4);
+        assert_eq!(
+            map.flight_phase,
+            Some(input::FlightPhase::Hover),
+            "前置：悬停已建立"
+        );
+        world.entities.get_mut(&pid).unwrap().kill();
+        let none: Vec<input::Intent> = vec![];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
+        assert!(!world.entities.contains_key(&pid), "死亡实体被清理");
+        assert_eq!(map.flight_phase, None, "飞行相位清零（喷气停止）");
+        assert_eq!(map.ws_move_target, None, "悬停/走位目标清零");
+    }
+
+    #[test]
+    fn controlled_stop_in_air_hovers_not_falls() {
+        // 空中 stop：悬停不坠（stop 语义 = 停止移动不是坠落；要落地玩家点地面）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let fly = vec![input::Intent::WsMove { x: 30.0, y: 3.0 }];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &fly);
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 4);
+        let stop = vec![input::Intent::Stop];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &stop);
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
+        let (px, py) = world.entities.get(&pid).unwrap().pos();
+        assert!((py - 3.0).abs() < 1e-6, "stop 后悬停不坠，实际 {py}");
+        assert_eq!(px, 30.0, "停止水平移动");
+        assert_eq!(map.flight_phase, Some(input::FlightPhase::Hover), "stop 空中转悬停相位");
+        let mt = map.ws_move_target.expect("stop 后悬停锚点在册");
+        assert_eq!(mt.0, pid);
+        assert!((mt.1 .1 - 3.0).abs() < 1e-6, "悬停锚点 = 脚下坐标");
+    }
+
+    #[test]
+    fn controlled_click_ground_from_air_lands_and_walks() {
+        // 悬停中点地面：先垂直降落到地面线（受控 -1/拍），落地后恢复旧规走位到点，
+        // 到达清除（地面路径与旧版完全一致——回归锚）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let fly = vec![input::Intent::WsMove { x: 30.0, y: 3.0 }];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &fly);
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 4);
+        assert_eq!(map.flight_phase, Some(input::FlightPhase::Hover), "前置：悬停已建立");
+        let land = vec![input::Intent::WsMove { x: 34.0, y: 0.0 }];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &land);
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
+        let (lx, ly) = world.entities.get(&pid).unwrap().pos();
+        assert!((ly - 0.0).abs() < 1e-6, "三拍降落到地面线，实际 {ly}");
+        assert_eq!(lx, 30.0, "降落期不横移（垂直优先）");
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 6);
+        let (wx, wy) = world.entities.get(&pid).unwrap().pos();
+        assert!((wx - 34.0).abs() < 1e-9, "落地后走位到点击点，实际 {wx}");
+        assert!((wy - 0.0).abs() < 1e-9, "贴地行走，实际 {wy}");
+        assert!(map.ws_move_target.is_none(), "地面目标到达清除（旧版语义）");
+        assert_eq!(map.flight_phase, None, "落地退出飞行相位");
     }
 
     #[test]
