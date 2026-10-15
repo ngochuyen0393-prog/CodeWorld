@@ -63,6 +63,10 @@ struct EntitySandboxMap {
     last_controlled: Option<String>,
     /// 操控目标下线 latch（#024：下线后本局锁定观战，重新进场不自动恢复，重启重开）
     controlled_offline_latched: bool,
+    /// WS 鼠标点击走位持续目标（#027：归属实体 + 世界坐标；跨拍保持，到达/Stop/换角清除）
+    ws_move_target: Option<(EntityId, (f64, f64))>,
+    /// 操控独占是否生效中（#025：me 在线=true；状态翻转沿打生命周期日志）
+    ctrl_exclusive_active: bool,
 }
 
 impl EntitySandboxMap {
@@ -80,6 +84,8 @@ impl EntitySandboxMap {
             warned_invalid_me: false,
             last_controlled: None,
             controlled_offline_latched: false,
+            ws_move_target: None,
+            ctrl_exclusive_active: false,
         })
     }
 
@@ -564,9 +570,10 @@ fn main() -> Result<()> {
 
     // 操控层 v0（#022）：raw mode 裸键输入 + 意图队列；旧 stdin read_line 线程退役
     //（read_line 等 Enter/EOF 的退出语义由 crossterm 事件循环接管：Quit 键/EOF 路等价）
+    // #027：同一 IntentSink 克隆给 WS 线程——终端键盘与浏览器鼠标单入口双来源
     let running = Arc::new(AtomicBool::new(true));
     let (intent_sink, intent_queue) = input::intent_channel();
-    let input_thread = input::spawn_input_thread(intent_sink, running.clone());
+    let input_thread = input::spawn_input_thread(intent_sink.clone(), running.clone());
 
     // 延迟变更队列（架构文档 4.1 节阶段一产出、阶段二 a 统一应用）
     // 玩家代码执行期间产生的变更放入 pending，本 tick 阶段二统一应用后清空
@@ -583,7 +590,8 @@ fn main() -> Result<()> {
 
     // 期四第一刀：WS 快照推送（与终端 ANSI 渲染并行存在，不替代终端）。
     // 端口 0 = 禁用（返回 None，tick 循环走零开销分支）；WS 线程挂掉不影响主循环。
-    let ws_snapshots = net::init(&config);
+    // #027：第三刀起 WS 线程同时是上行意图入口（转发进共享 intent_sink）
+    let ws_snapshots = net::init(&config, intent_sink);
 
     tracing::info!("tick 循环开始（WASD/方向键操控，空格攻击，q/Enter/Ctrl+C 退出）");
     while running.load(Ordering::SeqCst) {
@@ -749,8 +757,32 @@ fn tick_with_intents(
         tracing::debug!("[input] 观战模式无操控目标，按键仅 Quit 生效（no control target）");
         sandbox_map.warned_no_player = true;
     }
+    // #025 操控独占生命周期：me 在线期间自主全程挂起（状态翻转沿打日志，不逐拍刷）
+    if control_target.is_some() && !sandbox_map.ctrl_exclusive_active {
+        if let Some((name, _)) = &online {
+            tracing::info!("[ctrl] 操控独占开始 player={name}（自主挂起）");
+        }
+        sandbox_map.ctrl_exclusive_active = true;
+    } else if control_target.is_none() && sandbox_map.ctrl_exclusive_active {
+        tracing::info!("[ctrl] 操控释放（自主恢复）");
+        sandbox_map.ctrl_exclusive_active = false;
+    }
     let nearest = control_target.and_then(|id| find_nearest_enemy(world, &id, &bounds));
-    let action = input::route_intents(intents, control_target, nearest);
+    // 操控目标当前坐标（#027：点击走位步向计算依据）
+    let entity_pos = control_target
+        .and_then(|id| world.entities.get(&id))
+        .map(|e| e.pos());
+    // 观战/无操控拍：点击走位目标不滞留（换角不交接由 route_intents 兜底，这里清根）
+    if control_target.is_none() {
+        sandbox_map.ws_move_target = None;
+    }
+    let action = input::route_intents(
+        intents,
+        control_target,
+        nearest,
+        entity_pos,
+        &mut sandbox_map.ws_move_target,
+    );
     // 字幕 ctrl 段（#024 三态）：操控中 = ctrl:字形；观战（有人但不是你 / 操控目标
     // 下线 latch）= ctrl:--；无玩家在线且从未 latch（四生物基线）= 不显示 ctrl 段
     let ctrl = if sandbox_map.players.has_online() || sandbox_map.controlled_offline_latched {
@@ -782,11 +814,10 @@ fn tick_with_intents(
             }
         }
     }
-    let to_kill = sandbox_map.run_player_code_with_control(
-        world,
-        &bounds,
-        action.as_ref().map(|(id, _)| *id),
-    );
+    // #025 操控独占：me 在线（control_target 存在）即全程抑制该实体 on_tick——
+    // 不按键角色就站着，代码自主被完全抑制；不存在"无意图拍回落自主"。
+    // 有无本拍行动（action）不影响抑制范围；life() 照常（存在合同不受操控影响）。
+    let to_kill = sandbox_map.run_player_code_with_control(world, &bounds, control_target);
     for entity_id in &to_kill {
         if let Some(entity) = world.entities.get_mut(entity_id) {
             entity.kill();
@@ -2910,8 +2941,9 @@ mod tests {
     }
 
     #[test]
-    fn no_intent_keeps_autonomous_move() {
-        // 无人按键 = 代码自主照常（#022 离线回落语义；pioneer 挂机行为回归锚）
+    fn me_online_no_intent_stands_still_ctrl_exclusive() {
+        // #025 操控独占：me 在线期间不按键角色就站着（on_tick 全程抑制），
+        // 不存在"无意图拍回落自主"——旧语义（#022 回落）被 #025 取代
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
         tick(
@@ -2925,9 +2957,68 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (31.0, 0.0),
-            "无按键自主东行一步"
+            (30.0, 0.0),
+            "me 在线无按键：自主 move_by(+1,0) 被抑制，站住"
         );
+        assert!(
+            map.ctrl_exclusive_active,
+            "操控独占生效中（状态翻转沿供生命周期日志）"
+        );
+    }
+
+    #[test]
+    fn me_declaration_removed_resumes_autonomy() {
+        // #025 下线交接：me.txt 删除 -> 无操控目标 -> 自主恢复（P 自己走起来）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        std::fs::remove_file(me_dir.join("me.txt")).unwrap();
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (31.0, 0.0),
+            "me 删除后自主恢复东行"
+        );
+        assert!(
+            !map.ctrl_exclusive_active,
+            "操控释放（自主恢复），独占状态关闭"
+        );
+    }
+
+    #[test]
+    fn ctrl_exclusive_lifecycle_flip_on_gain_and_loss() {
+        // #025 生命周期：操控建立拍翻转 true（打"独占开始"日志），失去拍翻转 false（"释放"）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, _pid, me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        assert!(!map.ctrl_exclusive_active, "起步未独占");
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(map.ctrl_exclusive_active, "me 在线 -> 独占开始");
+        std::fs::write(me_dir.join("me.txt"), "nobody").unwrap(); // 声明改无效名 = 失去操控
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(!map.ctrl_exclusive_active, "声明失效 -> 操控释放（自主恢复）");
     }
 
     #[test]
@@ -3129,6 +3220,64 @@ mod tests {
     }
 
     #[test]
+    fn ws_move_walks_tick_by_tick_until_arrival() {
+        // #027 点击走位全链路：拍1 收 WsMove 立即走一步，拍2 无意图续走，拍3 到达停住
+        //（30 -> 31 -> 32 到达；之后不再抖动，持续目标清除）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let walk = vec![input::Intent::WsMove { x: 32.0, y: 0.0 }];
+        let none: Vec<input::Intent> = vec![];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &walk);
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.0), "拍1 向点击目标走一步");
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (32.0, 0.0), "拍2 续走到达");
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (32.0, 0.0),
+            "拍3 到达停住（目标清除，格距<=0.5 判定）"
+        );
+        assert!(map.ws_move_target.is_none(), "到达后持续目标清除");
+    }
+
+    #[test]
+    fn ws_stop_cancels_walk_and_stands() {
+        // #027 stop 全链路：走位中收到 Stop -> 清目标站住，后续空拍也不复活走位
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let walk = vec![input::Intent::WsMove { x: 35.0, y: 0.0 }];
+        let stop = vec![input::Intent::Stop];
+        let none: Vec<input::Intent> = vec![];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &walk);
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.0), "走位中");
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &stop);
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.0), "Stop 拍站住");
+        assert!(map.ws_move_target.is_none(), "Stop 清除持续目标");
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.0), "目标已清，不复活走位");
+    }
+
+    #[test]
+    fn ws_attack_strikes_clicked_coords_same_pipeline() {
+        // #027 点击出刀全链路：对点击坐标出刀（服务器以坐标找人），与键盘空格同一
+        // 两阶段结算通路——击杀 + 掠夺，操控不豁免物理
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let victim = make_entity_with_sandbox(&mut world, &mut map, 2, (32.0, 0.0), TARGET_WAT);
+        let intents = vec![input::Intent::WsAttack { x: 32.0, y: 0.0 }];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &intents);
+        assert!(
+            !world.entities.contains_key(&victim),
+            "点击坐标处的敌人被操控刀击杀"
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().survival.points(),
+            4,
+            "击杀掠夺：攻击者 3 -> 4（与键盘攻击同通路）"
+        );
+    }
+
+    #[test]
     fn controlled_offline_latches_spectator_no_auto_restore() {
         // #024 下线回落：操控中的目标下线（删玩家文件）-> warn 一次 + latch 观战；
         // 重新进场（文件回来，新实体）不自动恢复操控——重启重开（MVP 从简）
@@ -3181,8 +3330,8 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (30.0, 0.0),
-            "latch 后操控无效（残影不执行代码也不受操控位移）"
+            (29.0, 0.0),
+            "latch 后操控无效（#025 语义更新：下线检测拍 me 仍在线=独占抑制，实体冻在 29 不再自主多走一步）"
         );
         assert!(
             renderer.caption_line().contains("ctrl:--"),

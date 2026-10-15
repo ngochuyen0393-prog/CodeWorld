@@ -7,6 +7,7 @@
 //! 职责边界：快照是只读投影（渲染数据源 world.entities + caption + tick），
 //! 不回写世界；客户端输入第一刀只 pong/忽略（意图流是第三刀，接 input.rs 入口）。
 
+use crate::input::IntentSink;
 use crate::players::PlayerDirectory;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -17,12 +18,41 @@ use codeworld_core::entity::EntityId;
 use codeworld_core::world::WorldState;
 use codeworld_render::Viewport;
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 /// 快照广播通道容量（未消费帧积压上限；慢客户端丢旧帧即可，快照有"后值覆盖"语义）
 pub(crate) const SNAPSHOT_CHANNEL_CAP: usize = 16;
+
+// ---- 上行意图协议（docs/net-protocol.md v1.2 客户端 -> 服务器，#027）----
+
+/// 客户端上行消息（三型）：点击走位 / 点击出刀 / 停止。
+/// 坐标一律世界坐标（快照 viewport 域内），非法值解析层拒绝。
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub(crate) enum ClientMessage {
+    Move { x: f64, y: f64 },
+    Attack { x: f64, y: f64 },
+    Stop,
+}
+
+/// 上行文本 -> 客户端消息（纯函数；Err 带原因供 warn 丢弃，不 panic 不部分接受）
+pub(crate) fn parse_client_message(text: &str) -> Result<ClientMessage, String> {
+    let msg: ClientMessage =
+        serde_json::from_str(text).map_err(|e| format!("JSON/协议不符: {e}"))?;
+    let finite = |v: f64| v.is_finite();
+    let coords_ok = match &msg {
+        ClientMessage::Move { x, y } | ClientMessage::Attack { x, y } => finite(*x) && finite(*y),
+        ClientMessage::Stop => true,
+    };
+    if !coords_ok {
+        return Err("坐标非有限值（NaN/无穷）".to_string());
+    }
+    Ok(msg)
+}
 
 // ---- 快照数据形状（docs/net-protocol.md v1 前端契约，字段名与顺序第二刀依赖）----
 
@@ -119,24 +149,38 @@ pub(crate) fn build_snapshot(
 /// 静态验收页目录（相对工作目录；start.bat 已 cd 到项目根）
 pub(crate) const STATIC_DIR: &str = "bin/codeworld/static";
 
+/// WS 服务器共享状态：快照广播 + 上行意图队列 + 操控连接令牌（#027 单连接假设）
+pub(crate) struct WsState {
+    pub(crate) snapshots: broadcast::Sender<String>,
+    /// 与终端键盘共享的意图队列生产端（单入口双来源，input.rs 路由不区分来源）
+    pub(crate) intents: IntentSink,
+    /// 操控连接令牌：false=无主（下一连接即操控端）/ true=已被占用。
+    /// 第一连接认领、断开释放——"本机浏览器=我"的等价物（#024 me.txt 的连接版）。
+    pub(crate) ctrl_taken: Arc<AtomicBool>,
+}
+
 /// 生产装配：WS 启用（端口≠0）则起独立 ws-server 线程（内含 tokio runtime），
 /// 返回快照发送端供主循环每拍推送；禁用（端口 0）返回 None = 主循环零开销分支。
-pub(crate) fn init(config: &crate::config::Config) -> Option<broadcast::Sender<String>> {
+pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Option<broadcast::Sender<String>> {
     if config.ws_port == 0 {
         tracing::info!("[ws] CODEWORLD_WS_PORT=0，WS 快照推送禁用（纯终端模式）");
         return None;
     }
     let (tx, _) = broadcast::channel(SNAPSHOT_CHANNEL_CAP);
     let port = config.ws_port;
-    let thread_tx = tx.clone();
+    let state = Arc::new(WsState {
+        snapshots: tx.clone(),
+        intents,
+        ctrl_taken: Arc::new(AtomicBool::new(false)),
+    });
     let spawned = std::thread::Builder::new()
         .name("ws-server".to_string())
-        .spawn(move || run_ws_thread(port, thread_tx));
+        .spawn(move || run_ws_thread(port, state));
     match spawned {
         Ok(_) => {
             tracing::info!(
                 port,
-                "[ws] WS 快照推送已启动（浏览器打开 http://localhost:{port} 看世界）"
+                "[ws] WS 快照推送已启动（浏览器打开 http://localhost:{port} 看世界；第一连接=操控端）"
             );
             Some(tx)
         }
@@ -149,7 +193,7 @@ pub(crate) fn init(config: &crate::config::Config) -> Option<broadcast::Sender<S
 
 /// ws-server 线程体：自建 tokio current_thread runtime；监听失败/线程 panic
 /// 都只 warn 收口——世界主循环（std 线程）完全不受影响。
-fn run_ws_thread(port: u16, snapshots: broadcast::Sender<String>) {
+fn run_ws_thread(port: u16, state: Arc<WsState>) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -167,7 +211,7 @@ fn run_ws_thread(port: u16, snapshots: broadcast::Sender<String>) {
                 Ok(listener) => {
                     if let Err(e) = serve(
                         listener,
-                        snapshots,
+                        state,
                         std::path::PathBuf::from(STATIC_DIR),
                         std::future::pending::<()>(),
                     )
@@ -200,13 +244,13 @@ fn run_ws_thread(port: u16, snapshots: broadcast::Sender<String>) {
 /// shutdown future 完成即优雅停机（生产用永不完成的 pending，测试用 oneshot）。
 pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
-    snapshots: broadcast::Sender<String>,
+    state: Arc<WsState>,
     static_dir: std::path::PathBuf,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .with_state(snapshots)
+        .with_state(state)
         .fallback_service(ServeDir::new(static_dir));
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -216,16 +260,25 @@ pub(crate) async fn serve(
 /// WS 升级入口：连接建立后进入快照广播循环
 async fn ws_handler(
     ws: WebSocketUpgrade,
-    State(snapshots): State<broadcast::Sender<String>>,
+    State(state): State<Arc<WsState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, snapshots))
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-/// 单连接循环：下行推快照广播，上行只处理 Ping/忽略其余（输入是第三刀）。
+/// 单连接循环：下行推快照广播，上行解析意图入共享队列（仅操控连接）。
 /// 循环退出即连接清理（socket/rx 随任务结束释放，无泄漏）。
-async fn handle_socket(socket: WebSocket, snapshots: broadcast::Sender<String>) {
-    tracing::info!("[ws] 客户端连接（快照广播开始）");
-    let mut rx = snapshots.subscribe();
+async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
+    // 操控权认领（#027 单连接假设）：第一连接=操控端，后来者=观战（上行丢弃）
+    let controller = state
+        .ctrl_taken
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+    if controller {
+        tracing::info!("[ws] 客户端连接（操控连接：上行意图生效）");
+    } else {
+        tracing::info!("[ws] 客户端连接（观战连接：操控权已被占用）");
+    }
+    let mut rx = state.snapshots.subscribe();
     let (mut sender, mut receiver) = socket.split();
     loop {
         tokio::select! {
@@ -244,8 +297,25 @@ async fn handle_socket(socket: WebSocket, snapshots: broadcast::Sender<String>) 
                 Some(Ok(Message::Ping(payload))) => {
                     let _ = sender.send(Message::Pong(payload)).await;
                 }
-                Some(Ok(Message::Text(_))) => {
-                    tracing::debug!("[ws] 收到客户端文本（第三刀输入通道，本刀忽略）");
+                Some(Ok(Message::Text(text))) => {
+                    if !controller {
+                        tracing::warn!("[ws] 观战连接的上行消息已丢弃（单连接假设：非操控端）");
+                        continue;
+                    }
+                    match parse_client_message(&text) {
+                        Ok(ClientMessage::Move { x, y }) => {
+                            state.intents.send(crate::input::Intent::WsMove { x, y });
+                        }
+                        Ok(ClientMessage::Attack { x, y }) => {
+                            state.intents.send(crate::input::Intent::WsAttack { x, y });
+                        }
+                        Ok(ClientMessage::Stop) => {
+                            state.intents.send(crate::input::Intent::Stop);
+                        }
+                        Err(reason) => {
+                            tracing::warn!(raw = %text, reason, "[ws] 非法上行消息丢弃");
+                        }
+                    }
                 }
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Ok(_)) => {} // Binary 等：忽略
@@ -256,7 +326,12 @@ async fn handle_socket(socket: WebSocket, snapshots: broadcast::Sender<String>) 
             },
         }
     }
-    tracing::info!("[ws] 客户端断开（连接资源已清理）");
+    if controller {
+        state.ctrl_taken.store(false, Ordering::SeqCst);
+        tracing::info!("[ws] 操控连接断开（操控权已释放，下一连接接管）");
+    } else {
+        tracing::info!("[ws] 客户端断开（连接资源已清理）");
+    }
 }
 
 /// tick 侧推送（std 主循环每拍调用）：无观众不组装（零客户端零开销），
@@ -288,6 +363,7 @@ pub(crate) fn push_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::intent_channel;
     use codeworld_core::entity::{Appearance, Entity, PlayerId};
 
     /// 造一个测试实体（快照测试助手）
@@ -493,24 +569,31 @@ mod tests {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    /// 起测试服务器（127.0.0.1 临时端口；返回连接地址与快照发送端/停机开关）
+    /// 起测试服务器（127.0.0.1 临时端口；返回连接地址与快照发送端/意图接收端/停机开关）
+    #[allow(clippy::type_complexity)]
     async fn start_test_server(
         static_dir: std::path::PathBuf,
     ) -> (
         std::net::SocketAddr,
         broadcast::Sender<String>,
+        crate::input::IntentQueue,
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<std::io::Result<()>>,
     ) {
         let (tx, _) = broadcast::channel::<String>(SNAPSHOT_CHANNEL_CAP);
+        let (intents_tx, intents_rx) = crate::input::intent_channel();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let server_tx = tx.clone();
+        let state = Arc::new(WsState {
+            snapshots: tx.clone(),
+            intents: intents_tx,
+            ctrl_taken: Arc::new(AtomicBool::new(false)),
+        });
         let handle = tokio::spawn(async move {
             serve(
                 listener,
-                server_tx,
+                state,
                 static_dir,
                 async move {
                     let _ = shutdown_rx.await;
@@ -518,7 +601,176 @@ mod tests {
             )
             .await
         });
-        (addr, tx, shutdown_tx, handle)
+        (addr, tx, intents_rx, shutdown_tx, handle)
+    }
+
+    /// 轮询意图队列直到出现一条意图（backlog 保留 drain 多取的后续意图防丢；
+    /// 服务器异步处理消息，测试端轮询 std mpsc）
+    async fn next_intent(
+        queue: &crate::input::IntentQueue,
+        backlog: &mut Vec<crate::input::Intent>,
+    ) -> crate::input::Intent {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if backlog.is_empty() {
+                *backlog = queue.drain();
+            }
+            if !backlog.is_empty() {
+                return backlog.remove(0);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "5s 内应收到服务器转发的意图"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_move_message_lands_in_intent_queue() {
+        // 场景：第一连接 = 操控连接；发 move JSON -> 解析入共享意图队列（#027 单入口）
+        let static_dir = temp_static_dir("up-move");
+        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
+        let mut client = connect_client(addr).await;
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"type":"move","x":12.0,"y":0.0}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        let mut backlog = Vec::new();
+        let intent = next_intent(&queue, &mut backlog).await;
+        assert_eq!(
+            intent,
+            crate::input::Intent::WsMove { x: 12.0, y: 0.0 },
+            "move 消息转 WsMove 意图入共享队列"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn ws_attack_and_stop_messages_forward_to_queue() {
+        // attack/stop 同通路：WS 客户端消息 -> 共享意图队列（与键盘同一条 mpsc）
+        let static_dir = temp_static_dir("up-multi");
+        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
+        let mut client = connect_client(addr).await;
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"type":"attack","x":15.0,"y":1.0}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"type":"stop"}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::WsAttack { x: 15.0, y: 1.0 }
+        );
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::Stop
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn invalid_uplink_messages_dropped_connection_alive() {
+        // 非法上行（未知 type/坏 JSON）：丢弃不入队，连接不断（后续合法消息照常转发）
+        let static_dir = temp_static_dir("up-bad");
+        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
+        let mut client = connect_client(addr).await;
+        for bad in [r#"{"type":"dance"}"#.to_string(), "not json".to_string()] {
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Text(bad))
+                .await
+                .unwrap();
+        }
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"type":"stop"}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        // 前两条被丢弃：队列里只有最后的 stop
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::Stop
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            queue.drain().is_empty(),
+            "丢弃消息不入队（只有 stop 一条）"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn second_connection_uplink_dropped_controller_keeps_queue() {
+        // 单连接假设：第一连接拿操控权；第二连接（观战端）上行消息 warn 丢弃不入队；
+        // 操控连接的消息照常入队
+        let static_dir = temp_static_dir("up-second");
+        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
+        let mut c1 = connect_client(addr).await;
+        let mut c2 = connect_client(addr).await;
+        c2.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":99.0,"y":99.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            queue.drain().is_empty(),
+            "观战连接的意图不入队（操控权在第一连接）"
+        );
+        c1.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":12.0,"y":0.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::WsMove { x: 12.0, y: 0.0 },
+            "操控连接意图照常入队"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn controller_released_on_disconnect_next_connection_takes_over() {
+        // 操控权随连接生命周期：操控连接断开 -> 释放；下一个连接成为新操控端
+        let static_dir = temp_static_dir("up-release");
+        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
+        let mut c1 = connect_client(addr).await;
+        c1.send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .ok();
+        drop(c1);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut c2 = connect_client(addr).await;
+        c2.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":7.0,"y":0.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::WsMove { x: 7.0, y: 0.0 },
+            "断开后新连接获得操控权（消息入队）"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
     }
 
     async fn connect_client(addr: std::net::SocketAddr) -> ClientWs {
@@ -558,7 +810,7 @@ mod tests {
         // 场景：起服务器 -> 客户端连上收 2 帧（合法 JSON 且 tick 递增）-> 断开
         // -> 服务器仍可用（新客户端可再连：连接清理不伤服务）-> 优雅停机
         let static_dir = temp_static_dir("frames");
-        let (addr, tx, shutdown_tx, server) = start_test_server(static_dir.clone()).await;
+        let (addr, tx, _queue, shutdown_tx, server) = start_test_server(static_dir.clone()).await;
         let mut client = connect_client(addr).await;
 
         let mut world = WorldState::new();
@@ -603,7 +855,7 @@ mod tests {
     async fn ws_server_replies_pong_to_ping() {
         // 场景：客户端 Ping -> 服务器 Pong（连接保活；第一刀对客户端消息只回 pong/忽略）
         let static_dir = temp_static_dir("ping");
-        let (addr, _tx, shutdown_tx, server) = start_test_server(static_dir).await;
+        let (addr, _tx, _queue, shutdown_tx, server) = start_test_server(static_dir).await;
         let mut client = connect_client(addr).await;
         client
             .send(tokio_tungstenite::tungstenite::Message::Ping(b"ka".to_vec()))
@@ -636,7 +888,7 @@ mod tests {
     async fn ws_server_broadcasts_to_multiple_clients() {
         // 场景：两个客户端同时在线 -> 一拍推送双方各收到同一帧（多客户端并发观战）
         let static_dir = temp_static_dir("multi");
-        let (addr, tx, shutdown_tx, server) = start_test_server(static_dir).await;
+        let (addr, tx, _queue, shutdown_tx, server) = start_test_server(static_dir).await;
         let mut c1 = connect_client(addr).await;
         let mut c2 = connect_client(addr).await;
 
@@ -659,7 +911,7 @@ mod tests {
     async fn static_root_serves_index_html() {
         // 场景：GET / 走 ServeDir 返回 index.html（验收页伺服，第二刀 Canvas 同入口）
         let static_dir = temp_static_dir("static");
-        let (addr, _tx, shutdown_tx, server) = start_test_server(static_dir).await;
+        let (addr, _tx, _queue, shutdown_tx, server) = start_test_server(static_dir).await;
         let body = http_get(&addr).await;
         assert!(
             body.contains("cw-test"),
@@ -692,8 +944,59 @@ mod tests {
             ..crate::config::Config::default()
         };
         assert!(
-            init(&cfg).is_none(),
+            init(&cfg, intent_channel().0).is_none(),
             "端口 0 应禁用 WS（None = 主循环不组装快照）"
         );
+    }
+
+    // ---- 上行意图解析（#027 期四第三刀：客户端 JSON -> ClientMessage）----
+
+    #[test]
+    fn parse_move_message_with_world_coords() {
+        let msg = parse_client_message(r#"{"type":"move","x":12.0,"y":0.0}"#).expect("move 应可解析");
+        assert_eq!(
+            msg,
+            ClientMessage::Move { x: 12.0, y: 0.0 },
+            "move 携带点击的世界坐标"
+        );
+    }
+
+    #[test]
+    fn parse_attack_message_with_world_coords() {
+        let msg =
+            parse_client_message(r#"{"type":"attack","x":15.5,"y":-2.0}"#).expect("attack 应可解析");
+        assert_eq!(msg, ClientMessage::Attack { x: 15.5, y: -2.0 });
+    }
+
+    #[test]
+    fn parse_stop_message() {
+        let msg = parse_client_message(r#"{"type":"stop"}"#).expect("stop 应可解析");
+        assert_eq!(msg, ClientMessage::Stop);
+    }
+
+    #[test]
+    fn parse_unknown_type_rejected() {
+        // 未知 type：warn 丢弃的解析层依据（Err 带原因，不 panic）
+        assert!(parse_client_message(r#"{"type":"dance"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_missing_or_bad_coords_rejected() {
+        // 非法坐标：缺字段 / 类型不对 / 非有限值 -> 一律 Err
+        assert!(parse_client_message(r#"{"type":"move","x":12.0}"#).is_err(), "缺 y");
+        assert!(
+            parse_client_message(r#"{"type":"move","x":"abc","y":0}"#).is_err(),
+            "坐标类型不对"
+        );
+        assert!(
+            parse_client_message(r#"{"type":"move","x":1e400,"y":0}"#).is_err(),
+            "溢出/非有限坐标拒绝"
+        );
+    }
+
+    #[test]
+    fn parse_malformed_json_rejected() {
+        assert!(parse_client_message("not json").is_err());
+        assert!(parse_client_message(r#"[]"#).is_err(), "非对象 JSON 拒绝");
     }
 }

@@ -134,3 +134,9 @@
 - 原因：快照先对再省（delta/二进制留以后，前端要的是字段稳定不是带宽）；broadcast Sender::send 非 async 天然跨线程，std tick 侧零 async 改造；WS 线程挂/端口占用只 warn，终端世界完全不受影响；绑回环免防火墙弹窗，MVP 不暴露公网。
 - 否决：tokio-tungstenite 裸写服务器（静态伺服要再手搓 HTTP，axum 一把抓）；控制流反向（WS 线程拉快照改推模式，主循环耦合 async）。
 - 落点：bin/codeworld/src/net.rs；docs/net-protocol.md v1 前端契约；config.ws_port（0=禁用）。
+
+## #027 2026-10-15 · 鼠标操控定案：点击走位/点击出刀/操控独占#025落地（第三刀）
+- 定案：上行三消息 move/attack/stop（net-protocol.md v1.2）经 axum WS 接收循环解析入 input.rs 意图队列（IntentSink Clone 共享给 WS 线程——终端键盘与浏览器鼠标单入口双来源，路由不分来源）；move=持续目标逐拍先横后竖走一格、格距≤0.5 到达清除、键盘接管清除、attack 不清目标（单刀与走位并存）；点击出刀不判距离（落空自担，玩法归玩家）、与键盘空格同一两阶段结算；单连接假设=第一 WS 连接认领操控令牌（AtomicBool）、断开释放、观战连接上行丢弃——"本机浏览器=我"是 me.txt 的连接版等价物，意图作用仍由 me 声明裁决（连接≠操控权）；#025 操控独占同步落地：me 在线即全程抑制操控目标 on_tick（不再按 action 有无回落自主），状态翻转沿打"[ctrl] 操控独占开始/释放"日志；前端左键点地=move/点敌人=attack（命中=快照最近实体距点击<半格，排除自己）、右键/S 键=stop、走位虚线+目标标记+出刀红框闪（全本地提示）。
+- 原因：业界标准 client input → server authority（SnapNet/netcode 惯例，客户端只发意图服务器全权裁决，预测留第四刀）；单入口路由是 #023/#014 的既定形状（外部通道三位一体）；单连接假设是 me.txt 身份模型在本机的最小推广（多人认证留后）；操控独占修正了 #022 时代"无意图拍回落自主"的临时语义（土豆 #025 拍板：在线不许后台接管）。
+- 否决：攻击距离预判+前端提示（加规则=框架管玩法，违宪法；落空结算已是自然反馈）；点击敌人自动走近（同类）；多操控连接/连接即身份（MVP 单人本机，认证化是 #024 终态议题）；Intent 加来源字段（路由不分来源=最简，排错靠日志即可）。
+- 落点：input.rs Intent 三变体+route_intents 五参折叠；net.rs ClientMessage 解析+WsState 操控令牌+转发；main.rs tick_with_intents 独占抑制+ws_move_target 状态；static/index.html 点击/右键/S 键+虚线红框；net-protocol.md v1.2；f64::signum(+0.0)=1.0 坑记入 next_move_step 注释。

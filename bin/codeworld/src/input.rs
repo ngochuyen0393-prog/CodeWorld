@@ -18,7 +18,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 操控意图（#022：输入 = 意图流）
+/// 操控意图（#022：输入 = 意图流；#027 期四第三刀：终端键盘与 WS 鼠标双来源共享单入口）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Intent {
     /// 移动（方向键/WASD -> 四方向；步长 1.0 格，方向由 dx/dy 携带）
@@ -27,6 +27,12 @@ pub enum Intent {
     Attack,
     /// 退出（q/Enter/Ctrl+C）
     Quit,
+    /// 点击走位（#027 WS 鼠标：点击世界坐标 = 持续目标，逐拍向其走一步，到达或 Stop 清除）
+    WsMove { x: f64, y: f64 },
+    /// 点击出刀（#027 WS 鼠标：点击敌人坐标 = 单次攻击，点一下砍一刀，不自动连击）
+    WsAttack { x: f64, y: f64 },
+    /// 停止（#027 右键/浏览器 S 键：清除点击走位目标，站住不动）
+    Stop,
 }
 
 /// 按键 -> 意图映射全表（纯函数；crossterm KeyEvent 可在测试中直接构造）
@@ -55,7 +61,8 @@ pub struct IntentQueue {
     rx: Receiver<Intent>,
 }
 
-/// 意图队列生产端（输入线程持有）
+/// 意图队列生产端（输入线程持有；Clone 供 WS 线程共享同一队列——单入口双来源，#027）
+#[derive(Clone)]
 pub struct IntentSink {
     tx: Sender<Intent>,
 }
@@ -94,29 +101,83 @@ pub enum ControlledAction {
     Attack(Option<(f64, f64)>),
 }
 
-/// 意图路由（#022 双层模型核心；独立函数——期四 WebSocket 意图流复用同一入口，只换来源不换路由）
+/// 意图路由（#022 双层模型核心；#027 期四第三刀：终端键盘与 WS 鼠标双来源汇入同一折叠）
 ///
-/// - control_target = players/ 目录进场的第一个玩家实体；None = 无玩家在线（按键仅
-///   Quit 生效，路由返回 None，代码自主照常）
-/// - 同拍多键按到达顺序折叠，后到覆盖先到（最后一键说了算）；Quit 不路由
+/// - control_target = me 声明且在线的操控目标实体；None = 观战（无目标可路由）
+/// - 同拍多意图按到达顺序折叠，后到覆盖先到（最后一键说了算）；Quit 不路由
 ///   （退出是主循环语义，输入线程已消费）
+/// - `entity_pos`：操控目标当前坐标（算走位步向用）
+/// - `move_target`：点击走位持续目标（in-out 状态，存 EntitySandboxMap 跨拍）；
+///   键盘 Move 直接接管脚下并清除它；Stop 清除站住；目标换实体不交接
 /// - `nearest_enemy`：操控目标的最近可见敌人坐标（调用方用 main.rs find_nearest_enemy
 ///   预计算，与 scan 共用同一 viewport 口径；input.rs 不感知世界，保持纯路由）
 pub fn route_intents(
     intents: &[Intent],
     control_target: Option<EntityId>,
     nearest_enemy: Option<(f64, f64)>,
+    entity_pos: Option<(f64, f64)>,
+    move_target: &mut Option<(EntityId, (f64, f64))>,
 ) -> Option<(EntityId, ControlledAction)> {
     let target = control_target?;
+    // 点击走位目标不跨角色交接：操控目标换了（换声明/重进场）就清掉旧目标
+    if let Some((tid, _)) = *move_target {
+        if tid != target {
+            tracing::debug!("[input] 操控目标变更，清除旧点击走位目标");
+            *move_target = None;
+        }
+    }
     let mut action: Option<ControlledAction> = None;
     for intent in intents {
         match intent {
-            Intent::Move { dx, dy } => action = Some(ControlledAction::Move(*dx, *dy)),
+            Intent::Move { dx, dy } => {
+                // 键盘直控 = 玩家接管脚下：清除点击走位目标（后到优先，同拍互斥）
+                *move_target = None;
+                action = Some(ControlledAction::Move(*dx, *dy));
+            }
             Intent::Attack => action = Some(ControlledAction::Attack(nearest_enemy)),
+            Intent::WsMove { x, y } => {
+                // 后到的点击走路覆盖本拍已有行动（后到优先）：行动交给持续目标步进
+                action = None;
+                *move_target = Some((target, (*x, *y)));
+            }
+            Intent::WsAttack { x, y } => action = Some(ControlledAction::Attack(Some((*x, *y)))),
+            Intent::Stop => {
+                *move_target = None;
+                action = None;
+            }
             Intent::Quit => {}
         }
     }
+    // 持续目标执行：本拍无其他行动且点击目标在册 -> 向目标走一步；到达（格距<0.5）清除站住
+    if action.is_none() {
+        if let Some((_tid, tpos)) = *move_target {
+            match next_move_step(tpos, entity_pos) {
+                Some(step) => action = Some(step),
+                None => *move_target = None,
+            }
+        }
+    }
     action.map(|a| (target, a))
+}
+
+/// 点击走位的一步分解（net-protocol.md v1.2 写死语义）：先横后竖各整步；
+/// 到达判定 = 与目标欧氏格距平方 <= 0.25（即格距 <= 0.5；含 0.5 防恰好半格外
+/// 永远差半步的 ±0.5 振荡，浮点不用精确相等）。
+/// 坐标有限性由解析层（net.rs）保证，本函数信任来源。
+/// 注意：不能用 f64::signum——signum(+0.0) 返回 1.0 而非 0.0，横轴到位会被
+/// 误判成"还差一横步"永远走不出锯齿。
+fn next_move_step(tpos: (f64, f64), pos: Option<(f64, f64)>) -> Option<ControlledAction> {
+    let (px, py) = pos?;
+    let diff = (tpos.0 - px, tpos.1 - py);
+    if diff.0 * diff.0 + diff.1 * diff.1 <= 0.25 {
+        return None; // 已到达：格距 <= 0.5，清除目标站住
+    }
+    let sign = |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 };
+    if diff.0 != 0.0 {
+        Some(ControlledAction::Move(sign(diff.0), 0.0)) // 先横：横轴还有差距
+    } else {
+        Some(ControlledAction::Move(0.0, sign(diff.1))) // 横已到位 -> 竖
+    }
 }
 
 /// 独立输入线程：crossterm 事件轮询 -> 意图入队（生产者）
@@ -331,13 +392,24 @@ mod tests {
         assert!(queue.drain().is_empty(), "空队列 drain 返回空");
     }
 
-    // === route_intents：意图路由（任务 B，#022 双层模型核心）===
+    // === route_intents：意图路由（#022 双层模型核心；#027 双来源折叠）===
+
+    /// 路由测试便捷包装（旧签名迁移垫片：实体@pos、无点击目标起步）
+    fn route(
+        intents: &[Intent],
+        target: Option<EntityId>,
+        nearest: Option<(f64, f64)>,
+        pos: Option<(f64, f64)>,
+    ) -> Option<(EntityId, ControlledAction)> {
+        let mut mt: Option<(EntityId, (f64, f64))> = None;
+        route_intents(intents, target, nearest, pos, &mut mt)
+    }
 
     #[test]
     fn no_player_online_routes_to_none() {
         // 无玩家进场 = 按键仅 Quit 生效（Quit 不进路由），路由无目标
         let intents = vec![Intent::Move { dx: 1.0, dy: 0.0 }, Intent::Attack];
-        assert_eq!(route_intents(&intents, None, None), None);
+        assert_eq!(route(&intents, None, None, None), None);
     }
 
     #[test]
@@ -345,7 +417,7 @@ mod tests {
         let target = eid(1);
         let intents = vec![Intent::Move { dx: -1.0, dy: 0.0 }];
         assert_eq!(
-            route_intents(&intents, Some(target), None),
+            route(&intents, Some(target), None, Some((30.0, 0.0))),
             Some((target, ControlledAction::Move(-1.0, 0.0))),
             "Move 意图翻译为对操控目标的操控行动"
         );
@@ -357,7 +429,7 @@ mod tests {
         let enemy_pos = (12.0, 0.0);
         let intents = vec![Intent::Attack];
         assert_eq!(
-            route_intents(&intents, Some(target), Some(enemy_pos)),
+            route(&intents, Some(target), Some(enemy_pos), Some((30.0, 0.0))),
             Some((target, ControlledAction::Attack(Some(enemy_pos)))),
             "Attack 意图锁定调用方给的最近可见敌人（与 scan 同源）"
         );
@@ -369,7 +441,7 @@ mod tests {
         let target = eid(1);
         let intents = vec![Intent::Attack];
         assert_eq!(
-            route_intents(&intents, Some(target), None),
+            route(&intents, Some(target), None, Some((30.0, 0.0))),
             Some((target, ControlledAction::Attack(None))),
             "Attack(None) = 挥空"
         );
@@ -384,7 +456,7 @@ mod tests {
             Intent::Attack,
         ];
         assert_eq!(
-            route_intents(&intents, Some(target), Some((5.0, 0.0))),
+            route(&intents, Some(target), Some((5.0, 0.0)), Some((30.0, 0.0))),
             Some((target, ControlledAction::Attack(Some((5.0, 0.0))))),
             "先移动后攻击 -> 攻击生效"
         );
@@ -398,7 +470,7 @@ mod tests {
             Intent::Move { dx: -1.0, dy: 0.0 },
         ];
         assert_eq!(
-            route_intents(&intents, Some(target), Some((5.0, 0.0))),
+            route(&intents, Some(target), Some((5.0, 0.0)), Some((30.0, 0.0))),
             Some((target, ControlledAction::Move(-1.0, 0.0))),
             "先攻击后移动 -> 移动生效"
         );
@@ -409,14 +481,154 @@ mod tests {
         // Quit 是主循环语义，不是角色行动：路由跳过
         let target = eid(1);
         let intents = vec![Intent::Quit];
-        assert_eq!(route_intents(&intents, Some(target), None), None);
+        assert_eq!(route(&intents, Some(target), None, None), None);
     }
 
     #[test]
     fn empty_intents_route_to_none() {
-        // 无人按键 = 无操控行动（代码自主照常，#022 离线回落语义）
+        // 无人按键且无点击目标 = 无操控行动
         let target = eid(1);
-        assert_eq!(route_intents(&[], Some(target), Some((5.0, 0.0))), None);
+        assert_eq!(route(&[], Some(target), Some((5.0, 0.0)), Some((30.0, 0.0))), None);
+    }
+
+    // === route_intents：WS 鼠标意图（#027 点击走位/点击出刀/停止）===
+
+    #[test]
+    fn ws_move_sets_persistent_target_and_steps_toward_it() {
+        // 点击世界坐标 = 持续目标：本拍立即向目标走一步（先横后竖），目标记入状态
+        let target = eid(1);
+        let intents = vec![Intent::WsMove { x: 35.0, y: 0.0 }];
+        let mut mt: Option<(EntityId, (f64, f64))> = None;
+        let action = route_intents(&intents, Some(target), None, Some((30.0, 0.0)), &mut mt);
+        assert_eq!(
+            action,
+            Some((target, ControlledAction::Move(1.0, 0.0))),
+            "点击 (35,0) 本拍向东走一步"
+        );
+        assert_eq!(mt, Some((target, (35.0, 0.0))), "持续目标入册（归属操控实体）");
+    }
+
+    #[test]
+    fn persistent_target_steps_every_tick_without_intents() {
+        // 持续目标的核心语义：无按键拍继续向目标走（逐拍一步），不用客户端重发
+        let target = eid(1);
+        let mut mt = Some((target, (35.0, 0.0)));
+        let action = route_intents(&[], Some(target), None, Some((32.0, 0.0)), &mut mt);
+        assert_eq!(
+            action,
+            Some((target, ControlledAction::Move(1.0, 0.0))),
+            "无意图拍也向点击目标走一步"
+        );
+        assert_eq!(mt, Some((target, (35.0, 0.0))), "未到达目标保持");
+    }
+
+    #[test]
+    fn persistent_target_cleared_on_arrival() {
+        // 到达判定 = 格距 < 0.5（浮点不用精确相等）：走到目标邻域即清除站住
+        let target = eid(1);
+        let mut mt = Some((target, (35.0, 0.0)));
+        let action = route_intents(&[], Some(target), None, Some((34.7, 0.0)), &mut mt);
+        assert_eq!(action, None, "格距 0.3 < 0.5 = 已到达，无行动");
+        assert_eq!(mt, None, "到达后目标清除（下拍站住不抖动）");
+    }
+
+    #[test]
+    fn keyboard_move_clears_click_target() {
+        // 键盘直控 = 玩家接管脚下：清除点击走位目标（松键后不会"复活"旧点击走路）
+        let target = eid(1);
+        let intents = vec![Intent::Move { dx: 0.0, dy: -1.0 }];
+        let mut mt = Some((target, (35.0, 0.0)));
+        let action = route_intents(&intents, Some(target), None, Some((32.0, 0.0)), &mut mt);
+        assert_eq!(action, Some((target, ControlledAction::Move(0.0, -1.0))));
+        assert_eq!(mt, None, "键盘移动清除点击目标");
+    }
+
+    #[test]
+    fn stop_clears_target_and_stands() {
+        // Stop（右键/浏览器 S 键）= 清除点击目标站住；同拍已在走也不走
+        let target = eid(1);
+        let intents = vec![Intent::Stop];
+        let mut mt = Some((target, (35.0, 0.0)));
+        let action = route_intents(&intents, Some(target), None, Some((32.0, 0.0)), &mut mt);
+        assert_eq!(action, None, "Stop 拍站住");
+        assert_eq!(mt, None, "Stop 清除持续目标");
+    }
+
+    #[test]
+    fn ws_attack_uses_clicked_coords_not_nearest() {
+        // 点击出刀 = 对点击坐标出刀（单次），不吃 nearest_enemy（与键盘空格同通路不同目标源）
+        let target = eid(1);
+        let intents = vec![Intent::WsAttack { x: 15.0, y: 0.0 }];
+        let action = route(
+            &intents,
+            Some(target),
+            Some((5.0, 0.0)),
+            Some((30.0, 0.0)),
+        );
+        assert_eq!(
+            action,
+            Some((target, ControlledAction::Attack(Some((15.0, 0.0))))),
+            "点击坐标优先于最近敌人坐标"
+        );
+    }
+
+    #[test]
+    fn last_intent_wins_ws_attack_then_ws_move_same_batch() {
+        // 同拍互斥后到优先对 WS 意图同样成立：先点敌人后点地 -> 本拍走路且目标更新
+        let target = eid(1);
+        let intents = vec![
+            Intent::WsAttack { x: 15.0, y: 0.0 },
+            Intent::WsMove { x: 35.0, y: 0.0 },
+        ];
+        let mut mt = Some((target, (40.0, 0.0)));
+        let action = route_intents(&intents, Some(target), None, Some((30.0, 0.0)), &mut mt);
+        assert_eq!(
+            action,
+            Some((target, ControlledAction::Move(1.0, 0.0))),
+            "后到的 WsMove 生效（本拍向新目标走一步）"
+        );
+        assert_eq!(mt, Some((target, (35.0, 0.0))), "目标被后到点击覆盖");
+    }
+
+    #[test]
+    fn move_target_not_handed_over_on_control_change() {
+        // 点击目标不跨角色交接：目标属于 eid1，操控换 eid2 -> 旧目标清除，新角色不受旧点击支配
+        let old = eid(1);
+        let new = eid(2);
+        let intents: Vec<Intent> = vec![];
+        let mut mt = Some((old, (35.0, 0.0)));
+        let action = route_intents(&intents, Some(new), None, Some((30.0, 0.0)), &mut mt);
+        assert_eq!(action, None, "换角后旧点击目标不生效");
+        assert_eq!(mt, None, "旧目标清除");
+    }
+
+    #[test]
+    fn diagonal_target_decomposes_horizontal_first() {
+        // 斜向目标分解规则（net-protocol.md v1.2 写死）：先横后竖，每拍一格
+        let target = eid(1);
+        let mut mt = Some((target, (32.0, 3.0)));
+        let action = route_intents(&[], Some(target), None, Some((30.0, 0.0)), &mut mt);
+        assert_eq!(
+            action,
+            Some((target, ControlledAction::Move(1.0, 0.0))),
+            "横竖都差 -> 先横"
+        );
+        // 横到位后竖走
+        let action2 = route_intents(&[], Some(target), None, Some((32.0, 0.0)), &mut mt);
+        assert_eq!(
+            action2,
+            Some((target, ControlledAction::Move(0.0, 1.0))),
+            "横已到位 -> 竖"
+        );
+    }
+
+    #[test]
+    fn target_behind_steps_negative_direction() {
+        // 目标在起点西/北方向：分解出负向步（signum 语义，不是恒正向）
+        let target = eid(1);
+        let mut mt = Some((target, (28.0, 0.0)));
+        let action = route_intents(&[], Some(target), None, Some((30.0, 0.0)), &mut mt);
+        assert_eq!(action, Some((target, ControlledAction::Move(-1.0, 0.0))));
     }
 
     // === 输入线程 / 终端模式（任务 A：raw mode + alternate screen + 全路径恢复）===
