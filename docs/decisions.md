@@ -128,3 +128,9 @@
 ## #025 2026-10-15 · 操控独占与下线处置权定案
 - 定案：在线（me 声明有效）=操控独占——玩家不按键角色就站着不动，代码自主被完全抑制，不存在"超时交还"（否决 5 拍窗口方案，方向反了）；下线=玩家处置权：A 带走（残影消失，默认）/ B 停留世界+选接管者（自己写的后台逻辑=自主模式，或外部 AI=连接锚 #014）。接管者与键盘共享意图路由入口（input.rs 单入口双来源）。手感细节（按住连走/刀感节奏）推迟到渲染画面阶段（期四）再调。
 - 原因：土豆拍板"上线状态不允许后台接管，只有登出后自己选择停留+接管方式"。实施与期四浏览器化强耦合（选择界面/AI接入），攒到期四一次成型，当前不阻塞验证。
+
+## #026 2026-10-15 · 期四浏览器化定案：薄客户端/快照推送 v1（第一刀）
+- 定案：世界唯一权威，浏览器=显示器+遥控器。第一刀只做"推"：每拍全量 JSON 快照（tick/caption/viewport/entities，≤64 实体几 KB）经 tokio broadcast 从 std 主循环桥到独立 ws-server 线程（axum 0.7，/ws 快照广播 + ServeDir 静态页一把抓，绑定 127.0.0.1）；kind 映射 code_hash：四生物=npc / creation=creation / 在线名或残影=player；player 恒带 name+controlled，creation 带 owner，npc 无可选字段。插值渲染（第二刀）/输入回传（第三刀）/预测（第四刀）后续。
+- 原因：快照先对再省（delta/二进制留以后，前端要的是字段稳定不是带宽）；broadcast Sender::send 非 async 天然跨线程，std tick 侧零 async 改造；WS 线程挂/端口占用只 warn，终端世界完全不受影响；绑回环免防火墙弹窗，MVP 不暴露公网。
+- 否决：tokio-tungstenite 裸写服务器（静态伺服要再手搓 HTTP，axum 一把抓）；控制流反向（WS 线程拉快照改推模式，主循环耦合 async）。
+- 落点：bin/codeworld/src/net.rs；docs/net-protocol.md v1 前端契约；config.ws_port（0=禁用）。

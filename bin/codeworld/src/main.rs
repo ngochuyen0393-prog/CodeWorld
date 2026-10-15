@@ -13,6 +13,7 @@
 
 mod config;
 mod input;
+mod net;
 mod players;
 
 use anyhow::{Context, Result};
@@ -580,6 +581,10 @@ fn main() -> Result<()> {
     // 再交回默认 hook 打印 panic 信息
     input::install_panic_hook();
 
+    // 期四第一刀：WS 快照推送（与终端 ANSI 渲染并行存在，不替代终端）。
+    // 端口 0 = 禁用（返回 None，tick 循环走零开销分支）；WS 线程挂掉不影响主循环。
+    let ws_snapshots = net::init(&config);
+
     tracing::info!("tick 循环开始（WASD/方向键操控，空格攻击，q/Enter/Ctrl+C 退出）");
     while running.load(Ordering::SeqCst) {
         // 操控层 v0：每拍开头 drain 意图队列（输入线程生产 -> tick 主线程消费）
@@ -594,6 +599,18 @@ fn main() -> Result<()> {
             &mut sandbox_map,
             &intents,
         );
+        // 期四第一刀：每拍快照推 WS（渲染步骤旁组装；禁用时 None 完全跳过——不组装不发；
+        // 无浏览器连接时 push_snapshot 内部跳过组装，同样零开销）
+        if let Some(snapshots) = &ws_snapshots {
+            net::push_snapshot(
+                snapshots,
+                &world,
+                renderer.caption_line(),
+                renderer.viewport(),
+                &sandbox_map.players,
+                renderer.controlled(),
+            );
+        }
         std::thread::sleep(config.tick_interval());
     }
 

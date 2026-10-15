@@ -64,6 +64,11 @@ impl Renderer {
         self.controlled = controlled;
     }
 
+    /// 观测当前操控目标（期四第一刀：WS 快照组装在 tick 外部读；同 caption_line 先例）
+    pub fn controlled(&self) -> Option<EntityId> {
+        self.controlled
+    }
+
     /// 更新战况字幕（host 每 tick 喂入只读战况快照）
     ///
     /// - tick/距离/存活数来自 world；盾量来自玩家代码 env.log marker 上报（host 解析）。
@@ -363,6 +368,19 @@ mod tests {
     /// 宽屏渲染器（对齐真实配置 50x80：字幕 47 字符完整放下，不触发截断）
     fn renderer_80cols() -> Renderer {
         Renderer::new(Viewport::new((0.0, 0.0), 50.0, 25.0, 50, 80))
+    }
+
+    #[test]
+    fn controlled_accessor_returns_last_set_value() {
+        // 读写：controlled() 观测访问器（期四快照组装用，同 caption_line 先例）
+        // 返回最近一次 set_controlled 喂入的值，供 tick 外部（WS 推送）观测
+        let mut r = renderer_80cols();
+        assert_eq!(r.controlled(), None, "初始无操控目标");
+        let id = EntityId(Uuid::from_u128(9));
+        r.set_controlled(Some(id));
+        assert_eq!(r.controlled(), Some(id), "访问器应返回最近喂入值");
+        r.set_controlled(None);
+        assert_eq!(r.controlled(), None, "下线 latch 观战态应可见");
     }
 
     #[test]

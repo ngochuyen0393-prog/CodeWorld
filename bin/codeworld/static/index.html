@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CodeWorld 快照监视</title>
+<style>
+  /* 验收页极简样式：等宽字体对齐终端画面气质，不做装饰 */
+  body { font-family: Consolas, "Courier New", monospace; margin: 2rem; background: #111; color: #ddd; }
+  h3 { font-weight: 400; }
+  table { border-collapse: collapse; margin: 1rem 0; }
+  td, th { border: 1px solid #444; padding: 0.3rem 0.9rem; text-align: left; }
+  th { color: #8bc34a; font-weight: 400; }
+  #status { color: #ffcc00; }
+  #status.ok { color: #8bc34a; }
+  #frames { white-space: pre; font-size: 0.8rem; color: #999; max-height: 12rem; overflow: auto;
+            background: #1a1a1a; padding: 0.6rem; }
+  .hint { color: #777; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h3>CodeWorld 快照监视（期四第一刀验收页）</h3>
+<p id="status">连接中……</p>
+<table>
+  <tr><th>tick</th><td id="tick">-</td></tr>
+  <tr><th>实体数</th><td id="entities">-</td></tr>
+  <tr><th>操控目标</th><td id="controlled">-</td></tr>
+  <tr><th>帧计数</th><td id="frames-count">0</td></tr>
+</table>
+<div id="frames">（前 3 帧快照 JSON 显示在此，完整版见浏览器控制台 F12）</div>
+<p class="hint">数据源：ws 同源 /ws 每拍一帧全量快照（docs/net-protocol.md v1）。终端里世界照常跑，本页只是显示器。</p>
+<script>
+// 期四第一刀验收：连 WS -> 收快照 -> 前 3 帧 console.log + 页面滚 tick/实体数。
+// 手写零依赖（与项目零前端工具链一致，第二刀 Canvas 也手写）。
+(function () {
+  var MAX_CONSOLE_FRAMES = 3;
+  var frameCount = 0;
+  var statusEl = document.getElementById('status');
+  var tickEl = document.getElementById('tick');
+  var entitiesEl = document.getElementById('entities');
+  var controlledEl = document.getElementById('controlled');
+  var framesCountEl = document.getElementById('frames-count');
+  var framesEl = document.getElementById('frames');
+  var framesShown = '';
+
+  function connect() {
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var ws = new WebSocket(proto + location.host + '/ws');
+
+    ws.onopen = function () {
+      statusEl.textContent = '已连接 ' + location.host + '，等待世界快照……';
+      statusEl.className = 'ok';
+    };
+    ws.onmessage = function (ev) {
+      var snap;
+      try { snap = JSON.parse(ev.data); } catch (e) {
+        statusEl.textContent = '收到非 JSON 帧（协议不符）';
+        return;
+      }
+      frameCount++;
+      framesCountEl.textContent = String(frameCount);
+      tickEl.textContent = String(snap.tick);
+      entitiesEl.textContent = String(snap.entities.length);
+      var me = null;
+      for (var i = 0; i < snap.entities.length; i++) {
+        if (snap.entities[i].controlled) { me = snap.entities[i]; break; }
+      }
+      controlledEl.textContent = me ? me.name + ' (' + me.glyph + ')' : '--（观战）';
+      statusEl.textContent = '已连接，帧正在滚动';
+      if (frameCount <= MAX_CONSOLE_FRAMES) {
+        console.log('快照帧 #' + frameCount, snap);
+        framesShown += '# ' + frameCount + ' ' + JSON.stringify(snap) + '\n';
+        framesEl.textContent = framesShown;
+      }
+    };
+    ws.onclose = function () {
+      statusEl.textContent = '连接断开，2 秒后重连……（终端退出后本页会一直重试）';
+      statusEl.className = '';
+      setTimeout(connect, 2000);
+    };
+    ws.onerror = function () {
+      statusEl.textContent = '连接错误（服务未启动或端口不对）';
+    };
+  }
+
+  connect();
+})();
+</script>
+</body>
+</html>

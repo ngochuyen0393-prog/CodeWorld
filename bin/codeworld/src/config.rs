@@ -47,6 +47,10 @@ pub struct Config {
     /// 世界实体总数上限（门二 spawn 配套，decisions.md #020），默认 64。
     /// 达上限时 env.spawn 请求在阶段二拒绝。CODEWORLD_MAX_ENTITIES 覆盖。
     pub max_entities: usize,
+    /// WebSocket 快照推送端口（期四第一刀：每拍快照广播给浏览器），默认 8080。
+    /// 0 = 禁用 WS（不启动 WS 线程、tick 不组装快照，终端体验完全不变）。
+    /// CODEWORLD_WS_PORT 覆盖；监听失败仅 warn 不影响主循环。
+    pub ws_port: u16,
 }
 
 impl Default for Config {
@@ -66,6 +70,7 @@ impl Default for Config {
             s_enabled: true,
             players_dir: "./players".to_string(),
             max_entities: 64,
+            ws_port: 8080,
         }
     }
 }
@@ -106,6 +111,9 @@ impl Config {
         if let Some(n) = env_usize("CODEWORLD_MAX_ENTITIES") {
             cfg.max_entities = n;
         }
+        if let Some(p) = env_u16("CODEWORLD_WS_PORT") {
+            cfg.ws_port = p;
+        }
         // 布尔类开关："0"/"false"（大小写不敏感）= 关闭，缺失或其他值 = 默认开启
         if let Ok(v) = std::env::var("CODEWORLD_H_ENABLED") {
             if v == "0" || v.eq_ignore_ascii_case("false") {
@@ -143,6 +151,11 @@ fn env_u64(key: &str) -> Option<u64> {
 
 /// 读取并解析 usize 环境变量，缺失或非法返回 None
 fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.parse().ok()
+}
+
+/// 读取并解析 u16 环境变量，缺失或非法返回 None
+fn env_u16(key: &str) -> Option<u16> {
     std::env::var(key).ok()?.parse().ok()
 }
 
@@ -354,5 +367,48 @@ mod tests {
         let c = Config::load();
         std::env::remove_var("CODEWORLD_MAX_ENTITIES");
         assert_eq!(c.max_entities, 32, "环境变量应覆盖实体上限");
+    }
+
+    #[test]
+    fn default_ws_port_is_8080() {
+        // 创建：WS 端口默认 8080（期四第一刀快照推送；0=禁用）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CODEWORLD_WS_PORT");
+        let c = Config::load();
+        assert_eq!(c.ws_port, 8080, "WS 端口默认应为 8080");
+    }
+
+    #[test]
+    fn load_ws_port_env_overrides_default() {
+        // 修改：CODEWORLD_WS_PORT=9090 覆盖默认端口
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_WS_PORT", "9090");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_WS_PORT");
+        assert_eq!(c.ws_port, 9090, "环境变量应覆盖 WS 端口");
+    }
+
+    #[test]
+    fn load_ws_port_zero_means_disabled() {
+        // 修改：CODEWORLD_WS_PORT=0 = 禁用 WS（终端体验不受影响的逃生门）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_WS_PORT", "0");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_WS_PORT");
+        assert_eq!(c.ws_port, 0, "端口 0 应原样保留（禁用语义）");
+    }
+
+    #[test]
+    fn load_ws_port_invalid_falls_back_to_default() {
+        // 边界：CODEWORLD_WS_PORT 非法（非整数/超 u16 范围）-> 回退默认 8080（容错语义同数值类）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_WS_PORT", "not-a-port");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_WS_PORT");
+        assert_eq!(c.ws_port, 8080, "非法值应回退默认 WS 端口");
+        std::env::set_var("CODEWORLD_WS_PORT", "99999");
+        let c2 = Config::load();
+        std::env::remove_var("CODEWORLD_WS_PORT");
+        assert_eq!(c2.ws_port, 8080, "超 u16 范围应回退默认 WS 端口");
     }
 }
