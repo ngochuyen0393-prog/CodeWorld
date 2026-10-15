@@ -140,3 +140,8 @@
 - 原因：业界标准 client input → server authority（SnapNet/netcode 惯例，客户端只发意图服务器全权裁决，预测留第四刀）；单入口路由是 #023/#014 的既定形状（外部通道三位一体）；单连接假设是 me.txt 身份模型在本机的最小推广（多人认证留后）；操控独占修正了 #022 时代"无意图拍回落自主"的临时语义（土豆 #025 拍板：在线不许后台接管）。
 - 否决：攻击距离预判+前端提示（加规则=框架管玩法，违宪法；落空结算已是自然反馈）；点击敌人自动走近（同类）；多操控连接/连接即身份（MVP 单人本机，认证化是 #024 终态议题）；Intent 加来源字段（路由不分来源=最简，排错靠日志即可）。
 - 落点：input.rs Intent 三变体+route_intents 五参折叠；net.rs ClientMessage 解析+WsState 操控令牌+转发；main.rs tick_with_intents 独占抑制+ws_move_target 状态；static/index.html 点击/右键/S 键+虚线红框；net-protocol.md v1.2；f64::signum(+0.0)=1.0 坑记入 next_move_step 注释。
+
+## #028 2026-10-15 · 期四第四刀手感定案：预测镜像规则是协议契约入宪法；镜头/刀光是表现层不入
+- 定案：Valve 标准组合"己方预测+他人插值"——浏览器对自己发的 move/stop 建预测（锚点=最新快照 P 服务器坐标、拍号+1，进行中的一拍乐观先走一步=点击瞬时起步）；每帧快照对账阈值 0.25 格，一致锚点前移、分歧（被挡/外力/观战连接）瞬移回服务器真实坐标并清本地走位目标；P 死亡/断线重连清全部预测态；键盘（终端）来源不预测。预测规则= input.rs next_move_step 的 JS 镜像（applyMoveSteps），**改一处必须同步另一处**，契约锚在 net-protocol.md v1.3「客户端预测与和解」节。Rust 侧仅日志分级：apply_pending_changes 的 SetPos 应用日志仅 control_target 升 INFO 带 from→to（其余保持 debug 防刷爆）。
+- 原因：1秒/拍+1.5拍插值延迟下预测是消除"点击后 2 秒才动"的唯一正解；镜像规则是双实现漂移风险点，必须文档钉死而非口头约定；镜头跟随（lerp+viewport clamp+F 切换）、刀光线、击杀 ✕ 属纯表现层可随时重调重做，入宪法只会锁死调参空间。
+- 落点：bin/codeworld/static/index.html（PURE 区镜像函数+reconcile/startPrediction/stopPrediction+镜头 lerp/clamp/边界线）；main.rs apply_pending_changes 日志分级（14 处测试调用点补 None 参数，无断言变更）；net-protocol.md v1.3 §7。

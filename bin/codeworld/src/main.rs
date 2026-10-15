@@ -839,7 +839,7 @@ fn tick_with_intents(
     pending.extend(sandbox_map.collect_pending_moves());
     process_destroys(world, sandbox_map, pending);
     // #021：占位制下移动被挡产生的接触对在此收集，阶段二 c 步与物理同格对合并
-    let move_blocked_contacts = apply_pending_changes(world, pending);
+    let move_blocked_contacts = apply_pending_changes(world, pending, control_target);
 
     //   a1. 造物处理（门二：env.spawn 排队的请求在此编译/建实体/建沙箱/插入世界）。
     //       放在 destroy 应用之后：本拍自毁的创造者不再造物；上限按应用后世界实况算。
@@ -988,10 +988,15 @@ fn tick_with_intents(
 /// 目标格被其他存活实体占据 → 移动被拒（留原位）+ 记接触对。本 tick 所有移动
 /// 按 EntityId 升序统一裁决（先到先得，确定序，与 physics.step 同源口径）。
 ///
+/// `control_target`：本拍操控目标（期四第四刀）——仅它的 SetPos 应用日志升 INFO
+/// （battle.log 可追踪玩家走位），其余实体保持 debug（A/D/S 每拍自主移动，
+/// 全升 INFO 会刷爆日志）。
+///
 /// 返回移动被挡产生的接触对（汇入 handle_collisions 的接触语义，#021 B 项）。
 fn apply_pending_changes(
     world: &mut WorldState,
     pending: &mut Vec<PendingChange>,
+    control_target: Option<EntityId>,
 ) -> Vec<ContactPair> {
     let mut contacts: Vec<ContactPair> = Vec::new();
     let mut moves: Vec<(EntityId, (f64, f64))> = Vec::new();
@@ -1052,7 +1057,19 @@ fn apply_pending_changes(
                 });
             }
             None => {
-                tracing::debug!(entity_id = %entity.0, ?new_pos, "应用 SetPos");
+                // 期四第四刀：操控实体的移动应用升 INFO 且带 from→to（土豆实测曾因
+                // debug 级在 battle.log 看不到而误判"P 没动"）；其余实体保持 debug
+                if control_target == Some(entity) {
+                    let from = world.entities.get(&entity).map(|e| e.pos());
+                    tracing::info!(
+                        entity_id = %entity.0,
+                        from = ?from,
+                        to = ?new_pos,
+                        "[ctrl] 操控移动应用 SetPos（from→to）"
+                    );
+                } else {
+                    tracing::debug!(entity_id = %entity.0, ?new_pos, "应用 SetPos");
+                }
                 if let Some(e) = world.entities.get_mut(&entity) {
                     e.set_pos(new_pos);
                 }
@@ -2060,7 +2077,7 @@ mod tests {
         let entity = make_entity(7, (3.0, 4.0));
         let id = entity.id;
         let mut pending: Vec<PendingChange> = vec![PendingChange::Spawn { entity }];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert!(world.entities.contains_key(&id), "Spawn 后实体应在 world 中");
         assert_eq!(world.entities.get(&id).unwrap().pos(), (3.0, 4.0));
     }
@@ -2072,7 +2089,7 @@ mod tests {
         let id = EntityId(Uuid::from_u128(1));
         world.entities.insert(id, make_entity(1, (0.0, 0.0)));
         let mut pending: Vec<PendingChange> = vec![PendingChange::Destroy { entity: id }];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert!(
             !world.entities.get(&id).unwrap().is_alive(),
             "Destroy 应标记死亡"
@@ -2089,7 +2106,7 @@ mod tests {
             entity: id,
             new_pos: (8.0, 9.0),
         }];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id).unwrap().pos(), (8.0, 9.0));
     }
 
@@ -2103,7 +2120,7 @@ mod tests {
             entity: id,
             new_velocity: (1.0, 2.0),
         }];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id).unwrap().velocity(), (1.0, 2.0));
     }
 
@@ -2120,7 +2137,7 @@ mod tests {
             },
             PendingChange::Destroy { entity: id },
         ];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert!(pending.is_empty(), "apply 后 pending 应清空");
     }
 
@@ -2140,7 +2157,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.0),
         }];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "目标格被占应留原位");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 0.0), "占据者不受影响");
     }
@@ -2160,7 +2177,7 @@ mod tests {
             PendingChange::SetPos { entity: id2, new_pos: (6.0, 0.0) }, // 先入队
             PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.0) }, // 后入队
         ];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.0), "id 小者先到先得");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (7.0, 0.0), "id 大者被挡留原位");
     }
@@ -2180,7 +2197,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.0),
         }];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.0), "死者不占格，移动放行");
     }
 
@@ -2199,7 +2216,7 @@ mod tests {
             PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.0) },
             PendingChange::SetPos { entity: id2, new_pos: (9.0, 0.0) },
         ];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "E1 裁决时目标格仍被 E2 占 → 被挡");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (9.0, 0.0), "E2 照常搬走");
     }
@@ -2217,7 +2234,7 @@ mod tests {
             entity: id,
             new_pos: (9.0, 9.0),
         }];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(
             world.entities.get(&id).unwrap().pos(),
             (2.0, 3.0),
@@ -2241,7 +2258,7 @@ mod tests {
             },
             PendingChange::Destroy { entity: unknown },
         ];
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert!(pending.is_empty(), "即使目标不存在，变更也应被消费清空");
         assert!(world.entities.is_empty(), "不应插入任何实体");
     }
@@ -2845,7 +2862,7 @@ mod tests {
             entity: id1,
             new_pos: (6.5, 0.2),
         }];
-        let contacts = apply_pending_changes(&mut world, &mut pending);
+        let contacts = apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(contacts.len(), 1, "移动被挡应产生 1 对接触");
         assert_eq!(contacts[0].a, id1, "a = 被挡的移动者");
         assert_eq!(contacts[0].b, id2, "b = 占据者");
@@ -2864,7 +2881,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.0),
         }];
-        let contacts = apply_pending_changes(&mut world, &mut pending);
+        let contacts = apply_pending_changes(&mut world, &mut pending, None);
         assert!(contacts.is_empty(), "空格移动不产生接触");
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.0));
     }
@@ -5728,7 +5745,7 @@ mod tests {
             1,
             "产权匹配的销毁应排队 PendingChange::Destroy"
         );
-        apply_pending_changes(&mut world, &mut pending);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert!(
             !world.entities.get(&creation).unwrap().is_alive(),
             "自家造物应被标记死亡"

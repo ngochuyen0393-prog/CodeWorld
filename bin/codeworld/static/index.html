@@ -20,6 +20,14 @@
   意图经 WS 上行到服务器裁决（薄客户端：输入=意图流经服务器，不直写坐标）。
   服务器单连接假设：第一个 WS 连接=操控端，后来连接只观战（上行被丢弃）。
 
+  手感打磨（期四第四刀）：Valve 标准组合「己方预测 + 他人插值」。自己发出的
+  move/stop 立即作用于画面（预测规则 = input.rs next_move_step 的 JS 镜像，
+  见 applyMoveSteps 顶部镜像声明）；每帧快照到达与预测坐标对账（阈值 0.25 格），
+  一致则锚点前移继续预测，分歧（被挡/外力/意图未生效）则 P 弹回真实位置并清除
+  本地走位目标；P 死亡或断线重连清空全部预测状态。攻击点击画一道 0.3s 淡出
+  刀光线；实体从相邻快照消失时在最后坐标留 1.5s 渐隐 ✕。镜头默认跟随 P
+  （lerp 平滑 + viewport 域 clamp，贴边画出界线），F 键或底栏按钮切全景。
+
   手写零依赖声明：无框架、无 CDN、无构建工具、无 script src，
   单文件原生 JS + Canvas 2D（项目零前端工具链宪法）。
 -->
@@ -52,6 +60,11 @@
   #conn.ok   { color: #3fb950; }
   #conn.bad  { color: #f85149; }
   #mouse { margin-left: auto; color: #8b949e; }
+  #camBtn {
+    background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+    font: inherit; padding: 0 8px; cursor: pointer;
+  }
+  #camBtn:hover { border-color: #8b949e; }
 </style>
 </head>
 <body>
@@ -65,7 +78,8 @@
   <span>tick <b id="tick">-</b></span>
   <span>实体 <b id="cnt">-</b></span>
   <span>帧间隔 <b id="itv">-</b>ms</span>
-  <span>左键移动 · 右键停止 · 点击敌人攻击</span>
+  <span>左键移动 · 右键停止 · 点击敌人攻击 · F 切镜头</span>
+  <button id="camBtn" type="button">镜头：跟随</button>
   <span id="mouse">x=- , y=-</span>
 </div>
 <script>
@@ -80,6 +94,8 @@
   var INTERVAL_MAX = 10000;            // 帧间隔合理域上限（防异常大值污染平均）
   var BACKOFF_INIT = 1000;             // 重连退避起步（ms）
   var BACKOFF_MAX = 30000;             // 重连退避封顶（ms）
+  var CAM_LERP = 0.12;                 // 镜头跟随平滑系数（每帧，60fps；0.08-0.15 推荐域）
+  var CAM_ZOOM = 2;                    // 跟随窗口 = viewport 的 1/Z（跟随模式 P 周边放大观感）
 
   // ---- DOM ----
   var stage = document.getElementById('stage');
@@ -92,6 +108,7 @@
   var itvEl = document.getElementById('itv');
   var mouseEl = document.getElementById('mouse');
   var tipEl = document.getElementById('tip');
+  var camBtnEl = document.getElementById('camBtn');
 
   // ---- 状态 ----
   var buf = [];                 // 快照缓冲 [{t:接收时刻, tick, caption, viewport, ents:Map(id->e)}]
@@ -108,6 +125,17 @@
   var wsSock = null;            // 当前 WS 连接（上行意图发送用）
   var moveTarget = null;        // 点击走位目标（本地可视化；服务器才是权威，虚线只是提示）
   var attackFx = null;          // 点击出刀反馈 {x, y, t}（红框闪 300ms，前端本地效果）
+  var predTarget = null;        // 自发 move 意图的预测目标 {x,y}（仅浏览器自己发的才预测）
+  var predAnchor = null;        // 预测锚点 {tick,x,y,t}：最近确认的服务器坐标+拍号+确认时刻
+  var predHold = null;          // 停止冻结 {x,y}：stop 后立即站住的显示位置（快照确认后回落）
+  var lastRawTick = null;       // 最新原始快照拍号（预测锚定用；插值采样是延迟视图）
+  var lastRawEnts = null;       // 最新原始快照实体表（服务器权威坐标）
+  var attackLines = [];         // 刀光线数组 [{x0,y0,x1,y1,born}]（0.3s 生命周期，画完即剔）
+  var killFx = [];              // 击杀标记数组 [{x,y,born}]（1.5s 渐隐 ✕）
+  var camMode = 'follow';       // 镜头模式：'follow'=跟随 P（默认）/ 'pano'=全景
+  var cam = null;               // 相机中心（世界坐标，lerp 平滑）
+  var camEdges = null;          // 相机贴边标记 {l,r,b,t}（viewport 边界线可视化用）
+  var view = null;              // 当前可视世界窗口（全景=viewport；跟随=相机窗口）
 
   // ---- 快照接收：入缓冲 + 帧间隔滚动平均 ----
   function onMessage(ev) {
@@ -132,8 +160,23 @@
     for (var i = 0; i < snap.entities.length; i++) {
       ents.set(snap.entities[i].id, snap.entities[i]);
     }
+    var prevFrame = buf.length >= 1 ? buf[buf.length - 1] : null;
     buf.push({ t: now, tick: snap.tick, caption: snap.caption, viewport: snap.viewport, ents: ents });
     while (buf.length > MAX_FRAMES) buf.shift();
+    // 最新原始快照（服务器权威坐标）：预测锚定与和解的数据源；viewport 同步更新
+    lastRawTick = snap.tick;
+    lastRawEnts = ents;
+    vp = snap.viewport;
+    // 击杀标记（第四刀 B2）：相邻两帧对比，消失的实体在最后坐标留渐隐 ✕
+    if (prevFrame) {
+      var kills = collectKills(prevFrame.ents, ents);
+      for (var ki = 0; ki < kills.length; ki++) {
+        killFx.push({ x: kills[ki].x, y: kills[ki].y, born: now });
+      }
+      while (killFx.length > 32) killFx.shift();
+    }
+    // 和解（第四刀 A3）：P 的服务器坐标与该 tick 的预测坐标对账
+    reconcileSnapshot(snap.tick, ents, now);
     // 状态栏数字取最新帧（实时性优先；插值只作用于画面位置）
     tickEl.textContent = String(snap.tick);
     cntEl.textContent = String(snap.entities.length);
@@ -145,6 +188,70 @@
     avgInterval = null;
     lastRecvT = null;
     itvEl.textContent = '-';
+  }
+
+  // ---- 本地预测与和解（第四刀 A；镜像规则声明见 PURE 区 applyMoveSteps）----
+
+  function clearPrediction() {
+    predTarget = null;
+    predAnchor = null;
+    predHold = null;
+  }
+
+  // 和解：每帧快照到达，P 的服务器坐标与该 tick 的预测坐标对账（阈值 0.25 格）
+  function reconcileSnapshot(tick, entsMap, now) {
+    var me = findControlled(entsMap);
+    if (!me) {
+      clearPrediction(); // P 死亡/身份消失：清全部预测状态
+      return;
+    }
+    if (predHold) {
+      // 停止冻结中：服务器站定点==冻结点则确认回落插值；否则硬跟服务器
+      //（stop 在途时服务器可能多走一步），直到它停稳
+      if (worldDist2(predHold.x, predHold.y, me.x, me.y) < 0.0625) {
+        predHold = null;
+      } else {
+        predHold = { x: me.x, y: me.y };
+      }
+      return;
+    }
+    if (!predTarget || !predAnchor) return;
+    var steps = tick - predAnchor.tick;
+    if (steps < 0) return; // 拍号倒退（不应发生）：不动预测等下一帧
+    if (reconcileDecision(predAnchor.x, predAnchor.y, predTarget.x, predTarget.y, steps, me.x, me.y) === 'confirm') {
+      predAnchor = { tick: tick, x: me.x, y: me.y, t: now }; // 预测确认：锚点前移
+    } else {
+      // 分歧（被挡/外力移动/意图未生效如观战连接）：P 弹回真实位置——
+      // 清预测后渲染回落插值采样（=服务器真实坐标，玩家可见校正），
+      // 本地 move 目标与虚线一并清除
+      moveTarget = null;
+      clearPrediction();
+    }
+  }
+
+  // 建立预测（仅浏览器自己发的 move 意图调用；键盘/终端来源不预测）：
+  // 锚点 = 最新原始快照的 P 服务器坐标，拍号 +1（意图下一拍 drain 消费，
+  // 首个确认帧应零位移，此后每帧一步——见 net-protocol.md 预测节）
+  function startPrediction(target) {
+    if (lastRawTick === null || !lastRawEnts || avgInterval === null) return;
+    var me = findControlled(lastRawEnts);
+    if (!me) return;
+    predHold = null;
+    predTarget = { x: target.x, y: target.y };
+    predAnchor = { tick: lastRawTick + 1, x: me.x, y: me.y, t: performance.now() };
+  }
+
+  // 停止：清预测目标；预测在途则冻结当前预测位置实现"立即站住"，
+  // 待快照确认站定（或 ≤1 步的硬跟修正）后回落插值
+  function stopPrediction() {
+    moveTarget = null;
+    if (predTarget && predAnchor) {
+      var k = renderSteps(performance.now(), predAnchor.t, avgInterval || 0);
+      var pp = applyMoveSteps(predAnchor.x, predAnchor.y, predTarget.x, predTarget.y, k);
+      predHold = { x: pp.x, y: pp.y };
+    }
+    predTarget = null;
+    predAnchor = null;
   }
 
   // 渲染延迟：1.5×平均帧间隔（覆盖一整帧的到达抖动；间隔异常时钳进合理域）
@@ -193,17 +300,120 @@
     return { caption: B.caption, viewport: B.viewport, ents: ents };
   }
 
+  // ==== [PURE-BEGIN] 纯逻辑区（node 机器验证覆盖；不碰 DOM/WS/Canvas）====
+
+  // ⚠️ 镜像规则声明：applyMoveSteps 与 bin/codeworld/src/input.rs 的
+  // next_move_step（169-181 行）是同一规则的 JS/Rust 双实现——逐拍一步、
+  // 先横后竖、格距平方 ≤0.25（格距 ≤0.5）到达即停、显式符号函数
+  // （Rust f64::signum(+0.0)=1.0 的坑两边都避开）。改一处必须同步另一处，
+  // 协议契约见 docs/net-protocol.md「客户端预测与和解」节。
+  function signStep(v) {
+    return v > 0 ? 1.0 : (v < 0 ? -1.0 : 0.0);
+  }
+
+  // 从 (px,py) 向目标连走 steps 步（每步 1 格，到达即停）；镜像 next_move_step 的
+  // 循环展开版——每次迭代等价于 Rust 侧调用一次 next_move_step 走一步
+  function applyMoveSteps(px, py, tx, ty, steps) {
+    var x = px, y = py;
+    var k = steps;
+    while (k > 0) {
+      var dx = tx - x, dy = ty - y;
+      if (dx * dx + dy * dy <= 0.25) break; // 已到达（格距 ≤0.5，含边界防振荡）
+      if (dx !== 0) {
+        x += signStep(dx);                  // 先横：横轴还有差距
+      } else {
+        y += signStep(dy);                  // 横已到位 -> 竖
+      }
+      k--;
+    }
+    return { x: x, y: y };
+  }
+
+  function worldDist2(ax, ay, bx, by) {
+    var dx = ax - bx, dy = ay - by;
+    return dx * dx + dy * dy;
+  }
+
+  // 和解决策：预期位置（锚点起步 steps 步）与服务器坐标对账——
+  // 距离 < 0.25 格（平方 < 0.0625）= 一致确认；否则分歧
+  function reconcileDecision(ax, ay, tx, ty, steps, sx, sy) {
+    var e = applyMoveSteps(ax, ay, tx, ty, steps);
+    return worldDist2(e.x, e.y, sx, sy) < 0.0625 ? 'confirm' : 'diverge';
+  }
+
+  // 渲染外推步数：锚点确认后，进行中的那一拍乐观先走一步（点击瞬间 P 就动）；
+  // itv 无效或时钟回拨钳 1，上限钳 256（viewport 对角约 112 步封顶留富余）
+  function renderSteps(now, anchorT, itv) {
+    if (!(itv > 0)) return 1;
+    var k = 1 + Math.floor((now - anchorT) / itv);
+    if (k < 1) k = 1;
+    if (k > 256) k = 256;
+    return k;
+  }
+
+  // 相机 clamp：跟随窗口 cw×ch 夹进视口域 [vx0,vx0+vw]×[vy0,vy0+vh]；
+  // 窗口不小于域时居中并标记两侧贴边。返回中心 + 四边贴边标记（边界线可视化）
+  function clampCamera(cx, cy, vx0, vy0, vw, vh, cw, ch) {
+    var halfW = cw / 2, halfH = ch / 2;
+    var x = cx, y = cy;
+    var edgeL = false, edgeR = false, edgeB = false, edgeT = false;
+    if (cw >= vw) {
+      x = vx0 + vw / 2;
+      edgeL = true;
+      edgeR = true;
+    } else if (x < vx0 + halfW) {
+      x = vx0 + halfW;
+      edgeL = true;
+    } else if (x > vx0 + vw - halfW) {
+      x = vx0 + vw - halfW;
+      edgeR = true;
+    }
+    if (ch >= vh) {
+      y = vy0 + vh / 2;
+      edgeB = true;
+      edgeT = true;
+    } else if (y < vy0 + halfH) {
+      y = vy0 + halfH;
+      edgeB = true;
+    } else if (y > vy0 + vh - halfH) {
+      y = vy0 + vh - halfH;
+      edgeT = true;
+    }
+    return { x: x, y: y, edgeL: edgeL, edgeR: edgeR, edgeB: edgeB, edgeT: edgeT };
+  }
+
+  // 击杀检测：上一帧有、新帧无的实体 = 消失（死亡/残影消散），返回最后坐标
+  function collectKills(prevEnts, newEnts) {
+    var out = [];
+    prevEnts.forEach(function (e, id) {
+      if (!newEnts.has(id)) out.push({ x: e.x, y: e.y });
+    });
+    return out;
+  }
+
+  // 实体表里找操控目标（controlled 标记是服务器每拍解析的 me 声明，#024）
+  function findControlled(entsMap) {
+    var me = null;
+    entsMap.forEach(function (e) {
+      if (e.controlled === true) me = e;
+    });
+    return me;
+  }
+
+  // ==== [PURE-END] ====
+
   // ---- 坐标换算（net-protocol.md §4；世界 y 向上、屏幕 y 向下须翻转，负数域直接可用）----
+  // 基准 = view（当前可视窗口：全景=viewport / 跟随=相机窗口），镜头切换自动适配
   function worldToScreen(wx, wy) {
     return {
-      x: (wx - vp.x0) / vp.w * viewW,
-      y: viewH - (wy - vp.y0) / vp.h * viewH
+      x: (wx - view.x0) / view.w * viewW,
+      y: viewH - (wy - view.y0) / view.h * viewH
     };
   }
   function screenToWorld(sx, sy) {
     return {
-      x: vp.x0 + sx / viewW * vp.w,
-      y: vp.y0 + (viewH - sy) / viewH * vp.h
+      x: view.x0 + sx / viewW * view.w,
+      y: view.y0 + (viewH - sy) / viewH * view.h
     };
   }
 
@@ -269,21 +479,20 @@
       ctx.fillText('等待世界快照……（启动 start.bat 后自动连接）', viewW / 2, viewH / 2);
       return;
     }
-    vp = state.viewport;
-    var cell = Math.min(viewW / vp.w, viewH / vp.h);
+    var cell = Math.min(viewW / view.w, viewH / view.h);
 
-    // 背景网格：世界整数坐标处一条暗线（格子感）
+    // 背景网格：世界整数坐标处一条暗线（格子感，铺满当前可视窗口）
     ctx.strokeStyle = COLOR_GRID;
     ctx.lineWidth = 1;
     ctx.beginPath();
     var xi;
-    for (xi = Math.ceil(vp.x0); xi <= Math.floor(vp.x0 + vp.w); xi++) {
+    for (xi = Math.ceil(view.x0); xi <= Math.floor(view.x0 + view.w); xi++) {
       var sx = Math.round(worldToScreen(xi, 0).x) + 0.5;
       ctx.moveTo(sx, 0);
       ctx.lineTo(sx, viewH);
     }
     var yi;
-    for (yi = Math.ceil(vp.y0); yi <= Math.floor(vp.y0 + vp.h); yi++) {
+    for (yi = Math.ceil(view.y0); yi <= Math.floor(view.y0 + view.h); yi++) {
       var sy = Math.round(worldToScreen(0, yi).y) + 0.5;
       ctx.moveTo(0, sy);
       ctx.lineTo(viewW, sy);
@@ -291,12 +500,41 @@
     ctx.stroke();
 
     // 地面线：y=0 一条稍亮横线（域内才画）
-    if (vp.y0 <= 0 && 0 <= vp.y0 + vp.h) {
+    if (view.y0 <= 0 && 0 <= view.y0 + view.h) {
       var gy = Math.round(worldToScreen(0, 0).y) + 0.5;
       ctx.strokeStyle = COLOR_GROUND;
       ctx.beginPath();
       ctx.moveTo(0, gy);
       ctx.lineTo(viewW, gy);
+      ctx.stroke();
+    }
+
+    // 世界边界可视化（第四刀 C2）：viewport 域边缘落在画面内（相机贴边）时画界线，
+    // 玩家由此知道世界到头了；全景模式边界=画布边缘不画
+    if (camEdges && vp) {
+      ctx.strokeStyle = '#d29922';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      if (camEdges.l) {
+        var blx = Math.round(worldToScreen(vp.x0, 0).x) + 1;
+        ctx.moveTo(blx, 0);
+        ctx.lineTo(blx, viewH);
+      }
+      if (camEdges.r) {
+        var brx = Math.round(worldToScreen(vp.x0 + vp.w, 0).x) - 1;
+        ctx.moveTo(brx, 0);
+        ctx.lineTo(brx, viewH);
+      }
+      if (camEdges.b) {
+        var bby = Math.round(worldToScreen(0, vp.y0).y) - 1;
+        ctx.moveTo(0, bby);
+        ctx.lineTo(viewW, bby);
+      }
+      if (camEdges.t) {
+        var bty = Math.round(worldToScreen(0, vp.y0 + vp.h).y) + 1;
+        ctx.moveTo(0, bty);
+        ctx.lineTo(viewW, bty);
+      }
       ctx.stroke();
     }
 
@@ -321,10 +559,10 @@
       ctx.fillText(e.glyph, p.x, p.y);
     });
 
-    // 点击走位可视化（#027）：操控实体 -> 目标 虚线 + 目标点标记（本地提示，服务器权威）
+    // 点击走位可视化（#027）：操控实体 -> 目标 虚线 + 目标点标记（本地提示，服务器权威；
+    // 操控实体取的是预测后的渲染位置，虚线跟着预测走）
     if (moveTarget && lastState) {
-      var meEnt = null;
-      lastState.ents.forEach(function (e) { if (e.controlled === true) meEnt = e; });
+      var meEnt = findControlled(lastState.ents);
       if (meEnt) {
         var pa = worldToScreen(meEnt.x, meEnt.y);
         var pb = worldToScreen(moveTarget.x, moveTarget.y);
@@ -353,6 +591,41 @@
         ctx.globalAlpha = 1;
       }
     }
+
+    // 刀光线（第四刀 B1）：P 与目标间一道快速淡出的攻击线（0.3s 生命周期，超时即剔）
+    var nowFx = performance.now();
+    attackLines = attackLines.filter(function (l) { return nowFx - l.born < 300; });
+    for (var li = 0; li < attackLines.length; li++) {
+      var al = attackLines[li];
+      var p0 = worldToScreen(al.x0, al.y0);
+      var p1 = worldToScreen(al.x1, al.y1);
+      ctx.globalAlpha = 1 - (nowFx - al.born) / 300;
+      ctx.strokeStyle = '#f85149';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // 击杀标记（第四刀 B2）：快照中消失的实体在最后坐标留渐隐 ✕（1.5s）
+    killFx = killFx.filter(function (m) { return nowFx - m.born < 1500; });
+    for (var mi = 0; mi < killFx.length; mi++) {
+      var km = killFx[mi];
+      var pk = worldToScreen(km.x, km.y);
+      var kr = Math.max(6, cell * 0.3);
+      ctx.globalAlpha = 1 - (nowFx - km.born) / 1500;
+      ctx.strokeStyle = '#f85149';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(pk.x - kr, pk.y - kr);
+      ctx.lineTo(pk.x + kr, pk.y + kr);
+      ctx.moveTo(pk.x + kr, pk.y - kr);
+      ctx.lineTo(pk.x - kr, pk.y + kr);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
   }
 
   function updateCaption(state) {
@@ -366,8 +639,8 @@
   // ---- 悬浮提示 + 鼠标世界坐标（第三刀点击操控的直观校验）----
   function updateTooltip() {
     var hit = null;
-    if (mouse && lastState && lastState.ents.size > 0) {
-      var cell = Math.min(viewW / lastState.viewport.w, viewH / lastState.viewport.h);
+    if (mouse && lastState && lastState.ents.size > 0 && view) {
+      var cell = Math.min(viewW / view.w, viewH / view.h);
       var thr = Math.max(10, cell * 0.6);
       var thr2 = thr * thr;
       lastState.ents.forEach(function (e) {
@@ -393,7 +666,7 @@
   cv.addEventListener('mousemove', function (ev) {
     var r = cv.getBoundingClientRect();
     mouse = { x: ev.clientX - r.left, y: ev.clientY - r.top };
-    if (vp) {
+    if (view) {
       var w = screenToWorld(mouse.x, mouse.y);
       mouseEl.textContent = 'x=' + w.x.toFixed(1) + ', y=' + w.y.toFixed(1);
     }
@@ -404,30 +677,47 @@
     tipEl.hidden = true;
   });
 
-  // ---- 点击操控（#027）：左键 move/attack、右键 stop、S 键 stop ----
+  // ---- 点击操控（#027）：左键 move/attack、右键 stop、S 键 stop、F 切镜头 ----
   cv.addEventListener('click', function (ev) {
-    if (!vp || !lastState) return;
+    if (!view || !lastState) return;
     var r = cv.getBoundingClientRect();
     var w = screenToWorld(ev.clientX - r.left, ev.clientY - r.top);
     var decision = decideClickMessage(lastState, w.x, w.y);
     sendMsg(decision.msg);
     if (decision.fx) {
       attackFx = { x: decision.fx.x, y: decision.fx.y, t: performance.now() };
+      // 刀光线（第四刀 B1）：从 P 当前渲染位置到目标的一道淡出攻击线
+      var meAtk = findControlled(lastState.ents);
+      if (meAtk) {
+        attackLines.push({ x0: meAtk.x, y0: meAtk.y, x1: decision.fx.x, y1: decision.fx.y, born: performance.now() });
+        if (attackLines.length > 8) attackLines.shift();
+      }
     } else {
       moveTarget = { x: w.x, y: w.y }; // 本地虚线目标（服务器权威，仅提示）
+      startPrediction(moveTarget);     // 己方预测（第四刀 A1）：点击瞬间 P 就动
     }
   });
   cv.addEventListener('contextmenu', function (ev) {
     ev.preventDefault(); // 屏蔽浏览器默认菜单
     sendMsg({ type: 'stop' });
-    moveTarget = null;
+    stopPrediction();
   });
   window.addEventListener('keydown', function (ev) {
     if (ev.key === 's' || ev.key === 'S') {
       sendMsg({ type: 'stop' });
-      moveTarget = null;
+      stopPrediction();
+    }
+    if (ev.key === 'f' || ev.key === 'F') {
+      toggleCamera();
     }
   });
+  camBtnEl.addEventListener('click', toggleCamera);
+
+  // 镜头切换（第四刀 C3）：跟随/全景；P 不存在时自动回落全景（loop 里生效）
+  function toggleCamera() {
+    camMode = camMode === 'follow' ? 'pano' : 'follow';
+    camBtnEl.textContent = '镜头：' + (camMode === 'follow' ? '跟随' : '全景');
+  }
 
   // ---- 连接状态机：连接中 / 已连接 / 已断线（指数退避重连，单一定时器防死循环）----
   var CONN_TEXT = { wait: '连接中……', ok: '已连接', bad: '已断线，等待重连' };
@@ -454,6 +744,9 @@
       backoffMs = BACKOFF_INIT; // 连上了就重置退避
       resetBuffer();            // 重连后清空缓冲重新开始（断线期间旧帧与新世界不连续）
       moveTarget = null;        // 断线期间旧目标失效（重连后重新点击）
+      clearPrediction();        // 预测状态一并清空（重连后世界可能重启，坐标不连续）
+      attackLines = [];
+      killFx = [];
       renderConn();
     };
     ws.onmessage = onMessage;
@@ -465,6 +758,9 @@
       console.info('[cw] WS 断开，' + Math.round(backoffMs / 1000) + 's 后重连');
       wsSock = null;
       moveTarget = null;
+      clearPrediction(); // 断线清预测（重连后从服务器快照重新开始）
+      attackLines = [];
+      killFx = [];
       connState = 'bad';
       renderConn();
       if (reconnectTimer !== null) return; // 防双调度（onerror 后紧跟 onclose）
@@ -478,17 +774,55 @@
 
   // ---- 主循环：rAF 驱动，每帧重采样重画 ----
   function loop() {
-    var state = sampleState(performance.now() - renderDelay());
+    var nowMs = performance.now();
+    var state = sampleState(nowMs - renderDelay());
     lastState = state;
+    // 己方预测（第四刀 A1）：P 的渲染位置用本地预测/停住冻结覆盖插值采样（零等待），
+    // 他人实体照旧走插值——Valve 标准分工；对账与校正在 onMessage/reconcileSnapshot
+    var meRendered = null;
+    if (state) {
+      var meEnt = findControlled(state.ents);
+      if (meEnt) {
+        if (predHold) {
+          meEnt.x = predHold.x; // 停止冻结：立即站住
+          meEnt.y = predHold.y;
+          meRendered = predHold;
+        } else if (predTarget && predAnchor) {
+          var k = renderSteps(nowMs, predAnchor.t, avgInterval || 0);
+          var pp = applyMoveSteps(predAnchor.x, predAnchor.y, predTarget.x, predTarget.y, k);
+          meEnt.x = pp.x;
+          meEnt.y = pp.y;
+          meRendered = pp;
+        } else {
+          meRendered = { x: meEnt.x, y: meEnt.y };
+        }
+      }
+    }
     // 走位虚线到达自清（服务器到站判定才是权威，这里保持本地提示一致）
-    if (moveTarget && state) {
-      var meNow = null;
-      state.ents.forEach(function (e) { if (e.controlled === true) meNow = e; });
-      if (!meNow) {
+    if (moveTarget) {
+      if (!meRendered) {
         moveTarget = null; // 操控实体消失（死亡/下线）：虚线失效
+      } else if (worldDist2(meRendered.x, meRendered.y, moveTarget.x, moveTarget.y) <= 0.25) {
+        moveTarget = null;
+      }
+    }
+    // 镜头（第四刀 C）：跟随=lerp 对准 P + viewport 域 clamp（贴边标记→边界线）；
+    // 全景=整 viewport 铺满；P 不存在（未连/死亡/观战）自动回落全景
+    camEdges = null;
+    if (vp) {
+      if (camMode === 'follow' && meRendered) {
+        if (!cam) {
+          cam = { x: meRendered.x, y: meRendered.y }; // 首帧直接对准，不从原点滑移
+        } else {
+          cam.x += (meRendered.x - cam.x) * CAM_LERP;
+          cam.y += (meRendered.y - cam.y) * CAM_LERP;
+        }
+        var cw = vp.w / CAM_ZOOM, ch = vp.h / CAM_ZOOM;
+        var cc = clampCamera(cam.x, cam.y, vp.x0, vp.y0, vp.w, vp.h, cw, ch);
+        camEdges = { l: cc.edgeL, r: cc.edgeR, b: cc.edgeB, t: cc.edgeT };
+        view = { x0: cc.x - cw / 2, y0: cc.y - ch / 2, w: cw, h: ch };
       } else {
-        var ddx = meNow.x - moveTarget.x, ddy = meNow.y - moveTarget.y;
-        if (Math.sqrt(ddx * ddx + ddy * ddy) <= 0.5) moveTarget = null;
+        view = vp;
       }
     }
     updateCaption(state);
