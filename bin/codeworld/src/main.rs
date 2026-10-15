@@ -73,6 +73,9 @@ struct EntitySandboxMap {
     /// 上拍相触实体对集合（#030 接触边沿触发状态：本拍新进入接触才触发
     /// ContactPair，持续贴着不重复，分开再碰再触发；每拍整体重建）
     last_touching: std::collections::HashSet<(EntityId, EntityId)>,
+    /// 点击走位停滞检测窗口（期四第七刀）：目标变更即重开窗，测"当前目标"的
+    /// 走位进度；2 拍净位移 < 0.01 = 贴障蹭动/全挡，视为到达清目标
+    move_stall: Option<input::MoveStallTrack>,
 }
 
 impl EntitySandboxMap {
@@ -94,6 +97,7 @@ impl EntitySandboxMap {
             ctrl_exclusive_active: false,
             flight_phase: None,
             last_touching: std::collections::HashSet::new(),
+            move_stall: None,
         })
     }
 
@@ -280,6 +284,24 @@ impl EntitySandboxMap {
             tracing::debug!(count = all.len(), "[collect_pending_moves] 收集移动请求");
         }
         all
+    }
+
+    /// 收集本 tick 各沙箱的悬停声明（env.hover 置位）并清空（期四第七刀）
+    ///
+    /// 收集即清空——声明不跨拍延续（每拍重申语义，#029 无税但需持续出力声明）。
+    /// 产物并入本拍物理免重力集合，与操控悬停同集合同机制（#030 升力独立）。
+    fn collect_hover_declarations(&mut self) -> Vec<EntityId> {
+        let mut ids = Vec::new();
+        for (id, handle) in self.sandboxes.iter_mut() {
+            if handle.store.data_mut().hover_declared {
+                handle.store.data_mut().hover_declared = false;
+                ids.push(*id);
+            }
+        }
+        if !ids.is_empty() {
+            tracing::debug!(count = ids.len(), "[hover] 收集悬停声明");
+        }
+        ids
     }
 
     /// 收集本 tick 所有沙箱的 log marker 值序列（战况字幕数据源）
@@ -790,6 +812,9 @@ fn tick_with_intents(
         sandbox_map.ws_move_target = None;
         sandbox_map.flight_phase = None;
     }
+    // 停滞窗口随目标变更重开（期四第七刀）：新目标以拍首坐标开窗——窗口量的是
+    // "当前目标"的逐拍走位进度，旧目标的蹭动历史不带入
+    let prev_ws_target = sandbox_map.ws_move_target;
     let action = input::route_intents(
         intents,
         control_target,
@@ -798,6 +823,11 @@ fn tick_with_intents(
         entity_radius,
         &mut sandbox_map.ws_move_target,
     );
+    if sandbox_map.ws_move_target != prev_ws_target {
+        sandbox_map.move_stall = sandbox_map
+            .ws_move_target
+            .and_then(|_| entity_pos.map(input::MoveStallTrack::start));
+    }
     // 字幕 ctrl 段（#024 三态）：操控中 = ctrl:字形；观战（有人但不是你 / 操控目标
     // 下线 latch）= ctrl:--；无玩家在线且从未 latch（四生物基线）= 不显示 ctrl 段
     let ctrl = if sandbox_map.players.has_online() || sandbox_map.controlled_offline_latched {
@@ -882,6 +912,10 @@ fn tick_with_intents(
     if !to_kill.is_empty() {
         tracing::info!(tick = current_tick, killed = to_kill.len(), "阶段一标记死亡");
     }
+    // 玩家代码悬停声明并入本拍免重力集合（期四第七刀，#029/#030）：env.hover 置位
+    // 的实体与操控悬停同集合同机制；收集即清空——每拍重申，上一拍声明不延续
+    let hover_declarations = sandbox_map.collect_hover_declarations();
+    aloft.extend(hover_declarations);
     //    注意：不在此处清空 pending--apply_pending_changes 的 drain(..) 会消费并清空队列，
     //    保证不跨 tick 残留（架构 4.1 "不立即应用、同 tick 统一应用"）。
     //    TODO(Phase2)：架构文档 4.1 要求生存点数检查在阶段一每个实体线程内、on_tick 之前
@@ -897,6 +931,30 @@ fn tick_with_intents(
     // #030：移动裁决改半径碰撞（分轴滑动），移动被挡不再产生接触对——
     // 接触语义统一为"身体相触"，由阶段二 c 步全量扫描+边沿触发裁决
     apply_pending_changes(world, pending, control_target);
+
+    // 贴障停滞检测（期四第七刀，b8.log ±0.08 蹭动实锤）：点击走位 2 拍窗口
+    // 净位移 < 0.01 = 全挡原地/滑出滑回蹭动 -> 视为到达清目标（防死循环蹭动）。
+    // 悬停维持拍位置恒定是主动悬停（实体或目标在空中），不参与地面停滞判定
+    if let Some((tid, tpos)) = sandbox_map.ws_move_target {
+        if Some(tid) == control_target {
+            if let Some(e) = world.entities.get(&tid) {
+                if e.is_alive() {
+                    let (px, py) = e.pos();
+                    let r = e.radius();
+                    let track = sandbox_map
+                        .move_stall
+                        .get_or_insert_with(|| input::MoveStallTrack::start((px, py)));
+                    if py <= r && tpos.1 <= r && track.check((px, py)) {
+                        tracing::info!("[ctrl] 操控目标停滞，清除目标（贴障）");
+                        sandbox_map.ws_move_target = None;
+                        sandbox_map.move_stall = None;
+                    }
+                }
+            }
+        }
+    } else {
+        sandbox_map.move_stall = None;
+    }
 
     //   a1. 造物处理（门二：env.spawn 排队的请求在此编译/建实体/建沙箱/插入世界）。
     //       放在 destroy 应用之后：本拍自毁的创造者不再造物；上限按应用后世界实况算。
@@ -2038,14 +2096,16 @@ const HUNTER_WAT: &str = r#"(module
       (else (drop (call $move_by (f64.const -0.5) (f64.const 0.0))))))
   (func (export "life") (result i32) i32.const 1))"#;
 
-/// 伪装者 S 的玩家代码 WAT（紫色，性格：间谍——悬浮高空+高调侦察+撒谎身份）
+/// 伪装者 S 的玩家代码 WAT（紫色，性格：间谍——悬停高空+高调侦察+撒谎身份）
 ///
 /// 策略（on_tick 每 tick 执行）：
-/// 0. 每拍先悬浮：move_by(0,+9.8) 抵消当拍重力（DefaultPhysicsEngine 默认
-///    gravity=-9.8；阶段二 a 先应用悬浮位移、物理步再扣重力，净高度不变，
-///    S 稳定悬停 y≈12 永不落地）。悬浮在侦察节奏判断之前，每拍都执行，
-///    且位移让阶段一快照坐标与阶段二 a2 攻击结算坐标恒差 9.8——反制刀
-///    坐标过期落空，"够不着+打不中"就是间谍唯一的自卫
+/// 0. 每拍先 hover()：声明"本拍我要悬停"，世界把 S 并入当拍免重力集合
+///    （与操控悬停同集合同机制，decisions.md #030 升力独立）。声明不跨拍延续，
+///    每拍都要重申——"持续对抗世界规则"的代码体现（#029 无税）。
+///    旧 move_by(0,+9.8) 喷气 hack 退役（拍内 12↔21.8 弹跳、反制刀坐标错位
+///    两大副作用一并消失）：S 坐标全程精确稳定 (25,12)，被反制刀点名
+///    "点在身体内"必中（#031 点命中制）——坐标稳定换来的 Exposure 就是
+///    间谍的真实代价，喷气期的"打不中"是坐标错位 bug 不是自卫能力
 /// 1. tick 计数非 4 倍数直接返回；侦察轮先 log 10（侦察 marker）
 /// 2. visible_count 数敌人，空则收工（全场只剩自己时不折腾）
 /// 3. visible_at 循环扫一圈（眼睛列表），记与自己的平方距最近者
@@ -2060,7 +2120,7 @@ const HUNTER_WAT: &str = r#"(module
 const SPY_WAT: &str = r#"(module
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
-  (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
+  (import "env" "hover" (func $hover))
   (import "env" "visible_count" (func $visible_count (result i32)))
   (import "env" "visible_at" (func $visible_at (param i32 i32 i32) (result i32)))
   (import "env" "probe" (func $probe (param f64 f64 i32 i32 i32 i32) (result i32)))
@@ -2075,8 +2135,8 @@ const SPY_WAT: &str = r#"(module
     (local $x f64) (local $y f64) (local $mx f64) (local $my f64)
     (local $dx f64) (local $dy f64) (local $d f64)
     global.get $ticks i32.const 1 i32.add global.set $ticks
-    ;; 0. 每拍悬浮：先 +9.8 抵消物理步的 -9.8，净悬停（不受侦察节奏影响）
-    (drop (call $move_by (f64.const 0.0) (f64.const 9.8)))
+    ;; 0. 每拍悬停声明：本拍免重力（每拍重申，不受侦察节奏影响）
+    call $hover
     ;; 1. 每 4 tick 侦察一轮
     (if (i32.rem_u (global.get $ticks) (i32.const 4))
       (then (return)))
@@ -3478,6 +3538,60 @@ mod tests {
         assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.5), "目标已清，不复活走位");
     }
 
+    // === 期四第七刀：贴障停滞修复（2 拍净位移窗口 + 到达幂等）===
+
+    #[test]
+    fn ws_move_blocked_by_body_stagnation_clears_target() {
+        // 贴障修复主链路：P 点击走位被邻格实体挡死（贴站相切合法，#030）——
+        // 分轴滑动全挡后位置纹丝不动，停滞检测清目标，不再逐拍蹭动；
+        // 后续空拍不复活走位
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        // 阻挡者 @ (31,0.5)：与 P(30,0.5) 相切（距 1.0 = 2r，严格 < 不重叠，贴站合法）
+        world
+            .entities
+            .insert(EntityId(Uuid::from_u128(9)), make_entity(9, (31.0, 0.5)));
+        let walk = vec![input::Intent::WsMove { x: 33.0, y: 0.5 }];
+        let none: Vec<input::Intent> = vec![];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &walk);
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (30.0, 0.5),
+            "被挡拍：身体重叠分轴全挡，原地"
+        );
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
+        assert!(
+            map.ws_move_target.is_none(),
+            "贴障停滞：目标自动清除（不逐拍蹭动）"
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (30.0, 0.5),
+            "停住不蹭动"
+        );
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
+        assert!(map.ws_move_target.is_none(), "目标已清不复活");
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (30.0, 0.5));
+    }
+
+    #[test]
+    fn ws_move_arrival_is_idempotent_no_step_after_clear() {
+        // 到达清除幂等：踏上目标拍目标仍在册（快照语义下一拍判到达），
+        // 到达判定拍清目标且同拍不再生成新步；后续拍零位移零目标
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let walk = vec![input::Intent::WsMove { x: 31.0, y: 0.5 }];
+        let none: Vec<input::Intent> = vec![];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &walk);
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.5), "终进近一步踏上目标");
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
+        assert!(map.ws_move_target.is_none(), "到达判定拍清目标");
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.5), "到达拍不再生成新步");
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.5), "后续拍零位移");
+        assert!(map.ws_move_target.is_none(), "后续拍零目标");
+    }
+
     /// 飞行测试便捷：连跑 n 拍空意图（爬升/悬停/降落的延续拍）
     #[allow(clippy::too_many_arguments)]
     fn fly_ticks(
@@ -4606,10 +4720,12 @@ mod tests {
     // === 悬浮间谍（S 每拍抵消重力，悬停高空）===
 
     #[test]
-    fn spy_hovers_above_ground_every_tick() {
-        // 悬浮间谍：S 出生 (25,12) 空中，每拍 move_by(0,+9.8) 抵消重力
-        // （DefaultPhysicsEngine::new() 默认 gravity=-9.8）——跑 8 拍
-        // （含侦察 4 倍数拍与 1/2/3 非侦察拍），S 的 y 全程 > 5、永不落地。
+    fn spy_hovers_stable_at_spawn_every_tick() {
+        // 悬浮间谍（期四第七刀迁移）：S 每拍 hover() 声明悬停（免重力集合），
+        // move_by(0,+9.8) 喷气 hack 退役——坐标全程精确稳定 (25,12)，
+        // 拍内不再有 +9.8/-9.8 弹跳（阶段一快照与阶段二结算同坐标，
+        // D 按快照坐标出刀点在 S 身体内必中，#031 点命中制）。
+        // 跑 8 拍（含侦察 4 倍数拍与 1/2/3 非侦察拍）；api_calls 有 hover 无 move_by。
         let mut world = WorldState::new();
         let id = EntityId(Uuid::from_u128(7));
         world.entities.insert(id, make_entity(7, (25.0, 12.0)));
@@ -4630,17 +4746,182 @@ mod tests {
                 &mut pending,
                 &mut sandbox_map,
             );
-            let y = world
+            let s = world
                 .entities
                 .get(&id)
-                .unwrap_or_else(|| panic!("第 {tick_n} 拍 S 应存活"))
-                .pos()
-                .1;
-            assert!(
-                y > 5.0,
-                "第 {tick_n} 拍 S 应悬空（悬浮不受侦察节奏影响），实际 y={y}"
+                .unwrap_or_else(|| panic!("第 {tick_n} 拍 S 应存活"));
+            assert_eq!(
+                s.pos(),
+                (25.0, 12.0),
+                "第 {tick_n} 拍 S 应稳定悬停 (25,12)（hover 免重力，不弹跳）"
             );
         }
+        let handle = sandbox_map.sandboxes.get(&id).unwrap();
+        assert!(
+            handle.store.data().api_calls.contains(&"hover".to_string()),
+            "S 应调用 hover 声明悬停"
+        );
+        assert!(
+            !handle.store.data().api_calls.contains(&"move_by".to_string()),
+            "S 不应再调用 move_by（喷气 hack 退役）"
+        );
+    }
+
+    #[test]
+    fn d_blade_at_stable_spy_point_hits() {
+        // 第七刀验收锚：S 坐标稳定 (25,12) 后（hover 免重力，拍内无 +9.8 弹跳），
+        // D 按阶段一快照坐标出刀——打点 (25,12) 距 S 圆心 0 点在身体内
+        // （#031 点命中制）必中；S 脆皮无 on_attack 防守 -> 默认击杀刀换血击杀
+        // （喷气期"阶段一快照 12 / 结算 21.8 恒差 9.8 永远落空"一并终结）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let spy = make_entity_with_sandbox(&mut world, &mut map, 7, (25.0, 12.0), SPY_WAT);
+        let d = make_entity_with_sandbox(&mut world, &mut map, 2, (15.0, 0.5), PLAYER_WAT);
+        let attacks = vec![PendingAttack {
+            attacker: d,
+            target_pos: (25.0, 12.0),
+            payload: vec![],
+        }];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert!(
+            !world.entities.get(&spy).unwrap().is_alive(),
+            "稳定坐标下 D 打 (25,12) 应命中 S（点在身体内，脆皮被击杀）"
+        );
+    }
+
+    // === env.hover 悬停声明全链路（期四第七刀：玩家代码声明 -> 免重力集合）===
+
+    /// 常悬停 WAT：on_tick 每拍 hover()（S 迁移后的行为对照锚）
+    const ALWAYS_HOVER_WAT: &str = r#"(module
+  (import "env" "hover" (func $hover))
+  (func (export "on_tick") call $hover)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 隔拍悬停 WAT：奇数拍 hover、偶数拍不声明（验证声明不跨拍延续）
+    const EVEN_TICK_HOVER_WAT: &str = r#"(module
+  (import "env" "hover" (func $hover))
+  (global $ticks (mut i32) (i32.const 0))
+  (func (export "on_tick")
+    global.get $ticks i32.const 1 i32.add global.set $ticks
+    (if (i32.rem_u (global.get $ticks) (i32.const 2))
+      (then call $hover)))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn hover_declaration_lifts_entity_against_gravity() {
+        // 悬停声明接入免重力集合：空中实体每拍 hover() -> 物理免重力，
+        // 坐标纹丝不动（无位移无坠落——与操控悬停同集合同机制）
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(7));
+        world.entities.insert(id, make_entity(7, (5.0, 12.0)));
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut sandbox_map = test_sandbox_map();
+        sandbox_map
+            .create(id, &wasm(ALWAYS_HOVER_WAT), 1_000_000)
+            .unwrap();
+        for tick_n in 1..=3 {
+            tick(
+                &mut world,
+                &mut time,
+                &physics,
+                &mut renderer,
+                &mut storage,
+                &mut pending,
+                &mut sandbox_map,
+            );
+            assert_eq!(
+                world.entities.get(&id).unwrap().pos(),
+                (5.0, 12.0),
+                "第 {tick_n} 拍悬停实体坐标应纹丝不动（免重力）"
+            );
+        }
+    }
+
+    #[test]
+    fn hover_declaration_does_not_persist_across_ticks() {
+        // 每拍重申语义：偶数拍不声明 -> 该拍重力照扣（12 -> 2.2），声明不延续；
+        // 奇数拍重新声明 -> 免重力停在当前高度（低空悬停同样成立）
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(7));
+        world.entities.insert(id, make_entity(7, (5.0, 12.0)));
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut sandbox_map = test_sandbox_map();
+        sandbox_map
+            .create(id, &wasm(EVEN_TICK_HOVER_WAT), 1_000_000)
+            .unwrap();
+        // 拍1（奇数拍，声明悬停）：纹丝不动
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut sandbox_map,
+        );
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (5.0, 12.0),
+            "拍1 已声明悬停：免重力纹丝不动"
+        );
+        // 拍2（偶数拍，不声明）：重力照扣 12 - 9.8 ≈ 2.2（上拍声明不延续）
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut sandbox_map,
+        );
+        let y2 = world.entities.get(&id).unwrap().pos().1;
+        assert!(
+            (y2 - 2.2).abs() < 1e-9,
+            "拍2 未声明：重力照扣应落到 2.2，实际 {y2}"
+        );
+        // 拍3（奇数拍，重新声明）：停在 2.2 低空悬停
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut sandbox_map,
+        );
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (5.0, y2),
+            "拍3 重新声明：低空悬停停在当前高度"
+        );
+    }
+
+    #[test]
+    fn collect_hover_declarations_drains_flags() {
+        // 收集即清空（不跨拍残留）：collect 后二次收集为空
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world.entities.insert(id, make_entity(1, (0.0, 0.0)));
+        let mut map = test_sandbox_map();
+        map.create(id, &wasm(ALWAYS_HOVER_WAT), 1_000_000).unwrap();
+        map.run_player_code(&world, &unbounded_bb());
+        assert_eq!(
+            map.collect_hover_declarations(),
+            vec![id],
+            "应收集到该实体的悬停声明"
+        );
+        assert!(
+            map.collect_hover_declarations().is_empty(),
+            "收集后应清空（声明不跨拍残留）"
+        );
     }
 
     // === move_by 全链路（import 排队 -> tick 阶段二应用）===
@@ -4864,10 +5145,15 @@ mod tests {
         // 冒烟（scan 视野化回归验收点）：默认视口 50x25（对齐真实 Config），四生物
         // + E 类玩家 @(35,5)（PLAYER_WAT 同 players/_template.wat.txt：只 log 不动不 scan）。
         // 全员都在 [-50,50]x[-25,25] 内，视口过滤是 no-op。
-        // #030 半径物理后的剧本时间线（探针实测）：
+        // #030 半径物理 + 期四第七刀 S 坐标稳定后的剧本时间线（探针实测）：
         // - tick4 D 反制杀 H【确定】；A 可能同拍被 H 反杀（A 被身体挡停=站桩，
         //   H 点命中），也可能活下来继续贴 D——取决于 H/D 刀的随机 EntityId
         //   结算顺序（#002 序确定、id 随机），故 A 的生死断言取"最迟 tick12 必死"。
+        // - S 坐标稳定 (25,12) 后"悬浮躲刀"防御终结（旧喷气期阶段一快照与结算
+        //   坐标恒差 9.8 的错位 bug 退役）：A 死后 D 下一反制轮点名 S，脆皮必死
+        //   （早则 tick8、迟则 tick16）。D 的 scan 按距离序点名：S(15.6) 近于
+        //   E(20.6)，S 死后才轮到 E——E 最迟 tick20 被 D 清场（早则 tick12）。
+        //   站桩必中的世界，站桩=挨刀（#031 立法本意），D 逐个清场即新时间线。
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         spawn_test_entities(&mut world, &mut map, 10, true, true);
@@ -4896,9 +5182,95 @@ mod tests {
             &mut pending, &mut map, 8,
         );
         assert!(!glyph_alive(&world, "A"), "tick12 A 必死（早则 tick4 被 H 反杀，迟则贴 D 站桩后 tick12 被 D 反制）");
-        assert!(glyph_alive(&world, "D"), "D 应存活");
-        assert!(glyph_alive(&world, "S"), "S 应存活（悬浮躲刀）");
-        assert!(glyph_alive(&world, "E"), "E 无人锁定应全程存活");
+        run_ticks(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage,
+            &mut pending, &mut map, 12,
+        );
+        assert!(glyph_alive(&world, "D"), "D 站桩安全位应存活（清场者）");
+        assert!(!glyph_alive(&world, "S"), "tick24 S 必死（坐标稳定后 D 反制点名，脆皮无防守——第七刀起合法结局）");
+        assert!(!glyph_alive(&world, "E"), "tick24 E 必死（S 死后 D 距离序点名声呐清场）");
+    }
+
+    #[test]
+    fn smoke_seventh_cut_hover_stable_d_hits_s_and_stagnation_clears() {
+        // 第七刀验收冒烟（进程内 80 拍一局，等价 headless 实测；沙箱不能起进程时
+        // 本测试即验收证据）：四方布阵 + 受控玩家 p1@35 + 地面阻挡者 obst@30。
+        // a. S 坐标全程稳定 (25,12)：hover 免重力，无 12↔21.8 弹跳（存活期内逐拍断言）
+        // b. D 对 S 出刀命中：A 死（≤tick12）后 D 下一反制轮点名 S（≤tick16），
+        //    脆皮无防守被击杀——落空终结，命中结算合法
+        // c. P 点击走位贴障：p1 西行被 obst 挡死（31,0.5 全挡），2 拍窗口停滞
+        //    检测自动清目标站住，不逐拍蹭动
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        spawn_test_entities(&mut world, &mut map, 10, true, true);
+        // 受控玩家 + 阻挡者：stems 字典序 obst < p1 -> obst@30 / p1@35（y 落半径线 0.5）
+        let dir = temp_players_dir("seventh-cut");
+        std::fs::write(dir.join("me.txt"), "p1").unwrap();
+        std::fs::write(dir.join("obst.wat"), PLAYER_WAT).unwrap();
+        std::fs::write(dir.join("p1.wat"), PLAYER_WAT).unwrap();
+        map.players = PlayerDirectory::new(&dir);
+        map.load_players_initial(&mut world).unwrap();
+        let p1 = find_player_id(&world, "p1");
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = Renderer::new(Viewport::new((0.0, 0.0), 50.0, 25.0, 50, 80));
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let spy_id = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == SPY_CODE)
+            .map(|e| e.id)
+            .expect("四方布阵应有 S");
+        // tick 1-9：无意图（p1 受控独占站桩；S 悬停逐拍稳定）
+        let none: Vec<input::Intent> = vec![];
+        let walk = vec![input::Intent::WsMove { x: 30.0, y: 0.5 }];
+        // 停滞证据捕获：点击 tick10 -> 西行 4 拍（t13 到 31 贴障）-> 挡 t14 ->
+        // 停滞清目标 t15 末。D 清场点名序（距 D 最近者先死）：obst@30(15) <
+        // S@25,12(15.6) < p1@31(16)——快路径 p1 最迟 t16 被点名，故位置证据取
+        // t15 末快照（停滞已清、p1 尚存的安全点），清目标标记允许 t15/t16 捕获
+        //（t16 内停滞判定先于攻击结算，同拍先清后死也捕获得到）
+        let mut p1_frozen: Option<(f64, f64)> = None;
+        let mut p1_target_cleared = false;
+        for tick_n in 1..=80 {
+            let intents = if tick_n == 10 { &walk } else { &none };
+            tick_with_intents(
+                &mut world, &mut time, &physics, &mut renderer, &mut storage,
+                &mut pending, &mut map, intents,
+            );
+            // a. S 存活期内坐标恒 (25,12)（逐拍断言：无弹跳无飘移）
+            if let Some(s) = world.entities.get(&spy_id) {
+                assert_eq!(
+                    s.pos(),
+                    (25.0, 12.0),
+                    "第 {tick_n} 拍 S 应稳定悬停 (25,12)（hover 免重力）"
+                );
+            }
+            if tick_n == 15 {
+                p1_frozen = world.entities.get(&p1).map(|e| e.pos());
+            }
+            if tick_n >= 15 && map.ws_move_target.is_none() {
+                p1_target_cleared = true;
+            }
+        }
+        // a 附：S 死前最后坐标仍是 (25,12)（被点名击杀不是坠落——坠落会先改坐标）
+        // b. S 已被 D 命中击杀（A ≤tick12 死 -> D 距离序点名 S ≤tick20）
+        assert!(
+            !glyph_alive(&world, "S"),
+            "tick80 S 应被 D 反制刀命中击杀（坐标稳定后点在身体内必中）"
+        );
+        // c. 贴障停滞：p1 西行到 31 被 obst@30 挡死，2 拍窗口停滞清目标站住
+        assert_eq!(
+            p1_frozen,
+            Some((31.0, 0.5)),
+            "p1 应停在贴障位 (31,0.5)（身体重叠全挡）"
+        );
+        assert!(
+            p1_target_cleared,
+            "贴障停滞：走位目标应已自动清除（不逐拍蹭动）"
+        );
+        assert!(glyph_alive(&world, "D"), "D 站桩安全位应存活");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

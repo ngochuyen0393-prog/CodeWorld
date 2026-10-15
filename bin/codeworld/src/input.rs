@@ -255,6 +255,46 @@ fn next_move_step(
     })
 }
 
+/// 点击走位停滞检测窗口（期四第七刀：贴障微抖修复）
+///
+/// 判据 = **2 拍滑动窗口净位移 < 0.01 格**（位移平方 < 0.0001）。单拍阈值会被
+/// 蹭动骗过——实测贴障蹭动是"终进近步被挡滑出 0.08、下拍滑回"的乒乓（b8.log
+/// 实锤 y ±0.08 连蹭 7 拍），单拍位移 0.08~0.16 而窗口净位移 ≈ 0；净位移才是
+/// "贴着不走"的真签名。合法步最短也有 0.5（终进近剩余距离 ∈ (0.5,1.0]），
+/// 对阈值 0.01 安全边际巨大，不误杀慢速接近。
+///
+/// 悬停维持拍位置恒定属主动悬停（aerial），调用方在 aerial 场景跳过判定
+/// （悬停中位置不动是升力在出力，不是被挡）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MoveStallTrack {
+    /// 两拍前坐标（窗口基准）
+    pos_2ago: (f64, f64),
+    /// 一拍前坐标
+    pos_1ago: (f64, f64),
+}
+
+impl MoveStallTrack {
+    /// 以开窗时刻坐标建档（两拍前基准 = 当前位置）
+    pub fn start(pos: (f64, f64)) -> Self {
+        Self {
+            pos_2ago: pos,
+            pos_1ago: pos,
+        }
+    }
+
+    /// 喂入本拍实际坐标；返回 true = 窗口净位移 < 0.01（停滞）。
+    /// 窗口随后前移一格；首拍窗口历史不足 2 拍，按已有历史判定
+    /// （全挡原地 0 位移首拍即真，滑出滑回第 2 拍判真——"被挡 2 拍清目标"）。
+    pub fn check(&mut self, now: (f64, f64)) -> bool {
+        let dx = now.0 - self.pos_2ago.0;
+        let dy = now.1 - self.pos_2ago.1;
+        let stagnant = dx * dx + dy * dy < 0.0001;
+        self.pos_2ago = self.pos_1ago;
+        self.pos_1ago = now;
+        stagnant
+    }
+}
+
 /// 独立输入线程：crossterm 事件轮询 -> 意图入队（生产者）
 ///
 /// - event::poll(50ms) 非阻塞探测，线程不占主循环、可被 running 标志正常叫停
@@ -888,6 +928,38 @@ mod tests {
         let mut mt = Some((target, (28.0, 0.5)));
         let action = route_intents(&[], Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
         assert_step_close(action, (-1.0, 0.0, false), "西向目标负向步");
+    }
+
+    // === 期四第七刀：贴障停滞检测窗口（2 拍净位移）===
+
+    #[test]
+    fn move_stall_detects_two_tick_ping_pong_jitter() {
+        // 乒乓蹭动签名（b8.log 实锤的 ±0.08 蹭动）：单拍位移 0.08 骗过单拍阈值，
+        // 2 拍窗口净位移 ≈ 0（滑出去又滑回来）才是"贴着不走"的真签名
+        let mut t = MoveStallTrack::start((30.0, 0.5));
+        assert!(
+            !t.check((30.08, 0.5)),
+            "首拍滑动 0.08：窗口历史不足 2 拍不判停滞"
+        );
+        assert!(t.check((30.0, 0.5)), "滑回原位：2 拍窗口净位移 0 = 停滞");
+    }
+
+    #[test]
+    fn move_stall_not_triggered_by_normal_walk() {
+        // 正常走位每拍 1.0：窗口净位移 2.0，对阈值 0.01 安全边际巨大（不误杀慢速接近——
+        // 合法步最短也有 0.5：终进近剩余距离 ∈ (0.5,1.0]）
+        let mut t = MoveStallTrack::start((30.0, 0.5));
+        assert!(!t.check((31.0, 0.5)));
+        assert!(!t.check((32.0, 0.5)));
+        assert!(!t.check((33.0, 0.5)));
+    }
+
+    #[test]
+    fn move_stall_detects_fully_blocked_standstill() {
+        // 全挡原地：窗口净位移 0，首个完整窗口即判停滞
+        let mut t = MoveStallTrack::start((30.0, 0.5));
+        assert!(t.check((30.0, 0.5)), "全挡原地 = 停滞");
+        assert!(t.check((30.0, 0.5)), "持续全挡持续停滞");
     }
 
     // === 输入线程 / 终端模式（任务 A：raw mode + alternate screen + 全路径恢复）===

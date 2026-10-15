@@ -118,6 +118,9 @@ pub struct SandboxData {
     pub pending_spawns: Vec<PendingSpawn>,
     /// 本 tick 排队的销毁请求（env.destroy 推入，阶段二产权校验后 drain 清空）
     pub pending_destroys: Vec<PendingDestroy>,
+    /// 本 tick 的悬停声明（env.hover 置位，host 阶段一收件并入免重力集合后清空；
+    /// 每拍重申语义——玩家代码要持续对抗世界规则，上一拍声明不延续）
+    pub hover_declared: bool,
     /// probe 通路桥指针（三层感知 Phase A，见 ProbeBridge 的 SAFETY 契约）。
     /// 仅在主循环阶段一执行玩家代码的窗口内非空（挂载 -> call -> 置空同一循环体
     /// 作用域），窗口外恒为 null——import 层判空作废探测。
@@ -328,6 +331,20 @@ impl SandboxManager {
                 1
             },
         )?;
+        // env.hover()：玩家代码声明"本拍我要悬停"（期四第七刀）。无参无返回，只置位
+        // SandboxData.hover_declared——host 阶段一执行完玩家代码后收集声明并入本拍
+        // 免重力集合（与操控悬停同集合同机制，decisions.md #030 升力独立）。
+        // 每拍重申语义：声明不跨拍延续，玩家代码要悬停就得每拍出力声明（#029 无税，
+        // 但"持续对抗世界规则"以代码持续声明体现）。
+        linker.func_wrap("env", "hover", |mut caller: Caller<SandboxData>| {
+            let entity = caller.data().entity_id;
+            caller.data_mut().api_calls.push("hover".to_string());
+            caller.data_mut().hover_declared = true;
+            tracing::info!(
+                entity_id = %entity.0,
+                "[hover] 悬停声明（本拍免重力，每拍需重申）"
+            );
+        })?;
         linker.func_wrap(
             "env",
             "attack_at",
@@ -2223,6 +2240,40 @@ mod tests {
         assert!(
             handle.store.data().api_calls.contains(&"destroy".to_string()),
             "destroy 调用应记入 api_calls 元数据"
+        );
+    }
+
+    // === env.hover import（期四第七刀：玩家代码每拍悬停声明，接入物理免重力集合）===
+
+    /// 悬停声明 WAT：on_tick 调 hover()（无参无返回）
+    const HOVER_WAT: &str = r#"(module
+  (import "env" "hover" (func $hover))
+  (global $called (mut i32) (i32.const 0))
+  (func (export "on_tick")
+    call $hover
+    global.get $called i32.const 1 i32.add global.set $called)
+  (func (export "get_called") (result i32) global.get $called)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn hover_import_marks_declaration_for_current_tick() {
+        // hover()：玩家代码声明"本拍我要悬停"——import 置位 SandboxData.hover_declared，
+        // host 阶段一收件后并入本拍免重力集合（与操控悬停同集合同机制，#030 升力独立；
+        // #029 无税：悬停是持续对抗世界规则的代码声明，每拍需重申，不延续）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(HOVER_WAT), 100_000, id(901)).unwrap();
+        assert!(
+            !handle.store.data().hover_declared,
+            "未调用 hover 前声明位应为 false"
+        );
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert!(
+            handle.store.data().hover_declared,
+            "on_tick 调 hover 后声明位应为 true"
+        );
+        assert!(
+            handle.store.data().api_calls.contains(&"hover".to_string()),
+            "hover 调用应记入 api_calls 元数据"
         );
     }
 }

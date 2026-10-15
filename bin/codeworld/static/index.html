@@ -431,25 +431,25 @@
 
   // ---- 鼠标操控（#027 第三刀）：纯逻辑函数（node 桩环境机器验证过）----
 
-  // 点击处的实体命中判定（#030/#031 与服务器同判据）：点在身体内即命中——
-  // 活动实体=圆（距圆心 < radius 严格）；creation=格对齐方块（闭区间包含）。
-  // 半径内多个命中取最近者；操控目标自己排除（点自己不出刀）
-  function entityHitTest(e, wx, wy) {
-    if (e.kind === 'creation') {
-      var mx = Math.floor(e.x), my = Math.floor(e.y);
-      return wx >= mx && wx <= mx + 1 && wy >= my && wy <= my + 1;
-    }
-    var dx = e.x - wx, dy = e.y - wy;
-    return dx * dx + dy * dy < e.radius * e.radius;
-  }
+  // 选中容差（期四第七刀）：点击类游戏标配的选中放宽——距活动实体圆心 <1.5 格
+  // 即选中（不必点得极准）；多命中取最近；creation 仍 AABB 判定不吃容差
+  //（服务器 attack 结算仍是 #031 点命中制，容差只是前端"选谁"，命中消息带实体快照坐标）
+  var CLICK_TOLERANCE = 1.5;
 
+  // 点击处的实体选中判定（#031 + 第七刀容差）：活动实体=距圆心 < CLICK_TOLERANCE；
+  // creation=格对齐方块闭区间包含（原判据不动）；操控目标自己排除（点自己不出刀）
   function nearestEntityAtWorld(state, wx, wy) {
     if (!state) return null;
     var hit = null, hd = 0;
     state.ents.forEach(function (e) {
       if (e.controlled === true) return;
-      if (!entityHitTest(e, wx, wy)) return;
       var dx = e.x - wx, dy = e.y - wy;
+      if (e.kind === 'creation') {
+        var mx = Math.floor(e.x), my = Math.floor(e.y);
+        if (!(wx >= mx && wx <= mx + 1 && wy >= my && wy <= my + 1)) return;
+      } else {
+        if (dx * dx + dy * dy >= CLICK_TOLERANCE * CLICK_TOLERANCE) return;
+      }
       var d = dx * dx + dy * dy;
       if (!hit || d < hd) { hit = e; hd = d; }
     });
