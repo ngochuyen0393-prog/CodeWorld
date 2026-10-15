@@ -208,11 +208,11 @@ pub fn route_intents(
 /// 喷气补偿 = 生产重力模 |DefaultPhysicsEngine::default().gravity|（-9.8/拍）。
 /// SetPos 是绝对坐标且阶段二 a 先应用、c 步重力才扣：飞行步 dy = 净位移 + 9.8，
 /// 重力后净位移恰为意图步长（与 S 间谍 move_by(0,+9.8) 悬停同一耦合，#010/#029）。
-/// 改物理默认重力参数必须同步本值。
-const HOVER_JET: f64 = 9.8;
+/// 改物理默认重力参数必须同步本值。pub(crate)：main.rs 悬停中出刀不断气复用。
+pub(crate) const HOVER_JET: f64 = 9.8;
 /// 地面线阈值：目标/实体 y 高于此值才算空中（点击地面 y≈0，留半格余量防浮点
-/// 噪声把贴地点击误判成飞行目标）
-const GROUND_EPS: f64 = 0.5;
+/// 噪声把贴地点击误判成飞行目标）。pub(crate)：main.rs 空中判定复用同口径。
+pub(crate) const GROUND_EPS: f64 = 0.5;
 
 /// 点击走位的一步分解（net-protocol.md v1.4 三维语义）：
 /// - 地面目标 + 实体在地面：旧版先横后竖（回归锚，v1.2 语义零改动）
@@ -242,8 +242,9 @@ fn next_move_step(tpos: (f64, f64), pos: Option<(f64, f64)>) -> Option<Controlle
     }
     let sign = |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 };
     if py > GROUND_EPS || tpos.1 > GROUND_EPS {
-        if diff.1.abs() > 0.5 {
-            // 垂直优先：每拍净 ±1 格逼近目标高度（目标在地面 = 降落到地面线）
+        // 垂直优先：高度差未收进半格，或目标本就在地面（先落地再走，不贴地平飞
+        // ——贴地平飞到点即清目标断喷气，半格坠落会与前端预测分歧瞬移）
+        if diff.1.abs() > 0.5 || tpos.1 <= GROUND_EPS {
             let dy = if diff.1 > 0.0 {
                 1.0 + HOVER_JET
             } else {
@@ -255,9 +256,16 @@ fn next_move_step(tpos: (f64, f64), pos: Option<(f64, f64)>) -> Option<Controlle
                 phase: FlightPhase::Climb,
             });
         }
-        // 高度到位：水平推进，喷气维持（该分支仅空中可达）
+        // 高度到位：水平推进，喷气维持（该分支仅空中可达）；|dx|≤1 终进近半步
+        // 直接踏上目标 x——点击是连续坐标，垂直残差吃掉 0.25 到达预算时 ±1 整步
+        // 会在容差带两侧永久振荡（永不到达永不悬停，审查 P1）
+        let sx = if diff.0.abs() <= 1.0 {
+            diff.0
+        } else {
+            sign(diff.0)
+        };
         return Some(ControlledAction::Fly {
-            dx: sign(diff.0),
+            dx: sx,
             dy: HOVER_JET,
             phase: FlightPhase::Level,
         });
@@ -863,6 +871,64 @@ mod tests {
         let action = route_intents(&[Intent::Stop], Some(target), None, Some((30.0, 0.0)), &mut mt);
         assert_eq!(action, None, "地面 stop 站住");
         assert_eq!(mt, None, "地面 stop 清除目标");
+    }
+
+    #[test]
+    fn aerial_fractional_target_final_approach_no_oscillation() {
+        // 审查 P1：点击是连续坐标——非整数 tx + 垂直残差 |dy|∈(0.3,0.5] 吃掉
+        // 0.25 到达预算时，±1 整步会在容差带两侧永久振荡（永不到达永不悬停）。
+        // 修法：|dx|≤1 终进近半步直接踏上目标 x。（tx=32.25 精确可表示，
+        // 断言免 f64 噪声）
+        let target = eid(1);
+        let mut mt = Some((target, (32.25, 8.5)));
+        // 高度逼近到位（y=8，dy=0.5），水平差 2.25：整步东移
+        let action = route_intents(&[], Some(target), None, Some((30.0, 8.0)), &mut mt);
+        assert_eq!(
+            action,
+            Some((
+                target,
+                ControlledAction::Fly { dx: 1.0, dy: 9.8, phase: FlightPhase::Level }
+            )),
+            "水平差 >1：整步推进"
+        );
+        // x=32（dx=0.25，dy=0.5 使 dist²=0.3125>0.25 未到达）：终进近半步踏 0.25
+        let action2 = route_intents(&[], Some(target), None, Some((32.0, 8.0)), &mut mt);
+        assert_eq!(
+            action2,
+            Some((
+                target,
+                ControlledAction::Fly { dx: 0.25, dy: 9.8, phase: FlightPhase::Level }
+            )),
+            "终进近半步（|dx|≤1 踏上目标 x），防 ±1 永摆"
+        );
+        // 踏上目标 x：dy 残差 0.5 = dist² 0.25 ≤ 0.25 到达转悬停
+        let action3 = route_intents(&[], Some(target), None, Some((32.25, 8.0)), &mut mt);
+        assert_eq!(
+            action3,
+            Some((
+                target,
+                ControlledAction::Fly { dx: 0.0, dy: 9.8, phase: FlightPhase::Hover }
+            )),
+            "半步到位即悬停（收敛不振荡）"
+        );
+    }
+
+    #[test]
+    fn air_low_altitude_ground_target_descends_not_glides() {
+        // 审查 P2：半空贴地（y=0.6）点近处地面目标（ty=0.3，垂直残差 ≤0.5 且
+        // 水平差 >0.5 未到到达窗）——必须先降完落地再走（不贴地"平飞"后清目标
+        // 坠 0.6 格，防与前端预测分歧瞬移）
+        let target = eid(1);
+        let mut mt = Some((target, (30.8, 0.3)));
+        let action = route_intents(&[], Some(target), None, Some((30.0, 0.6)), &mut mt);
+        assert_eq!(
+            action,
+            Some((
+                target,
+                ControlledAction::Fly { dx: 0.0, dy: 8.8, phase: FlightPhase::Climb }
+            )),
+            "目标是地面：垂直优先降完，不贴地平飞"
+        );
     }
 
     #[test]

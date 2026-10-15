@@ -801,6 +801,7 @@ fn tick_with_intents(
     } else {
         None
     };
+    let mut jet_continues = false; // 空中出刀不断气标记（攻击拍喷气补偿已排队）
     if let (Some((name, _)), Some((id, act))) = (&online, &action) {
         match act {
             input::ControlledAction::Move(dx, dy) => {
@@ -842,13 +843,28 @@ fn tick_with_intents(
                 }
             }
             input::ControlledAction::Attack(tpos) => {
+                // 空中出刀不断气（审查 P1）：悬停/飞行是持续意图（attack 不清目标，
+                // #027 并存语义），攻击拍仍排队喷气补偿 SetPos——否则一拍重力全额
+                // 坠地钳 0（y=3 悬停=砸地再爬 3 拍）。攻击拍不移动（无横移/爬升）
+                if let Some(e) = world.entities.get(id) {
+                    let (x, y) = e.pos();
+                    if y > input::GROUND_EPS {
+                        pending.push(PendingChange::SetPos {
+                            entity: *id,
+                            new_pos: (x, y + input::HOVER_JET),
+                        });
+                        jet_continues = true;
+                    }
+                }
                 tracing::info!("[input] 操控意图 Attack target={tpos:?} player={name}（操控刀优先）");
             }
         }
     }
-    // 离开飞行（落地到达/键盘接管/出刀分心）：相位清零打结束沿——重力接管，
-    // 摔落伤害物理照常（#029：中断即坠落，无人为税）
+    // 离开飞行（落地到达/键盘接管/喷气中断）：相位清零打结束沿——重力接管，
+    // 摔落伤害物理照常（#029：中断即坠落，无人为税）。空中出刀（jet_continues）
+    // 不算离开飞行：喷气意图未被出刀撤回
     if sandbox_map.flight_phase.is_some()
+        && !jet_continues
         && !matches!(&action, Some((_, input::ControlledAction::Fly { .. })))
     {
         tracing::info!(
@@ -3362,6 +3378,23 @@ mod tests {
         assert!((py - 3.0).abs() < 1e-6, "悬停维持：喷气抵消重力位置稳定，实际 {py}");
         assert_eq!(px, 30.0, "独占抑制自主 on_tick（AUTO_MOVER 的 +1 东移没跑）");
         assert!(map.ws_move_target.is_some(), "悬停目标保留（新意图才改变）");
+    }
+
+    #[test]
+    fn controlled_hover_attack_does_not_drop() {
+        // 审查 P1：悬停中出刀不断气——悬停是持续意图（attack 不清目标，#027 并存
+        // 语义），攻击拍仍排队喷气补偿 SetPos，位置稳定不坠落（否则一拍砸地再爬）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let fly = vec![input::Intent::WsMove { x: 30.0, y: 3.0 }];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &fly);
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 5);
+        assert_eq!(map.flight_phase, Some(input::FlightPhase::Hover), "前置：悬停已建立");
+        let strike = vec![input::Intent::WsAttack { x: 40.0, y: 0.0 }];
+        tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &strike);
+        let y = world.entities.get(&pid).unwrap().pos().1;
+        assert!((y - 3.0).abs() < 1e-6, "悬停中出刀位置稳定不坠落，实际 {y}");
+        assert_eq!(map.flight_phase, Some(input::FlightPhase::Hover), "出刀不断气（相位保持）");
     }
 
     #[test]

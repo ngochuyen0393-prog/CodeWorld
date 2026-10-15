@@ -334,11 +334,13 @@
       var dx = tx - x, dy = ty - y;
       if (dx * dx + dy * dy <= 0.25) break; // 已到达：地面站住清目标 / 空中悬停（位置冻结）
       if (y > FLY_GROUND || aerialTarget) {
-        if (Math.abs(dy) > 0.5) {
-          y += signStep(dy);                  // 垂直优先：净 ±1/拍（爬升/降落）
+        if (Math.abs(dy) > 0.5 || !aerialTarget) {
+          y += signStep(dy);                  // 垂直优先：净 ±1/拍（爬升/降落；目标是地面=先降完不贴地平飞）
           if (y < 0) y = 0;                   // 落地钳 0（镜像服务器地面约束）
         } else {
-          x += signStep(dx);                  // 高度到位：水平推进（喷气维持，净横 ±1/拍）
+          // 高度到位：水平推进（喷气维持）；|dx|≤1 终进近半步踏上目标 x
+          // （镜像服务器：非整数点击坐标下 ±1 整步会在容差带两侧永久振荡）
+          x += Math.abs(dx) <= 1 ? dx : signStep(dx);
         }
       } else if (dx !== 0) {
         x += signStep(dx);                    // 地面走位：先横
