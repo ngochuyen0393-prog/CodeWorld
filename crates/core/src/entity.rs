@@ -100,6 +100,11 @@ pub struct Entity {
     pos: (f64, f64),
     velocity: (f64, f64),
 
+    // 身体半径（#030 半径物理：活动实体=圆，圆心即 pos；creation 不用它，用占地 AABB）
+    /// serde default：旧快照无此字段时回退 0.5（存储向后兼容）
+    #[serde(default = "default_radius")]
+    radius: f64,
+
     // 外观与动作状态
     /// 渲染数据
     pub appearance: Appearance,
@@ -115,6 +120,11 @@ pub struct Entity {
     alive: bool,
     /// 创建 tick
     pub created_tick: u64,
+}
+
+/// radius 默认值（新实体与旧快照回退共用：四生物/玩家/测试构造器全兼容）
+fn default_radius() -> f64 {
+    0.5
 }
 
 impl Entity {
@@ -139,6 +149,7 @@ impl Entity {
             code_hash,
             pos,
             velocity: (0.0, 0.0),
+            radius: default_radius(),
             appearance,
             action_state: ActionState::Idle,
             instruction_guard: InstructionGuard::new(per_tick_instruction_limit),
@@ -150,6 +161,7 @@ impl Entity {
             entity_id = %e.id.0,
             owner = %e.owner.0,
             pos = ?e.pos,
+            radius = e.radius,
             created_tick,
             "实体创建"
         );
@@ -159,6 +171,26 @@ impl Entity {
     /// 当前逻辑坐标
     pub fn pos(&self) -> (f64, f64) {
         self.pos
+    }
+
+    /// 身体半径（#030：活动实体圆半径；creation 不用它，身体=占地格 AABB）
+    pub fn radius(&self) -> f64 {
+        self.radius
+    }
+
+    /// 设置身体半径（超界 warn 并钳制到 0.05..=25.0，非有限值回退 0.5——
+    /// 与 spawn 第 7 参校验同口径，clamp 逻辑唯一实现在 collision::clamp_radius）
+    pub fn set_radius(&mut self, radius: f64) {
+        let clamped = crate::collision::clamp_radius(radius);
+        if clamped != radius {
+            tracing::warn!(
+                entity_id = %self.id.0,
+                requested = radius,
+                clamped,
+                "实体半径校验钳制"
+            );
+        }
+        self.radius = clamped;
     }
 
     /// 设置坐标（物理规则校验与变换管线由 space/physics 模块负责，此处只存）
@@ -360,6 +392,42 @@ mod tests {
         assert!(e.is_alive());
         e.kill();
         assert!(!e.is_alive());
+    }
+
+    // === radius（#030 半径物理）===
+
+    #[test]
+    fn entity_default_radius_is_half() {
+        // 创建：radius 默认 0.5（四生物/A/D/S/H/P 与旧测试构造器全兼容）
+        let e = sample_entity();
+        assert_eq!(e.radius(), 0.5);
+    }
+
+    #[test]
+    fn entity_set_radius_clamps_to_bounds() {
+        // 校验：0.05 ≤ radius ≤ 25.0，超界钳制（spawn 第 7 参同口径）
+        let mut e = sample_entity();
+        e.set_radius(2.0);
+        assert_eq!(e.radius(), 2.0);
+        e.set_radius(100.0);
+        assert_eq!(e.radius(), 25.0, "超上限钳到 25.0");
+        e.set_radius(0.01);
+        assert_eq!(e.radius(), 0.05, "低于下限钳到 0.05");
+        e.set_radius(f64::NAN);
+        assert_eq!(e.radius(), 0.5, "非有限值回退默认 0.5");
+    }
+
+    #[test]
+    fn entity_radius_serde_backward_compat() {
+        // 读写：旧快照 JSON 无 radius 字段 → 反序列化回退默认 0.5（存储兼容）
+        let e = sample_entity();
+        let mut json = serde_json::to_string(&e).unwrap();
+        // 手工剥掉 radius 字段模拟旧版数据
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("radius");
+        json = v.to_string();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.radius(), 0.5);
     }
 
     #[test]

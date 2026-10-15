@@ -307,46 +307,35 @@
 
   // ==== [PURE-BEGIN] 纯逻辑区（node 机器验证覆盖；不碰 DOM/WS/Canvas）====
 
-  // ⚠️ 镜像规则声明（v1.4）：applyMoveSteps 与 bin/codeworld/src/input.rs 的
+  // ⚠️ 镜像规则声明（v1.5，#030 半径物理）：applyMoveSteps 与 bin/codeworld/src/input.rs 的
   // next_move_step 是同一规则的 JS/Rust 双实现——
-  // 地面目标+地面实体：逐拍一步、先横后竖、格距平方 ≤0.25（格距 ≤0.5）到达
-  // 即停清目标（v1.2 语义不变）；
-  // 空中目标或空中实体：垂直优先每拍净 ±1 格（爬升/降落），高度到位后水平推进，
-  // 到位悬停位置冻结（服务器悬停=每拍喷气净零，本地无需建模）；
-  // 空中降落触地钳 0（镜像服务器地面约束）。
-  // 本函数建模"净位移"——服务器 SetPos 内含 +9.8 重力补偿、阶段二物理扣回，
-  // 净效果与本镜像一致（对账阈值 0.25 格覆盖浮点噪声）。显式符号函数两边都避开
-  // （Rust f64::signum(+0.0)=1.0 的坑）。改一处必须同步另一处，
-  // 协议契约见 docs/net-protocol.md v1.4「客户端预测与和解」节。
-  var FLY_GROUND = 0.5; // 地面线阈值（与服务器 input.rs GROUND_EPS 同步）
+  // 矢量步：步长恒 1.0 朝目标矢量方向（斜走一步到位，L 形先横后竖废除）；
+  // 剩余距离 ≤1.0 终进近一步精确踏上目标（防到达容差带两侧振荡）；
+  // 格距平方 ≤0.25（格距 ≤0.5）到达即停（地面清目标 / 空中悬停位置冻结）；
+  // 落地钳半径线 0.5（镜像服务器地面约束：圆心即位置，脚贴地）。
+  // 本函数建模"意图路径"（无阻挡理想轨迹）——服务器分轴滑动/被挡由和解对账
+  // 纠偏（分歧瞬移回服务器真实坐标，#028 契约不变）。改一处必须同步另一处，
+  // 协议契约见 docs/net-protocol.md v1.5「客户端预测与和解」节。
+  var FLY_GROUND = 0.5; // 地面线 = 玩家半径（P 恒 0.5；与服务器半径线同值）
 
-  function signStep(v) {
-    return v > 0 ? 1.0 : (v < 0 ? -1.0 : 0.0);
-  }
-
-  // 从 (px,py) 向目标连走 steps 步（每步净 1 格，到达即停）；镜像 next_move_step 的
+  // 从 (px,py) 向目标连走 steps 步（每步 1.0 矢量步，到达即停）；镜像 next_move_step 的
   // 循环展开版——每次迭代等价于 Rust 侧调用一次 next_move_step 的净效果
   function applyMoveSteps(px, py, tx, ty, steps) {
     var x = px, y = py;
     var k = steps;
-    var aerialTarget = ty > FLY_GROUND;
     while (k > 0) {
       var dx = tx - x, dy = ty - y;
-      if (dx * dx + dy * dy <= 0.25) break; // 已到达：地面站住清目标 / 空中悬停（位置冻结）
-      if (y > FLY_GROUND || aerialTarget) {
-        if (Math.abs(dy) > 0.5 || !aerialTarget) {
-          y += signStep(dy);                  // 垂直优先：净 ±1/拍（爬升/降落；目标是地面=先降完不贴地平飞）
-          if (y < 0) y = 0;                   // 落地钳 0（镜像服务器地面约束）
-        } else {
-          // 高度到位：水平推进（喷气维持）；|dx|≤1 终进近半步踏上目标 x
-          // （镜像服务器：非整数点击坐标下 ±1 整步会在容差带两侧永久振荡）
-          x += Math.abs(dx) <= 1 ? dx : signStep(dx);
-        }
-      } else if (dx !== 0) {
-        x += signStep(dx);                    // 地面走位：先横
+      var d2 = dx * dx + dy * dy;
+      if (d2 <= 0.25) break;                  // 已到达：地面站住清目标 / 空中悬停（位置冻结）
+      var sx, sy;
+      if (d2 <= 1.0) {
+        sx = dx; sy = dy;                     // 终进近：剩余 ≤1.0 一步踏上目标（防振荡）
       } else {
-        y += signStep(dy);                    // 横已到位 -> 竖
+        var inv = 1.0 / Math.sqrt(d2);
+        sx = dx * inv; sy = dy * inv;         // 矢量方向 ×1.0（斜走一步到位）
       }
+      x += sx; y += sy;
+      if (y < FLY_GROUND) y = FLY_GROUND;     // 落地钳半径线（镜像服务器地面约束）
       k--;
     }
     return { x: x, y: y };
@@ -442,18 +431,29 @@
 
   // ---- 鼠标操控（#027 第三刀）：纯逻辑函数（node 桩环境机器验证过）----
 
-  // 点击处的实体命中判定（任务书钉死语义）：快照采样里找距点击世界坐标
-  // 最近且距离 < 半格(0.5) 的实体；操控目标自己排除（点自己不出刀）
+  // 点击处的实体命中判定（#030/#031 与服务器同判据）：点在身体内即命中——
+  // 活动实体=圆（距圆心 < radius 严格）；creation=格对齐方块（闭区间包含）。
+  // 半径内多个命中取最近者；操控目标自己排除（点自己不出刀）
+  function entityHitTest(e, wx, wy) {
+    if (e.kind === 'creation') {
+      var mx = Math.floor(e.x), my = Math.floor(e.y);
+      return wx >= mx && wx <= mx + 1 && wy >= my && wy <= my + 1;
+    }
+    var dx = e.x - wx, dy = e.y - wy;
+    return dx * dx + dy * dy < e.radius * e.radius;
+  }
+
   function nearestEntityAtWorld(state, wx, wy) {
     if (!state) return null;
-    var hit = null;
+    var hit = null, hd = 0;
     state.ents.forEach(function (e) {
       if (e.controlled === true) return;
+      if (!entityHitTest(e, wx, wy)) return;
       var dx = e.x - wx, dy = e.y - wy;
-      var d = Math.sqrt(dx * dx + dy * dy);
-      if (d < 0.5 && (!hit || d < hit.d)) hit = { e: e, d: d };
+      var d = dx * dx + dy * dy;
+      if (!hit || d < hd) { hit = e; hd = d; }
     });
-    return hit ? hit.e : null;
+    return hit;
   }
 
   // 点击 -> 上行消息构造（纯决策）：有实体=attack（单次出刀，服务器以坐标找人），
@@ -561,7 +561,8 @@
       ctx.stroke();
     }
 
-    // 实体：glyph 居中画在插值后的连续世界坐标上
+    // 实体：glyph 居中画在插值后的连续世界坐标上；活动实体按 radius 画身体圆
+    //（#030：圆圈大小=身体，碰撞即此圈）；creation 画格对齐方形底衬（地址格）
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.font = Math.round(Math.min(32, Math.max(10, cell * 0.9))) + 'px Consolas, monospace';
@@ -572,6 +573,12 @@
       if (e.kind === 'creation') {
         ctx.fillStyle = 'rgba(255,255,255,0.10)'; // 造物方形底衬
         ctx.fillRect(p.x - half, p.y - half, half * 2, half * 2);
+      } else if (e.radius > 0) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.16)'; // 身体圆轮廓（半径可视化，网格线保留地址感）
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, Math.max(cell * e.radius, 4), 0, Math.PI * 2);
+        ctx.stroke();
       }
       if (e.controlled === true) {
         ctx.strokeStyle = '#ffffff';              // 操控目标白色描边框

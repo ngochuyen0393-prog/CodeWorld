@@ -9,6 +9,7 @@
 //!
 //! 本 crate 只定义数据结构与基本方法，不实现 tick 循环或 WASM 沙箱逻辑。
 
+pub mod collision;
 pub mod config;
 pub mod entity;
 pub mod guard;

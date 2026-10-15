@@ -1,7 +1,8 @@
 //! 实体占位判定（#021 实体占位制：一格一物，Screeps 阻挡制口径）
 //!
-//! 格键 = (floor(x), floor(y))：实体逻辑坐标仍是 f64，占位判定取整到格子。
-//! 全框架移动/重力/spawn 三处占位检查共用本函数（同源无绕过）。
+//! 【#030 已退役】半径物理取代格子占位：移动/重力/spawn 三处判据改走
+//! collision.rs 身体重叠（circle/AABB）。本模块保留仅作历史记录，
+//! 旧测试保留其行为文档价值（与 physics resolve_collision_archived 同例）。
 
 use crate::entity::{Entity, EntityId};
 use std::collections::HashMap;
@@ -10,6 +11,10 @@ use std::collections::HashMap;
 ///
 /// 返回占据者 EntityId（异常多占据时取 EntityId 最小者，保证确定序）；
 /// 空格 / 仅被 exclude 自己占据 / 占据者已死 → None。
+#[deprecated(
+    since = "0.1.0",
+    note = "#030 半径物理：格子占位退役，改用 collision::body_overlap 身体裁决"
+)]
 pub fn cell_occupied_by(
     entities: &HashMap<EntityId, Entity>,
     pos: (f64, f64),
@@ -37,6 +42,7 @@ pub fn cell_occupied_by(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::entity::{Appearance, Entity, PlayerId};

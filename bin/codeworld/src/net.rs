@@ -76,6 +76,8 @@ pub(crate) struct ViewportInfo {
 
 /// 单实体快照。kind 决定可选字段：player 带 controlled；creation 带 owner；
 /// name 恒有（v1.1，= code_hash 代码身份）；npc 无可选字段（skip_serializing_if 保持 JSON 干净）。
+/// radius（v1.5，#030）：活动实体圆半径（前端按它画身体圆）；creation 是格对齐
+/// 方块，radius 无意义（前端按 kind=creation 画方格底衬）。
 #[derive(Debug, Serialize)]
 pub(crate) struct EntitySnapshot {
     pub id: String,
@@ -83,6 +85,7 @@ pub(crate) struct EntitySnapshot {
     pub color: String,
     pub x: f64,
     pub y: f64,
+    pub radius: f64,
     pub kind: &'static str,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +128,7 @@ pub(crate) fn build_snapshot(
                 color: e.appearance.color.clone(),
                 x,
                 y,
+                radius: e.radius(),
                 kind,
                 name: e.code_hash.clone(),
                 controlled: (kind == "player").then(|| Some(e.id) == controlled),

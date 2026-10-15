@@ -47,6 +47,9 @@ pub struct PendingSpawn {
     pub glyph: String,
     /// 造物外观颜色（import 层已校验：非空）
     pub color: String,
+    /// 身体半径（#030 spawn 第 7 参；import 层已校验钳制 0.05..=25.0；
+    /// creation 身体=占地格 AABB 不用它，快照协议携带）
+    pub radius: f64,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
 }
@@ -567,7 +570,8 @@ impl SandboxManager {
              x: f64,
              y: f64,
              glyph_ptr: i32,
-             color_ptr: i32|
+             color_ptr: i32,
+             radius: f64|
              -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
@@ -650,11 +654,14 @@ impl SandboxManager {
                 }
                 // fuel 配额继承创造者（造物与创造者同算力档）
                 let fuel_limit = caller.data().fuel_limit;
+                // #030 第 7 参 radius 校验钳制（0.05..=25.0，非有限回退 0.5，超界 warn）
+                let radius = codeworld_core::collision::clamp_radius(radius);
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
                     glyph = %glyph,
                     color = %color,
+                    radius,
                     code_len = code.len(),
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
@@ -667,6 +674,7 @@ impl SandboxManager {
                         code,
                         glyph,
                         color,
+                        radius,
                         fuel_limit,
                     });
                 1
@@ -1968,7 +1976,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -1978,6 +1986,7 @@ mod tests {
     i32.const 0 i32.const {len}
     {x} {y}
     i32.const 8192 i32.const 8256
+    f64.const 0.5
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -1993,7 +2002,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
@@ -2004,10 +2013,12 @@ mod tests {
     i32.const 0 i32.const {len}
     f64.const 1.0 f64.const 1.0
     i32.const 8192 i32.const 8256
+    f64.const 0.5
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
     i32.const 8192 i32.const 8256
+    f64.const 0.5
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
@@ -2019,7 +2030,7 @@ mod tests {
 
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
@@ -2028,6 +2039,7 @@ mod tests {
     i32.const 0 i32.const 0
     f64.const 1.0 f64.const 1.0
     i32.const 8192 i32.const 8256
+    f64.const 0.5
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -2037,7 +2049,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -2047,6 +2059,7 @@ mod tests {
     i32.const 0 i32.const {len}
     f64.const 1.0 f64.const 1.0
     i32.const 8192 i32.const 8256
+    f64.const 0.5
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,

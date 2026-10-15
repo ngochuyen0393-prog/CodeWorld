@@ -94,30 +94,28 @@ impl IntentQueue {
 /// 本拍操控行动（route_intents 产物；tick 据此接管操控目标）
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlledAction {
-    /// 操控移动：相对操控目标当前坐标的方向向量（步长 MVP 恒 1.0 格）
-    Move(f64, f64),
-    /// 操控飞行步（期四第五刀 #029 无税版）：SetPos 语义同 Move，但 dy 内含
-    /// 重力补偿（阶段二 a 先应用位移、c 步重力扣回，净位移 = 意图步长）；
-    /// phase 供 main.rs 相位沿打日志（悬停维持不逐拍刷）
-    Fly {
+    /// 操控移动（#030 第六刀：矢量步 + 悬停独立）：
+    /// - dx/dy = 本拍位移。远目标 = 矢量方向归一化 ×1.0（斜走一步到位，L 形废除）；
+    ///   剩余 ≤1.0 = 一步精确踏上目标（防容差带振荡）
+    /// - aerial=true = 本拍悬停（升力独立于移动被挡：main.rs 据此把实体放进
+    ///   物理免重力集合——移动被挡/滑动时升力照出，被挡≠坠落，第五刀 bug 根治）
+    Move {
         dx: f64,
         dy: f64,
-        phase: FlightPhase,
+        aerial: bool,
     },
-    /// 操控攻击：目标坐标（最近可见敌人，与 scan 同源口径）；
+    /// 操控攻击：目标坐标（最近可见敌人 / 点击坐标，与 scan 同源口径）；
     /// None = 视野内无目标（本拍挥空不出刀，但操控仍接管本拍）
     Attack(Option<(f64, f64)>),
 }
 
-/// 操控飞行相位（期四第五刀）：Fly 行动携带，main.rs 按相位翻转沿打日志
-/// （任务 A.4：状态切换才打日志，悬停维持每拍喷气不刷）
+/// 操控飞行相位（期四第六刀简化：爬升/平飞合一——矢量方向自然覆盖，保留悬停态）。
+/// main.rs 按相位翻转沿打日志（状态切换才打，悬停维持不逐拍刷）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FlightPhase {
-    /// 垂直逼近：爬升/降落每拍净 ±1 格（喷气补偿重力；目标地面 = 降落到地面线）
-    Climb,
-    /// 平飞：高度已到位，水平推进每拍净 ±1 格（喷气维持高度）
-    Level,
-    /// 悬停：到位/空中停止后每拍喷气抵消重力（与 S 间谍同款物理动作，#029 无税）
+    /// 飞行：矢量步逼近目标（爬升/平飞/受控降落合一）
+    Fly,
+    /// 悬停：到位/空中停止后原地维持（升力照出，目标保留到新意图）
     Hover,
 }
 
@@ -125,8 +123,7 @@ impl FlightPhase {
     /// 日志中文名（相位沿日志用，GBK 安全性同既有中文 tracing 日志）
     pub fn name(self) -> &'static str {
         match self {
-            Self::Climb => "爬升",
-            Self::Level => "平飞",
+            Self::Fly => "飞行",
             Self::Hover => "悬停",
         }
     }
@@ -137,7 +134,8 @@ impl FlightPhase {
 /// - control_target = me 声明且在线的操控目标实体；None = 观战（无目标可路由）
 /// - 同拍多意图按到达顺序折叠，后到覆盖先到（最后一键说了算）；Quit 不路由
 ///   （退出是主循环语义，输入线程已消费）
-/// - `entity_pos`：操控目标当前坐标（算走位步向用）
+/// - `entity_pos`：操控目标当前坐标（算走位步向 + 空中判定用）
+/// - `radius`：操控目标身体半径（#030：空中判定线 = y > radius，圆心即位置）
 /// - `move_target`：点击走位持续目标（in-out 状态，存 EntitySandboxMap 跨拍）；
 ///   键盘 Move 直接接管脚下并清除它；Stop 清除站住；目标换实体不交接
 /// - `nearest_enemy`：操控目标的最近可见敌人坐标（调用方用 main.rs find_nearest_enemy
@@ -147,6 +145,7 @@ pub fn route_intents(
     control_target: Option<EntityId>,
     nearest_enemy: Option<(f64, f64)>,
     entity_pos: Option<(f64, f64)>,
+    radius: f64,
     move_target: &mut Option<(EntityId, (f64, f64))>,
 ) -> Option<(EntityId, ControlledAction)> {
     let target = control_target?;
@@ -157,13 +156,21 @@ pub fn route_intents(
             *move_target = None;
         }
     }
+    // 空中判定（#030：地面线 = 半径线，圆心即位置）：实体当前悬空 = 本拍意图
+    // 自带悬停升力（键盘移动/攻击空中不坠落——升力独立于移动，第五刀 bug 根治）
+    let aerial_now = entity_pos.map(|(_, py)| py > radius).unwrap_or(false);
     let mut action: Option<ControlledAction> = None;
     for intent in intents {
         match intent {
             Intent::Move { dx, dy } => {
-                // 键盘直控 = 玩家接管脚下：清除点击走位目标（后到优先，同拍互斥）
+                // 键盘直控 = 玩家接管脚下：清除点击走位目标（后到优先，同拍互斥）；
+                // 空中按键 = 飞行操控（W 爬升 S 降落 A/D 平移，升力照出）
                 *move_target = None;
-                action = Some(ControlledAction::Move(*dx, *dy));
+                action = Some(ControlledAction::Move {
+                    dx: *dx,
+                    dy: *dy,
+                    aerial: aerial_now,
+                });
             }
             Intent::Attack => action = Some(ControlledAction::Attack(nearest_enemy)),
             Intent::WsMove { x, y } => {
@@ -173,30 +180,29 @@ pub fn route_intents(
             }
             Intent::WsAttack { x, y } => action = Some(ControlledAction::Attack(Some((*x, *y)))),
             Intent::Stop => {
-                match entity_pos {
+                if aerial_now {
                     // 空中停止 = 悬停不坠（stop 语义 = 停止移动不是坠落）：目标改写
-                    // 为脚下坐标转悬停维持；要落地玩家点地面（任务 A.2）
-                    Some((px, py)) if py > GROUND_EPS => {
-                        *move_target = Some((target, (px, py)));
-                        action = Some(ControlledAction::Fly {
-                            dx: 0.0,
-                            dy: HOVER_JET,
-                            phase: FlightPhase::Hover,
-                        });
+                    // 为脚下坐标转悬停维持；要落地玩家点地面
+                    if let Some(feet) = entity_pos {
+                        *move_target = Some((target, feet));
                     }
-                    _ => {
-                        *move_target = None;
-                        action = None;
-                    }
+                    action = Some(ControlledAction::Move {
+                        dx: 0.0,
+                        dy: 0.0,
+                        aerial: true,
+                    });
+                } else {
+                    *move_target = None;
+                    action = None;
                 }
             }
             Intent::Quit => {}
         }
     }
-    // 持续目标执行：本拍无其他行动且点击目标在册 -> 向目标走一步；到达（格距<0.5）清除站住
+    // 持续目标执行：本拍无其他行动且点击目标在册 -> 向目标走一步；到达（格距≤0.5）清除站住
     if action.is_none() {
         if let Some((_tid, tpos)) = *move_target {
-            match next_move_step(tpos, entity_pos) {
+            match next_move_step(tpos, entity_pos, radius) {
                 Some(step) => action = Some(step),
                 None => *move_target = None,
             }
@@ -205,76 +211,48 @@ pub fn route_intents(
     action.map(|a| (target, a))
 }
 
-/// 喷气补偿 = 生产重力模 |DefaultPhysicsEngine::default().gravity|（-9.8/拍）。
-/// SetPos 是绝对坐标且阶段二 a 先应用、c 步重力才扣：飞行步 dy = 净位移 + 9.8，
-/// 重力后净位移恰为意图步长（与 S 间谍 move_by(0,+9.8) 悬停同一耦合，#010/#029）。
-/// 改物理默认重力参数必须同步本值。pub(crate)：main.rs 悬停中出刀不断气复用。
-pub(crate) const HOVER_JET: f64 = 9.8;
-/// 地面线阈值：目标/实体 y 高于此值才算空中（点击地面 y≈0，留半格余量防浮点
-/// 噪声把贴地点击误判成飞行目标）。pub(crate)：main.rs 空中判定复用同口径。
-pub(crate) const GROUND_EPS: f64 = 0.5;
-
-/// 点击走位的一步分解（net-protocol.md v1.4 三维语义）：
-/// - 地面目标 + 实体在地面：旧版先横后竖（回归锚，v1.2 语义零改动）
-/// - 空中语境（目标 y>0.5 或实体在空中）：一切步都是喷气步（Fly）——垂直优先
-///   每拍净 ±1 格逼近目标高度（爬升 dy=+10.8 / 降落 dy=+8.8，重力后净 ±1），
-///   高度到位后水平推进（dy=+9.8 维持高度）；目标地面 = 先降到地面线再走
-/// - 到达：地面目标清除站住（旧版）；空中目标转悬停（每拍 +9.8 净零，目标保留，
-///   悬停持续到新意图——新 move 改向 / stop 锚定脚下 / 键盘接管清除）
+/// 点击走位的一步分解（net-protocol.md v1.5 矢量步语义，#030 第六刀）：
+/// - 步长恒 1.0 朝目标矢量方向（dx,dy 归一化 ×1.0——斜走一步到位，L 形先横后竖废除）
+/// - 终进近：剩余距离 ≤1.0 时一步精确踏上目标（防 ±1 整步在到达容差带两侧永久振荡）
+/// - 到达判定 = 欧氏格距平方 ≤ 0.25（格距 ≤0.5，含边界防振荡）：
+///   空中目标转悬停维持（目标保留），地面目标清除站住
+/// - aerial 标记：实体悬空（py > radius）或目标在空中（tpos.1 > radius）——
+///   main.rs 据此注入物理免重力集合（升力独立，被挡≠坠落）
 ///
-/// 到达判定 = 欧氏格距平方 <= 0.25（格距 <= 0.5，含边界防振荡）不变；
 /// 坐标有限性由解析层（net.rs）保证，本函数信任来源。
-/// 注意：不能用 f64::signum——signum(+0.0) 返回 1.0 而非 0.0，横轴到位会被
-/// 误判成"还差一横步"永远走不出锯齿。
-fn next_move_step(tpos: (f64, f64), pos: Option<(f64, f64)>) -> Option<ControlledAction> {
+fn next_move_step(
+    tpos: (f64, f64),
+    pos: Option<(f64, f64)>,
+    radius: f64,
+) -> Option<ControlledAction> {
     let (px, py) = pos?;
-    let diff = (tpos.0 - px, tpos.1 - py);
-    if diff.0 * diff.0 + diff.1 * diff.1 <= 0.25 {
-        if tpos.1 > GROUND_EPS {
+    let dx = tpos.0 - px;
+    let dy = tpos.1 - py;
+    let d2 = dx * dx + dy * dy;
+    if d2 <= 0.25 {
+        if tpos.1 > radius {
             // 空中目标到位：悬停维持（目标保留；这是"站着，只是站在空中"）
-            return Some(ControlledAction::Fly {
+            return Some(ControlledAction::Move {
                 dx: 0.0,
-                dy: HOVER_JET,
-                phase: FlightPhase::Hover,
+                dy: 0.0,
+                aerial: true,
             });
         }
-        return None; // 地面目标到位：格距 <= 0.5，清除目标站住（旧版）
+        return None; // 地面目标到位：清除目标站住
     }
-    let sign = |v: f64| if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 };
-    if py > GROUND_EPS || tpos.1 > GROUND_EPS {
-        // 垂直优先：高度差未收进半格，或目标本就在地面（先落地再走，不贴地平飞
-        // ——贴地平飞到点即清目标断喷气，半格坠落会与前端预测分歧瞬移）
-        if diff.1.abs() > 0.5 || tpos.1 <= GROUND_EPS {
-            let dy = if diff.1 > 0.0 {
-                1.0 + HOVER_JET
-            } else {
-                HOVER_JET - 1.0
-            };
-            return Some(ControlledAction::Fly {
-                dx: 0.0,
-                dy,
-                phase: FlightPhase::Climb,
-            });
-        }
-        // 高度到位：水平推进，喷气维持（该分支仅空中可达）；|dx|≤1 终进近半步
-        // 直接踏上目标 x——点击是连续坐标，垂直残差吃掉 0.25 到达预算时 ±1 整步
-        // 会在容差带两侧永久振荡（永不到达永不悬停，审查 P1）
-        let sx = if diff.0.abs() <= 1.0 {
-            diff.0
-        } else {
-            sign(diff.0)
-        };
-        return Some(ControlledAction::Fly {
-            dx: sx,
-            dy: HOVER_JET,
-            phase: FlightPhase::Level,
-        });
-    }
-    if diff.0 != 0.0 {
-        Some(ControlledAction::Move(sign(diff.0), 0.0)) // 先横：横轴还有差距（地面）
+    let (sx, sy) = if d2 <= 1.0 {
+        // 终进近：剩余 ≤1.0 一步踏上目标（到达容差带不振荡）
+        (dx, dy)
     } else {
-        Some(ControlledAction::Move(0.0, sign(diff.1))) // 横已到位 -> 竖（地面）
-    }
+        // 矢量方向 ×1.0（斜走一步到位）
+        let inv = 1.0 / d2.sqrt();
+        (dx * inv, dy * inv)
+    };
+    Some(ControlledAction::Move {
+        dx: sx,
+        dy: sy,
+        aerial: py > radius || tpos.1 > radius,
+    })
 }
 
 /// 独立输入线程：crossterm 事件轮询 -> 意图入队（生产者）
@@ -491,7 +469,7 @@ mod tests {
 
     // === route_intents：意图路由（#022 双层模型核心；#027 双来源折叠）===
 
-    /// 路由测试便捷包装（旧签名迁移垫片：实体@pos、无点击目标起步）
+    /// 路由测试便捷包装（迁移垫片：实体@pos 半径 0.5、无点击目标起步）
     fn route(
         intents: &[Intent],
         target: Option<EntityId>,
@@ -499,7 +477,23 @@ mod tests {
         pos: Option<(f64, f64)>,
     ) -> Option<(EntityId, ControlledAction)> {
         let mut mt: Option<(EntityId, (f64, f64))> = None;
-        route_intents(intents, target, nearest, pos, &mut mt)
+        route_intents(intents, target, nearest, pos, 0.5, &mut mt)
+    }
+
+    /// 近似相等断言（矢量步产出归一化浮点，用容差比较）
+    fn assert_step_close(
+        action: Option<(EntityId, ControlledAction)>,
+        want: (f64, f64, bool),
+        ctx: &str,
+    ) {
+        match action {
+            Some((_, ControlledAction::Move { dx, dy, aerial })) => {
+                assert!((dx - want.0).abs() < 1e-9, "{ctx}: dx {} != {}", dx, want.0);
+                assert!((dy - want.1).abs() < 1e-9, "{ctx}: dy {} != {}", dy, want.1);
+                assert_eq!(aerial, want.2, "{ctx}: aerial 不符");
+            }
+            other => panic!("{ctx}: 期望 Move 步，实际 {:?}", other),
+        }
     }
 
     #[test]
@@ -511,22 +505,30 @@ mod tests {
 
     #[test]
     fn move_intent_routes_to_control_target() {
+        // 地面实体（y=0.5=半径线）：键盘移动 = 地面步（无升力）
         let target = eid(1);
         let intents = vec![Intent::Move { dx: -1.0, dy: 0.0 }];
         assert_eq!(
-            route(&intents, Some(target), None, Some((30.0, 0.0))),
-            Some((target, ControlledAction::Move(-1.0, 0.0))),
-            "Move 意图翻译为对操控目标的操控行动"
+            route(&intents, Some(target), None, Some((30.0, 0.5))),
+            Some((
+                target,
+                ControlledAction::Move {
+                    dx: -1.0,
+                    dy: 0.0,
+                    aerial: false
+                }
+            )),
+            "Move 意图翻译为对操控目标的地面步"
         );
     }
 
     #[test]
     fn attack_intent_uses_nearest_visible_enemy() {
         let target = eid(1);
-        let enemy_pos = (12.0, 0.0);
+        let enemy_pos = (12.0, 0.5);
         let intents = vec![Intent::Attack];
         assert_eq!(
-            route(&intents, Some(target), Some(enemy_pos), Some((30.0, 0.0))),
+            route(&intents, Some(target), Some(enemy_pos), Some((30.0, 0.5))),
             Some((target, ControlledAction::Attack(Some(enemy_pos)))),
             "Attack 意图锁定调用方给的最近可见敌人（与 scan 同源）"
         );
@@ -538,7 +540,7 @@ mod tests {
         let target = eid(1);
         let intents = vec![Intent::Attack];
         assert_eq!(
-            route(&intents, Some(target), None, Some((30.0, 0.0))),
+            route(&intents, Some(target), None, Some((30.0, 0.5))),
             Some((target, ControlledAction::Attack(None))),
             "Attack(None) = 挥空"
         );
@@ -553,8 +555,8 @@ mod tests {
             Intent::Attack,
         ];
         assert_eq!(
-            route(&intents, Some(target), Some((5.0, 0.0)), Some((30.0, 0.0))),
-            Some((target, ControlledAction::Attack(Some((5.0, 0.0))))),
+            route(&intents, Some(target), Some((5.0, 0.5)), Some((30.0, 0.5))),
+            Some((target, ControlledAction::Attack(Some((5.0, 0.5))))),
             "先移动后攻击 -> 攻击生效"
         );
     }
@@ -567,8 +569,15 @@ mod tests {
             Intent::Move { dx: -1.0, dy: 0.0 },
         ];
         assert_eq!(
-            route(&intents, Some(target), Some((5.0, 0.0)), Some((30.0, 0.0))),
-            Some((target, ControlledAction::Move(-1.0, 0.0))),
+            route(&intents, Some(target), Some((5.0, 0.5)), Some((30.0, 0.5))),
+            Some((
+                target,
+                ControlledAction::Move {
+                    dx: -1.0,
+                    dy: 0.0,
+                    aerial: false
+                }
+            )),
             "先攻击后移动 -> 移动生效"
         );
     }
@@ -585,47 +594,47 @@ mod tests {
     fn empty_intents_route_to_none() {
         // 无人按键且无点击目标 = 无操控行动
         let target = eid(1);
-        assert_eq!(route(&[], Some(target), Some((5.0, 0.0)), Some((30.0, 0.0))), None);
+        assert_eq!(
+            route(&[], Some(target), Some((5.0, 0.5)), Some((30.0, 0.5))),
+            None
+        );
     }
 
     // === route_intents：WS 鼠标意图（#027 点击走位/点击出刀/停止）===
 
     #[test]
     fn ws_move_sets_persistent_target_and_steps_toward_it() {
-        // 点击世界坐标 = 持续目标：本拍立即向目标走一步（先横后竖），目标记入状态
+        // 点击世界坐标 = 持续目标：本拍立即向目标走一步，目标记入状态
+        // （实体站在半径线 y=0.5，点击同高地面 (35,0.5)：矢量步 = 正东 (1,0)）
         let target = eid(1);
-        let intents = vec![Intent::WsMove { x: 35.0, y: 0.0 }];
+        let intents = vec![Intent::WsMove { x: 35.0, y: 0.5 }];
         let mut mt: Option<(EntityId, (f64, f64))> = None;
-        let action = route_intents(&intents, Some(target), None, Some((30.0, 0.0)), &mut mt);
-        assert_eq!(
+        let action = route_intents(&intents, Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        assert_step_close(
             action,
-            Some((target, ControlledAction::Move(1.0, 0.0))),
-            "点击 (35,0) 本拍向东走一步"
+            (1.0, 0.0, false),
+            "点击 (35,0.5) 本拍向东走一步（地面步）",
         );
-        assert_eq!(mt, Some((target, (35.0, 0.0))), "持续目标入册（归属操控实体）");
+        assert_eq!(mt, Some((target, (35.0, 0.5))), "持续目标入册（归属操控实体）");
     }
 
     #[test]
     fn persistent_target_steps_every_tick_without_intents() {
         // 持续目标的核心语义：无按键拍继续向目标走（逐拍一步），不用客户端重发
         let target = eid(1);
-        let mut mt = Some((target, (35.0, 0.0)));
-        let action = route_intents(&[], Some(target), None, Some((32.0, 0.0)), &mut mt);
-        assert_eq!(
-            action,
-            Some((target, ControlledAction::Move(1.0, 0.0))),
-            "无意图拍也向点击目标走一步"
-        );
-        assert_eq!(mt, Some((target, (35.0, 0.0))), "未到达目标保持");
+        let mut mt = Some((target, (35.0, 0.5)));
+        let action = route_intents(&[], Some(target), None, Some((32.0, 0.5)), 0.5, &mut mt);
+        assert_step_close(action, (1.0, 0.0, false), "无意图拍也向点击目标走一步");
+        assert_eq!(mt, Some((target, (35.0, 0.5))), "未到达目标保持");
     }
 
     #[test]
     fn persistent_target_cleared_on_arrival() {
-        // 到达判定 = 格距 < 0.5（浮点不用精确相等）：走到目标邻域即清除站住
+        // 到达判定 = 格距 ≤0.5（含边界防振荡）：走到目标邻域即清除站住
         let target = eid(1);
-        let mut mt = Some((target, (35.0, 0.0)));
-        let action = route_intents(&[], Some(target), None, Some((34.7, 0.0)), &mut mt);
-        assert_eq!(action, None, "格距 0.3 < 0.5 = 已到达，无行动");
+        let mut mt = Some((target, (35.0, 0.5)));
+        let action = route_intents(&[], Some(target), None, Some((34.7, 0.5)), 0.5, &mut mt);
+        assert_eq!(action, None, "格距 0.3 ≤ 0.5 = 已到达，无行动");
         assert_eq!(mt, None, "到达后目标清除（下拍站住不抖动）");
     }
 
@@ -634,9 +643,19 @@ mod tests {
         // 键盘直控 = 玩家接管脚下：清除点击走位目标（松键后不会"复活"旧点击走路）
         let target = eid(1);
         let intents = vec![Intent::Move { dx: 0.0, dy: -1.0 }];
-        let mut mt = Some((target, (35.0, 0.0)));
-        let action = route_intents(&intents, Some(target), None, Some((32.0, 0.0)), &mut mt);
-        assert_eq!(action, Some((target, ControlledAction::Move(0.0, -1.0))));
+        let mut mt = Some((target, (35.0, 0.5)));
+        let action = route_intents(&intents, Some(target), None, Some((32.0, 0.5)), 0.5, &mut mt);
+        assert_eq!(
+            action,
+            Some((
+                target,
+                ControlledAction::Move {
+                    dx: 0.0,
+                    dy: -1.0,
+                    aerial: false
+                }
+            ))
+        );
         assert_eq!(mt, None, "键盘移动清除点击目标");
     }
 
@@ -645,8 +664,8 @@ mod tests {
         // Stop（右键/浏览器 S 键）= 清除点击目标站住；同拍已在走也不走
         let target = eid(1);
         let intents = vec![Intent::Stop];
-        let mut mt = Some((target, (35.0, 0.0)));
-        let action = route_intents(&intents, Some(target), None, Some((32.0, 0.0)), &mut mt);
+        let mut mt = Some((target, (35.0, 0.5)));
+        let action = route_intents(&intents, Some(target), None, Some((32.0, 0.5)), 0.5, &mut mt);
         assert_eq!(action, None, "Stop 拍站住");
         assert_eq!(mt, None, "Stop 清除持续目标");
     }
@@ -655,16 +674,11 @@ mod tests {
     fn ws_attack_uses_clicked_coords_not_nearest() {
         // 点击出刀 = 对点击坐标出刀（单次），不吃 nearest_enemy（与键盘空格同通路不同目标源）
         let target = eid(1);
-        let intents = vec![Intent::WsAttack { x: 15.0, y: 0.0 }];
-        let action = route(
-            &intents,
-            Some(target),
-            Some((5.0, 0.0)),
-            Some((30.0, 0.0)),
-        );
+        let intents = vec![Intent::WsAttack { x: 15.0, y: 0.5 }];
+        let action = route(&intents, Some(target), Some((5.0, 0.5)), Some((30.0, 0.5)));
         assert_eq!(
             action,
-            Some((target, ControlledAction::Attack(Some((15.0, 0.0))))),
+            Some((target, ControlledAction::Attack(Some((15.0, 0.5))))),
             "点击坐标优先于最近敌人坐标"
         );
     }
@@ -674,17 +688,17 @@ mod tests {
         // 同拍互斥后到优先对 WS 意图同样成立：先点敌人后点地 -> 本拍走路且目标更新
         let target = eid(1);
         let intents = vec![
-            Intent::WsAttack { x: 15.0, y: 0.0 },
-            Intent::WsMove { x: 35.0, y: 0.0 },
+            Intent::WsAttack { x: 15.0, y: 0.5 },
+            Intent::WsMove { x: 35.0, y: 0.5 },
         ];
-        let mut mt = Some((target, (40.0, 0.0)));
-        let action = route_intents(&intents, Some(target), None, Some((30.0, 0.0)), &mut mt);
-        assert_eq!(
+        let mut mt = Some((target, (40.0, 0.5)));
+        let action = route_intents(&intents, Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        assert_step_close(
             action,
-            Some((target, ControlledAction::Move(1.0, 0.0))),
-            "后到的 WsMove 生效（本拍向新目标走一步）"
+            (1.0, 0.0, false),
+            "后到的 WsMove 生效（本拍向新目标走一步）",
         );
-        assert_eq!(mt, Some((target, (35.0, 0.0))), "目标被后到点击覆盖");
+        assert_eq!(mt, Some((target, (35.0, 0.5))), "目标被后到点击覆盖");
     }
 
     #[test]
@@ -693,171 +707,139 @@ mod tests {
         let old = eid(1);
         let new = eid(2);
         let intents: Vec<Intent> = vec![];
-        let mut mt = Some((old, (35.0, 0.0)));
-        let action = route_intents(&intents, Some(new), None, Some((30.0, 0.0)), &mut mt);
+        let mut mt = Some((old, (35.0, 0.5)));
+        let action = route_intents(&intents, Some(new), None, Some((30.0, 0.5)), 0.5, &mut mt);
         assert_eq!(action, None, "换角后旧点击目标不生效");
         assert_eq!(mt, None, "旧目标清除");
     }
 
-    // === 期四第五刀：操控飞行（#029 无税版；net-protocol.md v1.4 三维语义）===
+    // === 期四第六刀：矢量步 + 悬停独立（#030/#031；net-protocol.md v1.5）===
 
     #[test]
-    fn aerial_target_climbs_first_net_one_per_tick() {
-        // 空中目标垂直优先：地面起步爬升（喷气步 +10.8，阶段二重力 -9.8 扣回净 +1），
-        // 爬升中继续垂直，到目标高度转悬停（目标保留），无意图拍每拍继续喷气
+    fn diagonal_target_is_one_vector_step_not_l_shape() {
+        // L 形废除（验收 a）：地面斜向目标 = 矢量方向归一化 ×1.0 一步斜走，
+        // 不再先横后竖。（点击半径线地面点 (33,0)：dx=3 dy=-0.5，步长按
+        // sqrt(9.25) 归一化——断言用同一表达式构造期望值免手算浮点）
         let target = eid(1);
-        let mut mt = Some((target, (30.0, 3.0)));
-        let action = route_intents(&[], Some(target), None, Some((30.0, 0.0)), &mut mt);
-        assert_eq!(
-            action,
-            Some((
-                target,
-                ControlledAction::Fly { dx: 0.0, dy: 10.8, phase: FlightPhase::Climb }
-            )),
-            "地面起步爬升：喷气步 +10.8 净 +1/拍"
-        );
-        let action2 = route_intents(&[], Some(target), None, Some((30.0, 1.0)), &mut mt);
-        assert_eq!(
-            action2,
-            Some((
-                target,
-                ControlledAction::Fly { dx: 0.0, dy: 10.8, phase: FlightPhase::Climb }
-            )),
-            "爬升中（y=1）继续垂直逼近"
-        );
-        let action3 = route_intents(&[], Some(target), None, Some((30.0, 3.0)), &mut mt);
-        assert_eq!(
-            action3,
-            Some((
-                target,
-                ControlledAction::Fly { dx: 0.0, dy: 9.8, phase: FlightPhase::Hover }
-            )),
-            "到位转悬停（每拍 +9.8 抵消重力，S 同款）"
-        );
-        assert_eq!(
-            mt,
-            Some((target, (30.0, 3.0))),
-            "悬停维持：目标保留（新意图/stop 才改变状态）"
-        );
-        let action4 = route_intents(&[], Some(target), None, Some((30.0, 3.0)), &mut mt);
-        assert_eq!(
-            action4,
-            Some((
-                target,
-                ControlledAction::Fly { dx: 0.0, dy: 9.8, phase: FlightPhase::Hover }
-            )),
-            "无意图拍继续悬停（目标不清除）"
-        );
+        let mut mt = Some((target, (33.0, 0.0)));
+        let action = route_intents(&[], Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        let d = (9.25f64).sqrt();
+        assert_step_close(action, (3.0 / d, -0.5 / d, false), "斜向目标一步矢量斜走（非先横后竖）");
     }
 
     #[test]
-    fn aerial_target_levels_after_height_then_hovers_on_arrival() {
-        // 高度已到位、水平差 2：平飞（净横 ±1/拍 + 喷气维持高度），到位悬停
+    fn aerial_target_marks_aerial_for_lift() {
+        // 空中目标（ty > radius）→ 步带 aerial 标记（main.rs 注入物理免重力集合，
+        // 升力独立于移动被挡——被挡≠坠落）
         let target = eid(1);
-        let mut mt = Some((target, (32.0, 3.0)));
-        let action = route_intents(&[], Some(target), None, Some((30.0, 3.0)), &mut mt);
-        assert_eq!(
-            action,
-            Some((
-                target,
-                ControlledAction::Fly { dx: 1.0, dy: 9.8, phase: FlightPhase::Level }
-            )),
-            "高度到位 -> 水平推进（先横后竖的横，喷气维持）"
-        );
-        let action2 = route_intents(&[], Some(target), None, Some((31.8, 3.0)), &mut mt);
-        assert_eq!(
-            action2,
-            Some((
-                target,
-                ControlledAction::Fly { dx: 0.0, dy: 9.8, phase: FlightPhase::Hover }
-            )),
-            "水平到位（格距≤0.5）-> 悬停"
-        );
+        let mut mt = Some((target, (30.0, 3.5)));
+        let action = route_intents(&[], Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        assert_step_close(action, (0.0, 1.0, true), "地面起步爬升：aerial 标记");
     }
 
     #[test]
-    fn aerial_target_below_current_height_descends_one_per_tick() {
-        // 悬停 y=12 点 (30,8)：垂直优先降落，净 -1/拍（喷气步 +8.8，重力扣成 -1，
-        // 是受控下降不是自由落体；相位仍属垂直逼近 Climb）
+    fn aerial_arrival_hovers_and_keeps_target() {
+        // 空中目标到位（格距 ≤0.5）：转悬停（零位移 + aerial），目标保留到新意图
         let target = eid(1);
-        let mut mt = Some((target, (30.0, 8.0)));
-        let action = route_intents(&[], Some(target), None, Some((30.0, 12.0)), &mut mt);
+        let mut mt = Some((target, (30.0, 3.5)));
+        let action = route_intents(&[], Some(target), None, Some((30.0, 3.0)), 0.5, &mut mt);
         assert_eq!(
             action,
             Some((
                 target,
-                ControlledAction::Fly { dx: 0.0, dy: 8.8, phase: FlightPhase::Climb }
+                ControlledAction::Move {
+                    dx: 0.0,
+                    dy: 0.0,
+                    aerial: true
+                }
             )),
-            "目标在下方：受控降落净 -1/拍"
+            "到位转悬停（零位移 + 升力）"
         );
+        assert_eq!(mt, Some((target, (30.0, 3.5))), "悬停维持：目标保留");
     }
 
     #[test]
-    fn ground_target_from_air_lands_by_vertical_first() {
-        // 空中点地面目标：先垂直降落到地面线（喷气步），落地后恢复旧规先横——
-        // 不做"空中横走自由落体"（前端净位移镜像无需建模物理，#028 契约保持简单）
+    fn airborne_entity_descends_controlled_to_ground_target() {
+        // 空中点地面：受控降落（矢量步向下，aerial=true 免重力——是操控不是自由落体）
         let target = eid(1);
-        let mut mt = Some((target, (28.0, 0.0)));
-        let action = route_intents(&[], Some(target), None, Some((30.0, 10.0)), &mut mt);
+        let mut mt = Some((target, (30.0, 0.5)));
+        let action = route_intents(&[], Some(target), None, Some((30.0, 5.0)), 0.5, &mut mt);
+        assert_step_close(action, (0.0, -1.0, true), "空中降落地面向下 1.0/拍（受控）");
+        // 落到半径线后到达（dy 残差 0），地面目标清除站住
+        let action2 = route_intents(&[], Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        assert_eq!(action2, None, "落地到达清除目标");
+        assert_eq!(mt, None, "落地目标清除");
+    }
+
+    #[test]
+    fn keyboard_move_while_airborne_carries_lift() {
+        // 空中键盘移动 = 飞行操控（aerial 标记随实体状态，不随按键方向）
+        let target = eid(1);
+        let intents = vec![Intent::Move { dx: 1.0, dy: 0.0 }];
+        let action = route(&intents, Some(target), None, Some((30.0, 5.0)));
         assert_eq!(
             action,
             Some((
                 target,
-                ControlledAction::Fly { dx: 0.0, dy: 8.8, phase: FlightPhase::Climb }
+                ControlledAction::Move {
+                    dx: 1.0,
+                    dy: 0.0,
+                    aerial: true
+                }
             )),
-            "空中 -> 地面目标：先降落到地面线"
-        );
-        let action2 = route_intents(&[], Some(target), None, Some((30.0, 0.0)), &mut mt);
-        assert_eq!(
-            action2,
-            Some((target, ControlledAction::Move(-1.0, 0.0))),
-            "落地后恢复旧版地面走位（Move 步，无喷气补偿）"
+            "空中按键平移：升力照出"
         );
     }
 
     #[test]
     fn ground_target_ground_start_regression_anchor() {
-        // 回归锚（验收#1）：地面目标 + 地面实体 = 旧版完全一致（Move 步先横后竖、
-        // 到达清除站住）——锁定飞行改造不波及地面走位
+        // 回归锚：地面目标 + 地面实体（半径线坐标）直线走位，到达清除站住
         let target = eid(1);
-        let mut mt = Some((target, (32.0, 0.0)));
-        let action = route_intents(&[], Some(target), None, Some((30.0, 0.0)), &mut mt);
-        assert_eq!(
-            action,
-            Some((target, ControlledAction::Move(1.0, 0.0))),
-            "地面走位仍是 Move 步（非 Fly）"
-        );
-        let action2 = route_intents(&[], Some(target), None, Some((32.0, 0.0)), &mut mt);
-        assert_eq!(action2, None, "到达清除站住（旧版语义不变）");
+        let mut mt = Some((target, (32.0, 0.5)));
+        let action = route_intents(&[], Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        assert_step_close(action, (1.0, 0.0, false), "地面直线走位");
+        let action2 = route_intents(&[], Some(target), None, Some((32.0, 0.5)), 0.5, &mut mt);
+        assert_eq!(action2, None, "到达清除站住");
         assert_eq!(mt, None, "地面到达清除目标");
     }
 
     #[test]
     fn stop_in_air_hovers_instead_of_falling() {
-        // stop 空中 = 停止水平移动但继续喷气悬停（stop 语义 = 停止移动不是坠落）：
-        // 目标改写为脚下坐标转悬停，后续无意图拍继续悬停；要落地玩家点地面
+        // stop 空中 = 悬停不坠（stop 语义 = 停止移动不是坠落）：目标改写为脚下坐标，
+        // 后续无意图拍继续悬停；要落地玩家点地面
         let target = eid(1);
-        let mut mt = Some((target, (35.0, 0.0)));
-        let action = route_intents(&[Intent::Stop], Some(target), None, Some((30.0, 5.0)), &mut mt);
+        let mut mt = Some((target, (35.0, 0.5)));
+        let action = route_intents(
+            &[Intent::Stop],
+            Some(target),
+            None,
+            Some((30.0, 5.0)),
+            0.5,
+            &mut mt,
+        );
         assert_eq!(
             action,
             Some((
                 target,
-                ControlledAction::Fly { dx: 0.0, dy: 9.8, phase: FlightPhase::Hover }
+                ControlledAction::Move {
+                    dx: 0.0,
+                    dy: 0.0,
+                    aerial: true
+                }
             )),
-            "空中 stop 本拍即转悬停喷气"
+            "空中 stop 本拍即转悬停"
         );
-        assert_eq!(
-            mt,
-            Some((target, (30.0, 5.0))),
-            "悬停锚点 = 脚下坐标（目标改写）"
-        );
-        let action2 = route_intents(&[], Some(target), None, Some((30.0, 5.0)), &mut mt);
+        assert_eq!(mt, Some((target, (30.0, 5.0))), "悬停锚点 = 脚下坐标（目标改写）");
+        let action2 = route_intents(&[], Some(target), None, Some((30.0, 5.0)), 0.5, &mut mt);
         assert_eq!(
             action2,
             Some((
                 target,
-                ControlledAction::Fly { dx: 0.0, dy: 9.8, phase: FlightPhase::Hover }
+                ControlledAction::Move {
+                    dx: 0.0,
+                    dy: 0.0,
+                    aerial: true
+                }
             )),
             "后续无意图拍继续悬停不坠"
         );
@@ -865,100 +847,47 @@ mod tests {
 
     #[test]
     fn stop_on_ground_keeps_old_stand_semantics() {
-        // 回归锚：地面（含贴地）stop 仍是清除站住，不受飞行语义影响
+        // 回归锚：地面（半径线）stop 仍是清除站住
         let target = eid(1);
-        let mut mt = Some((target, (35.0, 0.0)));
-        let action = route_intents(&[Intent::Stop], Some(target), None, Some((30.0, 0.0)), &mut mt);
+        let mut mt = Some((target, (35.0, 0.5)));
+        let action = route_intents(
+            &[Intent::Stop],
+            Some(target),
+            None,
+            Some((30.0, 0.5)),
+            0.5,
+            &mut mt,
+        );
         assert_eq!(action, None, "地面 stop 站住");
         assert_eq!(mt, None, "地面 stop 清除目标");
     }
 
     #[test]
-    fn aerial_fractional_target_final_approach_no_oscillation() {
-        // 审查 P1：点击是连续坐标——非整数 tx + 垂直残差 |dy|∈(0.3,0.5] 吃掉
-        // 0.25 到达预算时，±1 整步会在容差带两侧永久振荡（永不到达永不悬停）。
-        // 修法：|dx|≤1 终进近半步直接踏上目标 x。（tx=32.25 精确可表示，
-        // 断言免 f64 噪声）
+    fn fractional_target_final_approach_no_oscillation() {
+        // 终进近防振荡：剩余距离 ≤1.0 一步精确踏上目标（±1 整步会在到达容差带
+        // 两侧永久振荡——点击是连续坐标）。(30.6, 0.8) 与 (30,0.5) 距离≈0.67 ∈ (0.5,1]
         let target = eid(1);
-        let mut mt = Some((target, (32.25, 8.5)));
-        // 高度逼近到位（y=8，dy=0.5），水平差 2.25：整步东移
-        let action = route_intents(&[], Some(target), None, Some((30.0, 8.0)), &mut mt);
-        assert_eq!(
-            action,
-            Some((
-                target,
-                ControlledAction::Fly { dx: 1.0, dy: 9.8, phase: FlightPhase::Level }
-            )),
-            "水平差 >1：整步推进"
-        );
-        // x=32（dx=0.25，dy=0.5 使 dist²=0.3125>0.25 未到达）：终进近半步踏 0.25
-        let action2 = route_intents(&[], Some(target), None, Some((32.0, 8.0)), &mut mt);
-        assert_eq!(
-            action2,
-            Some((
-                target,
-                ControlledAction::Fly { dx: 0.25, dy: 9.8, phase: FlightPhase::Level }
-            )),
-            "终进近半步（|dx|≤1 踏上目标 x），防 ±1 永摆"
-        );
-        // 踏上目标 x：dy 残差 0.5 = dist² 0.25 ≤ 0.25 到达转悬停
-        let action3 = route_intents(&[], Some(target), None, Some((32.25, 8.0)), &mut mt);
-        assert_eq!(
-            action3,
-            Some((
-                target,
-                ControlledAction::Fly { dx: 0.0, dy: 9.8, phase: FlightPhase::Hover }
-            )),
-            "半步到位即悬停（收敛不振荡）"
-        );
-    }
-
-    #[test]
-    fn air_low_altitude_ground_target_descends_not_glides() {
-        // 审查 P2：半空贴地（y=0.6）点近处地面目标（ty=0.3，垂直残差 ≤0.5 且
-        // 水平差 >0.5 未到到达窗）——必须先降完落地再走（不贴地"平飞"后清目标
-        // 坠 0.6 格，防与前端预测分歧瞬移）
-        let target = eid(1);
-        let mut mt = Some((target, (30.8, 0.3)));
-        let action = route_intents(&[], Some(target), None, Some((30.0, 0.6)), &mut mt);
-        assert_eq!(
-            action,
-            Some((
-                target,
-                ControlledAction::Fly { dx: 0.0, dy: 8.8, phase: FlightPhase::Climb }
-            )),
-            "目标是地面：垂直优先降完，不贴地平飞"
-        );
-    }
-
-    #[test]
-    fn diagonal_target_decomposes_horizontal_first() {
-        // 地面斜向目标分解规则（net-protocol.md v1.2 写死，v1.4 仍锁定地面路径）：
-        // 先横后竖，每拍一格；空中目标 v1.4 起垂直优先（见飞行测试组）
-        let target = eid(1);
-        let mut mt = Some((target, (32.0, -2.0)));
-        let action = route_intents(&[], Some(target), None, Some((30.0, 0.0)), &mut mt);
-        assert_eq!(
-            action,
-            Some((target, ControlledAction::Move(1.0, 0.0))),
-            "横竖都差 -> 先横"
-        );
-        // 横到位后竖走
-        let action2 = route_intents(&[], Some(target), None, Some((32.0, 0.0)), &mut mt);
-        assert_eq!(
-            action2,
-            Some((target, ControlledAction::Move(0.0, -1.0))),
-            "横已到位 -> 竖"
-        );
+        let mut mt = Some((target, (30.6, 0.8)));
+        let action = route_intents(&[], Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        match action {
+            Some((_, ControlledAction::Move { dx, dy, aerial })) => {
+                assert!((dx - 0.6).abs() < 1e-9 && (dy - 0.3).abs() < 1e-9, "终进近踏上目标");
+                assert!(aerial, "目标 y=0.8 > 半径 0.5 = 空中目标");
+            }
+            other => panic!("期望 Move 步，实际 {:?}", other),
+        }
+        // 踏上后到达（格距 0）转悬停/清除，不振荡
+        let action2 = route_intents(&[], Some(target), None, Some((30.6, 0.8)), 0.5, &mut mt);
+        assert_eq!(action2, Some((target, ControlledAction::Move { dx: 0.0, dy: 0.0, aerial: true })), "到位即悬停（收敛不振荡）");
     }
 
     #[test]
     fn target_behind_steps_negative_direction() {
-        // 目标在起点西/北方向：分解出负向步（signum 语义，不是恒正向）
+        // 目标在起点西方向：矢量步为负向（不是恒正向）
         let target = eid(1);
-        let mut mt = Some((target, (28.0, 0.0)));
-        let action = route_intents(&[], Some(target), None, Some((30.0, 0.0)), &mut mt);
-        assert_eq!(action, Some((target, ControlledAction::Move(-1.0, 0.0))));
+        let mut mt = Some((target, (28.0, 0.5)));
+        let action = route_intents(&[], Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        assert_step_close(action, (-1.0, 0.0, false), "西向目标负向步");
     }
 
     // === 输入线程 / 终端模式（任务 A：raw mode + alternate screen + 全路径恢复）===

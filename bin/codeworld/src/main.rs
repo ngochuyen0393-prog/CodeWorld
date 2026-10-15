@@ -67,9 +67,12 @@ struct EntitySandboxMap {
     ws_move_target: Option<(EntityId, (f64, f64))>,
     /// 操控独占是否生效中（#025：me 在线=true；状态翻转沿打生命周期日志）
     ctrl_exclusive_active: bool,
-    /// 操控飞行相位（期四第五刀）：Some(p)=飞行中（相位翻转沿打日志，悬停不刷）；
-    /// None=地面/非飞行。操控死亡/下线/落地清零（喷气停止，重力接管）
+    /// 操控飞行相位（期四第六刀简化：Fly/Hover 两态；翻转沿打日志，悬停不刷）；
+    /// None=地面/非飞行。操控死亡/下线/落地清零（升力停止，重力接管）
     flight_phase: Option<input::FlightPhase>,
+    /// 上拍相触实体对集合（#030 接触边沿触发状态：本拍新进入接触才触发
+    /// ContactPair，持续贴着不重复，分开再碰再触发；每拍整体重建）
+    last_touching: std::collections::HashSet<(EntityId, EntityId)>,
 }
 
 impl EntitySandboxMap {
@@ -90,6 +93,7 @@ impl EntitySandboxMap {
             ws_move_target: None,
             ctrl_exclusive_active: false,
             flight_phase: None,
+            last_touching: std::collections::HashSet::new(),
         })
     }
 
@@ -772,10 +776,14 @@ fn tick_with_intents(
         sandbox_map.ctrl_exclusive_active = false;
     }
     let nearest = control_target.and_then(|id| find_nearest_enemy(world, &id, &bounds));
-    // 操控目标当前坐标（#027：点击走位步向计算依据）
+    // 操控目标当前坐标与身体半径（#027 步向计算 + #030 空中判定线=半径线）
     let entity_pos = control_target
         .and_then(|id| world.entities.get(&id))
         .map(|e| e.pos());
+    let entity_radius = control_target
+        .and_then(|id| world.entities.get(&id))
+        .map(|e| e.radius())
+        .unwrap_or(0.5);
     // 观战/无操控拍：点击走位目标不滞留（换角不交接由 route_intents 兜底，这里清根）；
     // 飞行相位一并清零（操控死亡/下线 = 喷气停止，重力接管）
     if control_target.is_none() {
@@ -787,6 +795,7 @@ fn tick_with_intents(
         control_target,
         nearest,
         entity_pos,
+        entity_radius,
         &mut sandbox_map.ws_move_target,
     );
     // 字幕 ctrl 段（#024 三态）：操控中 = ctrl:字形；观战（有人但不是你 / 操控目标
@@ -801,11 +810,14 @@ fn tick_with_intents(
     } else {
         None
     };
-    let mut jet_continues = false; // 空中出刀不断气标记（攻击拍喷气补偿已排队）
+    // 本拍悬停集合（#030 升力独立）：aerial 意图实体进物理免重力集合——
+    // 移动被挡/滑动/出刀时升力照出，被挡≠坠落（期四第五刀 bug 根治）。
+    // 升力是意图层持续作用：悬停维持拍由持续目标每拍重发零位移 aerial 步
+    let mut aloft: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
     if let (Some((name, _)), Some((id, act))) = (&online, &action) {
         match act {
-            input::ControlledAction::Move(dx, dy) => {
-                // 操控移动 = 排队 SetPos（占位裁决照常，一格一物不豁免）；
+            input::ControlledAction::Move { dx, dy, aerial } => {
+                // 操控移动 = 排队 SetPos（半径碰撞裁决照常，不豁免物理）；
                 // 自主 on_tick 本拍被抑制（run_player_code_with_control），无坐标冲突
                 if let Some(e) = world.entities.get(id) {
                     let (x, y) = e.pos();
@@ -814,59 +826,44 @@ fn tick_with_intents(
                         new_pos: (x + dx, y + dy),
                     });
                 }
-                tracing::info!("[input] 操控意图 Move({dx},{dy}) player={name}（覆盖自主移动）");
-            }
-            input::ControlledAction::Fly { dx, dy, phase } => {
-                // 操控飞行 = 排队 SetPos（占位裁决照常；dy 内含重力补偿，阶段二 a
-                // 先应用位移、c 步重力扣回，净位移 = 意图步长。#029 无税：喷气是
-                // 意图层动作非 on_tick，操控独占不抑制——独占只抑制自主代码）
-                if let Some(e) = world.entities.get(id) {
-                    let (x, y) = e.pos();
-                    pending.push(PendingChange::SetPos {
-                        entity: *id,
-                        new_pos: (x + dx, y + dy),
-                    });
+                if *aerial {
+                    aloft.insert(*id);
+                    // 相位沿日志：零位移=悬停，矢量位移=飞行（状态切换才打，维持不刷）
+                    let phase = if *dx == 0.0 && *dy == 0.0 {
+                        input::FlightPhase::Hover
+                    } else {
+                        input::FlightPhase::Fly
+                    };
+                    if sandbox_map.flight_phase != Some(phase) {
+                        tracing::info!("[ctrl] 操控飞行（{}）player={name}", phase.name());
+                        sandbox_map.flight_phase = Some(phase);
+                    }
                 }
-                // 相位沿日志（任务 A.4：起飞/平飞/悬停状态切换才打，悬停维持不逐拍刷）
-                if sandbox_map.flight_phase != Some(*phase) {
-                    let tgt = sandbox_map
-                        .ws_move_target
-                        .map(|(_, p)| p)
-                        .unwrap_or((0.0, 0.0));
-                    tracing::info!(
-                        "[ctrl] 操控飞行 move→({},{}) player={name}（{}）",
-                        tgt.0,
-                        tgt.1,
-                        phase.name()
-                    );
-                    sandbox_map.flight_phase = Some(*phase);
-                }
+                tracing::info!("[input] 操控意图 Move({dx},{dy},aerial={aerial}) player={name}（覆盖自主移动）");
             }
             input::ControlledAction::Attack(tpos) => {
-                // 空中出刀不断气（审查 P1）：悬停/飞行是持续意图（attack 不清目标，
-                // #027 并存语义），攻击拍仍排队喷气补偿 SetPos——否则一拍重力全额
-                // 坠地钳 0（y=3 悬停=砸地再爬 3 拍）。攻击拍不移动（无横移/爬升）
+                // 空中出刀不掉（升力独立）：悬空实体攻击拍照常免重力——
+                // 出刀不再排喷气补偿 SetPos（旧 +9.8 位移 hack 退役）
                 if let Some(e) = world.entities.get(id) {
-                    let (x, y) = e.pos();
-                    if y > input::GROUND_EPS {
-                        pending.push(PendingChange::SetPos {
-                            entity: *id,
-                            new_pos: (x, y + input::HOVER_JET),
-                        });
-                        jet_continues = true;
+                    if e.pos().1 > e.radius() {
+                        aloft.insert(*id);
                     }
                 }
                 tracing::info!("[input] 操控意图 Attack target={tpos:?} player={name}（操控刀优先）");
             }
         }
     }
-    // 离开飞行（落地到达/键盘接管/喷气中断）：相位清零打结束沿——重力接管，
-    // 摔落伤害物理照常（#029：中断即坠落，无人为税）。空中出刀（jet_continues）
-    // 不算离开飞行：喷气意图未被出刀撤回
-    if sandbox_map.flight_phase.is_some()
-        && !jet_continues
-        && !matches!(&action, Some((_, input::ControlledAction::Fly { .. })))
-    {
+    // 离开飞行（落地到达/地面意图/出刀后无悬停锚）：相位清零打结束沿——重力接管
+    let still_flying = match &action {
+        Some((_, input::ControlledAction::Move { aerial: true, .. })) => true,
+        Some((id, input::ControlledAction::Attack(_))) => world
+            .entities
+            .get(id)
+            .map(|e| e.pos().1 > e.radius())
+            .unwrap_or(false),
+        _ => false,
+    };
+    if sandbox_map.flight_phase.is_some() && !still_flying {
         tracing::info!(
             "[ctrl] 操控飞行结束（重力接管）player={}",
             online.as_ref().map(|(n, _)| n.as_str()).unwrap_or("?")
@@ -897,8 +894,9 @@ fn tick_with_intents(
     //      再并入产权校验通过的销毁请求（env.destroy，门二）一起应用
     pending.extend(sandbox_map.collect_pending_moves());
     process_destroys(world, sandbox_map, pending);
-    // #021：占位制下移动被挡产生的接触对在此收集，阶段二 c 步与物理同格对合并
-    let move_blocked_contacts = apply_pending_changes(world, pending, control_target);
+    // #030：移动裁决改半径碰撞（分轴滑动），移动被挡不再产生接触对——
+    // 接触语义统一为"身体相触"，由阶段二 c 步全量扫描+边沿触发裁决
+    apply_pending_changes(world, pending, control_target);
 
     //   a1. 造物处理（门二：env.spawn 排队的请求在此编译/建实体/建沙箱/插入世界）。
     //       放在 destroy 应用之后：本拍自毁的创造者不再造物；上限按应用后世界实况算。
@@ -926,30 +924,44 @@ fn tick_with_intents(
     //   b. 生存点数扣减（架构 4.1：每 86400 tick 扣 1 点，归零标记死亡）
     decay_survival(world, current_tick);
 
-    //   c. 物理规则（重力/地面/速度，架构 4.1 b 步；#021 推挤退役——step 只检不推）
-    //      接触事件在 step 之前捕获（物理同格检测）：step 内占位重力被挡的实体
-    //      坐标不变，检测时序不再敏感（旧推挤"挤完测不到"的时序约束已随退役消失）。
-    let collision_pairs = physics.detect_collisions(&world.entities);
-    let changes = physics.step(world);
+    //   c. 物理规则（#030 半径物理：重力落点解析 + 悬停免重力，架构 4.1 b 步）
+    let changes = physics.step(world, &aloft);
     if !changes.is_empty() {
         tracing::debug!(tick = current_tick, change_count = changes.len(), "物理变更");
     }
-    //      接触触发沙箱通道（架构 4.1 b 步）：两类接触合并（#021 B 项）——
-    //      ①物理同格检测（same_cell）②移动被挡（move_blocked，阶段二 a 步产生）。
-    //      MVP 仅逐对日志；Phase 2：经 sandbox_map 为双方开启 probe/attack 通道。
-    let mut contacts: Vec<ContactPair> = collision_pairs
-        .into_iter()
-        .map(|p| ContactPair {
-            a: p.a,
-            b: p.b,
-            pos: p.pos,
-            source: "same_cell",
-        })
-        .collect();
-    contacts.extend(move_blocked_contacts);
+    //      接触触发沙箱通道（架构 4.1 b 步，#030 边沿触发）：step 后全量扫描相触对
+    //      （≤：圆-圆/圆-AABB/塔-塔），与上拍集合差分——新进入接触才触发 ContactPair，
+    //      持续贴着不重复，分开后再碰再触发（battle.log 进接触一行不刷屏）
+    let touching_now: std::collections::HashSet<(EntityId, EntityId)> =
+        if physics.params().collision_enabled {
+            physics
+                .detect_touching(&world.entities)
+                .into_iter()
+                .map(|p| (p.a, p.b)) // detect_touching 已保证 a.id < b.id（确定序）
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+    let mut contacts: Vec<ContactPair> = Vec::new();
+    for (a, b) in &touching_now {
+        if !sandbox_map.last_touching.contains(&(*a, *b)) {
+            let pos = world
+                .entities
+                .get(a)
+                .map(|e| e.pos())
+                .unwrap_or((0.0, 0.0));
+            contacts.push(ContactPair {
+                a: *a,
+                b: *b,
+                pos,
+                source: "touch",
+            });
+        }
+    }
+    sandbox_map.last_touching = touching_now; // 每拍整体重建（上拍状态 = 本拍全量）
     let contact_count = handle_collisions(&contacts, &world.entities);
     if contact_count > 0 {
-        tracing::info!(tick = current_tick, contact_count, "接触事件处理");
+        tracing::info!(tick = current_tick, contact_count, "接触事件处理（边沿触发）");
     }
 
     //   d0. 玩家目录在线锚（门一进场/下线/残影消散；disabled 时 no-op 零开销）。
@@ -1038,26 +1050,22 @@ fn tick_with_intents(
     }
 }
 
-/// 应用延迟变更队列（架构文档 4.1 节阶段二 a 步 + #021 实体占位制）
+/// 应用延迟变更队列（架构文档 4.1 节阶段二 a 步 + #030 半径物理移动裁决）
 ///
 /// 阶段一玩家代码执行期间产生的变更（spawn/destroy/set_pos/set_velocity）
 /// 放入 pending 队列，此处统一应用到 WorldState。应用后队列清空。
 ///
-/// #021 占位制：SetPos 应用前过占位检查（一格一物，Screeps 阻挡制）——
-/// 目标格被其他存活实体占据 → 移动被拒（留原位）+ 记接触对。本 tick 所有移动
-/// 按 EntityId 升序统一裁决（先到先得，确定序，与 physics.step 同源口径）。
+/// #030 移动裁决（取代 #021 格子占位）：SetPos 目标与任何身体重叠 → **分轴滑动**
+/// ——先试整步，撞则试 (new_x, old_y)，再试 (old_x, new_y)，都撞则原地不动
+/// （贴墙滑而非整步作废，不推挤）。落地钳制：y < radius → y = radius（脚贴地，
+/// 圆心即位置）。本 tick 所有移动按 EntityId 升序统一裁决（先到先得，确定序）。
+/// 移动被挡不再产生接触对：接触语义统一为"身体相触"，由阶段二 c 步全量扫描
+/// +边沿触发裁决（被挡后贴着的实体必然被扫描捕获）。
 ///
 /// `control_target`：本拍操控目标（期四第四刀）——仅它的 SetPos 应用日志升 INFO
 /// （battle.log 可追踪玩家走位），其余实体保持 debug（A/D/S 每拍自主移动，
 /// 全升 INFO 会刷爆日志）。
-///
-/// 返回移动被挡产生的接触对（汇入 handle_collisions 的接触语义，#021 B 项）。
-fn apply_pending_changes(
-    world: &mut WorldState,
-    pending: &mut Vec<PendingChange>,
-    control_target: Option<EntityId>,
-) -> Vec<ContactPair> {
-    let mut contacts: Vec<ContactPair> = Vec::new();
+fn apply_pending_changes(world: &mut WorldState, pending: &mut Vec<PendingChange>, control_target: Option<EntityId>) {
     let mut moves: Vec<(EntityId, (f64, f64))> = Vec::new();
     for change in pending.drain(..) {
         match change {
@@ -1099,43 +1107,92 @@ fn apply_pending_changes(
         if !alive {
             continue;
         }
-        match codeworld_core::occupancy::cell_occupied_by(&world.entities, new_pos, entity) {
-            Some(occupant) => {
-                // 目标格被占：移动被拒，实体留在原坐标 + 记接触对（双方 EntityId）
-                tracing::info!(
-                    entity_id = %entity.0,
-                    occupant = %occupant.0,
-                    target = ?new_pos,
-                    "[move] 移动被挡（目标格被占），实体留在原位"
-                );
-                contacts.push(ContactPair {
-                    a: entity,
-                    b: occupant,
-                    pos: new_pos,
-                    source: "move_blocked",
-                });
+        let Some(me) = world.entities.get(&entity) else {
+            continue;
+        };
+        let radius = me.radius();
+        let old = me.pos();
+        // 落地钳制（#030）：y < radius → y = radius（脚贴地）
+        let mut target = new_pos;
+        if target.1 < radius {
+            target.1 = radius;
+        }
+        // 悬停维持的零位移步跳过（不过裁决不刷日志；悬停升力由 aloft 集合承载，
+        // 不依赖本 SetPos 应用）
+        if target == old {
+            continue;
+        }
+        // 分轴滑动裁决（#030）：整步 → 滑 x → 滑 y → 原地（贴墙滑非整步作废）
+        let (final_pos, slide) = if first_overlap(world, entity, target, radius).is_none() {
+            (target, "")
+        } else {
+            let slide_x = (target.0, old.1);
+            let slide_y = (old.0, target.1);
+            if slide_x != old && first_overlap(world, entity, slide_x, radius).is_none() {
+                (slide_x, "滑x")
+            } else if slide_y != old && first_overlap(world, entity, slide_y, radius).is_none() {
+                (slide_y, "滑y")
+            } else {
+                (old, "全挡")
             }
-            None => {
-                // 期四第四刀：操控实体的移动应用升 INFO 且带 from→to（土豆实测曾因
-                // debug 级在 battle.log 看不到而误判"P 没动"）；其余实体保持 debug
-                if control_target == Some(entity) {
-                    let from = world.entities.get(&entity).map(|e| e.pos());
-                    tracing::info!(
-                        entity_id = %entity.0,
-                        from = ?from,
-                        to = ?new_pos,
-                        "[ctrl] 操控移动应用 SetPos（from→to）"
-                    );
-                } else {
-                    tracing::debug!(entity_id = %entity.0, ?new_pos, "应用 SetPos");
-                }
-                if let Some(e) = world.entities.get_mut(&entity) {
-                    e.set_pos(new_pos);
-                }
+        };
+        // 被挡日志 INFO 带滑动信息（battle.log 可见贴墙行为）；操控实体应用日志
+        // 升 INFO 带 from→to（第四刀先例），其余实体 debug
+        if !slide.is_empty() {
+            let blocker = first_overlap(world, entity, target, radius);
+            tracing::info!(
+                entity_id = %entity.0,
+                target = ?target,
+                result = if slide == "全挡" { "原地" } else { slide },
+                blocker = ?blocker.map(|b| b.0.to_string()),
+                "[move] 移动被挡（身体重叠），分轴滑动裁决"
+            );
+        }
+        if control_target == Some(entity) {
+            tracing::info!(
+                entity_id = %entity.0,
+                from = ?old,
+                to = ?final_pos,
+                slide = if slide.is_empty() { "-" } else { slide },
+                "[ctrl] 操控移动应用 SetPos（from→to）"
+            );
+        } else if slide.is_empty() {
+            tracing::debug!(entity_id = %entity.0, ?final_pos, "应用 SetPos");
+        }
+        if final_pos != old {
+            if let Some(e) = world.entities.get_mut(&entity) {
+                e.set_pos(final_pos);
             }
         }
     }
-    contacts
+}
+
+/// 找与 (pos, radius) 圆身重叠的第一个其他存活身体（EntityId 升序取最小者，
+/// 确定序可重现；None = 不重叠）。移动裁决/出生预检共用。
+fn first_overlap(
+    world: &WorldState,
+    mover: EntityId,
+    pos: (f64, f64),
+    radius: f64,
+) -> Option<EntityId> {
+    use codeworld_core::collision::{body_of, body_overlap, Body};
+    let me = Body::Circle { center: pos, radius };
+    let mut best: Option<EntityId> = None;
+    for (id, e) in &world.entities {
+        if *id == mover || !e.is_alive() {
+            continue;
+        }
+        if body_overlap(&me, &body_of(e)) {
+            let better = match best {
+                None => true,
+                Some(cur) => id.0 < cur.0,
+            };
+            if better {
+                best = Some(*id);
+            }
+        }
+    }
+    best
 }
 
 /// 门二销毁处理（架构 4.1 阶段二 + world-foundation 门二 + decisions.md #015）
@@ -1243,20 +1300,30 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
             continue;
         };
         let entity_id = EntityId::new();
-        // #021 出生预检（Factorio 放置检查）：出生格被占 → 该次 spawn 失败。
-        // 放在编译之后、建沙箱之前（防沙箱泄漏）；不诞生、不占世界名额，下拍可重试。
-        if let Some(occupant) =
-            codeworld_core::occupancy::cell_occupied_by(&world.entities, req.pos, entity_id)
+        // #030 出生预检（Factorio 放置检查，半径版）：造物身体（格对齐 AABB）与
+        // 任何存活身体重叠 → 该次 spawn 失败。放在编译之后、建沙箱之前（防沙箱
+        // 泄漏）；不诞生、不占世界名额，下拍可重试。
         {
-            tracing::warn!(
-                creator = %req.creator.0,
-                occupant = %occupant.0,
-                pos = ?req.pos,
-                "[process_spawns] 出生格被占，该次 spawn 失败（下拍可重试）"
-            );
-            continue;
+            use codeworld_core::collision::{body_of, body_overlap, creation_aabb, Body};
+            let (bmin, bmax) = creation_aabb(req.pos);
+            let body = Body::Aabb { min: bmin, max: bmax };
+            let blocker = world
+                .entities
+                .iter()
+                .filter(|(oid, e)| **oid != entity_id && e.is_alive())
+                .find(|(_, e)| body_overlap(&body, &body_of(e)))
+                .map(|(oid, _)| *oid);
+            if let Some(occupant) = blocker {
+                tracing::warn!(
+                    creator = %req.creator.0,
+                    occupant = %occupant.0,
+                    pos = ?req.pos,
+                    "[process_spawns] 出生点与现有身体重叠，该次 spawn 失败（下拍可重试）"
+                );
+                continue;
+            }
         }
-        let entity = Entity::new(
+        let mut entity = Entity::new(
             entity_id,
             owner,
             "creation".to_string(),
@@ -1265,6 +1332,9 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
             current_tick,
             req.fuel_limit,
         );
+        // #030 spawn 第 7 参 radius：import 层已校验钳制（0.05..=25.0），
+        // 此处再过一遍 set_radius 兜底（幂等；creation 身体=AABB 不用它，快照携带）
+        entity.set_radius(req.radius);
         // 沙箱创建成功才插入世界（失败则实体不落世界，不留无沙箱活体）
         if let Err(e) = sandbox_map.create(entity_id, &wasm_bytes, req.fuel_limit) {
             tracing::warn!(
@@ -1341,10 +1411,40 @@ fn process_attacks(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, a
     settle_attacks(world, sandbox_map, &strikes);
 }
 
+/// 攻击点命中（#031）：找"点在体内"的存活实体取最近者（圆=dist<r 严格；
+/// 造物 AABB=闭区间包含），距离并列按 EntityId 升序定序（消灭随机性——
+/// 延续两阶段结算立法精神）。None = 点不在任何身体内（落空）。
+fn find_hit_target(world: &WorldState, point: (f64, f64)) -> Option<EntityId> {
+    use codeworld_core::collision::{body_of, point_in_body};
+    let mut best: Option<(f64, EntityId)> = None;
+    for (id, e) in &world.entities {
+        if !e.is_alive() {
+            continue;
+        }
+        let body = body_of(e);
+        if !point_in_body(point, &body) {
+            continue;
+        }
+        let (ex, ey) = e.pos();
+        let dx = point.0 - ex;
+        let dy = point.1 - ey;
+        let d2 = dx * dx + dy * dy;
+        let better = match best {
+            None => true,
+            Some((bd, bid)) => d2 < bd || (d2 == bd && id.0 < bid.0),
+        };
+        if better {
+            best = Some((d2, *id));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 /// 收件阶段：逐刀问防守、产出待结算列表（架构 4.2 两阶段-收件）
 ///
 /// - 攻击者已死 -> 整刀作废（不触发防守、不结算；防死者点数蒸发，P1）。
-/// - 坐标解析命中多个存活实体时 find 取首个（HashMap 顺序随机，测试用唯一坐标避免歧义）。
+/// - 坐标解析（#031 点命中制）：点在体内（圆 dist<r / AABB 内）的存活实体取最近者
+///   （同距按 EntityId 升序）——站桩目标必中，移动目标打不中（猫鼠博弈仍在）。
 /// - 防守询问失败（如防守方 fuel 耗尽）-> 该刀作废（架构 4.2：on_attack 超时=默认行为，
 ///   life 维持原值不被覆写）。
 /// - 输出全局按攻击者 EntityId 升序（结算确定序）。
@@ -1376,18 +1476,14 @@ fn deliver_attacks(
         // 参战记录-攻击者（#013 战斗残影期）：出刀即战斗——落空/拦截/命中都算，
         // 堵"打空再拔线"绕过战斗残影的漏洞。world.tick() 即当前 tick（tick 开头已 advance）。
         sandbox_map.players.record_combat_id(atk.attacker, world.tick());
-        // 坐标解析：找坐标上的存活实体（attack_at 攻击坐标不是 EntityId，目标移动可能 miss）
-        let Some(target_id) = world
-            .entities
-            .values()
-            .find(|e| e.is_alive() && e.pos() == atk.target_pos)
-            .map(|e| e.id)
-        else {
+        // 坐标解析（#031 点命中制）：点在体内取最近者（attack_at 攻击坐标不是
+        // EntityId，目标移动出点则落空——猫鼠博弈）
+        let Some(target_id) = find_hit_target(world, atk.target_pos) else {
             missed += 1;
             tracing::info!(
                 attacker = %atk.attacker.0,
                 pos = ?atk.target_pos,
-                "[deliver_attacks] 攻击落空（坐标无存活实体）"
+                "[deliver_attacks] 攻击落空（点不在任何身体内）"
             );
             continue;
         };
@@ -2200,84 +2296,85 @@ mod tests {
         assert!(pending.is_empty(), "apply 后 pending 应清空");
     }
 
-    // === #021 实体占位制：移动占位裁决 ===
+    // === #030 半径物理：移动碰撞裁决（取代 #021 格子占位）===
 
     #[test]
     fn setpos_blocked_stays_at_origin() {
-        // 占位移动：目标格被其他存活实体占据 → 移动被拒，实体留在原坐标
+        // 碰撞移动（#030）：目标位与其他存活身体重叠 → 滑动裁决（滑x=目标/滑y=原地
+        // 都试不了）→ 原地不动；实体留在原坐标（贴墙站，不推挤）
         let mut world = WorldState::new();
-        let e1 = make_entity(1, (5.0, 0.0));
-        let e2 = make_entity(2, (6.0, 0.0));
+        let e1 = make_entity(1, (5.0, 0.5));
+        let e2 = make_entity(2, (6.0, 0.5));
         let id1 = e1.id;
         let id2 = e2.id;
         world.entities.insert(id1, e1);
         world.entities.insert(id2, e2);
         let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
             entity: id1,
-            new_pos: (6.0, 0.0),
+            new_pos: (6.0, 0.5),
         }];
         apply_pending_changes(&mut world, &mut pending, None);
-        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "目标格被占应留原位");
-        assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 0.0), "占据者不受影响");
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.5), "目标位被占应留原位");
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 0.5), "占据者不受影响");
     }
 
     #[test]
     fn setpos_two_movers_same_target_lower_id_wins() {
-        // 占位裁决确定序：两实体同抢一格，EntityId 小者先到先得（与排队顺序无关）
+        // 裁决确定序：两实体同抢一点，EntityId 小者先到先得（与排队顺序无关）
         // E2 的请求先入队、E1 的后入队：按队序应用则 E2 赢；按 id 升序裁决则 E1 赢
+        // （E1 走到与 E2 恰好相切处——距离=半径和不算重叠，先到者贴着占位）
         let mut world = WorldState::new();
-        let e1 = make_entity(1, (5.0, 0.0));
-        let e2 = make_entity(2, (7.0, 0.0));
+        let e1 = make_entity(1, (5.0, 0.5));
+        let e2 = make_entity(2, (7.0, 0.5));
         let id1 = e1.id;
         let id2 = e2.id;
         world.entities.insert(id1, e1);
         world.entities.insert(id2, e2);
         let mut pending: Vec<PendingChange> = vec![
-            PendingChange::SetPos { entity: id2, new_pos: (6.0, 0.0) }, // 先入队
-            PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.0) }, // 后入队
+            PendingChange::SetPos { entity: id2, new_pos: (6.0, 0.5) }, // 先入队
+            PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.5) }, // 后入队
         ];
         apply_pending_changes(&mut world, &mut pending, None);
-        assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.0), "id 小者先到先得");
-        assert_eq!(world.entities.get(&id2).unwrap().pos(), (7.0, 0.0), "id 大者被挡留原位");
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "id 小者先到先得");
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (7.0, 0.5), "id 大者被挡留原位");
     }
 
     #[test]
     fn setpos_dead_occupant_does_not_block() {
         // 反向护栏：占据者已死（待清理）→ 不挡移动
         let mut world = WorldState::new();
-        let e1 = make_entity(1, (5.0, 0.0));
-        let mut e2 = make_entity(2, (6.0, 0.0));
+        let e1 = make_entity(1, (5.0, 0.5));
+        let mut e2 = make_entity(2, (6.0, 0.5));
         e2.kill();
         let id1 = e1.id;
-        let id2 = e2.id;
         world.entities.insert(id1, e1);
-        world.entities.insert(id2, e2);
+        world.entities.insert(e2.id, e2);
         let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
             entity: id1,
-            new_pos: (6.0, 0.0),
+            new_pos: (6.0, 0.5),
         }];
         apply_pending_changes(&mut world, &mut pending, None);
-        assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.0), "死者不占格，移动放行");
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "死者不挡路，移动放行");
     }
 
     #[test]
     fn setpos_sequential_vacated_cell_blocked_for_lower_id() {
-        // 先到先得语义边界：低 id 先裁决——E1 想进 E2 的格、E2 同拍搬走：
-        // E1 裁决时 E2 还在原格 → E1 被挡（Screeps 顺序移动语义，下拍 E1 可进）
+        // 先到先得语义边界：低 id 先裁决——E1 想进 E2 身上位、E2 同拍搬走：
+        // E1 裁决时 E2 还在原位 → E1 被挡（顺序裁决语义，下拍 E1 可进）
         let mut world = WorldState::new();
-        let e1 = make_entity(1, (5.0, 0.0));
-        let e2 = make_entity(2, (6.0, 0.0));
+        let e1 = make_entity(1, (5.0, 0.5));
+        let e2 = make_entity(2, (6.0, 0.5));
         let id1 = e1.id;
         let id2 = e2.id;
         world.entities.insert(id1, e1);
         world.entities.insert(id2, e2);
         let mut pending: Vec<PendingChange> = vec![
-            PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.0) },
-            PendingChange::SetPos { entity: id2, new_pos: (9.0, 0.0) },
+            PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.5) },
+            PendingChange::SetPos { entity: id2, new_pos: (9.0, 0.5) },
         ];
         apply_pending_changes(&mut world, &mut pending, None);
-        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "E1 裁决时目标格仍被 E2 占 → 被挡");
-        assert_eq!(world.entities.get(&id2).unwrap().pos(), (9.0, 0.0), "E2 照常搬走");
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.5), "E1 裁决时目标位仍被 E2 占 → 被挡");
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (9.0, 0.5), "E2 照常搬走");
     }
 
     #[test]
@@ -2382,7 +2479,8 @@ mod tests {
 
     #[test]
     fn tick_applies_physics_gravity() {
-        // 集成：空中实体受重力下落（架构 4.1 b 步 physics.step）
+        // 集成：空中实体受重力下落（架构 4.1 b 步 physics.step；#030 落点解析：
+        // 单拍 -9.8 从 10 落到 0.2，落地钳制收进半径线 0.5——脚贴地）
         let mut world = WorldState::new();
         let id = EntityId(Uuid::from_u128(1));
         world.entities.insert(id, make_entity(1, (0.0, 10.0)));
@@ -2394,24 +2492,19 @@ mod tests {
         let mut sandbox_map = test_sandbox_map();
         tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut sandbox_map);
         let e = world.entities.get(&id).unwrap();
-        // 重力 -9.8：10.0 -> 0.2
         assert!(e.pos().1 < 10.0, "重力应使实体下落");
-        assert!(
-            (e.pos().1 - 0.2).abs() < 0.01,
-            "下落到约 0.2，实际 {}",
-            e.pos().1
-        );
+        assert_eq!(e.pos(), (0.0, 0.5), "落到半径线（0.2 会穿地，被钳到 0.5）");
     }
 
     #[test]
     fn tick_applies_pending_then_physics() {
         // 集成：pending 的 SetPos 变更在 physics 之前应用（架构 4.1 阶段二 a 在 b 之前）
-        // 实体初始在地面 (0,0)，pending 设 SetPos 到 (0,10)
-        // - 若 pending 先于 physics：实体到 (0,10) 后受重力 -> (0,0.2)
-        // - 若 pending 后于 physics：实体留在 (0,0)（地面无重力），再被 SetPos 覆盖到 (0,10)
+        // 实体初始在地面，pending 设 SetPos 到 (0,10)
+        // - 若 pending 先于 physics：实体到 (0,10) 后受重力落点解析 -> (0,0.5)
+        // - 若 pending 后于 physics：实体留在原地，再被 SetPos 覆盖到 (0,10)
         let mut world = WorldState::new();
         let id = EntityId(Uuid::from_u128(1));
-        world.entities.insert(id, make_entity(1, (0.0, 0.0)));
+        world.entities.insert(id, make_entity(1, (0.0, 0.5)));
         let mut time = TimeEngine::new();
         let physics = DefaultPhysicsEngine::new();
         let mut renderer = test_renderer();
@@ -2431,12 +2524,8 @@ mod tests {
             &mut sandbox_map,
         );
         let y = world.entities.get(&id).unwrap().pos().1;
-        // SetPos 先应用 -> 重力 10.0 -> 0.2（既非 10.0 也非 0.0）
-        assert!(
-            (y - 0.2).abs() < 0.01,
-            "pending 应在 physics 之前应用：预期 ~0.2，实际 {}",
-            y
-        );
+        // SetPos 先应用 -> 重力落点解析到半径线 0.5（既非 10.0 也非 0.0）
+        assert_eq!(y, 0.5, "pending 应在 physics 之前应用：预期 0.5，实际 {}", y);
         assert!(pending.is_empty(), "tick 后 pending 应被 apply 清空");
     }
 
@@ -2741,18 +2830,18 @@ mod tests {
         assert_eq!(loaded.tick(), 5);
         assert_eq!(loaded.entities.len(), 1);
         assert!(loaded.entities.contains_key(&id));
-        assert_eq!(loaded.entities.get(&id).unwrap().pos(), (3.0, 0.0));
+        assert_eq!(loaded.entities.get(&id).unwrap().pos(), (3.0, 0.5), "实体站半径线（物理落位+序列化往返含 radius）");
     }
 
     // === handle_collisions（阶段二 c 步：接触触发沙箱通道，#021 接触记双方）===
 
-    /// 构造接触对（测试辅助，固定 EntityId 便于断言；默认来源 same_cell）
+    /// 构造接触对（测试辅助，固定 EntityId 便于断言；来源 touch=#030 边沿触发）
     fn make_contact_pair(a: u128, b: u128, pos: (f64, f64)) -> ContactPair {
         ContactPair {
             a: EntityId(Uuid::from_u128(a)),
             b: EntityId(Uuid::from_u128(b)),
             pos,
-            source: "same_cell",
+            source: "touch",
         }
     }
 
@@ -2798,25 +2887,24 @@ mod tests {
     }
 
     #[test]
-    fn handle_collisions_counts_pairs_from_detect_collisions() {
-        // 集成：两实体同坐标 -> detect_collisions 返回 1 对 -> handle_collisions 返回 1
-        // 验证 detect -> handle 链路：物理引擎检测到的碰撞对原样传给接触处理
+    fn handle_collisions_counts_pairs_from_detect_touching() {
+        // 集成：两身体相触（#030 半径版）-> detect_touching 返回 1 对 -> handle_collisions 返回 1
+        // 验证 detect -> handle 链路：物理引擎检测到的接触对原样传给接触处理
         let engine = DefaultPhysicsEngine::new();
         let mut entities = HashMap::new();
         let e1 = make_entity(1, (5.0, 5.0));
         let e2 = make_entity(2, (5.0, 5.0));
         entities.insert(e1.id, e1);
         entities.insert(e2.id, e2);
-        let pairs = engine.detect_collisions(&entities);
-        assert_eq!(pairs.len(), 1, "同坐标应检测到 1 对碰撞");
-        // #021：物理同格对转 ContactPair（same_cell 来源）后汇入 handle_collisions
+        let pairs = engine.detect_touching(&entities);
+        assert_eq!(pairs.len(), 1, "重叠（同点）应检测到 1 对接触");
         let contacts: Vec<ContactPair> = pairs
             .into_iter()
             .map(|p| ContactPair {
                 a: p.a,
                 b: p.b,
                 pos: p.pos,
-                source: "same_cell",
+                source: "touch",
             })
             .collect();
         let count = handle_collisions(&contacts, &entities);
@@ -2843,11 +2931,10 @@ mod tests {
 
     #[test]
     fn tick_retires_shove_no_displacement_on_same_cell() {
-        // #021 推挤退役回归：两实体同坐标（异常路径）→ tick 后坐标原样保留，
-        // 不再出现旧挤压的 x+1 连环位移（P/T 连体环游世界 bug 的退役验证）。
-        // 旧断言"坐标应不同（一方被挤开）"随推挤机制一并退役，本测试取而代之。
-        // （占位制下正常路径不会再产生同格：移动被挡/spawn 预检/占位重力三闸，
-        //   本测试直接构造异常同格，验证即使发生也无推挤。）
+        // #021 推挤退役回归（#030 半径版延续）：两实体同坐标（异常路径）→ tick 后
+        // 坐标原样保留（仅落地钳制到半径线），无挤压位移。
+        // （半径物理下正常路径不会再产生重叠：移动被挡/spawn 预检双闸，
+        //   本测试直接构造异常重叠，验证即使发生也无推挤。）
         let mut world = WorldState::new();
         let id1 = EntityId(Uuid::from_u128(1));
         let id2 = EntityId(Uuid::from_u128(2));
@@ -2870,16 +2957,15 @@ mod tests {
         );
         let pos1 = world.entities.get(&id1).unwrap().pos();
         let pos2 = world.entities.get(&id2).unwrap().pos();
-        assert_eq!(pos1, (5.0, 0.0), "退役后不推挤：实体1坐标不变");
-        assert_eq!(pos2, (5.0, 0.0), "退役后不推挤：实体2坐标不变");
+        assert_eq!(pos1, (5.0, 0.5), "不推挤：实体1只被地面钳到半径线");
+        assert_eq!(pos2, (5.0, 0.5), "不推挤：实体2只被地面钳到半径线");
     }
 
     #[test]
     fn tick_move_blocked_records_contact_and_stays() {
-        // tick 级集成（#021 A+B）：移动者试图走进占据格 → 留原位；
-        // 移动被挡接触对与物理同格对一样汇入 handle_collisions
-        // （返回值为 usize 无法从 tick 断言，这里验证坐标行为；接触计数由
-        // apply_pending_changes/handle_collisions 单元测试覆盖）
+        // tick 级集成（#030）：移动者试图走进占位者身体 → 分轴滑动后留在原位侧；
+        // 贴着占位者 = 身体相触，由阶段二 c 步接触扫描+边沿触发接管（#021 的
+        // move_blocked 接触对来源退役）。
         let mut world = WorldState::new();
         let id1 = EntityId(Uuid::from_u128(1));
         let id2 = EntityId(Uuid::from_u128(2));
@@ -2903,46 +2989,103 @@ mod tests {
             &mut pending,
             &mut sandbox_map,
         );
-        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.0), "目标格被占应留原位");
-        assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 0.0), "占据者不受影响");
+        // 目标 (6,0) 落地钳到 (6,0.5) 与占位者 (6,0.5) 重叠 → 滑 x 同挡 → 滑 y 到
+        // (5,0.5) 不重叠 → 滑 y 落地站稳；下拍向东的尝试才会全挡贴墙
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.5), "滑动裁决：滑 y 落地");
+        assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 0.5), "占位者不受影响");
     }
 
     #[test]
-    fn apply_blocked_move_returns_contact_pair() {
-        // #021 B 项：apply_pending_changes 返回移动被挡接触对（双方 EntityId + 目标格 + 来源）
+    fn apply_blocked_move_full_block_stays() {
+        // #030 全挡：目标与滑动替代位全被身体重叠 → 原地不动（不推挤不穿越）
         let mut world = WorldState::new();
-        let e1 = make_entity(1, (5.0, 0.0));
-        let e2 = make_entity(2, (6.0, 0.0));
+        let e1 = make_entity(1, (5.0, 5.0));
+        let e2 = make_entity(2, (6.0, 5.0));
         let id1 = e1.id;
-        let id2 = e2.id;
         world.entities.insert(id1, e1);
-        world.entities.insert(id2, e2);
+        world.entities.insert(e2.id, e2);
         let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
             entity: id1,
-            new_pos: (6.5, 0.2),
+            new_pos: (6.0, 5.0),
         }];
-        let contacts = apply_pending_changes(&mut world, &mut pending, None);
-        assert_eq!(contacts.len(), 1, "移动被挡应产生 1 对接触");
-        assert_eq!(contacts[0].a, id1, "a = 被挡的移动者");
-        assert_eq!(contacts[0].b, id2, "b = 占据者");
-        assert_eq!(contacts[0].pos, (6.5, 0.2), "接触坐标 = 被挡的目标格坐标");
-        assert_eq!(contacts[0].source, "move_blocked", "来源 = 移动被挡");
+        apply_pending_changes(&mut world, &mut pending, None);
+        assert_eq!(
+            world.entities.get(&id1).unwrap().pos(),
+            (5.0, 5.0),
+            "整步/滑x/滑y 全被挡 → 原地"
+        );
     }
 
     #[test]
-    fn apply_free_move_returns_no_contacts() {
-        // 反向护栏：正常移动不产生接触对
+    fn apply_blocked_move_slides_x() {
+        // #030 滑 x：正北有身体、目标斜向东北被挡 → 沿 x 滑开（贴墙滑）
         let mut world = WorldState::new();
-        let e1 = make_entity(1, (5.0, 0.0));
+        let e1 = make_entity(1, (5.0, 5.0));
+        let e2 = make_entity(2, (5.0, 6.0));
+        let id1 = e1.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(e2.id, e2);
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id1,
+            new_pos: (5.2, 5.9),
+        }];
+        apply_pending_changes(&mut world, &mut pending, None);
+        assert_eq!(
+            world.entities.get(&id1).unwrap().pos(),
+            (5.2, 5.0),
+            "整步被挡 → 滑 x (5.2, 5.0) 不重叠"
+        );
+    }
+
+    #[test]
+    fn apply_blocked_move_slides_y() {
+        // #030 滑 y：正东有身体、目标斜入其身 → 沿 y 滑开
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, (5.0, 5.0));
+        let e2 = make_entity(2, (6.0, 5.0));
+        let id1 = e1.id;
+        world.entities.insert(id1, e1);
+        world.entities.insert(e2.id, e2);
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id1,
+            new_pos: (5.9, 5.3),
+        }];
+        apply_pending_changes(&mut world, &mut pending, None);
+        assert_eq!(
+            world.entities.get(&id1).unwrap().pos(),
+            (5.0, 5.3),
+            "整步被挡 → 滑 x (5.9,5.0) 距 0.5 仍挡 → 滑 y (5.0,5.3) 不重叠"
+        );
+    }
+
+    #[test]
+    fn apply_move_clamps_to_radius_line() {
+        // #030 落地钳制：目标 y < radius → y = radius（脚贴地，圆心即位置）
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, (5.0, 5.0));
         let id1 = e1.id;
         world.entities.insert(id1, e1);
         let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
             entity: id1,
             new_pos: (6.0, 0.0),
         }];
-        let contacts = apply_pending_changes(&mut world, &mut pending, None);
-        assert!(contacts.is_empty(), "空格移动不产生接触");
-        assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.0));
+        apply_pending_changes(&mut world, &mut pending, None);
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "目标 (6,0) 钳到 (6,0.5)");
+    }
+
+    #[test]
+    fn apply_free_move_no_block() {
+        // 反向护栏：不重叠的目标照常应用
+        let mut world = WorldState::new();
+        let e1 = make_entity(1, (5.0, 5.0));
+        let id1 = e1.id;
+        world.entities.insert(id1, e1);
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id1,
+            new_pos: (7.0, 5.0),
+        }];
+        apply_pending_changes(&mut world, &mut pending, None);
+        assert_eq!(world.entities.get(&id1).unwrap().pos(), (7.0, 5.0));
     }
 
     // === 操控层 v0：tick 级意图路由（#022 操控优先于自主）===
@@ -2954,7 +3097,8 @@ mod tests {
   (func (export "on_tick") (drop (call $move_by (f64.const 1.0) (f64.const 0.0))))
   (func (export "life") (result i32) i32.const 1))"#;
 
-    /// 操控测试舞台：玩家 p1@(30,0) 挂指定 WAT 沙箱并登记为 me 声明的操控目标（#024），
+    /// 操控测试舞台：玩家 p1@(30,0.5)（半径线站位，#030 圆心即位置）挂指定 WAT 沙箱
+    /// 并登记为 me 声明的操控目标（#024），
     /// 返回 (world, time, physics, renderer, storage, pending, sandbox_map, pid, me 目录)。
     /// me 目录 = 临时 players/ 目录（p1.wat 在场 + me.txt="p1"），测试可改文件模拟声明变化。
     #[allow(clippy::type_complexity)]
@@ -2973,7 +3117,7 @@ mod tests {
     ) {
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        let pid = make_entity_with_sandbox(&mut world, &mut map, 1, (30.0, 0.0), player_wat);
+        let pid = make_entity_with_sandbox(&mut world, &mut map, 1, (30.0, 0.5), player_wat);
         let dir = temp_players_dir("control");
         std::fs::write(dir.join("p1.wat"), player_wat).unwrap();
         std::fs::write(dir.join("me.txt"), "p1").unwrap();
@@ -3011,7 +3155,7 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (29.0, 0.0),
+            (29.0, 0.5),
             "操控移动覆盖自主移动"
         );
     }
@@ -3033,7 +3177,7 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (30.0, 0.0),
+            (30.0, 0.5),
             "me 在线无按键：自主 move_by(+1,0) 被抑制，站住"
         );
         assert!(
@@ -3059,7 +3203,7 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (31.0, 0.0),
+            (31.0, 0.5),
             "me 删除后自主恢复东行"
         );
         assert!(
@@ -3102,10 +3246,10 @@ mod tests {
         // 操控不豁免物理（宪法）：目标格被占 -> 操控移动被占位裁决挡下，实体留原位
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
-        // 占据者：无沙箱普通实体（非玩家）放在西邻格
+        // 占据者：无沙箱普通实体（非玩家）放在西邻位
         world.entities.insert(
             EntityId(Uuid::from_u128(9)),
-            make_entity(9, (29.0, 0.0)),
+            make_entity(9, (29.0, 0.5)),
         );
         let intents = vec![input::Intent::Move { dx: -1.0, dy: 0.0 }];
         tick_with_intents(
@@ -3120,12 +3264,12 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (30.0, 0.0),
-            "操控移动被占位裁决挡下（塔前停）"
+            (30.0, 0.5),
+            "操控移动被碰撞裁决挡下（贴墙滑 y 落半径线站住）"
         );
         assert_eq!(
             world.entities.get(&EntityId(Uuid::from_u128(9))).unwrap().pos(),
-            (29.0, 0.0),
+            (29.0, 0.5),
             "占据者不受影响"
         );
     }
@@ -3187,7 +3331,7 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&lone).unwrap().pos(),
-            (31.0, 0.0),
+            (31.0, 0.5),
             "无玩家在线时按键不操控实体（自主照常）"
         );
         assert!(map.warned_no_player, "应记一次 no player online 提示");
@@ -3221,12 +3365,12 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&pid2).unwrap().pos(),
-            (34.0, 0.0),
+            (34.0, 0.5),
             "声明的 p2 被操控西移（on_tick 被抑制，仅操控位移）"
         );
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (31.0, 0.0),
+            (31.0, 0.5),
             "未声明的 p1 不受操控，代码自主东移"
         );
     }
@@ -3254,7 +3398,7 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (31.0, 0.0),
+            (31.0, 0.5),
             "观战模式按键不操控实体（代码自主照常）"
         );
         assert!(map.warned_no_player, "观战模式按键应提示一次");
@@ -3284,7 +3428,7 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (31.0, 0.0),
+            (31.0, 0.5),
             "声明无效 -> 观战，代码自主照常"
         );
         assert!(map.warned_invalid_me, "无效声明应 warn 一次");
@@ -3298,19 +3442,20 @@ mod tests {
     #[test]
     fn ws_move_walks_tick_by_tick_until_arrival() {
         // #027 点击走位全链路：拍1 收 WsMove 立即走一步，拍2 无意图续走，拍3 到达停住
-        //（30 -> 31 -> 32 到达；之后不再抖动，持续目标清除）
+        //（30 -> 31 -> 32 到达；之后不再抖动，持续目标清除。#030：实体站半径线，
+        // 点击同高地面坐标 (32,0.5)，矢量步=正东）
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
-        let walk = vec![input::Intent::WsMove { x: 32.0, y: 0.0 }];
+        let walk = vec![input::Intent::WsMove { x: 32.0, y: 0.5 }];
         let none: Vec<input::Intent> = vec![];
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &walk);
-        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.0), "拍1 向点击目标走一步");
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.5), "拍1 向点击目标走一步");
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
-        assert_eq!(world.entities.get(&pid).unwrap().pos(), (32.0, 0.0), "拍2 续走到达");
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (32.0, 0.5), "拍2 续走到达");
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (32.0, 0.0),
+            (32.0, 0.5),
             "拍3 到达停住（目标清除，格距<=0.5 判定）"
         );
         assert!(map.ws_move_target.is_none(), "到达后持续目标清除");
@@ -3321,16 +3466,16 @@ mod tests {
         // #027 stop 全链路：走位中收到 Stop -> 清目标站住，后续空拍也不复活走位
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
-        let walk = vec![input::Intent::WsMove { x: 35.0, y: 0.0 }];
+        let walk = vec![input::Intent::WsMove { x: 35.0, y: 0.5 }];
         let stop = vec![input::Intent::Stop];
         let none: Vec<input::Intent> = vec![];
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &walk);
-        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.0), "走位中");
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.5), "走位中");
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &stop);
-        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.0), "Stop 拍站住");
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.5), "Stop 拍站住");
         assert!(map.ws_move_target.is_none(), "Stop 清除持续目标");
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &none);
-        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.0), "目标已清，不复活走位");
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.5), "目标已清，不复活走位");
     }
 
     /// 飞行测试便捷：连跑 n 拍空意图（爬升/悬停/降落的延续拍）
@@ -3355,18 +3500,19 @@ mod tests {
 
     #[test]
     fn controlled_flight_click_aerial_point_climbs_and_hovers() {
-        // 第五刀主链路：点空中 (30,3) -> 每拍净 +1 爬升（喷气步+重力扣回）-> 到位
-        // 悬停（y 稳定）-> 目标保留；悬停中 x 不动（独占抑制自主 on_tick）而 y 稳定
-        //（喷气在跑）——即"喷气是意图层动作非 on_tick"的分层证明（审查 A.3）
+        // 第六刀主链路（#030 升力独立）：点空中 (30,3) -> 矢量步每拍 +1 爬升
+        //（免重力集合承载升力，不再 +9.8 位移 hack）-> 进到达窗（格距≤0.5）
+        // 转 hover 维持 -> 目标保留；悬停中 x 不动（独占抑制自主 on_tick）而 y 稳定
+        //（免重力生效）——升力独立于移动的分层证明
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
         let fly = vec![input::Intent::WsMove { x: 30.0, y: 3.0 }];
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &fly);
         let y1 = world.entities.get(&pid).unwrap().pos().1;
-        assert!((y1 - 1.0).abs() < 1e-9, "首拍净爬升 1 格，实际 {y1}");
+        assert!((y1 - 1.5).abs() < 1e-9, "首拍矢量爬升 1 格（0.5->1.5），实际 {y1}");
         fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
         let y3 = world.entities.get(&pid).unwrap().pos().1;
-        assert!((y3 - 3.0).abs() < 1e-9, "三拍到位 y=3（净 +1/拍），实际 {y3}");
+        assert!((y3 - 2.5).abs() < 1e-9, "三拍进到达窗 y=2.5（距目标 0.5），实际 {y3}");
         fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
         assert_eq!(
             map.flight_phase,
@@ -3375,15 +3521,15 @@ mod tests {
         );
         fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 3);
         let (px, py) = world.entities.get(&pid).unwrap().pos();
-        assert!((py - 3.0).abs() < 1e-6, "悬停维持：喷气抵消重力位置稳定，实际 {py}");
+        assert!((py - 2.5).abs() < 1e-6, "悬停维持：免重力位置稳定（被挡≠坠落的机制本体），实际 {py}");
         assert_eq!(px, 30.0, "独占抑制自主 on_tick（AUTO_MOVER 的 +1 东移没跑）");
         assert!(map.ws_move_target.is_some(), "悬停目标保留（新意图才改变）");
     }
 
     #[test]
     fn controlled_hover_attack_does_not_drop() {
-        // 审查 P1：悬停中出刀不断气——悬停是持续意图（attack 不清目标，#027 并存
-        // 语义），攻击拍仍排队喷气补偿 SetPos，位置稳定不坠落（否则一拍砸地再爬）
+        // 审查 P1（#030 升力独立版）：悬停中出刀不掉——空中出刀实体仍进免重力
+        // 集合（升力独立于行动类型），位置稳定不坠落（旧 +9.8 喷气补偿 hack 退役）
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
         let fly = vec![input::Intent::WsMove { x: 30.0, y: 3.0 }];
@@ -3393,7 +3539,7 @@ mod tests {
         let strike = vec![input::Intent::WsAttack { x: 40.0, y: 0.0 }];
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &strike);
         let y = world.entities.get(&pid).unwrap().pos().1;
-        assert!((y - 3.0).abs() < 1e-6, "悬停中出刀位置稳定不坠落，实际 {y}");
+        assert!((y - 2.5).abs() < 1e-6, "悬停中出刀位置稳定不坠落，实际 {y}");
         assert_eq!(map.flight_phase, Some(input::FlightPhase::Hover), "出刀不断气（相位保持）");
     }
 
@@ -3431,18 +3577,18 @@ mod tests {
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &stop);
         fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
         let (px, py) = world.entities.get(&pid).unwrap().pos();
-        assert!((py - 3.0).abs() < 1e-6, "stop 后悬停不坠，实际 {py}");
+        assert!((py - 2.5).abs() < 1e-6, "stop 后悬停不坠，实际 {py}");
         assert_eq!(px, 30.0, "停止水平移动");
         assert_eq!(map.flight_phase, Some(input::FlightPhase::Hover), "stop 空中转悬停相位");
         let mt = map.ws_move_target.expect("stop 后悬停锚点在册");
         assert_eq!(mt.0, pid);
-        assert!((mt.1 .1 - 3.0).abs() < 1e-6, "悬停锚点 = 脚下坐标");
+        assert!((mt.1 .1 - 2.5).abs() < 1e-6, "悬停锚点 = 脚下坐标");
     }
 
     #[test]
     fn controlled_click_ground_from_air_lands_and_walks() {
-        // 悬停中点地面：先垂直降落到地面线（受控 -1/拍），落地后恢复旧规走位到点，
-        // 到达清除（地面路径与旧版完全一致——回归锚）
+        // 悬停中点地面：矢量步斜向受控降落（#030 L 形废除——直奔落点不垂直优先），
+        // 终进近踏上点击点（y 落地钳制收进半径线），到达清除 + 退出飞行相位
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
         let fly = vec![input::Intent::WsMove { x: 30.0, y: 3.0 }];
@@ -3451,16 +3597,16 @@ mod tests {
         assert_eq!(map.flight_phase, Some(input::FlightPhase::Hover), "前置：悬停已建立");
         let land = vec![input::Intent::WsMove { x: 34.0, y: 0.0 }];
         tick_with_intents(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, &land);
-        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 5);
         let (lx, ly) = world.entities.get(&pid).unwrap().pos();
-        assert!((ly - 0.0).abs() < 1e-6, "三拍降落到地面线，实际 {ly}");
-        assert_eq!(lx, 30.0, "降落期不横移（垂直优先）");
-        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 6);
+        let d2 = (lx - 34.0) * (lx - 34.0) + ly * ly;
+        assert!(d2 <= 0.25 + 1e-9, "矢量降落进到达窗（距点击点 ≤0.5），实际 ({lx},{ly})");
+        fly_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
         let (wx, wy) = world.entities.get(&pid).unwrap().pos();
-        assert!((wx - 34.0).abs() < 1e-9, "落地后走位到点击点，实际 {wx}");
-        assert!((wy - 0.0).abs() < 1e-9, "贴地行走，实际 {wy}");
-        assert!(map.ws_move_target.is_none(), "地面目标到达清除（旧版语义）");
-        assert_eq!(map.flight_phase, None, "落地退出飞行相位");
+        assert!((wx - 34.0).abs() < 1e-9, "终进近踏上点击点 x，实际 {wx}");
+        assert!((wy - 0.5).abs() < 1e-9, "落地钳制站半径线（脚贴地），实际 {wy}");
+        assert!(map.ws_move_target.is_none(), "地面目标到达清除");
+        assert_eq!(map.flight_phase, None, "落地退出飞行相位（重力接管）");
     }
 
     #[test]
@@ -3502,7 +3648,7 @@ mod tests {
             &mut map,
             &intents,
         );
-        assert_eq!(world.entities.get(&pid).unwrap().pos(), (29.0, 0.0), "操控中");
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (29.0, 0.5), "操控中");
         // 删玩家文件 = 下线信号（在线锚本拍 d0 检测）；tick2 下线进残影
         std::fs::remove_file(me_dir.join("p1.wat")).unwrap();
         tick_with_intents(
@@ -3536,7 +3682,7 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (29.0, 0.0),
+            (29.0, 0.5),
             "latch 后操控无效（#025 语义更新：下线检测拍 me 仍在线=独占抑制，实体冻在 29 不再自主多走一步）"
         );
         assert!(
@@ -3577,7 +3723,7 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&new_id).unwrap().pos(),
-            (31.0, 0.0),
+            (31.0, 0.5),
             "不自动恢复操控：新实体走代码自主东移（操控西移无效）"
         );
     }
@@ -4509,10 +4655,10 @@ mod tests {
     #[test]
     fn tick_applies_move_by_queued_in_phase_one() {
         // 全链路：on_tick 调 move_by 排队 SetPos -> tick 阶段二 a 步统一应用 -> 坐标变更。
-        // 实体站地面 (0,0)：物理无干扰（地面实体不受重力），tick 后应恰在 (1.0, 0.0)。
+        // 实体站半径线 (0,0.5)：物理无干扰（地面实体不受重力），tick 后应恰在 (1.0, 0.5)。
         let mut world = WorldState::new();
         let id = EntityId(Uuid::from_u128(1));
-        world.entities.insert(id, make_entity(1, (0.0, 0.0)));
+        world.entities.insert(id, make_entity(1, (0.0, 0.5)));
         let mut time = TimeEngine::new();
         let physics = DefaultPhysicsEngine::new();
         let mut renderer = test_renderer();
@@ -4531,7 +4677,7 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&id).unwrap().pos(),
-            (1.0, 0.0),
+            (1.0, 0.5),
             "move_by 排队的 SetPos 应在阶段二应用（右移 1 步）"
         );
     }
@@ -4661,8 +4807,8 @@ mod tests {
         let pa = world.entities.get(&a).unwrap().pos();
         assert_eq!(
             pa,
-            (14.0, 0.0),
-            "9 tick 后 A 应走到 (14,0)（每 tick 恰走 1.0）"
+            (14.0, 0.5),
+            "9 tick 后 A 应走到 (14,0.5)（每 tick 恰走 1.0，站半径线与 D 相切）"
         );
         assert!(prev_dist <= 1.5, "9 tick 后应进入攻击范围，实际距离 {prev_dist}");
         assert_eq!(
@@ -4717,8 +4863,11 @@ mod tests {
     fn smoke_default_viewport_four_bio_timeline_unchanged() {
         // 冒烟（scan 视野化回归验收点）：默认视口 50x25（对齐真实 Config），四生物
         // + E 类玩家 @(35,5)（PLAYER_WAT 同 players/_template.wat.txt：只 log 不动不 scan）。
-        // 全员都在 [-50,50]x[-25,25] 内，视口过滤是 no-op——剧本时间线必须不变：
-        // tick4 D 反制杀 H、tick12 杀 A；E 距离最远无人锁定，全程存活。
+        // 全员都在 [-50,50]x[-25,25] 内，视口过滤是 no-op。
+        // #030 半径物理后的剧本时间线（探针实测）：
+        // - tick4 D 反制杀 H【确定】；A 可能同拍被 H 反杀（A 被身体挡停=站桩，
+        //   H 点命中），也可能活下来继续贴 D——取决于 H/D 刀的随机 EntityId
+        //   结算顺序（#002 序确定、id 随机），故 A 的生死断言取"最迟 tick12 必死"。
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         spawn_test_entities(&mut world, &mut map, 10, true, true);
@@ -4742,17 +4891,11 @@ mod tests {
             &mut pending, &mut map, 1,
         );
         assert!(!glyph_alive(&world, "H"), "tick4 D 反制应杀 H（时间线回归点一）");
-        assert!(glyph_alive(&world, "A"), "tick4 A 应还活着");
         run_ticks(
             &mut world, &mut time, &physics, &mut renderer, &mut storage,
-            &mut pending, &mut map, 7,
+            &mut pending, &mut map, 8,
         );
-        assert!(glyph_alive(&world, "A"), "tick11 A 应还活着");
-        run_ticks(
-            &mut world, &mut time, &physics, &mut renderer, &mut storage,
-            &mut pending, &mut map, 1,
-        );
-        assert!(!glyph_alive(&world, "A"), "tick12 D 反制应杀 A（时间线回归点二）");
+        assert!(!glyph_alive(&world, "A"), "tick12 A 必死（早则 tick4 被 H 反杀，迟则贴 D 站桩后 tick12 被 D 反制）");
         assert!(glyph_alive(&world, "D"), "D 应存活");
         assert!(glyph_alive(&world, "S"), "S 应存活（悬浮躲刀）");
         assert!(glyph_alive(&world, "E"), "E 无人锁定应全程存活");
@@ -4799,8 +4942,8 @@ mod tests {
         );
         assert_eq!(
             world.entities.get(&e).unwrap().pos(),
-            (35.0, 0.0),
-            "E 应原地未动（无人锁定无人接触）"
+            (35.0, 0.5),
+            "E 应原地未动（无人锁定无人接触；落地钳半径线）"
         );
     }
 
@@ -4831,23 +4974,23 @@ mod tests {
                 .values()
                 .find(|e| e.code_hash == "creation" && e.appearance.glyph == "T")
         }
-        // tick 1：立塔拍——塔在 +5，P 不动
+        // tick 1：立塔拍——塔在 +5，P 不动（半径物理：P 落半径线 0.5，塔造物落地 y=0）
         run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
-        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (30.0, 0.0), "立塔拍 P 不应移动");
+        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (30.0, 0.5), "立塔拍 P 不应移动（落地钳半径线）");
         let t = tower(&world).expect("立塔拍应有塔诞生");
-        assert_eq!(t.pos(), (35.0, 0.0), "塔应立在 P 的 +5 格 (35,0)");
+        assert_eq!(t.pos(), (35.0, 0.0), "塔应立在 P 的 +5 格 (35,0)，造物贴地 y=0");
         assert!(map.sandboxes.contains_key(&t.id), "塔应有自己的沙箱（活造物）");
-        // tick 2-5：每拍东移一步
+        // tick 2-5：每拍东移一步（走到塔西脸相切处：距塔面恰 0.5=半径）
         run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 4);
-        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (34.0, 0.0), "4 拍后 P 应走到塔前 (34,0)");
+        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (34.0, 0.5), "4 拍后 P 应走到塔前 (34,0.5)（贴塔脸）");
         assert_eq!(tower(&world).unwrap().pos(), (35.0, 0.0), "塔应原地站岗");
-        // tick 6：P 试图进塔的格 → 占位制挡下（留原位，不推挤不穿塔）
+        // tick 6：P 试图进塔身体 → 碰撞裁决挡下（滑 x/y 均不行，原地贴墙，不穿塔）
         run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
-        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (34.0, 0.0), "P 走进塔格应被挡在 (34,0)");
-        assert_eq!(tower(&world).unwrap().pos(), (35.0, 0.0), "被挡后塔不位移（推挤已退役）");
-        // 再跑 2 拍：P 持续被挡（每拍记移动被挡接触），塔纹丝不动
+        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (34.0, 0.5), "P 走进塔身应被挡在 (34,0.5)");
+        assert_eq!(tower(&world).unwrap().pos(), (35.0, 0.0), "被挡后塔不位移（不推挤）");
+        // 再跑 2 拍：P 持续被挡（贴着塔 = 接触边沿触发只报一次），塔纹丝不动
         run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
-        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (34.0, 0.0), "持续被挡");
+        assert_eq!(world.entities.get(&p_id).unwrap().pos(), (34.0, 0.5), "持续被挡");
         assert_eq!(tower(&world).unwrap().pos(), (35.0, 0.0), "塔持续站岗");
         // 四生物不受 P/T 影响：D 站桩存活（H 在 tick4 已被 D 反制清理，属既有时间线）
         assert!(glyph_alive(&world, "D"), "D 应存活");
@@ -5361,17 +5504,17 @@ mod tests {
             .values()
             .find(|e| e.code_hash == "example")
             .expect("玩家 example 应进场");
-        assert_eq!(p.pos(), (30.0, 0.0), "第 1 名玩家出生点 (30,0)");
+        assert_eq!(p.pos(), (30.0, 0.0), "第 1 名玩家出生点 (30,0)（d0 进场在物理步后，本拍不落位）");
         assert_eq!(p.appearance.glyph, "E");
         assert_eq!(p.appearance.color, "green");
         assert!(map.sandboxes.contains_key(&p.id), "进场玩家必有沙箱");
         let pid = p.id;
-        // tick 2：玩家代码第一次执行（on_tick 右移 1.0）
+        // tick 2：玩家代码第一次执行（on_tick 右移 1.0；上拍落地钳制已站半径线）
         run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (31.0, 0.0),
-            "玩家 on_tick 应真实执行（每拍右移 1.0）"
+            (31.0, 0.5),
+            "玩家 on_tick 应真实执行（每拍右移 1.0，站半径线）"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5433,8 +5576,8 @@ mod tests {
         let pid = find_player_id(&world, "mover");
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
-            (31.0, 0.0),
-            "存活期玩家代码应每拍右移 1.0"
+            (31.0, 0.5),
+            "存活期玩家代码应每拍右移 1.0（站半径线）"
         );
         std::fs::remove_file(dir.join("mover.wat")).unwrap();
         // tick 3：阶段一仍执行玩家代码（残影下拍才生效）-> (32,0)，随后 d0 检测下线
@@ -5537,12 +5680,12 @@ mod tests {
         std::fs::remove_file(dir.join("example.wat")).unwrap();
         run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
         assert!(map.players.is_ghost(&pid), "前置：残影已建立");
-        // 击杀刀打残影（空 payload = 默认击杀）
+        // 击杀刀打残影（空 payload = 默认击杀；#030 点命中：残影已落半径线 (30,0.5)）
         let enemy = make_entity_with_sandbox(&mut world, &mut map, 201, (29.0, 0.0), TARGET_WAT);
         process_attacks(
             &mut world,
             &mut map,
-            &[PendingAttack { attacker: enemy, target_pos: (30.0, 0.0), payload: vec![] }],
+            &[PendingAttack { attacker: enemy, target_pos: (30.0, 0.5), payload: vec![] }],
         );
         assert!(
             !world.entities.get(&pid).unwrap().is_alive(),
@@ -5622,7 +5765,7 @@ mod tests {
         process_attacks(
             &mut world,
             &mut map,
-            &[PendingAttack { attacker: enemy, target_pos: (30.0, 0.0), payload: stun }],
+            &[PendingAttack { attacker: enemy, target_pos: (30.0, 0.5), payload: stun }],
         );
         assert_eq!(
             call_i32_export(&mut map, &pid, "get_ver"),
@@ -5704,7 +5847,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -5713,6 +5856,7 @@ mod tests {
     i32.const 0 i32.const {len}
     f64.const {x} f64.const {y}
     i32.const 8192 i32.const 8256
+    f64.const 0.5
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -5892,6 +6036,7 @@ mod tests {
                 code: "this is not wat ((".to_string(),
                 glyph: "T".to_string(),
                 color: "cyan".to_string(),
+                radius: 0.5,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -5991,7 +6136,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -6007,6 +6152,7 @@ mod tests {
         f64.const {y}
         (i32.const 8192)
         (i32.const 8256)
+        (f64.const 0.5)
         (call $spawn)
         (drop))))
   (func (export "life") (result i32) i32.const 1))"#,
