@@ -44,8 +44,8 @@ pub(crate) struct ViewportInfo {
     pub h: f64,
 }
 
-/// 单实体快照。kind 决定可选字段：player 带 name+controlled；creation 带 owner；
-/// npc 三者皆无（skip_serializing_if 保持 JSON 干净）。
+/// 单实体快照。kind 决定可选字段：player 带 controlled；creation 带 owner；
+/// name 恒有（v1.1，= code_hash 代码身份）；npc 无可选字段（skip_serializing_if 保持 JSON 干净）。
 #[derive(Debug, Serialize)]
 pub(crate) struct EntitySnapshot {
     pub id: String,
@@ -54,8 +54,7 @@ pub(crate) struct EntitySnapshot {
     pub x: f64,
     pub y: f64,
     pub kind: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controlled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,7 +96,7 @@ pub(crate) fn build_snapshot(
                 x,
                 y,
                 kind,
-                name: (kind == "player").then(|| e.code_hash.clone()),
+                name: e.code_hash.clone(),
                 controlled: (kind == "player").then(|| Some(e.id) == controlled),
                 owner: (kind == "creation").then(|| e.owner.0.to_string()),
             }
@@ -330,19 +329,19 @@ mod tests {
     }
 
     #[test]
-    fn test_entity_maps_to_npc_without_player_fields() {
-        // 规则：开局四生物（attacker/defender/hunter/spy）= npc，不带 name/controlled/owner
+    fn test_entity_maps_to_npc_with_code_identity_name() {
+        // 规则（v1.1）：npc 带 name=code_hash（代码身份，悬浮提示用），不带 controlled/owner
         let mut world = WorldState::new();
         put_entity(&mut world, "attacker", "A", "red", (12.5, 0.0));
         let dir = PlayerDirectory::disabled();
         let json = build(&world, &dir, None);
         let e = &json["entities"][0];
         assert_eq!(e["kind"], "npc", "attacker 是 NPC");
+        assert_eq!(e["name"], "attacker", "npc 的 name = code_hash 代码身份");
         assert_eq!(e["glyph"], "A");
         assert_eq!(e["color"], "red");
         assert_eq!(e["x"], 12.5);
         assert_eq!(e["y"], 0.0);
-        assert!(e.get("name").is_none(), "npc 不带 name 字段");
         assert!(e.get("controlled").is_none(), "npc 不带 controlled 字段");
         assert!(e.get("owner").is_none(), "npc 不带 owner 字段");
         assert!(e["id"].is_string(), "id 是 UUID 字符串");
@@ -387,12 +386,12 @@ mod tests {
         let json = build(&world, &dir, None);
         let e = &json["entities"][0];
         assert_eq!(e["kind"], "creation");
+        assert_eq!(e["name"], "creation", "creation 的 name = code_hash 原文");
         assert_eq!(
             e["owner"],
             owner.0.to_string(),
             "owner = 创造者 PlayerId UUID 字符串"
         );
-        assert!(e.get("name").is_none(), "creation 不带 name");
         assert!(e.get("controlled").is_none(), "creation 不带 controlled");
     }
 

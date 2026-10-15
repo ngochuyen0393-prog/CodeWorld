@@ -2,12 +2,13 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-15 期四第一刀 WS 快照推送收工更新）
-- 在做：无（期四第一刀落地：WebSocket 快照推送 + 验收页，axum 0.7，554 测试）
+## 现在（2026-10-15 期四第二刀 Canvas 观战收工更新）
+- 在做：无（期四第二刀落地：Canvas 战场画面 + 快照插值观战页，554 测试）
 - 卡在：无
-- 下一步：① 本刀人工冒烟（start.bat 启动 → 浏览器开 http://localhost:8080 → 看 tick 跳动+实体数+console 前 3 帧，步骤见收工报告——CC 沙箱不能起进程开浏览器）；② 期四第二刀：Canvas 渲染（前端手写零框架，消费 net-protocol.md v1 契约，viewport 换算基准已定）+ 插值；③ 期四第三刀：WS 输入回传（客户端意图流接 input.rs 单入口，替换键盘生产者）+ 下线处置界面（#025 选择接管者）；④ #024 人工冒烟仍未做（me.txt 声明操控，可与本刀一起验）；⑤ wasmtime 25.0.3 Windows out-of-fuel trap 进程 abort 仍是生产化阻断项（.cc-bugs #5）；⑥ 已知 MVP 缺口同前（probe 残影答 on_probe/接触通道未开/门二销毁通路）；⑦ Phase 2 议题同前
+- 下一步：① 本刀人工冒烟（start.bat → 浏览器开 http://localhost:8080 → 网格/地面/彩色实体/平滑滑动/断线重连/悬停提示，步骤见收工报告——CC 沙箱不能起进程开浏览器）；② 期四第三刀：WS 输入回传（客户端意图流接 input.rs 单入口，替换键盘生产者）+ 下线处置界面（#025 选择接管者）；③ #024 人工冒烟仍未做（me.txt 声明操控，可与本刀一起验——Canvas 页白框高亮实体即操控目标直观判据）；④ wasmtime 25.0.3 Windows out-of-fuel trap 进程 abort 仍是生产化阻断项（.cc-bugs #5）；⑤ 已知 MVP 缺口同前（probe 残影答 on_probe/接触通道未开/门二销毁通路）；⑥ Phase 2 议题同前
 
 ## 已完成
+- 期四第二刀：Canvas 战场画面 + 快照插值观战页（2026-10-15）：index.html 整页重写（手写零依赖原生 JS+Canvas 2D，无框架无 CDN 无构建：字幕条/主画布/状态栏三段布局；暗网格+地面线+实体 glyph 连续坐标绘制，creation 方形底衬、controlled 白框高亮、悬停 name/kind 提示、状态栏鼠标世界坐标）+ 快照插值（Valve snapshot interpolation：12 帧缓冲带本地接收时刻，渲染时间=now-1.5×EMA 平均帧间隔即「渲染在过去」，两帧线性插值；出生即现/死亡即消失；tick 间隔自适应跟随 CODEWORLD_TICK_MS）+ 断线指数退避重连（1s 起步封顶 30s，单定时器防双调度，重连清空缓冲）+ 协议 v1.1（name 从仅 player 扩为恒有=code_hash 代码身份，悬浮提示可显示 npc 名；net.rs EntitySnapshot.name Option→String，2 测试同步）+ 插值逻辑 node 桩环境 29 项机器验证（帧间定位/边界钳边/新生死亡/断线状态机/坐标翻转/64 实体满载 fillText≤65）；554 测试零回归（2026-10-15）
 - 期四第一刀：WebSocket 快照推送 + 验收页（2026-10-15，decisions #026）：net.rs 新模块（WorldSnapshot/EntitySnapshot serde 序列化——kind 三映射 npc/player/creation、controlled 标记、viewport 域、实体按 id 字典序稳定帧序；push_snapshot 无观众零开销桥——tokio broadcast Sender 跨 std/tokio 线程；axum 0.7 serve=/ws 快照广播+ServeDir 静态页一把抓，绑定 127.0.0.1）+ config ws_port（默认 8080，0=禁用）+ main 循环渲染旁推快照（禁用=None 零开销分支）+ WS 线程隔离（监听失败/panic 只 warn，终端世界不受影响）+ 静态验收页 static/index.html（手写零依赖 JS：tick/实体数/操控目标滚动显示+前 3 帧 console+断线 2s 重连）+ docs/net-protocol.md v1 前端契约 + render controlled() 观测访问器；TDD 红绿全程 18 新测试（含 4 个 WS 集成：帧递增/断开存活/多客户端/ping-pong），536 基线零回归，554 测试（2026-10-15）
 - 操控身份绑定 #024（2026-10-15）：me 声明解析（read_me_declaration：CODEWORLD_ME 环境变量优先、空串回落 me.txt、trim、空文件/缺失=未声明）+ 操控目标身份绑定（controlled_target：声明名字校验在线，first_online+online_order 退役——修正 #023 进场序偷懒语义）+ 观战模式（未声明/无效：按键仅 Quit 生效 debug 提示一次、字幕 ctrl:--、无高亮；四生物无人在线仍无 ctrl 段）+ 下线 latch（操控目标下线 warn 一次本局锁定观战，重新进场不自动恢复需重启）+ 字幕 ctrl 段三态（操控:字形/观战:--/无人:无段）+ example.wat 归位 _template.wat.txt（下划线前缀+.txt 后缀不进场）+ README/start.bat/api.md/decisions #024 同步；TDD 红绿全程 9 新测试 2 退役，四生物剧本/无人按键回归不变，536 测试（2026-10-15）
 - 操控层 v0 #023（2026-10-15）：input.rs 意图层（Intent 枚举/key_to_intent 键位全表 WASD+方向键双支持/空格攻击/q+Enter+Ctrl+C 退出/route_intents 纯函数路由同拍多键后到覆盖）+ crossterm 输入线程（raw mode + 50ms 事件轮询 + mpsc 队列 + Quit/EOF 置退出标志）+ 终端模式（alternate screen 进/出 + panic hook 全路径恢复 + setup 失败降级普通输出）+ tick_with_intents 路由接线（操控目标=第一个进场玩家 first_online 进场序【#024 已修正为 me 声明】；按键拍抑制该实体 on_tick 完全接管 life() 照常；操控移动 SetPos 排队过占位裁决；操控攻击空 payload 并入两阶段结算；无玩家按键安全+no player online 日志一次）+ 视觉反馈（caption ctrl:字形段 + 被操控实体白色高亮渲染层特判 + color_to_ansi white=97）；TDD 红绿全程 34 新测试，四生物剧本/无人按键自主行为回归不变，529 测试（2026-10-15）

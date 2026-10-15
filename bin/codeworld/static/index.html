@@ -3,87 +3,388 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CodeWorld 快照监视</title>
+<title>CodeWorld 战场</title>
+<!--
+  CodeWorld 战场（期四第二刀）：Canvas 观战画面 + 快照插值
+
+  插值原理（Valve snapshot interpolation）：世界是唯一权威（decisions #026），
+  浏览器只是显示器。WS 每拍推全量 JSON 快照（docs/net-protocol.md v1.1），
+  本页维护最近 12 帧快照缓冲，每帧带本地接收时刻；渲染时间取
+  「当前时间 - 1.5×平均帧间隔」——即画面刻意呈现在过去，使渲染时刻总被
+  最近两帧快照夹住，实体位置在两帧之间线性插值。1 秒/拍的离散世界因此
+  呈现平滑连续运动，代价是约 1.5 拍的画面延迟（观战无感）。
+  tick 间隔自适应：帧到达间隔滚动平均（EMA），CODEWORLD_TICK_MS 变了自动跟随。
+  断线指数退避重连（1s 起步、封顶 30s），重连成功清空缓冲重新开始。
+
+  手写零依赖声明：无框架、无 CDN、无构建工具、无 script src，
+  单文件原生 JS + Canvas 2D（项目零前端工具链宪法）。
+-->
 <style>
-  /* 验收页极简样式：等宽字体对齐终端画面气质，不做装饰 */
-  body { font-family: Consolas, "Courier New", monospace; margin: 2rem; background: #111; color: #ddd; }
-  h3 { font-weight: 400; }
-  table { border-collapse: collapse; margin: 1rem 0; }
-  td, th { border: 1px solid #444; padding: 0.3rem 0.9rem; text-align: left; }
-  th { color: #8bc34a; font-weight: 400; }
-  #status { color: #ffcc00; }
-  #status.ok { color: #8bc34a; }
-  #frames { white-space: pre; font-size: 0.8rem; color: #999; max-height: 12rem; overflow: auto;
-            background: #1a1a1a; padding: 0.6rem; }
-  .hint { color: #777; font-size: 0.85rem; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; overflow: hidden;
+    display: flex; flex-direction: column;
+    background: #0e1116; color: #c9d1d9;
+    font-family: Consolas, "Courier New", monospace; font-size: 14px;
+  }
+  #caption {
+    padding: 6px 12px; background: #161b22; border-bottom: 1px solid #21262d;
+    line-height: 1.5; white-space: pre; color: #8b949e;
+    min-height: 1.5em; overflow-x: auto;
+  }
+  #stage { flex: 1; position: relative; min-height: 0; }
+  #cv { display: block; width: 100%; height: 100%; cursor: crosshair; }
+  #tip {
+    position: absolute; pointer-events: none; z-index: 2;
+    background: #1c2128; border: 1px solid #30363d; border-radius: 4px;
+    padding: 3px 8px; font-size: 12px; color: #e6edf3; white-space: nowrap;
+  }
+  #bar {
+    display: flex; gap: 18px; padding: 6px 12px;
+    background: #161b22; border-top: 1px solid #21262d;
+  }
+  #bar b { color: #e6edf3; font-weight: 400; }
+  #conn.wait { color: #d29922; }
+  #conn.ok   { color: #3fb950; }
+  #conn.bad  { color: #f85149; }
+  #mouse { margin-left: auto; color: #8b949e; }
 </style>
 </head>
 <body>
-<h3>CodeWorld 快照监视（期四第一刀验收页）</h3>
-<p id="status">连接中……</p>
-<table>
-  <tr><th>tick</th><td id="tick">-</td></tr>
-  <tr><th>实体数</th><td id="entities">-</td></tr>
-  <tr><th>操控目标</th><td id="controlled">-</td></tr>
-  <tr><th>帧计数</th><td id="frames-count">0</td></tr>
-</table>
-<div id="frames">（前 3 帧快照 JSON 显示在此，完整版见浏览器控制台 F12）</div>
-<p class="hint">数据源：ws 同源 /ws 每拍一帧全量快照（docs/net-protocol.md v1）。终端里世界照常跑，本页只是显示器。</p>
+<div id="caption">（等待世界字幕……）</div>
+<div id="stage">
+  <canvas id="cv"></canvas>
+  <div id="tip" hidden></div>
+</div>
+<div id="bar">
+  <span id="conn" class="wait">连接中……</span>
+  <span>tick <b id="tick">-</b></span>
+  <span>实体 <b id="cnt">-</b></span>
+  <span>帧间隔 <b id="itv">-</b>ms</span>
+  <span id="mouse">x=- , y=-</span>
+</div>
 <script>
-// 期四第一刀验收：连 WS -> 收快照 -> 前 3 帧 console.log + 页面滚 tick/实体数。
-// 手写零依赖（与项目零前端工具链一致，第二刀 Canvas 也手写）。
 (function () {
-  var MAX_CONSOLE_FRAMES = 3;
-  var frameCount = 0;
-  var statusEl = document.getElementById('status');
+  'use strict';
+
+  // ---- 插值与连接参数 ----
+  var DELAY_FACTOR = 1.5;              // 渲染延迟 = 1.5 × 平均帧间隔（渲染在过去）
+  var EMA_ALPHA = 0.2;                 // 帧间隔滚动平均系数（小=平滑，大=跟随快）
+  var MAX_FRAMES = 12;                 // 快照缓冲上限（≥2 即可插值，留余量抗抖动）
+  var INTERVAL_MIN = 16;               // 帧间隔合理域下限（防异常小值）
+  var INTERVAL_MAX = 10000;            // 帧间隔合理域上限（防异常大值污染平均）
+  var BACKOFF_INIT = 1000;             // 重连退避起步（ms）
+  var BACKOFF_MAX = 30000;             // 重连退避封顶（ms）
+
+  // ---- DOM ----
+  var stage = document.getElementById('stage');
+  var cv = document.getElementById('cv');
+  var ctx = cv.getContext('2d');
+  var captionEl = document.getElementById('caption');
+  var connEl = document.getElementById('conn');
   var tickEl = document.getElementById('tick');
-  var entitiesEl = document.getElementById('entities');
-  var controlledEl = document.getElementById('controlled');
-  var framesCountEl = document.getElementById('frames-count');
-  var framesEl = document.getElementById('frames');
-  var framesShown = '';
+  var cntEl = document.getElementById('cnt');
+  var itvEl = document.getElementById('itv');
+  var mouseEl = document.getElementById('mouse');
+  var tipEl = document.getElementById('tip');
 
-  function connect() {
-    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    var ws = new WebSocket(proto + location.host + '/ws');
+  // ---- 状态 ----
+  var buf = [];                 // 快照缓冲 [{t:接收时刻, tick, caption, viewport, ents:Map(id->e)}]
+  var avgInterval = null;       // 帧到达间隔滚动平均（自适应 tick 周期）
+  var lastRecvT = null;
+  var vp = null;                // 当前视口域（来自快照，世界坐标 <-> 画布换算基准）
+  var viewW = 0, viewH = 0;     // 画布 CSS 尺寸
+  var mouse = null;             // 画布内鼠标位置（CSS px）
+  var lastState = null;         // 最近一次采样结果（悬浮提示用）
+  var lastCaption = null;
+  var connState = 'wait';       // wait=连接中 / ok=已连接 / bad=已断线
+  var reconnectTimer = null;
+  var backoffMs = BACKOFF_INIT;
 
-    ws.onopen = function () {
-      statusEl.textContent = '已连接 ' + location.host + '，等待世界快照……';
-      statusEl.className = 'ok';
-    };
-    ws.onmessage = function (ev) {
-      var snap;
-      try { snap = JSON.parse(ev.data); } catch (e) {
-        statusEl.textContent = '收到非 JSON 帧（协议不符）';
-        return;
+  // ---- 快照接收：入缓冲 + 帧间隔滚动平均 ----
+  function onMessage(ev) {
+    var snap;
+    try { snap = JSON.parse(ev.data); } catch (e) {
+      console.warn('[cw] 收到非 JSON 帧，丢弃');
+      return;
+    }
+    if (!snap || !Array.isArray(snap.entities) || !snap.viewport) {
+      console.warn('[cw] 快照字段缺失（协议不符），丢弃');
+      return;
+    }
+    var now = performance.now();
+    if (lastRecvT !== null) {
+      var dt = now - lastRecvT;
+      if (dt > 0 && dt < INTERVAL_MAX) {
+        avgInterval = avgInterval === null ? dt : avgInterval + (dt - avgInterval) * EMA_ALPHA;
       }
-      frameCount++;
-      framesCountEl.textContent = String(frameCount);
-      tickEl.textContent = String(snap.tick);
-      entitiesEl.textContent = String(snap.entities.length);
-      var me = null;
-      for (var i = 0; i < snap.entities.length; i++) {
-        if (snap.entities[i].controlled) { me = snap.entities[i]; break; }
+    }
+    lastRecvT = now;
+    var ents = new Map();
+    for (var i = 0; i < snap.entities.length; i++) {
+      ents.set(snap.entities[i].id, snap.entities[i]);
+    }
+    buf.push({ t: now, tick: snap.tick, caption: snap.caption, viewport: snap.viewport, ents: ents });
+    while (buf.length > MAX_FRAMES) buf.shift();
+    // 状态栏数字取最新帧（实时性优先；插值只作用于画面位置）
+    tickEl.textContent = String(snap.tick);
+    cntEl.textContent = String(snap.entities.length);
+    itvEl.textContent = avgInterval === null ? '-' : String(Math.round(avgInterval));
+  }
+
+  function resetBuffer() {
+    buf = [];
+    avgInterval = null;
+    lastRecvT = null;
+    itvEl.textContent = '-';
+  }
+
+  // 渲染延迟：1.5×平均帧间隔（覆盖一整帧的到达抖动；间隔异常时钳进合理域）
+  function renderDelay() {
+    if (avgInterval === null) return 0;
+    var itv = Math.min(Math.max(avgInterval, INTERVAL_MIN), INTERVAL_MAX);
+    return DELAY_FACTOR * itv;
+  }
+
+  // 单帧原样采样（无插值：缓冲不足两帧 / 渲染时间溢出钳边时用）
+  function plainFrame(f) {
+    return { caption: f.caption, viewport: f.viewport, ents: f.ents };
+  }
+
+  // 按渲染时间定位两帧并线性插值（本刀灵魂）
+  function sampleState(renderTime) {
+    var n = buf.length;
+    if (n === 0) return null;
+    if (n === 1) return plainFrame(buf[0]);
+    var ai = -1;
+    for (var i = n - 1; i >= 0; i--) {
+      if (buf[i].t <= renderTime) { ai = i; break; }
+    }
+    if (ai < 0) return plainFrame(buf[0]);        // 早于最老帧（延迟突降短暂窗口）：钳最老
+    if (ai >= n - 1) return plainFrame(buf[n - 1]); // 晚于最新帧（断流/暂停）：钳最新=画面冻结
+    var A = buf[ai], B = buf[ai + 1];
+    var span = B.t - A.t;
+    var alpha = span > 0 ? Math.min(1, Math.max(0, (renderTime - A.t) / span)) : 0;
+    var ents = new Map();
+    B.ents.forEach(function (b, id) {
+      var a = A.ents.get(id);
+      if (a) {
+        // 两帧同在：位置线性插值，其余字段取新帧
+        ents.set(id, {
+          id: id, glyph: b.glyph, color: b.color, kind: b.kind, name: b.name,
+          controlled: b.controlled === true, owner: b.owner,
+          x: a.x + (b.x - a.x) * alpha,
+          y: a.y + (b.y - a.y) * alpha
+        });
+      } else {
+        // 新实体：从出生帧位置直接显示（无插值起点）
+        ents.set(id, b);
       }
-      controlledEl.textContent = me ? me.name + ' (' + me.glyph + ')' : '--（观战）';
-      statusEl.textContent = '已连接，帧正在滚动';
-      if (frameCount <= MAX_CONSOLE_FRAMES) {
-        console.log('快照帧 #' + frameCount, snap);
-        framesShown += '# ' + frameCount + ' ' + JSON.stringify(snap) + '\n';
-        framesEl.textContent = framesShown;
-      }
+    });
+    // A 有 B 无的实体自然消失（死亡即消失，任务书定案可接受）
+    return { caption: B.caption, viewport: B.viewport, ents: ents };
+  }
+
+  // ---- 坐标换算（net-protocol.md §4；世界 y 向上、屏幕 y 向下须翻转，负数域直接可用）----
+  function worldToScreen(wx, wy) {
+    return {
+      x: (wx - vp.x0) / vp.w * viewW,
+      y: viewH - (wy - vp.y0) / vp.h * viewH
     };
-    ws.onclose = function () {
-      statusEl.textContent = '连接断开，2 秒后重连……（终端退出后本页会一直重试）';
-      statusEl.className = '';
-      setTimeout(connect, 2000);
-    };
-    ws.onerror = function () {
-      statusEl.textContent = '连接错误（服务未启动或端口不对）';
+  }
+  function screenToWorld(sx, sy) {
+    return {
+      x: vp.x0 + sx / viewW * vp.w,
+      y: vp.y0 + (viewH - sy) / viewH * vp.h
     };
   }
 
+  // ---- 画布尺寸（devicePixelRatio 适配；绘制一律用 CSS 像素）----
+  function resize() {
+    var dpr = window.devicePixelRatio || 1;
+    var r = stage.getBoundingClientRect();
+    viewW = Math.max(1, r.width);
+    viewH = Math.max(1, r.height);
+    cv.width = Math.round(viewW * dpr);
+    cv.height = Math.round(viewH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  var COLOR_BG = '#0e1116';
+  var COLOR_GRID = '#1b222d';
+  var COLOR_GROUND = '#4b5666';
+
+  // 每帧全量重画（60fps × 实体≤64 + 网格一次 path 画完，无压力）
+  function draw(state) {
+    ctx.fillStyle = COLOR_BG;
+    ctx.fillRect(0, 0, viewW, viewH);
+    if (!state) {
+      ctx.fillStyle = '#8b949e';
+      ctx.font = '14px Consolas, monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('等待世界快照……（启动 start.bat 后自动连接）', viewW / 2, viewH / 2);
+      return;
+    }
+    vp = state.viewport;
+    var cell = Math.min(viewW / vp.w, viewH / vp.h);
+
+    // 背景网格：世界整数坐标处一条暗线（格子感）
+    ctx.strokeStyle = COLOR_GRID;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    var xi;
+    for (xi = Math.ceil(vp.x0); xi <= Math.floor(vp.x0 + vp.w); xi++) {
+      var sx = Math.round(worldToScreen(xi, 0).x) + 0.5;
+      ctx.moveTo(sx, 0);
+      ctx.lineTo(sx, viewH);
+    }
+    var yi;
+    for (yi = Math.ceil(vp.y0); yi <= Math.floor(vp.y0 + vp.h); yi++) {
+      var sy = Math.round(worldToScreen(0, yi).y) + 0.5;
+      ctx.moveTo(0, sy);
+      ctx.lineTo(viewW, sy);
+    }
+    ctx.stroke();
+
+    // 地面线：y=0 一条稍亮横线（域内才画）
+    if (vp.y0 <= 0 && 0 <= vp.y0 + vp.h) {
+      var gy = Math.round(worldToScreen(0, 0).y) + 0.5;
+      ctx.strokeStyle = COLOR_GROUND;
+      ctx.beginPath();
+      ctx.moveTo(0, gy);
+      ctx.lineTo(viewW, gy);
+      ctx.stroke();
+    }
+
+    // 实体：glyph 居中画在插值后的连续世界坐标上
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = Math.round(Math.min(32, Math.max(10, cell * 0.9))) + 'px Consolas, monospace';
+    var half = cell * 0.45;
+    state.ents.forEach(function (e) {
+      var p = worldToScreen(e.x, e.y);
+      if (p.x < -cell || p.x > viewW + cell || p.y < -cell || p.y > viewH + cell) return; // 视口外剔除
+      if (e.kind === 'creation') {
+        ctx.fillStyle = 'rgba(255,255,255,0.10)'; // 造物方形底衬
+        ctx.fillRect(p.x - half, p.y - half, half * 2, half * 2);
+      }
+      if (e.controlled === true) {
+        ctx.strokeStyle = '#ffffff';              // 操控目标白色描边框
+        ctx.lineWidth = 2;
+        ctx.strokeRect(p.x - half - 2, p.y - half - 2, half * 2 + 4, half * 2 + 4);
+      }
+      ctx.fillStyle = e.color;
+      ctx.fillText(e.glyph, p.x, p.y);
+    });
+  }
+
+  function updateCaption(state) {
+    var text = state ? state.caption : '（未连接世界）';
+    if (text !== lastCaption) {
+      lastCaption = text;
+      captionEl.textContent = text;
+    }
+  }
+
+  // ---- 悬浮提示 + 鼠标世界坐标（第三刀点击操控的直观校验）----
+  function updateTooltip() {
+    var hit = null;
+    if (mouse && lastState && lastState.ents.size > 0) {
+      var cell = Math.min(viewW / lastState.viewport.w, viewH / lastState.viewport.h);
+      var thr = Math.max(10, cell * 0.6);
+      var thr2 = thr * thr;
+      lastState.ents.forEach(function (e) {
+        var p = worldToScreen(e.x, e.y);
+        var d = (p.x - mouse.x) * (p.x - mouse.x) + (p.y - mouse.y) * (p.y - mouse.y);
+        if (d <= thr2 && (!hit || d < hit.d)) hit = { e: e, d: d };
+      });
+    }
+    if (!hit) {
+      tipEl.hidden = true;
+      return;
+    }
+    var e = hit.e;
+    var text = e.name + ' · ' + e.kind;
+    if (e.controlled) text += ' · 操控中';
+    if (e.kind === 'creation' && e.owner) text += ' · owner ' + e.owner.slice(0, 8);
+    tipEl.textContent = text;
+    tipEl.hidden = false;
+    tipEl.style.left = Math.min(mouse.x + 14, viewW - tipEl.offsetWidth - 4) + 'px';
+    tipEl.style.top = Math.max(mouse.y - 26, 4) + 'px';
+  }
+
+  cv.addEventListener('mousemove', function (ev) {
+    var r = cv.getBoundingClientRect();
+    mouse = { x: ev.clientX - r.left, y: ev.clientY - r.top };
+    if (vp) {
+      var w = screenToWorld(mouse.x, mouse.y);
+      mouseEl.textContent = 'x=' + w.x.toFixed(1) + ', y=' + w.y.toFixed(1);
+    }
+  });
+  cv.addEventListener('mouseleave', function () {
+    mouse = null;
+    mouseEl.textContent = 'x=- , y=-';
+    tipEl.hidden = true;
+  });
+
+  // ---- 连接状态机：连接中 / 已连接 / 已断线（指数退避重连，单一定时器防死循环）----
+  var CONN_TEXT = { wait: '连接中……', ok: '已连接', bad: '已断线，等待重连' };
+  function renderConn() {
+    var text = CONN_TEXT[connState];
+    if (connState === 'bad') text += '（' + Math.round(backoffMs / 1000) + 's 后重试）';
+    connEl.textContent = text;
+    connEl.className = connState;
+  }
+
+  function connect() {
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    connState = 'wait';
+    renderConn();
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var ws = new WebSocket(proto + location.host + '/ws');
+    ws.onopen = function () {
+      console.info('[cw] WS 已连接');
+      connState = 'ok';
+      backoffMs = BACKOFF_INIT; // 连上了就重置退避
+      resetBuffer();            // 重连后清空缓冲重新开始（断线期间旧帧与新世界不连续）
+      renderConn();
+    };
+    ws.onmessage = onMessage;
+    ws.onerror = function () {
+      // onclose 会跟进来，重连统一在 onclose 调度（防双调度）
+      console.info('[cw] WS 连接错误（服务未启动或端口不对）');
+    };
+    ws.onclose = function () {
+      console.info('[cw] WS 断开，' + Math.round(backoffMs / 1000) + 's 后重连');
+      connState = 'bad';
+      renderConn();
+      if (reconnectTimer !== null) return; // 防双调度（onerror 后紧跟 onclose）
+      reconnectTimer = setTimeout(function () {
+        reconnectTimer = null;
+        connect();
+      }, backoffMs);
+      backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX);
+    };
+  }
+
+  // ---- 主循环：rAF 驱动，每帧重采样重画 ----
+  function loop() {
+    var state = sampleState(performance.now() - renderDelay());
+    lastState = state;
+    updateCaption(state);
+    draw(state);
+    updateTooltip();
+    requestAnimationFrame(loop);
+  }
+
   connect();
+  requestAnimationFrame(loop);
 })();
 </script>
 </body>

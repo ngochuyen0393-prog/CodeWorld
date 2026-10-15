@@ -1,4 +1,4 @@
-# CodeWorld 网络协议 v1：快照推送（期四第一刀）
+# CodeWorld 网络协议：快照推送（期四第一刀 v1 / 第二刀 v1.1）
 
 > 前端契约文档。第二刀（Canvas 渲染）依赖本文字段名与语义；改字段先改这里再改代码。
 > 依据 decisions.md #026（薄客户端/快照推送）；世界是唯一权威，浏览器只是显示器。
@@ -43,11 +43,16 @@
 | `color` | string | 恒有 | 颜色名（red/cyan/yellow/purple/green/magenta/blue/white） |
 | `x`, `y` | f64 | 恒有 | 世界坐标（f64 原值，未取整；画布换算见 §4） |
 | `kind` | string | 恒有 | `"npc"` / `"player"` / `"creation"`（见 §3.1） |
-| `name` | string | 仅 player | 玩家名（= code_hash 身份承载，players/ 目录文件名） |
+| `name` | string | 恒有（v1.1 起，原仅 player） | 代码身份 `code_hash` 原文：npc=`attacker`/`defender`/`hunter`/`spy`；player=玩家名（players/ 文件名）；creation=`"creation"`（身份看 `owner`） |
 | `controlled` | bool | 仅 player | `true` = me 声明的操控目标（#024，每拍解析）；player 字段恒在（前端 `e.controlled` 直接可用） |
 | `owner` | string | 仅 creation | 创造者 PlayerId 的 UUID 字符串（产权链 #015） |
 
-npc 实体**没有** `name`/`controlled`/`owner` 键（`skip_serializing_if` 保持 JSON 干净）。
+npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSON 干净）；v1.1 起 `name` 全实体恒有（第二刀悬浮提示需要 npc 的代码身份）。
+
+### v1.1 变更记录（2026-10-15，期四第二刀）
+
+- `name` 字段出现条件从「仅 player」扩为「恒有」，值为 `code_hash` 原文。原因：Canvas 页悬浮提示要显示 name/kind，npc（A/D/H/S 主角四人组）在 v1 下无名可显；`code_hash` 即代码身份（本世界"代码即现实"的第一身份），恒有后前端无需可选分支。
+- 其余字段与语义零变更；player 的 `name` 值不变（仍=玩家名）。
 
 ### 3.1 kind 判定（code_hash 纯映射）
 
