@@ -195,6 +195,22 @@ impl DefaultPhysicsEngine {
             vel.1 += self.params.gravity;
             // 3. 阻力定律（质量为分母）
             vel = apply_drag(vel, mass, self.params.drag_coefficient);
+            // 3.5 世界极速钳制（#034 修订一，双审 P1-A 修复）：积分后（重力+阻力）、
+            // 位移前归一化压回——重力累积从此封顶，弹丸一拍位移不超过极速。
+            // 视觉可读性常数：攻击永远看得见飞过来（发射端钳制见 arena shoot import，
+            // 两处口径同源 config.max_speed / DefaultPhysics.max_speed）
+            let speed2 = vel.0 * vel.0 + vel.1 * vel.1;
+            let max_speed = self.params.max_speed;
+            if speed2 > max_speed * max_speed {
+                let scale = max_speed / speed2.sqrt();
+                tracing::debug!(
+                    projectile = %pid.0,
+                    from_speed = speed2.sqrt(),
+                    to_speed = max_speed,
+                    "[projectile] 世界极速钳制（重力累积封顶）"
+                );
+                vel = (vel.0 * scale, vel.1 * scale);
+            }
             // 4. 位移（一拍一步）
             let after = (before.0 + vel.0, before.1 + vel.1);
             if let Some(p) = world.entities.get_mut(&pid) {
@@ -507,6 +523,7 @@ mod tests {
             collision_enabled: false,
             max_velocity: 50.0,
             drag_coefficient: 0.1,
+            max_speed: 25.0,
         };
         let engine = DefaultPhysicsEngine::new_with_params(p);
         assert_eq!(engine.params().gravity, -5.0);
@@ -1075,5 +1092,87 @@ mod tests {
 
     fn near(a: (f64, f64), b: (f64, f64)) -> bool {
         (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9
+    }
+
+    // === 世界极速·飞行中钳制（#034 修订一，双审 P1-A 修复）===
+
+    fn zero_drag_engine() -> DefaultPhysicsEngine {
+        // 无阻力引擎：隔离重力累积效应（阻力会抵消重力，掩盖钳制是否生效）
+        DefaultPhysicsEngine::new_with_params(DefaultPhysics {
+            drag_coefficient: 0.0,
+            ..DefaultPhysics::default_values()
+        })
+    }
+
+    #[test]
+    fn projectile_flight_speed_capped_at_world_max_speed() {
+        // P1-A 复现锚：重弹 mass=100 自由落体（阻力 0 可忽略），重力逐拍累积
+        // 修复前速度无封顶（29 拍 vy≈-284）；修复后速度模长封顶于世界极速 25
+        let engine = zero_drag_engine();
+        let mut world = WorldState::new();
+        let p = make_projectile(1, (50.0, 5000.0), (0.0, 0.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let mut peak = 0.0f64;
+        for t in 1..=29 {
+            engine.step_projectiles(&mut world, t, &HashMap::new());
+            let (vx, vy) = world.entities.get(&pid).unwrap().velocity();
+            let speed = (vx * vx + vy * vy).sqrt();
+            peak = peak.max(speed);
+            assert!(
+                speed <= 25.0 + 1e-9,
+                "第 {t} 拍速度应封顶世界极速 25，实际 {speed}"
+            );
+        }
+        assert!(
+            peak > 24.0,
+            "重力应把速度推到接近极速（证明钳制真实在工作而非速度没涨），峰值 {peak}"
+        );
+    }
+
+    #[test]
+    fn projectile_flight_displacement_per_tick_capped() {
+        // 钳制在位移之前（重力+阻力后、位移前）：一拍位移不超过极速——
+        // 视觉可读性常数的世界保证：任何飞行物一拍最多走 25 格
+        let engine = zero_drag_engine();
+        let mut world = WorldState::new();
+        let p = make_projectile(1, (50.0, 5000.0), (0.0, 0.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        for t in 1..=29 {
+            let before = world.entities.get(&pid).unwrap().pos();
+            engine.step_projectiles(&mut world, t, &HashMap::new());
+            let after = world.entities.get(&pid).unwrap().pos();
+            let moved = ((after.0 - before.0).powi(2) + (after.1 - before.1).powi(2)).sqrt();
+            assert!(
+                moved <= 25.0 + 1e-9,
+                "第 {t} 拍位移应不超过极速 25，实际 {moved}"
+            );
+        }
+    }
+
+    #[test]
+    fn projectile_at_exact_max_speed_untouched() {
+        // 边界：速度恰等于极速不钳（严格 > 判据）：无重力无阻力下 (25,0) 分毫不动
+        let engine = DefaultPhysicsEngine::new_with_params(DefaultPhysics {
+            gravity: 0.0,
+            drag_coefficient: 0.0,
+            ..DefaultPhysics::default_values()
+        });
+        let mut world = WorldState::new();
+        let p = make_projectile(1, (0.0, 10.0), (25.0, 0.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        engine.step_projectiles(&mut world, 1, &HashMap::new());
+        assert_eq!(
+            world.entities.get(&pid).unwrap().velocity(),
+            (25.0, 0.0),
+            "恰等于极速的速度不应被改动"
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (25.0, 10.0),
+            "一拍位移恰为极速 25 格"
+        );
     }
 }

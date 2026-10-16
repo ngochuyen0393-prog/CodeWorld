@@ -87,6 +87,15 @@ impl PhysicsOverride {
     }
 }
 
+/// 世界极速（#034 修订一：视觉可读性常数，telegraphing constant）。
+/// 任何离体之物一拍位移的硬上限：一拍最大位移不超过世界宽度（100 格）的 1/4，
+/// 任何飞行物在画面上至少存在多拍、肉眼可追随，攻击永远"看得见飞过来"；
+/// 同时天然保证防御反应窗口（极速内任何弹至少飞 1 拍以上，零窗口狙击物理上不存在）。
+/// 不是玩法平衡数字，是世界的物理常数（与重力 -9.8 同级）。
+/// 标定锚：横穿全图（100 格）最短约 4 拍的观感；拍速变更时随世界常数批次
+/// 重标定（不自动公式耦合，明改明公告）。
+pub const WORLD_MAX_SPEED: f64 = 25.0;
+
 /// 默认物理规则参数（框架内置，不可删除，可通过覆盖替换行为）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultPhysics {
@@ -105,14 +114,25 @@ pub struct DefaultPhysics {
     /// serde default：旧参数快照无此字段回退 0.05。
     #[serde(default = "default_drag")]
     pub drag_coefficient: f64,
+    /// 世界极速（#034 修订一：视觉可读性常数 WORLD_MAX_SPEED）。
+    /// 对弹丸生效的两处钳制：发射时初速超限拒绝 + 飞行中每拍积分后归一化压回
+    /// （重力累积从此封顶，双审 P1-A 修复）。
+    /// serde default：旧参数快照无此字段回退世界极速默认 25.0。
+    #[serde(default = "default_max_speed")]
+    pub max_speed: f64,
 }
 
 fn default_drag() -> f64 {
     0.05
 }
 
+fn default_max_speed() -> f64 {
+    WORLD_MAX_SPEED
+}
+
 impl DefaultPhysics {
-    /// 默认物理参数：gravity=-9.8, ground_y=0.0, collision_enabled=true, max_velocity=100.0, drag=0.05
+    /// 默认物理参数：gravity=-9.8, ground_y=0.0, collision_enabled=true,
+    /// max_velocity=100.0, drag=0.05, max_speed=25.0（世界极速）
     pub fn default_values() -> Self {
         Self {
             gravity: -9.8,
@@ -120,6 +140,7 @@ impl DefaultPhysics {
             collision_enabled: true,
             max_velocity: 100.0,
             drag_coefficient: default_drag(),
+            max_speed: default_max_speed(),
         }
     }
 }
@@ -284,6 +305,27 @@ mod tests {
         let back: DefaultPhysics = serde_json::from_str(&json).unwrap();
         assert_eq!(back.gravity, -9.8);
         assert!(back.collision_enabled);
+    }
+
+    // === 世界极速（#034 修订一：视觉可读性常数）===
+
+    #[test]
+    fn world_max_speed_default_is_twenty_five() {
+        // 创建：世界极速默认 25 格/拍（视觉可读性常数：一拍最大位移不超过世界宽度
+        // 1/4，任何飞行物画面上至少存在多拍肉眼可追随；标定锚：横穿全图 100 格
+        // 最短约 4 拍。拍速变更时随世界常数批次重标定，不自动公式耦合）
+        assert_eq!(WORLD_MAX_SPEED, 25.0);
+        let p = DefaultPhysics::default_values();
+        assert_eq!(p.max_speed, WORLD_MAX_SPEED, "默认参数应采用世界极速常数");
+    }
+
+    #[test]
+    fn default_physics_max_speed_serde_backcompat() {
+        // 边界：旧参数快照（无 max_speed 字段）反序列化回退世界极速默认
+        //（serde default 与 drag/radius/mass 同款向后兼容）
+        let json = r#"{"gravity":-9.8,"ground_y":0.0,"collision_enabled":true,"max_velocity":100.0,"drag_coefficient":0.05}"#;
+        let back: DefaultPhysics = serde_json::from_str(json).unwrap();
+        assert_eq!(back.max_speed, WORLD_MAX_SPEED, "旧快照应回退世界极速默认");
     }
 
     // === PhysicsReason ===

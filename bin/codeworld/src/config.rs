@@ -59,6 +59,11 @@ pub struct Config {
     /// 标定判据：默认参数下标准上抛弹（vx=4/vy=+9.8/mass=1.0）射程 5~15 格。
     /// CODEWORLD_DRAG 覆盖。
     pub drag_coefficient: f64,
+    /// 世界极速（#034 修订一：视觉可读性常数），默认 25.0（codeworld_core
+    /// WORLD_MAX_SPEED）。任何离体之物一拍位移的硬上限：发射超限拒绝 + 飞行中
+    /// 积分后归一化压回（重力累积封顶）。标定锚：横穿全图 100 格最短约 4 拍。
+    /// CODEWORLD_MAX_SPEED 覆盖；非正数/非有限值回退默认。
+    pub max_speed: f64,
 }
 
 impl Default for Config {
@@ -81,6 +86,7 @@ impl Default for Config {
             ws_port: 8080,
             dispose_wait_ticks: 30,
             drag_coefficient: 0.05,
+            max_speed: codeworld_core::physics::WORLD_MAX_SPEED,
         }
     }
 }
@@ -137,6 +143,15 @@ impl Config {
                 cfg.drag_coefficient = 0.0;
             } else {
                 cfg.drag_coefficient = d;
+            }
+        }
+        if let Some(s) = env_f64("CODEWORLD_MAX_SPEED") {
+            // 护栏：世界极速是归一化压回的分母候选——0/负值除零，非有限值污染弹道，
+            // 一律回退默认 25.0（视觉可读性常数，坏值不进世界）
+            if !s.is_finite() || s <= 0.0 {
+                tracing::warn!(value = s, "[config] CODEWORLD_MAX_SPEED 非正数或非有限值，回退默认 25.0");
+            } else {
+                cfg.max_speed = s;
             }
         }
         // 布尔类开关："0"/"false"（大小写不敏感）= 关闭，缺失或其他值 = 默认开启
@@ -518,5 +533,40 @@ mod tests {
         let c = Config::load();
         std::env::remove_var("CODEWORLD_DRAG");
         assert_eq!(c.drag_coefficient, 0.0, "负阻力应钳到 0（无阻力，不放大力）");
+    }
+
+    // === 世界极速（#034 修订一：视觉可读性常数，CODEWORLD_MAX_SPEED）===
+
+    #[test]
+    fn default_max_speed_is_twenty_five() {
+        // 创建：世界极速默认 25 格/拍（视觉可读性常数：一拍位移 ≤ 世界宽度 1/4，
+        // 攻击永远看得见飞过来；横穿全图 100 格最短约 4 拍的标定锚）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CODEWORLD_MAX_SPEED");
+        let c = Config::load();
+        assert_eq!(c.max_speed, 25.0, "世界极速默认应为 25.0");
+    }
+
+    #[test]
+    fn load_max_speed_env_overrides_default() {
+        // 修改：CODEWORLD_MAX_SPEED 覆盖默认（世界常数可调）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_MAX_SPEED", "40");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_MAX_SPEED");
+        assert_eq!(c.max_speed, 40.0, "环境变量应覆盖世界极速");
+    }
+
+    #[test]
+    fn load_max_speed_invalid_falls_back_to_default() {
+        // 边界：非正数/非有限值 -> 回退默认 25.0（极速是物理常数，坏值不进世界：
+        // 0 或负值会让归一化压回除零/反向，NaN 污染弹道）
+        let _g = ENV_LOCK.lock().unwrap();
+        for bad in ["0", "-5", "nan", "abc"] {
+            std::env::set_var("CODEWORLD_MAX_SPEED", bad);
+            let c = Config::load();
+            std::env::remove_var("CODEWORLD_MAX_SPEED");
+            assert_eq!(c.max_speed, 25.0, "非法值 {bad} 应回退默认世界极速");
+        }
     }
 }

@@ -87,10 +87,15 @@ struct EntitySandboxMap {
 }
 
 impl EntitySandboxMap {
-    /// 创建映射表（初始化 SandboxManager）
+    /// 创建映射表（初始化 SandboxManager，世界极速用缺省常数——测试基线用）
     fn new() -> Result<Self> {
+        Self::new_with_max_speed(codeworld_core::physics::WORLD_MAX_SPEED)
+    }
+
+    /// 创建映射表（指定世界极速，#034 修订一：发射钳制与飞行钳制同源装配）
+    fn new_with_max_speed(max_speed: f64) -> Result<Self> {
         Ok(Self {
-            manager: SandboxManager::new()?,
+            manager: SandboxManager::new_with_max_speed(max_speed)?,
             sandboxes: HashMap::new(),
             visible_ids: Vec::new(),
             visible_positions: Vec::new(),
@@ -624,8 +629,11 @@ fn main() -> Result<()> {
     // 初始化各引擎（架构文档 4.1：time/physics/render）
     let mut time_engine = TimeEngine::new();
     // #034：阻力常量装配（世界基石参数，CODEWORLD_DRAG 可调；默认 0.05 标定射程 5~15 格）
+    // #034 修订一：世界极速装配（视觉可读性常数，CODEWORLD_MAX_SPEED 可调；默认 25），
+    // 同一参数对象喂给物理步（飞行中钳制）——发射端钳制在下方 sandbox_map 装配同源
     let physics = DefaultPhysicsEngine::new_with_params(codeworld_core::physics::DefaultPhysics {
         drag_coefficient: config.drag_coefficient,
+        max_speed: config.max_speed,
         ..codeworld_core::physics::DefaultPhysics::default_values()
     });
     let viewport = Viewport::new(
@@ -640,7 +648,7 @@ fn main() -> Result<()> {
     // 实体-沙箱映射表（架构 4.1 阶段一：玩家代码执行）
     // 注意：从快照恢复的实体只有元数据、无沙箱（WASM 实例不持久化），
     //       这些实体 run_player_code 会跳过；重新挂沙箱属 Phase 2 范畴。
-    let mut sandbox_map = EntitySandboxMap::new()?;
+    let mut sandbox_map = EntitySandboxMap::new_with_max_speed(config.max_speed)?;
     // probe 预算装配（三层感知 Phase A：config 可调的 on_probe 独立小 fuel）
     sandbox_map.probe_fuel = config.probe_fuel;
     // 世界实体上限装配（门二 spawn 配套，decisions.md #020）

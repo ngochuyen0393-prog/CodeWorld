@@ -25,9 +25,11 @@ pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 /// MVP 一刀切的简单规则；规则由宪法允许后续玩法化（decisions.md #012）。
 pub const SPAWN_RANGE: f64 = 10.0;
 
-/// shoot 初速模长上限（#034：防一拍穿世界——弹丸一拍一步，初速 50 即一拍最多
-/// 飞 50 格≈半个视口；工程护栏非玩法裁定）
-pub const MAX_SHOOT_SPEED: f64 = 50.0;
+/// shoot 初速模长上限（#034 修订一：MAX_SHOOT_SPEED=50 硬编码退役——发射钳制
+/// 改用世界极速常数 WORLD_MAX_SPEED（默认 25，视觉可读性常数），经
+/// SandboxManager::new_with_max_speed 装配，与飞行中钳制（DefaultPhysics.max_speed）
+/// 同源一个世界常数。此常量仅作 new() 的缺省值）
+pub const MAX_SHOOT_SPEED: f64 = codeworld_core::physics::WORLD_MAX_SPEED;
 
 /// spawn 外观字符串（glyph/color，NUL 结尾）最大字节数
 ///
@@ -211,16 +213,23 @@ pub struct SandboxManager {
 }
 
 impl SandboxManager {
-    /// 创建管理器：初始化 Engine（启用 fuel）和 Linker（注册 env.log）
+    /// 创建管理器：初始化 Engine（启用 fuel）和 Linker（注册 env.log）。
+    /// 世界极速用缺省常数 WORLD_MAX_SPEED（测试与默认装配用）
     pub fn new() -> Result<Self> {
+        Self::new_with_max_speed(codeworld_core::physics::WORLD_MAX_SPEED)
+    }
+
+    /// 创建管理器（指定世界极速，#034 修订一）：发射钳制与飞行钳制同源。
+    /// 极速值经 move 闭包进 shoot import，管理器本体不再存副本
+    pub fn new_with_max_speed(max_speed: f64) -> Result<Self> {
         let mut config = Config::new();
         config.consume_fuel(true);
         // 内存限制：每个 WASM 实例最大 64MB（CLAUDE.md 技术约束）
         // static_memory_maximum_size 设静态内存上限；完整动态内存硬上限用 ResourceLimiter（Phase 2）
         config.static_memory_maximum_size(64 * 1024 * 1024);
         let engine = Engine::new(&config)?;
-        let linker = Self::make_linker(&engine)?;
-        tracing::debug!("SandboxManager 创建");
+        let linker = Self::make_linker(&engine, max_speed)?;
+        tracing::debug!(max_speed, "SandboxManager 创建");
         Ok(Self { engine, linker })
     }
 
@@ -234,7 +243,7 @@ impl SandboxManager {
     ///   - len 超过 MAX_PAYLOAD_LEN（1MB）直接拒绝：不入队、不拷贝内存
     ///     （防大块拷贝 + 超大模块编译阻塞 tick，编译不受 fuel 约束）。
     ///   - 返回 1=已排队，0=拒绝（超限）。
-    fn make_linker(engine: &Engine) -> Result<Linker<SandboxData>> {
+    fn make_linker(engine: &Engine, max_speed: f64) -> Result<Linker<SandboxData>> {
         let mut linker = Linker::new(engine);
         // env.log(v)：玩家代码日志（v 为玩家自定义 marker，含义见各生物 WAT 注释）。
         // 记 api_calls 元数据 + marker 值序列（log_markers，host 字幕解析用）
@@ -746,13 +755,13 @@ impl SandboxManager {
         linker.func_wrap(
             "env",
             "shoot",
-            |mut caller: Caller<SandboxData>,
-             vx: f64,
-             vy: f64,
-             mass: f64,
-             payload_ptr: i32,
-             payload_len: i32|
-             -> i32 {
+            move |mut caller: Caller<SandboxData>,
+                  vx: f64,
+                  vy: f64,
+                  mass: f64,
+                  payload_ptr: i32,
+                  payload_len: i32|
+                  -> i32 {
                 caller.data_mut().api_calls.push("shoot".to_string());
                 let shooter = caller.data().entity_id;
                 // 限流：同实体一拍至多 1 发
@@ -763,7 +772,7 @@ impl SandboxManager {
                     );
                     return 0;
                 }
-                // 速度校验：有限 + 模长 ≤ 50
+                // 速度校验：有限 + 模长 ≤ 世界极速（#034 修订一，原硬编码 50 退役）
                 if !vx.is_finite() || !vy.is_finite() {
                     tracing::warn!(
                         entity_id = %shooter.0,
@@ -774,12 +783,12 @@ impl SandboxManager {
                     return 0;
                 }
                 let speed2 = vx * vx + vy * vy;
-                if speed2 > MAX_SHOOT_SPEED * MAX_SHOOT_SPEED {
+                if speed2 > max_speed * max_speed {
                     tracing::warn!(
                         entity_id = %shooter.0,
                         speed = speed2.sqrt(),
-                        max = MAX_SHOOT_SPEED,
-                        "[shoot] 初速超上限，拒绝（防一拍穿世界）"
+                        max = max_speed,
+                        "[shoot] 初速超世界极速，拒绝（视觉可读性常数：攻击必须看得见飞过来）"
                     );
                     return 0;
                 }
@@ -2366,7 +2375,8 @@ mod tests {
 
     #[test]
     fn shoot_import_rejects_overspeed() {
-        // 速度模长上限 50（防一拍穿世界）：(40, 40) 模长 ~56.6 > 50 -> 拒绝
+        // 世界极速上限（#034 修订一：MAX_SHOOT_SPEED=50 退役，改用 WORLD_MAX_SPEED=25）：
+        // (40, 40) 模长 ~56.6 > 25 -> 拒绝
         let mgr = SandboxManager::new().unwrap();
         let wat_text = shooter_wat("f64.const 40.0", "f64.const 40.0", "f64.const 1.0", "0");
         let mut handle = mgr
@@ -2375,6 +2385,45 @@ mod tests {
         mgr.call_on_tick(&mut handle).unwrap();
         assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超速射击应被拒绝");
         assert!(handle.store.data().pending_shoots.is_empty(), "超速请求不应入队");
+    }
+
+    #[test]
+    fn shoot_import_allows_exactly_world_max_speed() {
+        // 边界：初速模长恰等于世界极速 25 不拒（严格 > 超限判据，审查锚定）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = shooter_wat("f64.const 25.0", "f64.const 0.0", "f64.const 1.0", "0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(908))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "恰等于极速应放行");
+        assert_eq!(handle.store.data().pending_shoots.len(), 1);
+    }
+
+    #[test]
+    fn shoot_import_rejects_just_above_world_max_speed() {
+        // 边界：刚过极速一点（25.5）即拒
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = shooter_wat("f64.const 25.5", "f64.const 0.0", "f64.const 1.0", "0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(909))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "刚过极速应拒绝");
+        assert!(handle.store.data().pending_shoots.is_empty());
+    }
+
+    #[test]
+    fn shoot_import_uses_manager_max_speed_not_hardcoded() {
+        // 口径同源：new_with_max_speed(10) 的管理器按 10 判超限——发射钳制与
+        // 飞行钳制（DefaultPhysics.max_speed）同源一个世界常数，不再各自硬编码
+        let mgr = SandboxManager::new_with_max_speed(10.0).unwrap();
+        let wat_text = shooter_wat("f64.const 12.0", "f64.const 0.0", "f64.const 1.0", "0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(910))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "12 > 自定义极速 10 应拒绝");
     }
 
     #[test]
