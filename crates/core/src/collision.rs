@@ -266,6 +266,92 @@ fn clamp_point_to_aabb_dist(
     (c_pos.0 - cx, c_pos.1 - cy)
 }
 
+/// CCD 线段-圆首触参数（#034 修订二：路径扫掠）。
+/// 线段 a->b 与圆（center, r）的扫掠重叠判据：路径上任一点距圆心 < r。
+/// 返回 Some(t)：首触的线段参数（0=起点即重叠，1=终点恰触）；
+/// None：路径未扫过身体。起点已在重叠区（异常态）返回 0。
+pub fn segment_first_contact_circle(
+    a: (f64, f64),
+    b: (f64, f64),
+    center: (f64, f64),
+    r: f64,
+) -> Option<f64> {
+    // 解 |P(t) - C|² = r²，P(t) = a + t·d：标准二次方程
+    let d = (b.0 - a.0, b.1 - a.1);
+    let f = (a.0 - center.0, a.1 - center.1);
+    let qa = d.0 * d.0 + d.1 * d.1;
+    let qb = 2.0 * (f.0 * d.0 + f.1 * d.1);
+    let qc = f.0 * f.0 + f.1 * f.1 - r * r;
+    if qc < 0.0 {
+        // 起点已在重叠区（严格 < 判据下的内部）
+        return Some(0.0);
+    }
+    if qa <= 0.0 {
+        // 零长度线段：起点不在重叠区（qc >= 0）则无接触
+        return None;
+    }
+    let disc = qb * qb - 4.0 * qa * qc;
+    if disc <= 0.0 {
+        return None; // 不相交或恰好擦边（严格判据：擦边不算命中）
+    }
+    let t = (-qb - disc.sqrt()) / (2.0 * qa);
+    if (0.0..=1.0).contains(&t) {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+/// CCD 线段-扩展 AABB 首触参数（#034 修订二：造物判据）。
+/// 把 AABB 四周扩展 r（Minkowski 膨胀近似：角部以方角代替圆角，最大偏差
+/// r·(√2-1)≈0.06 格，弹丸 r=0.15 尺度下不可感知），线段与扩展盒做 slab 相交，
+/// 返回首触参数 t（0=起点即在内）；None=路径未扫到。
+pub fn segment_first_contact_expanded_aabb(
+    a: (f64, f64),
+    b: (f64, f64),
+    aabb_min: (f64, f64),
+    aabb_max: (f64, f64),
+    r: f64,
+) -> Option<f64> {
+    // 起点在扩展盒内 → 立即接触
+    let inside = a.0 >= aabb_min.0 - r
+        && a.0 <= aabb_max.0 + r
+        && a.1 >= aabb_min.1 - r
+        && a.1 <= aabb_max.1 + r;
+    if inside {
+        return Some(0.0);
+    }
+    // slab 法：两轴分别解进入/离开参数区间，交集非空 = 相交
+    let d = (b.0 - a.0, b.1 - a.1);
+    let mut tmin = 0.0f64;
+    let mut tmax = 1.0f64;
+    for axis in 0..2 {
+        let (p, dd, lo, hi) = match axis {
+            0 => (a.0, d.0, aabb_min.0 - r, aabb_max.0 + r),
+            _ => (a.1, d.1, aabb_min.1 - r, aabb_max.1 + r),
+        };
+        if dd.abs() < f64::EPSILON {
+            // 该轴无位移：起点不在该轴区间内则永不相交
+            if p < lo || p > hi {
+                return None;
+            }
+        } else {
+            let mut t1 = (lo - p) / dd;
+            let mut t2 = (hi - p) / dd;
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            tmin = tmin.max(t1);
+            tmax = tmax.min(t2);
+        }
+    }
+    if tmin <= tmax {
+        Some(tmin)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +641,98 @@ mod tests {
         assert!(!is_projectile(&b), "普通生物不是弹丸");
         let t = make_entity(3, "creation", (10.0, 0.0));
         assert!(!is_projectile(&t), "造物不是弹丸");
+    }
+
+    // === CCD 路径检查几何原语（#034 修订二：线段扫掠首触参数 t）===
+
+    #[test]
+    fn segment_circle_first_contact_midpoint() {
+        // 直线穿过圆心：首触在半径和减去处（t=0.4，接触于圆的近侧）
+        // 线段 (0,0)->(10,0)，圆心 (5,0) r=1，弹 r=0：接触距离 1 → t=(5-1)/10=0.4
+        let t = segment_first_contact_circle((0.0, 0.0), (10.0, 0.0), (5.0, 0.0), 1.0);
+        assert!((t.unwrap() - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn segment_circle_miss_when_path_far() {
+        // 路径离圆心 2.0 > 半径和 1.0 → 不命中
+        let t = segment_first_contact_circle((0.0, 0.0), (10.0, 0.0), (5.0, 2.0), 1.0);
+        assert!(t.is_none(), "路径未扫过身体应 None");
+    }
+
+    #[test]
+    fn segment_circle_start_inside_returns_zero() {
+        // 起点已在身体重叠区内（异常态兜底）：首触 t=0
+        let t = segment_first_contact_circle((5.0, 0.0), (10.0, 0.0), (5.0, 0.0), 1.0);
+        assert_eq!(t, Some(0.0), "起点已重叠应立即命中 t=0");
+    }
+
+    #[test]
+    fn segment_circle_graze_beyond_segment_none() {
+        // 圆在线段延长线之外（最接近点 t>1）：路径未扫到 → None
+        let t = segment_first_contact_circle((0.0, 0.0), (10.0, 0.0), (15.0, 0.0), 1.0);
+        assert!(t.is_none());
+    }
+
+    #[test]
+    fn segment_circle_stationary_inside_returns_zero() {
+        // 零长度线段（起点=终点）且在身内：t=0
+        let t = segment_first_contact_circle((5.0, 0.0), (5.0, 0.0), (5.0, 0.0), 1.0);
+        assert_eq!(t, Some(0.0));
+    }
+
+    #[test]
+    fn segment_expanded_aabb_face_entry() {
+        // 正对 AABB 左脸直线穿入：扩展盒（r=0.15）左缘 9.85，线段 (9,0.5)->(11,0.5)
+        // → 首触 t=(9.85-9)/2=0.425
+        let t = segment_first_contact_expanded_aabb(
+            (9.0, 0.5),
+            (11.0, 0.5),
+            (10.0, 0.0),
+            (11.0, 1.0),
+            0.15,
+        );
+        assert!((t.unwrap() - 0.425).abs() < 1e-9);
+    }
+
+    #[test]
+    fn segment_expanded_aabb_miss() {
+        // 路径从盒上方掠过（间距 0.5 > r=0.15）→ None
+        let t = segment_first_contact_expanded_aabb(
+            (0.0, 1.65),
+            (12.0, 1.65),
+            (10.0, 0.0),
+            (11.0, 1.0),
+            0.15,
+        );
+        assert!(t.is_none(), "距盒顶 0.65 > 0.15 不命中");
+    }
+
+    #[test]
+    fn segment_expanded_aabb_start_inside_returns_zero() {
+        // 起点在扩展盒内：t=0
+        let t = segment_first_contact_expanded_aabb(
+            (10.5, 0.5),
+            (12.0, 0.5),
+            (10.0, 0.0),
+            (11.0, 1.0),
+            0.15,
+        );
+        assert_eq!(t, Some(0.0));
+    }
+
+    #[test]
+    fn segment_expanded_aabb_vertical_axis_only() {
+        // 纯垂直下落穿盒顶：x 恒 10.5（盒 x 区间内），y 从 2 落到 0.5
+        // → 扩展顶 1.15，t=(2-1.15)/1.5≈0.5667
+        let t = segment_first_contact_expanded_aabb(
+            (10.5, 2.0),
+            (10.5, 0.5),
+            (10.0, 0.0),
+            (11.0, 1.0),
+            0.15,
+        );
+        let tv = t.unwrap();
+        assert!((tv - (2.0 - 1.15) / 1.5).abs() < 1e-9);
     }
 }

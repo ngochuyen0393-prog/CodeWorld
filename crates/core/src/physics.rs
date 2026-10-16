@@ -109,8 +109,9 @@ pub struct DefaultPhysics {
     pub max_velocity: f64,
     /// 阻力常量（#034 世界基石参数，与重力同级：对一切离体之物生效不豁免不分类）。
     /// 阻力定律：v = v - drag*v/mass（线性阻力，方向不变模衰减）。
-    /// 默认 0.05（标定判据：默认参数下标准斜抛 45°/v0=10/mass=1.0 射程 5~15 格，
-    /// physics crate projectile_range_calibration_default_drag 测试锚定）。
+    /// 默认 0.05（标定判据：默认参数下标准上抛弹 vx=4/vy=+9.8/mass=1.0 射程
+    /// 3~6 格，physics crate projectile_range_calibration_default_drag 测试锚定；
+    /// #034 修订二 CCD 后落点=地面交点，锚随量测口径重标，drag 常数未变）。
     /// serde default：旧参数快照无此字段回退 0.05。
     #[serde(default = "default_drag")]
     pub drag_coefficient: f64,

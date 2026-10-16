@@ -56,7 +56,8 @@ pub struct Config {
     pub dispose_wait_ticks: u64,
     /// 阻力常量（#034 世界基石参数，与重力同级），默认 0.05。
     /// 阻力定律：v = v - drag*v/mass（线性阻力，方向不变模衰减）。
-    /// 标定判据：默认参数下标准上抛弹（vx=4/vy=+9.8/mass=1.0）射程 5~15 格。
+    /// 标定判据：默认参数下标准上抛弹（vx=4/vy=+9.8/mass=1.0）射程 3~6 格
+    ///（#034 修订二 CCD 地面交点口径重标，drag 常数未变）。
     /// CODEWORLD_DRAG 覆盖。
     pub drag_coefficient: f64,
     /// 世界极速（#034 修订一：视觉可读性常数），默认 25.0（codeworld_core

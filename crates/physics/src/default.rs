@@ -217,8 +217,15 @@ impl DefaultPhysicsEngine {
                 p.set_velocity(vel);
                 p.set_pos(after);
             }
-            // 5. 撞身体：与所有活体圆判据（严格 <；跳过自己/发射者/其他弹丸）
+            // 5. CCD 路径检查（#034 修订二）：撞身体从"拍末点在身内"升级为
+            //    "起点->终点线段扫过身体"（点到线段距离 < r弹+r身；造物 AABB 用
+            //    线段-扩展 AABB 相交）——高速弹一拍跳过目标的隧穿修复，
+            //    极速常数之内的任何速度都如实结算。
+            //    多目标取线段参数 t 最小者（最先碰到），与触地 t 一起统一按真实
+            //    先后定序（先撞体后落地不再靠检查顺序，消灭随机性）。
+            //    跳过发射者（出生拍起豁免）/其他弹丸（互撞 MVP 不做）的口径不变。
             let shooter = shooters.get(&pid).copied();
+            let mut best_t: Option<f64> = None;
             let mut hit: Option<EntityId> = None;
             let mut others: Vec<EntityId> = world
                 .entities
@@ -231,28 +238,52 @@ impl DefaultPhysicsEngine {
                 })
                 .map(|(oid, _)| *oid)
                 .collect();
-            others.sort_by_key(|id| id.0); // 确定序：同拍多目标命中取 id 最小者
+            others.sort_by_key(|id| id.0); // 确定序：t 并列时先扫到者保留（id 升序）
             for oid in others {
                 let Some(target) = world.entities.get(&oid) else {
                     continue;
                 };
-                if body_overlap(
-                    &Body::Circle {
-                        center: after,
-                        radius,
-                    },
-                    &body_of(target),
-                ) {
-                    hit = Some(oid);
-                    break;
+                let contact_t = match body_of(target) {
+                    Body::Circle { center, radius: tr } => {
+                        codeworld_core::collision::segment_first_contact_circle(
+                            before, after, center, radius + tr,
+                        )
+                    }
+                    Body::Aabb { min, max } => {
+                        codeworld_core::collision::segment_first_contact_expanded_aabb(
+                            before, after, min, max, radius,
+                        )
+                    }
+                };
+                if let Some(t) = contact_t {
+                    if best_t.is_none_or(|bt| t < bt) {
+                        best_t = Some(t);
+                        hit = Some(oid);
+                    }
                 }
             }
-            if let Some(tid) = hit {
+            // 触地参数 t（地面=半径线）：路径自上而下穿过半径线的交点
+            let ground_t: Option<f64> = if after.1 < radius {
+                if before.1 >= radius {
+                    Some((before.1 - radius) / (before.1 - after.1))
+                } else {
+                    Some(0.0) // 起步已在半径线下（异常态兜底）：立即触地
+                }
+            } else {
+                None
+            };
+            let body_first = match (best_t, ground_t) {
+                (Some(bt), Some(gt)) => bt <= gt,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if body_first {
+                let tid = hit.expect("body_first=true 时必有目标");
                 let point = world.entities.get(&tid).map(|e| e.pos()).unwrap_or(after);
                 if let Some(p) = world.entities.get_mut(&pid) {
                     p.kill();
                 }
-                tracing::debug!(projectile = %pid.0, target = %tid.0, "[projectile] 撞身体");
+                tracing::debug!(projectile = %pid.0, target = %tid.0, "[projectile] 撞身体（CCD 路径扫掠）");
                 events.push(ProjectileEvent::HitBody {
                     projectile: pid,
                     target: tid,
@@ -260,17 +291,19 @@ impl DefaultPhysicsEngine {
                 });
                 continue;
             }
-            // 6. 落地：y < radius 触地消亡（落点=触地时的地面线：x 取积分值、y 钳回
-            // 半径线——弹丸触地在地面，不在地下；落点点命中才打得中地面目标，
-            // 审查修正：裸积分落点在地下深处，#031 点命中永远够不着地面身体）
-            if after.1 < radius {
+            // 6. 落地：路径先触地则结算于触地点——落点=线段与地面线的交点
+            //（x 取交点插值、y=半径线），不再是拍末积分位置（高速弹穿地后拉回的
+            // 旧口径同时退役）；P2 顺手修：尸体坐标同步钳到落点，地下异态不留在世界
+            if let Some(gt) = ground_t {
+                let land = (before.0 + (after.0 - before.0) * gt, radius);
                 if let Some(p) = world.entities.get_mut(&pid) {
+                    p.set_pos(land);
                     p.kill();
                 }
-                tracing::debug!(projectile = %pid.0, pos = ?after, "[projectile] 触地");
+                tracing::debug!(projectile = %pid.0, pos = ?land, "[projectile] 触地（CCD 地面交点）");
                 events.push(ProjectileEvent::Landed {
                     projectile: pid,
-                    point: (after.0, radius),
+                    point: land,
                 });
             }
         }
@@ -1068,7 +1101,10 @@ mod tests {
     fn projectile_range_calibration_default_drag() {
         // 射程调参判据（阻力默认值的标定锚）：默认参数（drag=0.05）下，
         // 标准上抛弹（vx=4, vy=+9.8, mass=1.0 地面发射——vy 顶一拍重力再坠）
-        // 水平射程落在 5~15 格。实测约 7.4 格（两拍弧线）
+        // 水平射程落在 3~6 格。
+        // CCD（#034 修订二）量测口径修正：落点=路径与地面线交点，同弹实测约
+        // 3.9 格；旧口径 7.4 格是"穿地后拉回拍末 x"的量测伪影（drag 常数本身
+        // 未变，此锚随修订二重标定）
         let engine = DefaultPhysicsEngine::new();
         let mut world = WorldState::new();
         let x0 = 50.0; // 远离边界，排除 viewport 干扰
@@ -1085,8 +1121,8 @@ mod tests {
         }
         let range = range.expect("60 拍内必落地");
         assert!(
-            (5.0..=15.0).contains(&range),
-            "标准上抛弹射程应 5~15 格，实际 {range}"
+            (3.0..=6.0).contains(&range),
+            "标准上抛弹射程应 3~6 格（CCD 地面交点口径），实际 {range}"
         );
     }
 
@@ -1174,5 +1210,120 @@ mod tests {
             (25.0, 10.0),
             "一拍位移恰为极速 25 格"
         );
+    }
+
+    // === CCD 路径检查（#034 修订二：撞体/落地从点检查升级为线段扫掠）===
+
+    fn straight_engine() -> DefaultPhysicsEngine {
+        // 直线弹道引擎（零重力零阻力）：CCD 几何断言不受抛物线干扰
+        DefaultPhysicsEngine::new_with_params(DefaultPhysics {
+            gravity: 0.0,
+            drag_coefficient: 0.0,
+            ..DefaultPhysics::default_values()
+        })
+    }
+
+    #[test]
+    fn swept_path_hits_midway_target_point_check_would_miss() {
+        // CCD 锚定用例：极速内高速弹一拍跨 20 格、目标在路径中点——必命中。
+        // 旧点检查：拍末 (20,20) 距目标 (10,20) 有 10 格 → 漏（隧穿实锤）；
+        // CCD：线段 (0,20)->(20,20) 扫过目标 → 命中
+        let engine = straight_engine();
+        let mut world = WorldState::new();
+        let target = make_entity(2, 10.0, 20.0, 0);
+        let tid = target.id;
+        world.entities.insert(tid, target);
+        let p = make_projectile(1, (0.0, 20.0), (20.0, 0.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        assert_eq!(events.len(), 1, "路径中点目标必须命中（点检查必漏的反例）");
+        match &events[0] {
+            ProjectileEvent::HitBody { target: t, .. } => assert_eq!(*t, tid),
+            other => panic!("应命中事件，实际 {other:?}"),
+        }
+        assert!(!world.entities.get(&pid).unwrap().is_alive());
+    }
+
+    #[test]
+    fn swept_multi_target_first_contact_wins() {
+        // 多目标取线段参数 t 最小者（最先碰到）：路径上 x=5 与 x=15 两个目标 → 命中 x=5
+        let engine = straight_engine();
+        let mut world = WorldState::new();
+        let far = make_entity(2, 15.0, 20.0, 0);
+        let near = make_entity(3, 5.0, 20.0, 0);
+        let fid = far.id;
+        let nid = near.id;
+        world.entities.insert(fid, far);
+        world.entities.insert(nid, near);
+        let p = make_projectile(1, (0.0, 20.0), (20.0, 0.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ProjectileEvent::HitBody { target, .. } => {
+                assert_eq!(*target, nid, "应命中路径上最先碰到的（t 最小）目标")
+            }
+            other => panic!("应命中事件，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn landed_point_is_ground_crossing_not_tick_end() {
+        // 落地=路径与地面线的交点（CCD 落地）：(0,1) 直线 vel(20,-2) 一拍末 (20,-1)，
+        // 地面交点 t=(1-0.15)/2=0.425 → x=8.5。旧实现落点 (20,0.15)=穿地后拉回，位置错
+        let engine = straight_engine();
+        let mut world = WorldState::new();
+        let p = make_projectile(1, (0.0, 1.0), (20.0, -2.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ProjectileEvent::Landed { point, .. } => {
+                assert!((point.0 - 8.5).abs() < 1e-9, "落点 x 应为地面交点 8.5，实际 {point:?}");
+                assert!((point.1 - 0.15).abs() < 1e-9, "落点 y 应为半径线，实际 {point:?}");
+            }
+            other => panic!("应落地事件，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn landing_corpse_position_clamped_to_ground_line() {
+        // P2 顺手修：落地弹尸体坐标=落点（半径线上），不再是地下积分值（异态不留世界）
+        let engine = straight_engine();
+        let mut world = WorldState::new();
+        let p = make_projectile(1, (0.0, 1.0), (20.0, -2.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let _ = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        let corpse = world.entities.get(&pid).unwrap();
+        assert!(
+            (corpse.pos().1 - 0.15).abs() < 1e-9,
+            "尸体 y 应钳回半径线 0.15，实际 {}",
+            corpse.pos().1
+        );
+        assert!((corpse.pos().0 - 8.5).abs() < 1e-9, "尸体 x 应为地面交点");
+    }
+
+    #[test]
+    fn body_hit_before_ground_wins_by_contact_t() {
+        // 同拍路径既穿身体又触地：按 t 定序（先撞体后落地不再靠检查顺序，是真实先后）。
+        // (0,0.3) vel(10,-1)：地面 t=0.15（x=1.5）；身体 (1,0.29) r0.5 首触 t≈0.035 → 撞体
+        let engine = straight_engine();
+        let mut world = WorldState::new();
+        let target = make_entity(2, 1.0, 0.29, 0);
+        let tid = target.id;
+        world.entities.insert(tid, target);
+        let p = make_projectile(1, (0.0, 0.3), (10.0, -1.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ProjectileEvent::HitBody { target: t, .. } => assert_eq!(*t, tid, "先触身体应撞体结算"),
+            other => panic!("应撞体事件（t 先于触地），实际 {other:?}"),
+        }
     }
 }
