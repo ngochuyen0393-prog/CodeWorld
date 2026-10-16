@@ -1050,6 +1050,12 @@ fn tick_with_intents(
     //      距离/存活数取死亡清理后的 world 快照（entities 里只剩存活实体，len 即存活数）；
     //      A 或 D 缺席（被击杀/未登场）则距离显示占位符。
     let markers = sandbox_map.collect_all_log_markers();
+    // S 替身台词：拦截 marker 计数 > 0 -> battle.log 打一行伪装台词
+    // （间谍中弹不承认的人设味道；marker 本身是 i32，台词由 host 侧翻译呈现）
+    let spy_tells = spy_disguise_intercept_count(&markers);
+    if spy_tells > 0 {
+        tracing::info!(intercepts = spy_tells, "S: 那只是我的替身");
+    }
     let shield_report = parse_shield_markers(&markers);
     let attacker = world
         .entities
@@ -1794,6 +1800,14 @@ fn parse_shield_markers(markers: &[i32]) -> Option<i32> {
     shield
 }
 
+/// 统计 marker 流中 S 替身拦截次数（d2 步伪装台词触发源，纯函数便于测试）
+fn spy_disguise_intercept_count(markers: &[i32]) -> usize {
+    markers
+        .iter()
+        .filter(|&&m| m == SPY_INTERCEPT_MARKER)
+        .count()
+}
+
 /// 感知规则：找 target 最近的**视野内**其他存活实体坐标（env.scan 的数据源）
 ///
 /// - 排除自己（不能锁定自己为敌人）
@@ -1836,14 +1850,20 @@ const DEFENDER_CODE: &str = "defender";
 const HUNTER_CODE: &str = "hunter";
 const SPY_CODE: &str = "spy";
 
+/// S 替身盾拦截 marker：S 的 on_attack 拦截成功时 log(11)，host d2 步据此在
+/// battle.log 打伪装台词"S: 那只是我的替身"。不能用 D 的 7/8——那两个值被
+/// 盾量字幕协议占用（parse_shield_markers 会把 S 的上报误当 D 的盾量显示）
+const SPY_INTERCEPT_MARKER: i32 = 11;
+
 /// 生成开局布阵生物（三层感知 Phase A 版）
 ///
 /// A 攻击者（红"A"）@(5,0)：直线冲锋逼近，进范围连砍空 payload 击杀刀
 /// D 防御者（青"D"）@(15,0)：原地站桩+盾 d_shield 拦截+每 4 tick 反制
 /// H 搅局者（黄"H"）@(10,8)：中场上空，落地后观望游走，敌人进 3 格参战（h_enabled 开关）
-/// S 伪装者（紫"S"）@(25,12)：右侧高空悬停（每拍 move_by 抵消重力，永不落地），
+/// S 伪装者（紫"S"）@(25,12)：右侧高空悬停（hover 每拍声明免重力），
 ///   每 4 tick 眼睛列表扫描+probe 最近者，on_probe 撒谎"我是友军 life=9"；
-///   无防守无攻击（间谍脆皮，s_enabled 开关）
+///   替身盾 3（on_attack 拦截前 3 刀，marker 11 触发 host 伪装台词，盾尽回脆皮，
+///   s_enabled 开关）
 /// A/D 站地面 y=0：地面实体不受重力，坐标 tick 间稳定，scan/attack_at 的
 /// 坐标精确匹配（f64 相等）不被物理漂移打穿。
 /// S 出生位 (25,12) 的取舍（任务书建议 (20,5) 微调）：D 的 scan 锁"最近敌人"，
@@ -1906,7 +1926,7 @@ fn spawn_test_entities(
         spy_spawned = s_ok,
         distance_a_d = 10.0,
         defender_shield = d_shield,
-        "开局布阵：A 攻击者冲锋 / D 防御者站桩（盾每拦一刀-1，每4tick反制）/ H 搅局者={}（投机者：敌人进3格参战，被攻击50%拦截）/ S 伪装者={}（间谍：悬停高空+每4tick扫描+probe，on_probe撒谎友军，无防守）",
+        "开局布阵：A 攻击者冲锋 / D 防御者站桩（盾每拦一刀-1，每4tick反制）/ H 搅局者={}（投机者：敌人进3格参战，被攻击50%拦截）/ S 伪装者={}（间谍：悬停高空+每4tick扫描+probe，on_probe撒谎友军，替身盾3拦截+伪装台词）",
         if h_enabled { "登场" } else { "缺席" },
         if s_enabled { "登场" } else { "缺席" }
     );
@@ -2096,7 +2116,7 @@ const HUNTER_WAT: &str = r#"(module
       (else (drop (call $move_by (f64.const -0.5) (f64.const 0.0))))))
   (func (export "life") (result i32) i32.const 1))"#;
 
-/// 伪装者 S 的玩家代码 WAT（紫色，性格：间谍——悬停高空+高调侦察+撒谎身份）
+/// 伪装者 S 的玩家代码 WAT（紫色，性格：间谍——悬停高空+高调侦察+撒谎身份+轻装替身）
 ///
 /// 策略（on_tick 每 tick 执行）：
 /// 0. 每拍先 hover()：声明"本拍我要悬停"，世界把 S 并入当拍免重力集合
@@ -2115,8 +2135,18 @@ const HUNTER_WAT: &str = r#"(module
 /// [0x4C,0x49,0x45,0x39]——谎称"友军、life=9"。撒谎=玩家代码自由，框架只透传；
 /// 但被动体徵（api_calls 计数/fuel 剩余，host 采集）藏不住高调侦察的代价。
 ///
-/// 无 on_attack 导出 = 不设防：被反制刀命中即被换血击杀（间谍脆皮）。
-/// 日志 marker：10=侦察轮开始（D 的反制已占用 9，S 用 10；probe 往返见 host 侧 [probe] 日志）
+/// on_attack（被攻击时，第八刀新增，拦截模式照抄 defender 的盾）：
+/// 护盾有余 -> 拦截（log 11 替身 marker，host 据此在 battle.log 打伪装台词
+/// "S: 那只是我的替身"），盾尽 -> 放行（后续攻击照常结算，S 回到脆皮）。
+/// 盾不回复（一次性替身）。间谍是轻装：盾 3（远低于 D 的 10，调盾量改下方
+/// $shield 初始值）。marker 用 11 不用 D 的 7/8——那两个值被盾量字幕协议
+/// 占用（parse_shield_markers 会把 S 的上报误当 D 的盾量显示）。
+///
+/// 挪窝加分项（每 16 拍伪随机挪窝）跳过：S 一动，(25,12) 测试锚与 D 距离序
+/// 点名的确定性时间线全崩（D 按快照坐标出刀，移动目标打不中/打中看拍奇偶），
+/// 回归面远超人设收益——间谍的活感由 hover+侦察+撒谎承担。
+///
+/// 日志 marker：10=侦察轮开始 11=替身拦截（D 的反制已占用 9；probe 往返见 host 侧 [probe] 日志）
 const SPY_WAT: &str = r#"(module
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
@@ -2128,8 +2158,24 @@ const SPY_WAT: &str = r#"(module
   ;; tick 计数（4 倍数侦察）；probe 返回值（观测导出）
   (global $ticks (mut i32) (i32.const 0))
   (global $probe_ret (mut i32) (i32.const -999))
+  ;; ===== 替身盾（调盾量改这里：间谍轻装，盾 3）=====
+  ;; 护盾余量：每拦一刀 -1，归零后不再拦截（与 D 的盾同模式，盾不回复）
+  (global $shield (mut i32) (i32.const 3))
+  ;; 已拦截刀数（观测导出用）
+  (global $intercepts (mut i32) (i32.const 0))
   ;; 被探测：固定回撒谎假串 "LIE9"
   (func (export "on_probe") (param i32) (result i32) i32.const 0x3945494C)
+  ;; 被攻击：盾有余拦截（log 11 替身 marker，host 打伪装台词），盾尽放行
+  (func (export "on_attack") (param i32) (result i32)
+    global.get $shield
+    if (result i32)
+      global.get $shield i32.const 1 i32.sub global.set $shield
+      global.get $intercepts i32.const 1 i32.add global.set $intercepts
+      i32.const 11 call $log
+      i32.const 1
+    else
+      i32.const 0
+    end)
   (func (export "on_tick")
     (local $n i32) (local $i i32) (local $best f64) (local $bx f64) (local $by f64)
     (local $x f64) (local $y f64) (local $mx f64) (local $my f64)
@@ -2175,7 +2221,9 @@ const SPY_WAT: &str = r#"(module
       (call $probe (local.get $bx) (local.get $by)
                     (i32.const 16) (i32.const 4) (i32.const 32) (i32.const 64))))
   (func (export "life") (result i32) i32.const 1)
-  (func (export "get_probe_ret") (result i32) global.get $probe_ret))"#;
+  (func (export "get_probe_ret") (result i32) global.get $probe_ret)
+  (func (export "get_shield") (result i32) global.get $shield)
+  (func (export "get_intercepts") (result i32) global.get $intercepts))"#;
 
 #[cfg(test)]
 mod tests {
@@ -4768,11 +4816,11 @@ mod tests {
     }
 
     #[test]
-    fn d_blade_at_stable_spy_point_hits() {
-        // 第七刀验收锚：S 坐标稳定 (25,12) 后（hover 免重力，拍内无 +9.8 弹跳），
+    fn d_blade_at_stable_spy_point_intercepted_by_shield() {
+        // 第七刀锚的第八刀续篇：S 坐标稳定 (25,12) 后（hover 免重力，拍内无弹跳），
         // D 按阶段一快照坐标出刀——打点 (25,12) 距 S 圆心 0 点在身体内
-        // （#031 点命中制）必中；S 脆皮无 on_attack 防守 -> 默认击杀刀换血击杀
-        // （喷气期"阶段一快照 12 / 结算 21.8 恒差 9.8 永远落空"一并终结）
+        // （#031 点命中制）必中；第八刀起 S 有替身盾，首刀被 on_attack 拦截
+        // （S 存活 + 盾 3→2），"命中"语义不变、"击杀"由盾耗尽后的刀完成
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         let spy = make_entity_with_sandbox(&mut world, &mut map, 7, (25.0, 12.0), SPY_WAT);
@@ -4784,8 +4832,65 @@ mod tests {
         }];
         process_attacks(&mut world, &mut map, &attacks);
         assert!(
+            world.entities.get(&spy).unwrap().is_alive(),
+            "首刀应被替身盾拦截（S 存活，盾 3→2）"
+        );
+        assert_eq!(
+            call_i32_export(&mut map, &spy, "get_shield"),
+            2,
+            "首刀拦截后替身盾应剩 2"
+        );
+    }
+
+    #[test]
+    fn spy_shield_intercepts_three_then_fourth_kills() {
+        // 第八刀主体：S 的替身盾（on_attack 拦截，人设"你砍中的可能不是我"）——
+        // 前 3 刀全拦截（S 存活 + 盾 3→0 逐刀递减 + marker 11 替身台词触发源 ×3），
+        // 第 4 刀盾尽放行进入正常结算（S 回到脆皮被击杀，与 D 的盾尽放行同语义）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let spy = make_entity_with_sandbox(&mut world, &mut map, 7, (25.0, 12.0), SPY_WAT);
+        let d = make_entity_with_sandbox(&mut world, &mut map, 2, (15.0, 0.5), PLAYER_WAT);
+        let blade_at_spy = |attacker: EntityId| {
+            vec![PendingAttack {
+                attacker,
+                target_pos: (25.0, 12.0),
+                payload: vec![],
+            }]
+        };
+        for round in 1..=3 {
+            process_attacks(&mut world, &mut map, &blade_at_spy(d));
+            assert!(
+                world.entities.get(&spy).unwrap().is_alive(),
+                "第 {round} 刀应被替身盾拦截，S 存活"
+            );
+            assert_eq!(
+                call_i32_export(&mut map, &spy, "get_shield"),
+                3 - round,
+                "第 {round} 刀拦截后替身盾应剩 {}",
+                3 - round
+            );
+        }
+        assert_eq!(
+            call_i32_export(&mut map, &spy, "get_intercepts"),
+            3,
+            "替身盾应记录 3 次拦截"
+        );
+        // 替身台词触发源：3 次拦截 = marker 11 ×3（host 据此打"S: 那只是我的替身"）
+        let markers = map.collect_all_log_markers();
+        assert_eq!(
+            markers
+                .iter()
+                .filter(|&&m| m == SPY_INTERCEPT_MARKER)
+                .count(),
+            3,
+            "3 次拦截应发 3 个替身 marker（battle.log 台词触发源）"
+        );
+        // 第 4 刀：盾尽放行（on_attack 返回 0），正常结算击杀
+        process_attacks(&mut world, &mut map, &blade_at_spy(d));
+        assert!(
             !world.entities.get(&spy).unwrap().is_alive(),
-            "稳定坐标下 D 打 (25,12) 应命中 S（点在身体内，脆皮被击杀）"
+            "盾尽后第 4 刀应击杀 S（回到脆皮）"
         );
     }
 
@@ -5145,15 +5250,15 @@ mod tests {
         // 冒烟（scan 视野化回归验收点）：默认视口 50x25（对齐真实 Config），四生物
         // + E 类玩家 @(35,5)（PLAYER_WAT 同 players/_template.wat.txt：只 log 不动不 scan）。
         // 全员都在 [-50,50]x[-25,25] 内，视口过滤是 no-op。
-        // #030 半径物理 + 期四第七刀 S 坐标稳定后的剧本时间线（探针实测）：
+        // #030 半径物理 + 第七刀 S 坐标稳定 + 第八刀 S 替身盾后的剧本时间线（探针实测）：
         // - tick4 D 反制杀 H【确定】；A 可能同拍被 H 反杀（A 被身体挡停=站桩，
         //   H 点命中），也可能活下来继续贴 D——取决于 H/D 刀的随机 EntityId
         //   结算顺序（#002 序确定、id 随机），故 A 的生死断言取"最迟 tick12 必死"。
-        // - S 坐标稳定 (25,12) 后"悬浮躲刀"防御终结（旧喷气期阶段一快照与结算
-        //   坐标恒差 9.8 的错位 bug 退役）：A 死后 D 下一反制轮点名 S，脆皮必死
-        //   （早则 tick8、迟则 tick16）。D 的 scan 按距离序点名：S(15.6) 近于
-        //   E(20.6)，S 死后才轮到 E——E 最迟 tick20 被 D 清场（早则 tick12）。
-        //   站桩必中的世界，站桩=挨刀（#031 立法本意），D 逐个清场即新时间线。
+        // - S 坐标稳定 (25,12) 后"悬浮躲刀"防御终结：A 死后 D 下一反制轮点名 S，
+        //   第八刀替身盾 3 拦 3 刀、第 4 刀破盾（早分支 t8 起点名→t20 死，
+        //   迟分支 t16 起→t28 死）。D 的 scan 按距离序点名：S(15.6) 近于
+        //   E(20.6)，S 死后才轮到 E——E 最迟 tick32 被 D 清场（早分支 tick24）。
+        //   站桩必中的世界，站桩=挨刀（#031 立法本意）；替身盾只改时间线不改结局。
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         spawn_test_entities(&mut world, &mut map, 10, true, true);
@@ -5184,25 +5289,48 @@ mod tests {
         assert!(!glyph_alive(&world, "A"), "tick12 A 必死（早则 tick4 被 H 反杀，迟则贴 D 站桩后 tick12 被 D 反制）");
         run_ticks(
             &mut world, &mut time, &physics, &mut renderer, &mut storage,
-            &mut pending, &mut map, 12,
+            &mut pending, &mut map, 16,
         );
         assert!(glyph_alive(&world, "D"), "D 站桩安全位应存活（清场者）");
-        assert!(!glyph_alive(&world, "S"), "tick24 S 必死（坐标稳定后 D 反制点名，脆皮无防守——第七刀起合法结局）");
-        assert!(!glyph_alive(&world, "E"), "tick24 E 必死（S 死后 D 距离序点名声呐清场）");
+        assert!(
+            !glyph_alive(&world, "S"),
+            "tick28 S 必死（替身盾 3 拦 3 刀第 4 刀破盾：迟分支 t16 起点名 t28 死，早分支 t20 已死）"
+        );
+        run_ticks(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage,
+            &mut pending, &mut map, 4,
+        );
+        assert!(
+            !glyph_alive(&world, "E"),
+            "tick32 E 必死（S 死后 D 距离序点名清场：迟分支 t32，早分支 t24 已死）"
+        );
     }
 
     #[test]
-    fn smoke_seventh_cut_hover_stable_d_hits_s_and_stagnation_clears() {
+    fn smoke_seventh_cut_hover_stable_and_stagnation_clears() {
         // 第七刀验收冒烟（进程内 80 拍一局，等价 headless 实测；沙箱不能起进程时
-        // 本测试即验收证据）：四方布阵 + 受控玩家 p1@35 + 地面阻挡者 obst@30。
-        // a. S 坐标全程稳定 (25,12)：hover 免重力，无 12↔21.8 弹跳（存活期内逐拍断言）
-        // b. D 对 S 出刀命中：A 死（≤tick12）后 D 下一反制轮点名 S（≤tick16），
-        //    脆皮无防守被击杀——落空终结，命中结算合法
+        // 本测试即验收证据）：四方布阵 + 受控玩家 p1@35 + 地面阻挡者 obst@30，D 摘除。
+        // a. S 坐标全程稳定 (25,12)：hover 免重力，无 12↔21.8 弹跳（全程逐拍断言）
         // c. P 点击走位贴障：p1 西行被 obst 挡死（31,0.5 全挡），2 拍窗口停滞
         //    检测自动清目标站住，不逐拍蹭动
+        // 【为什么摘 D】第七刀首版此测试同时验证"D 破盾杀 S"，但 D 的清场点名序
+        // 按随机 EntityId 结算：快路径（H 的 uuid 抢在 A/D 前）A 死 t4 -> obst t8
+        // 即被点名 -> p1 无阻挡走满 5 拍到 (30,0.5)，贴障断言随 uuid 掷骰子
+        // （基线实测 4 跑 2 挂的隐性 flaky）。停滞验证需要 obst 恒存活 -> D 缺席；
+        // "D 破盾杀 S"由 smoke_default_viewport_four_bio_timeline_unchanged
+        // （t28 破盾死锚，快慢分支确定性绿）+ spy_shield_intercepts_three_then_
+        // fourth_kills（3 拦 1 破逐刀断言）承担。
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         spawn_test_entities(&mut world, &mut map, 10, true, true);
+        let d_id = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == DEFENDER_CODE)
+            .map(|e| e.id)
+            .expect("四方布阵应有 D");
+        map.remove(&d_id);
+        world.entities.remove(&d_id);
         // 受控玩家 + 阻挡者：stems 字典序 obst < p1 -> obst@30 / p1@35（y 落半径线 0.5）
         let dir = temp_players_dir("seventh-cut");
         std::fs::write(dir.join("me.txt"), "p1").unwrap();
@@ -5226,10 +5354,7 @@ mod tests {
         let none: Vec<input::Intent> = vec![];
         let walk = vec![input::Intent::WsMove { x: 30.0, y: 0.5 }];
         // 停滞证据捕获：点击 tick10 -> 西行 4 拍（t13 到 31 贴障）-> 挡 t14 ->
-        // 停滞清目标 t15 末。D 清场点名序（距 D 最近者先死）：obst@30(15) <
-        // S@25,12(15.6) < p1@31(16)——快路径 p1 最迟 t16 被点名，故位置证据取
-        // t15 末快照（停滞已清、p1 尚存的安全点），清目标标记允许 t15/t16 捕获
-        //（t16 内停滞判定先于攻击结算，同拍先清后死也捕获得到）
+        // 停滞清目标 t15 末 -> t15 末快照即贴障位（D 缺席后无人清场，确定性成立）
         let mut p1_frozen: Option<(f64, f64)> = None;
         let mut p1_target_cleared = false;
         for tick_n in 1..=80 {
@@ -5253,11 +5378,11 @@ mod tests {
                 p1_target_cleared = true;
             }
         }
-        // a 附：S 死前最后坐标仍是 (25,12)（被点名击杀不是坠落——坠落会先改坐标）
-        // b. S 已被 D 命中击杀（A ≤tick12 死 -> D 距离序点名 S ≤tick20）
-        assert!(
-            !glyph_alive(&world, "S"),
-            "tick80 S 应被 D 反制刀命中击杀（坐标稳定后点在身体内必中）"
+        // a 附：D 缺席后 S 全程存活，80 拍末坐标仍是 (25,12)（悬停不是坠落）
+        assert_eq!(
+            world.entities.get(&spy_id).expect("D 缺席 S 应存活").pos(),
+            (25.0, 12.0),
+            "tick80 S 仍稳定悬停 (25,12)"
         );
         // c. 贴障停滞：p1 西行到 31 被 obst@30 挡死，2 拍窗口停滞清目标站住
         assert_eq!(
@@ -5269,7 +5394,6 @@ mod tests {
             p1_target_cleared,
             "贴障停滞：走位目标应已自动清除（不逐拍蹭动）"
         );
-        assert!(glyph_alive(&world, "D"), "D 站桩安全位应存活");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5466,8 +5590,21 @@ mod tests {
 
     #[test]
     fn parse_shield_markers_non_defender_markers_mean_none() {
-        // 负面路径：A 的 marker（0/2/3）不含盾上报 -> None（字幕显示占位符）
+        // 负面路径：A 的 marker（0/2/3）、H 拦截 6、S 侦察 10、S 替身拦截 11
+        // 都不含盾上报 -> None（S 的 11 不许撞 D 的 7/8 字幕协议）
         assert_eq!(parse_shield_markers(&[0, 2, 3]), None);
+        assert_eq!(
+            parse_shield_markers(&[6, 10, 11]),
+            None,
+            "S/H 的 marker 不进盾量字幕"
+        );
+    }
+
+    #[test]
+    fn spy_disguise_intercept_count_counts_marker_11() {
+        // 替身台词触发源计数：只数 S 拦截 marker 11，其他 marker（含 D 的 7）不算
+        assert_eq!(spy_disguise_intercept_count(&[11, 11, 11]), 3);
+        assert_eq!(spy_disguise_intercept_count(&[10, 7, 8, 6]), 0);
     }
 
     #[test]
