@@ -1237,6 +1237,10 @@ fn tick_with_intents(
     //   b. 生存点数扣减（架构 4.1：每 86400 tick 扣 1 点，归零标记死亡）
     decay_survival(world, current_tick);
 
+    //   b1. 绑定契约托管清算（#034 修订四：fade_on_death 随主消亡，主人死那一拍
+    //       弹即无/塔即无——排在攻击与衰减之后，本拍所有死亡来源都已落地）
+    enforce_binding_deaths(world, sandbox_map);
+
     //   c. 物理规则（#030 半径物理：重力落点解析 + 悬停免重力，架构 4.1 b 步）
     let changes = physics.step(world, &aloft);
     if !changes.is_empty() {
@@ -1718,6 +1722,10 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
         entity.set_radius(req.radius);
         // #034 spawn 第 8 参 mass：import 层已钳制（0.05..=100.0），此处兜底（幂等）
         entity.set_mass(req.mass);
+        // #034 修订四 spawn 第 9 参 binding：契约写进造物数据（出生声明，世界每拍
+        // 托管执行）；绑定对象=创造者（fade_on_death 的"主人"）
+        entity.set_binding(req.binding);
+        entity.set_bound_to(Some(req.creator));
         // 沙箱创建成功才插入世界（失败则实体不落世界，不留无沙箱活体）
         if let Err(e) = sandbox_map.create(entity_id, &wasm_bytes, req.fuel_limit) {
             tracing::warn!(
@@ -1783,11 +1791,16 @@ fn process_shoots(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
         projectile.set_radius(codeworld_core::collision::PROJECTILE_RADIUS);
         projectile.set_mass(req.mass);
         projectile.set_velocity((req.vx, req.vy));
+        // #034 修订四：绑定契约写进弹丸数据（出生声明，世界每拍托管执行——
+        // 遗嘱模式：契约不需要链路）+ 账本留档（结算侧 grace 判定数据源）
+        projectile.set_binding(req.binding);
+        projectile.set_bound_to(Some(req.shooter));
         sandbox_map.projectiles.insert(
             projectile_id,
             ProjectileMeta {
                 shooter: req.shooter,
                 payload: req.payload,
+                binding: req.binding,
             },
         );
         // 发射痕迹（#034 修订三：发射即暴露——攻击自由，但攻击留下痕迹）。
@@ -1853,6 +1866,7 @@ fn settle_projectile_events(
                     meta.shooter,
                     *point,
                     meta.payload,
+                    meta.binding == codeworld_core::entity::BINDING_GRACE_OWNER,
                 ));
             }
             ProjectileEvent::Landed { projectile, point } => {
@@ -1871,6 +1885,7 @@ fn settle_projectile_events(
                     meta.shooter,
                     *point,
                     meta.payload,
+                    meta.binding == codeworld_core::entity::BINDING_GRACE_OWNER,
                 ));
             }
             ProjectileEvent::Expired { projectile } => {
@@ -1885,8 +1900,7 @@ fn settle_projectile_events(
 ///
 /// 遍历存活实体调用 survival.decay(current_tick)，归零则标记死亡。
 /// 死亡清理步（retain is_alive）会随后移除死亡实体。
-fn decay_survival(world: &mut WorldState, current_tick: u64) {
-    for entity in world.entities.values_mut() {
+fn decay_survival(world: &mut WorldState, current_tick: u64) {    for entity in world.entities.values_mut() {
         if !entity.is_alive() {
             continue;
         }
@@ -1921,6 +1935,71 @@ struct PendingStrike {
     attack: PendingAttack,
 }
 
+/// 绑定契约托管清算（#034 修订四：世界每拍执行出生声明——遗嘱模式，
+/// 契约不需要链路）。排在攻击结算/生存衰减之后：本拍所有死亡来源
+/// （击杀/衰减/life()=false/登出）都已落地，同生契约当拍生效。
+/// - fade_on_death（弹丸与造物同款）：绑定对象已死或不在 → 本体即刻消亡
+/// - grace_owner：不在此清算（豁免在 deliver_attacks 结算路径执行）
+/// - unbound：跳过（离体即世界之物，同生不共死=现状默认）
+fn enforce_binding_deaths(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap) {
+    use codeworld_core::entity::BINDING_FADE_ON_DEATH;
+    // 弹丸先清（账本同步）：主人死的同生弹即刻消亡（哑弹，INFO 日志）
+    let dead_shells: Vec<(EntityId, EntityId)> = sandbox_map
+        .projectiles
+        .iter()
+        .filter(|(_, meta)| meta.binding == BINDING_FADE_ON_DEATH)
+        .filter(|(_, meta)| {
+            !world
+                .entities
+                .get(&meta.shooter)
+                .map(|e| e.is_alive())
+                .unwrap_or(false)
+        })
+        .map(|(pid, meta)| (*pid, meta.shooter))
+        .collect();
+    for (pid, shooter) in dead_shells {
+        if let Some(e) = world.entities.get_mut(&pid) {
+            e.kill();
+        }
+        sandbox_map.projectiles.remove(&pid);
+        tracing::info!(
+            projectile = %pid.0,
+            shooter = %shooter.0,
+            "[binding] 同生契约生效，随主消亡（弹丸哑弹）"
+        );
+    }
+    // 造物与一切声明体：binding=fade 且绑定对象已死/不在 → 消亡
+    //（塔随创造者消亡；bound_to=None 的 fade 声明视为主人已失，即刻消亡）
+    let doomed: Vec<EntityId> = world
+        .entities
+        .iter()
+        .filter(|(_, e)| e.is_alive() && e.binding() == BINDING_FADE_ON_DEATH)
+        .filter(|(_, e)| {
+            !e.bound_to()
+                .map(|owner| {
+                    world
+                        .entities
+                        .get(&owner)
+                        .map(|o| o.is_alive())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for id in doomed {
+        let bound_to = world.entities.get(&id).and_then(|e| e.bound_to());
+        if let Some(e) = world.entities.get_mut(&id) {
+            e.kill();
+        }
+        tracing::info!(
+            entity_id = %id.0,
+            bound_to = ?bound_to.map(|o| o.0),
+            "[binding] 同生契约生效，随主消亡（造物）"
+        );
+    }
+}
+
 /// 在飞弹丸账本（#034 弹道系统）
 ///
 /// Entity 本体只存物理（质量/速度/半径/坐标）；发射者与携带 payload 归本账本——
@@ -1932,6 +2011,9 @@ struct ProjectileMeta {
     shooter: EntityId,
     /// 弹丸携带的攻击字节（空=默认击杀模块）
     payload: Vec<u8>,
+    /// 绑定契约（#034 修订四：unbound 照飞 / fade_on_death 随主消亡 /
+    /// grace_owner 落地不砸发射者）
+    binding: i32,
 }
 
 /// 处理阶段一排队的攻击请求（架构 4.2 两阶段模型 + 4.1 阶段二 a2 步）
@@ -2034,6 +2116,17 @@ fn deliver_attacks(
         // 严格 <（恰好等于判距=落空，collision.rs melee_in_reach 测试锚定）。
         // 弹丸结算不走本门（contact_exempt=true）：弹丸撞身体本身就是接触事实——
         // 离体之物是攻击者手臂的延伸，再判发射者贴身会把弹道打回瞬发瞬达。
+        // #034 修订四攻击豁免条款（声明式）：grace_owner 弹命中发射者本人（现实
+        // 场景=落点在自己脚下的落地弹；飞行撞体在物理步已全程豁免发射者）→ 哑弹。
+        // unbound 不豁免——落地砸自己合法（世界不豁免，豁免是声明）
+        if atk.grace_owner && target_id == atk.attacker {
+            tracing::info!(
+                attacker = %atk.attacker.0,
+                pos = ?atk.target_pos,
+                "[binding] grace_owner 豁免生效：弹丸落地不结算发射者（哑弹消亡）"
+            );
+            continue;
+        }
         let attacker = &world.entities[&atk.attacker];
         let target = &world.entities[&target_id];
         let in_reach = codeworld_core::collision::melee_in_reach(
@@ -2604,7 +2697,7 @@ const HUNTER_WAT: &str = r#"(module
   (import "env" "scan" (func $scan (param i32 i32) (result i32)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
   (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   ;; tick 计数：on_attack 的 50% 伪随机源（奇=拦截），也是游走方向源与射击节拍源
   (global $ticks (mut i32) (i32.const 0))
@@ -2636,8 +2729,9 @@ const HUNTER_WAT: &str = r#"(module
     (local.set $dist (f64.sqrt
       (f64.add (f64.mul (local.get $dx) (local.get $dx))
                (f64.mul (local.get $dy) (local.get $dy)))))
-    ;; 2. 每 8 拍抛射一发（vx=dx/1.71 两拍回弧、vy=+14.7 上抛补偿、mass 0.5）。
-    ;;    装填拍到此为止（不游走不出刀）——弹丸从实况位置出手，本拍移动会带偏弹道
+    ;; 2. 每 8 拍抛射一发（vx=dx/1.71 两拍回弧、vy=+14.7 上抛补偿、mass 0.5、
+    ;;    binding 0=unbound——弹道照旧回归锚）。装填拍到此为止（不游走不出刀）
+    ;;    ——弹丸从实况位置出手，本拍移动会带偏弹道
     (if (i32.eqz (i32.rem_u (global.get $ticks) (i32.const 8)))
       (then
         (call $log (i32.const 12))
@@ -2645,7 +2739,7 @@ const HUNTER_WAT: &str = r#"(module
           (f64.div (local.get $dx) (f64.const 1.71))
           (f64.const 14.7)
           (f64.const 0.5)
-          (i32.const 0) (i32.const 0)))
+          (i32.const 0) (i32.const 0) (i32.const 0)))
         (return)))
     ;; 3. 贴身机会刀（dist <= 1.0 在贴身判距内；投机者不追击肉搏）
     (if (f64.le (local.get $dist) (f64.const 1.0))
@@ -6479,7 +6573,7 @@ mod tests {
     /// 一次性射手 WAT：首拍向固定方向 shoot（vx=4, vy=+14.7 两拍回弧, mass 1.0），
     /// 之后待机。配合靶位 (12.41, 0.5)（射手位 +7.41 = 1.8525×vx 两拍回弧落点）
     const SHOOTER_ONCE_WAT: &str = r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
   (import "env" "log" (func $log (param i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
@@ -6489,7 +6583,7 @@ mod tests {
         (global.set $done (i32.const 1))
         (call $log (i32.const 21))
         (drop (call $shoot (f64.const 4.0) (f64.const 14.7)
-                           (f64.const 1.0) (i32.const 0) (i32.const 0))))))
+                           (f64.const 1.0) (i32.const 0) (i32.const 0) (i32.const 0))))))
   (func (export "life") (result i32) i32.const 1))"#;
 
     /// 构造弹丸实体（测试用：code_hash=projectile + 半径/速度）
@@ -6618,7 +6712,7 @@ mod tests {
         let mut map = test_sandbox_map();
         let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (0.0, 0.5), PLAYER_WAT);
         let target = make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.5), TARGET_WAT);
-        let attacks = vec![PendingAttack::projectile_strike(shooter, (5.0, 0.5), vec![])];
+        let attacks = vec![PendingAttack::projectile_strike(shooter, (5.0, 0.5), vec![], false)];
         process_attacks(&mut world, &mut map, &attacks);
         assert!(
             !world.entities.get(&target).unwrap().is_alive(),
@@ -6650,6 +6744,7 @@ mod tests {
                 vx: 3.0,
                 vy: 4.0,
                 mass: 0.5,
+                binding: 0,
                 payload: vec![1, 2, 3],
             });
         process_shoots(&mut world, &mut map, 7);
@@ -6686,6 +6781,7 @@ mod tests {
                 vx,
                 vy,
                 mass,
+                binding: 0,
                 payload: vec![],
             });
     }
@@ -6756,6 +6852,206 @@ mod tests {
         assert_eq!(map.traces.len(), 1);
     }
 
+    // === 绑定契约（#034 修订四：出生声明，世界每拍托管执行——遗嘱模式）===
+
+    fn push_binding_shoot(
+        map: &mut EntitySandboxMap,
+        shooter: EntityId,
+        vx: f64,
+        vy: f64,
+        mass: f64,
+        binding: i32,
+    ) {
+        map.sandboxes
+            .get_mut(&shooter)
+            .unwrap()
+            .store
+            .data_mut()
+            .pending_shoots
+            .push(codeworld_arena::sandbox::PendingShoot {
+                shooter,
+                vx,
+                vy,
+                mass,
+                binding,
+                payload: vec![],
+            });
+    }
+
+    #[test]
+    fn fade_on_death_shell_dies_same_tick_owner_dies() {
+        // 同生弹：主人死那一拍弹即无（托管执行不等下一拍物理）——弹丸标记死亡
+        // （死亡清理链移除）+ 发射账本清空
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+        push_binding_shoot(&mut map, shooter, 3.0, 0.0, 1.0, codeworld_core::entity::BINDING_FADE_ON_DEATH);
+        process_shoots(&mut world, &mut map, 3);
+        assert_eq!(map.projectiles.len(), 1, "弹已出手在飞");
+        // 主人当场死亡（击杀/衰减/登出三路同源：实体 kill 即死）
+        world.entities.get_mut(&shooter).unwrap().kill();
+        enforce_binding_deaths(&mut world, &mut map);
+        assert!(
+            !map.projectiles.iter().any(|(pid, _)| world
+                .entities
+                .get(pid)
+                .map(|e| e.is_alive())
+                .unwrap_or(false)),
+            "同生契约生效：弹丸不再有活体在册"
+        );
+        assert!(map.projectiles.is_empty(), "发射账本同步清空");
+        let proj = world
+            .entities
+            .values()
+            .find(|e| codeworld_core::collision::is_projectile(e))
+            .expect("弹丸实体仍在账面（尸体由清理链移除）");
+        assert!(!proj.is_alive(), "弹丸已标记死亡");
+    }
+
+    #[test]
+    fn unbound_shell_keeps_flying_after_owner_death() {
+        // unbound 回归锚：主人死弹照飞（离体即世界之物，同生不共死=现状默认）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+        push_binding_shoot(&mut map, shooter, 3.0, 0.0, 1.0, codeworld_core::entity::BINDING_UNBOUND);
+        process_shoots(&mut world, &mut map, 3);
+        world.entities.get_mut(&shooter).unwrap().kill();
+        enforce_binding_deaths(&mut world, &mut map);
+        assert_eq!(map.projectiles.len(), 1, "unbound 弹不随主消亡");
+        assert!(
+            world
+                .entities
+                .values()
+                .find(|e| codeworld_core::collision::is_projectile(e))
+                .unwrap()
+                .is_alive(),
+            "unbound 弹照飞"
+        );
+    }
+
+    #[test]
+    fn fade_on_death_tower_dies_with_creator_unbound_tower_survives() {
+        // 塔契约：fade_on_death 塔随创造者死消亡；unbound 塔照站（同生不共死=现状）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let creator = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+        let owner = world.entities[&creator].owner;
+        let mut fade_tower = Entity::new(
+            EntityId(Uuid::from_u128(201)),
+            owner,
+            "creation".to_string(),
+            (10.0, 0.0),
+            Appearance::new("T".to_string(), "cyan".to_string(), 1.0),
+            3,
+            1_000_000,
+        );
+        fade_tower.set_binding(codeworld_core::entity::BINDING_FADE_ON_DEATH);
+        fade_tower.set_bound_to(Some(creator));
+        world.entities.insert(fade_tower.id, fade_tower);
+        let unbound_tower = Entity::new(
+            EntityId(Uuid::from_u128(202)),
+            owner,
+            "creation".to_string(),
+            (12.0, 0.0),
+            Appearance::new("T".to_string(), "cyan".to_string(), 1.0),
+            3,
+            1_000_000,
+        );
+        world.entities.insert(unbound_tower.id, unbound_tower);
+        // 创造者死亡 -> 托管清算
+        world.entities.get_mut(&creator).unwrap().kill();
+        enforce_binding_deaths(&mut world, &mut map);
+        assert!(
+            !world.entities.get(&EntityId(Uuid::from_u128(201))).unwrap().is_alive(),
+            "同生塔随主消亡"
+        );
+        assert!(
+            world.entities.get(&EntityId(Uuid::from_u128(202))).unwrap().is_alive(),
+            "unbound 塔照站（同生不共死=unbound 现状默认）"
+        );
+    }
+
+    #[test]
+    fn grace_owner_landing_does_not_settle_shooter() {
+        // 攻击豁免条款（声明式）：grace_owner 弹落地结算不伤发射者（P1-B 定案：
+        // 世界不豁免，豁免是声明——unbound 落地砸自己合法）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+        let grace = PendingAttack {
+            attacker: shooter,
+            target_pos: (5.0, 0.5), // 落点在发射者自己身体内
+            payload: vec![],
+            contact_exempt: true,
+            grace_owner: true,
+        };
+        let strikes = deliver_attacks(&world, &mut map, &[grace]);
+        assert!(strikes.is_empty(), "grace_owner 落地弹不结算发射者（哑弹）");
+        assert!(world.entities.get(&shooter).unwrap().is_alive());
+    }
+
+    #[test]
+    fn unbound_landing_still_settles_shooter() {
+        // P1-B 定案回归锚：unbound 弹落地砸自己合法（世界不豁免，豁免是声明）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+        let unbound = PendingAttack {
+            attacker: shooter,
+            target_pos: (5.0, 0.5),
+            payload: vec![],
+            contact_exempt: true,
+            grace_owner: false,
+        };
+        let strikes = deliver_attacks(&world, &mut map, &[unbound]);
+        assert_eq!(strikes.len(), 1, "unbound 落地砸自己照常进结算");
+        assert_eq!(strikes[0].target, shooter, "目标就是发射者自己");
+    }
+
+    #[test]
+    fn grace_owner_upward_shell_lands_at_feet_without_self_kill() {
+        // 端到端冒烟（进程内代 headless）：grace_owner 上抛弹（binding=2）垂直升空
+        // -> CCD 落回脚下（落点在自己身体内）-> 落地结算被豁免 -> 发射者无伤
+        const GRACE_UPWARD_WAT: &str = r#"(module
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+  (global $done (mut i32) (i32.const 0))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    (if (i32.eqz (global.get $done))
+      (then
+        (global.set $done (i32.const 1))
+        (drop (call $shoot (f64.const 0.0) (f64.const 14.7)
+                           (f64.const 1.0) (i32.const 0) (i32.const 0) (i32.const 2))))))
+  (func (export "life") (result i32) i32.const 1))"#;
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), GRACE_UPWARD_WAT);
+        let points_before = world.entities.get(&shooter).unwrap().survival.points();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        for _ in 0..8 {
+            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        }
+        assert!(
+            world
+                .entities
+                .values()
+                .all(|e| !codeworld_core::collision::is_projectile(e)),
+            "弹丸已落地消亡"
+        );
+        let me = world.entities.get(&shooter).expect("发射者存活未清理");
+        assert!(me.is_alive(), "grace_owner 上抛弹落回脚下不炸自己");
+        assert_eq!(
+            me.survival.points(),
+            points_before,
+            "豁免结算无掠夺（点数不动）"
+        );
+    }
+
 
     #[test]
     fn process_shoots_dead_shooter_and_cap_void_requests() {
@@ -6774,6 +7070,7 @@ mod tests {
                 vx: 1.0,
                 vy: 0.0,
                 mass: 1.0,
+                binding: 0,
                 payload: vec![],
             });
         world.entities.get_mut(&shooter).unwrap().kill();
@@ -6795,6 +7092,7 @@ mod tests {
                 vx: 1.0,
                 vy: 0.0,
                 mass: 1.0,
+                binding: 0,
                 payload: vec![],
             });
         process_shoots(&mut world, &mut map, 1);
@@ -7739,7 +8037,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -7750,6 +8048,7 @@ mod tests {
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1.0
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -7931,6 +8230,7 @@ mod tests {
                 color: "cyan".to_string(),
                 radius: 0.5,
                 mass: 1.0,
+                binding: 0,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -8030,7 +8330,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -8048,6 +8348,7 @@ mod tests {
         (i32.const 8256)
         (f64.const 0.5)
         (f64.const 1.0)
+        (i32.const 0)
         (call $spawn)
         (drop))))
   (func (export "life") (result i32) i32.const 1))"#,

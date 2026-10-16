@@ -58,6 +58,9 @@ pub struct PendingSpawn {
     pub radius: f64,
     /// 质量（#034 spawn 第 8 参；import 层已钳制 0.05..=100.0，物理人格属性）
     pub mass: f64,
+    /// 绑定契约（#034 修订四 spawn 第 9 参；import 层已钳制非法值为 unbound：
+    /// 0=独立存在 1=fade_on_death 主人死塔消亡）
+    pub binding: i32,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
 }
@@ -77,6 +80,9 @@ pub struct PendingShoot {
     pub vy: f64,
     /// 弹丸质量（import 层已钳制 0.05..=100.0）
     pub mass: f64,
+    /// 绑定契约（#034 修订四 shoot 第 6 参；import 层已钳制非法值为 unbound：
+    /// 0=照飞 1=fade_on_death 主人死弹消 2=grace_owner 落地不砸发射者）
+    pub binding: i32,
     /// 弹丸携带的攻击字节（同 attack_at payload 语义：空=默认击杀模块）
     pub payload: Vec<u8>,
 }
@@ -684,7 +690,8 @@ impl SandboxManager {
              glyph_ptr: i32,
              color_ptr: i32,
              radius: f64,
-             mass: f64|
+             mass: f64,
+             binding: i32|
              -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
@@ -771,6 +778,8 @@ impl SandboxManager {
                 let radius = codeworld_core::collision::clamp_radius(radius);
                 // #034 第 8 参 mass 校验钳制（0.05..=100.0，非有限回退 1.0，超界 warn）
                 let mass = codeworld_core::collision::clamp_mass(mass);
+                // #034 修订四第 9 参 binding 校验钳制（非法值钳 unbound，warn）
+                let binding = codeworld_core::entity::clamp_binding(binding);
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
@@ -778,6 +787,7 @@ impl SandboxManager {
                     color = %color,
                     radius,
                     mass,
+                    binding,
                     code_len = code.len(),
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
@@ -792,6 +802,7 @@ impl SandboxManager {
                         color,
                         radius,
                         mass,
+                        binding,
                         fuel_limit,
                     });
                 1
@@ -815,7 +826,8 @@ impl SandboxManager {
                   vy: f64,
                   mass: f64,
                   payload_ptr: i32,
-                  payload_len: i32|
+                  payload_len: i32,
+                  binding: i32|
                   -> i32 {
                 caller.data_mut().api_calls.push("shoot".to_string());
                 let shooter = caller.data().entity_id;
@@ -860,6 +872,8 @@ impl SandboxManager {
                 let payload = read_payload_from_caller(&mut caller, payload_ptr, payload_len);
                 // mass 钳制（除零护栏，#034）
                 let mass = codeworld_core::collision::clamp_mass(mass);
+                // #034 修订四第 6 参 binding 校验钳制（非法值钳 unbound，warn）
+                let binding = codeworld_core::entity::clamp_binding(binding);
                 caller.data_mut().shots_fired += 1;
                 let serial = caller.data().shots_fired;
                 caller.data_mut().pending_shoots.push(PendingShoot {
@@ -867,6 +881,7 @@ impl SandboxManager {
                     vx,
                     vy,
                     mass,
+                    binding,
                     payload,
                 });
                 tracing::info!(
@@ -874,6 +889,7 @@ impl SandboxManager {
                     vx,
                     vy,
                     mass,
+                    binding,
                     serial,
                     "[shoot] 射击已排队（阶段二统一发射）"
                 );
@@ -2269,10 +2285,15 @@ mod tests {
     /// on_tick 调 spawn(0, code.len(), x, y, 256, 300)，返回值存全局 get_ret。
     /// code_len 用 Rust 侧 code.len() 计算——手数 WAT 字符串长度天然易错（截断坑）。
     fn spawner_wat(code: &str, x: &str, y: &str) -> String {
+        spawner_binding_wat(code, x, y, "i32.const 0")
+    }
+
+    /// 带契约的造物方 WAT（#034 修订四：spawn 第 9 参 binding）
+    fn spawner_binding_wat(code: &str, x: &str, y: &str, binding: &str) -> String {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -2284,6 +2305,7 @@ mod tests {
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1.0
+    {binding}
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -2291,6 +2313,7 @@ mod tests {
             len = code.len(),
             x = x,
             y = y,
+            binding = binding,
         )
     }
 
@@ -2299,7 +2322,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
@@ -2312,12 +2335,14 @@ mod tests {
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1.0
+    i32.const 0
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1.0
+    i32.const 0
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
@@ -2329,7 +2354,7 @@ mod tests {
 
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
@@ -2340,6 +2365,7 @@ mod tests {
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1.0
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -2349,7 +2375,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -2361,6 +2387,7 @@ mod tests {
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1.0
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -2410,7 +2437,7 @@ mod tests {
         // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
         let wat_text = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -2421,6 +2448,7 @@ mod tests {
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1000.0
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -2441,14 +2469,19 @@ mod tests {
     /// 射手 WAT 生成器：on_tick 调 shoot(vx, vy, mass, 0, payload_len)（payload 从
     /// data 段 [0..4) 读 [1,2,3,4]），返回值存全局 get_ret。
     fn shooter_wat(vx: &str, vy: &str, mass: &str, payload_len: &str) -> String {
+        shooter_binding_wat(vx, vy, mass, payload_len, "i32.const 0")
+    }
+
+    /// 带契约的射击方 WAT（#034 修订四：shoot 第 6 参 binding）
+    fn shooter_binding_wat(vx: &str, vy: &str, mass: &str, payload_len: &str, binding: &str) -> String {
         format!(
             r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "\01\02\03\04")
   (func (export "on_tick")
-    {vx} {vy} {mass} i32.const 0 i32.const {payload_len}
+    {vx} {vy} {mass} i32.const 0 i32.const {payload_len} {binding}
     call $shoot global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -2456,6 +2489,7 @@ mod tests {
             vy = vy,
             mass = mass,
             payload_len = payload_len,
+            binding = binding,
         )
     }
 
@@ -2490,13 +2524,13 @@ mod tests {
         // 限流：同实体一拍至多 1 发（防弹幕灌爆），第二次返回 0 不入队
         let mgr = SandboxManager::new().unwrap();
         let wat_text = r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (func (export "on_tick")
-    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 0 call $shoot global.set $r1
-    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 0 call $shoot global.set $r2)
+    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 0 i32.const 0 call $shoot global.set $r1
+    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 0 i32.const 0 call $shoot global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -2608,16 +2642,78 @@ mod tests {
         assert_eq!(handle.store.data().pending_shoots[0].mass, 0.05, "低下限应钳到 0.05");
     }
 
+    // === 绑定契约（#034 修订四：shoot 第 6 参 / spawn 第 9 参）===
+
+    #[test]
+    fn shoot_import_passes_binding_through() {
+        // 第 6 参 binding：1=fade_on_death / 2=grace_owner 原样透传进 PendingShoot
+        for (raw, expect) in [("i32.const 1", 1), ("i32.const 2", 2)] {
+            let mgr = SandboxManager::new().unwrap();
+            let wat_text =
+                shooter_binding_wat("f64.const 1.0", "f64.const 0.0", "f64.const 1.0", "0", raw);
+            let mut handle = mgr
+                .create_sandbox(&wasm(&wat_text), 100_000, id(911))
+                .unwrap();
+            mgr.call_on_tick(&mut handle).unwrap();
+            assert_eq!(handle.store.data().pending_shoots[0].binding, expect, "binding {raw} 应透传");
+        }
+    }
+
+    #[test]
+    fn shoot_import_clamps_invalid_binding_to_unbound() {
+        // 非法契约值（9）钳 unbound——坏声明不进世界，回退最保守现状语义
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text =
+            shooter_binding_wat("f64.const 1.0", "f64.const 0.0", "f64.const 1.0", "0", "i32.const 9");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(912))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "非法契约值不拒绝发射");
+        assert_eq!(
+            handle.store.data().pending_shoots[0].binding, 0,
+            "非法契约值应钳 unbound"
+        );
+    }
+
+    #[test]
+    fn spawn_import_passes_binding_through_and_clamps_invalid() {
+        // spawn 第 9 参：合法值透传（1=fade_on_death 塔随主消亡）；非法值钳 unbound
+        let mgr = SandboxManager::new().unwrap();
+        let creator = id(801);
+        let wat_text =
+            spawner_binding_wat(SPAWNED_CODE, "f64.const 2.0", "f64.const 3.0", "i32.const 1");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, creator)
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(handle.store.data().pending_spawns[0].binding, 1, "合法契约值应透传");
+        // 非法值
+        handle.store.data_mut().pending_spawns.clear();
+        let bad_text =
+            spawner_binding_wat(SPAWNED_CODE, "f64.const 2.0", "f64.const 3.0", "i32.const 7");
+        let mut h2 = mgr
+            .create_sandbox(&wasm(&bad_text), 100_000, id(802))
+            .unwrap();
+        h2.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut h2).unwrap();
+        assert_eq!(
+            h2.store.data().pending_spawns[0].binding, 0,
+            "非法契约值应钳 unbound"
+        );
+    }
+
     #[test]
     fn shoot_import_rejects_oversized_payload() {
         // payload 超限（>1MB）-> 拒绝不入队（与 attack_at 同上限 MAX_PAYLOAD_LEN）
         let mgr = SandboxManager::new().unwrap();
         let wat_text = r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 24)
   (func (export "on_tick")
-    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 1048577
+    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 1048577 i32.const 0
     call $shoot global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;

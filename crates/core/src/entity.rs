@@ -111,6 +111,16 @@ pub struct Entity {
     #[serde(default = "default_mass")]
     mass: f64,
 
+    // 绑定契约（#034 修订四：出生时声明写进造物数据，世界结算引擎每拍托管执行
+    // ——遗嘱模式：契约不需要链路，控制（实时指挥）才需要）
+    /// serde default：旧快照无此字段时回退 unbound（现状语义）
+    #[serde(default = "default_binding")]
+    binding: i32,
+    /// 绑定对象（fade_on_death 的"主人"：造物=创造者、弹丸=发射者；
+    /// None=无绑定对象）。serde default 同上
+    #[serde(default)]
+    bound_to: Option<EntityId>,
+
     // 外观与动作状态
     /// 渲染数据
     pub appearance: Appearance,
@@ -138,6 +148,32 @@ fn default_mass() -> f64 {
     1.0
 }
 
+/// 绑定契约默认值（#034 修订四：新实体与旧快照回退共用 unbound）
+fn default_binding() -> i32 {
+    BINDING_UNBOUND
+}
+
+/// 绑定契约档位（#034 修订四，design-binding.md 机制层 MVP 三档）
+/// - unbound（默认）：离体即世界之物——主人死照飞照命中（弹丸）/独立存在（造物）
+/// - fade_on_death（同生）：主人死→在飞弹丸/造物当拍即刻消亡（世界每拍托管执行）
+/// - grace_owner（攻击豁免）：弹丸落地结算不伤发射者（飞行撞体本就全程豁免发射者，
+///   #034 既有口径）；不声明则落地砸自己合法——世界不豁免，豁免是声明
+pub const BINDING_UNBOUND: i32 = 0;
+pub const BINDING_FADE_ON_DEATH: i32 = 1;
+pub const BINDING_GRACE_OWNER: i32 = 2;
+
+/// 契约值校验钳制（shoot 第 6 参/spawn 第 9 参口径）：非法值钳 unbound 并 warn——
+/// 出生声明写进造物数据，坏声明不进世界（回退到最保守的现状语义）
+pub fn clamp_binding(v: i32) -> i32 {
+    match v {
+        BINDING_UNBOUND | BINDING_FADE_ON_DEATH | BINDING_GRACE_OWNER => v,
+        other => {
+            tracing::warn!(value = other, clamped = BINDING_UNBOUND, "[binding] 非法契约值，钳 unbound");
+            BINDING_UNBOUND
+        }
+    }
+}
+
 impl Entity {
     /// 创建新实体
     ///
@@ -162,6 +198,8 @@ impl Entity {
             velocity: (0.0, 0.0),
             radius: default_radius(),
             mass: default_mass(),
+            binding: default_binding(),
+            bound_to: None,
             appearance,
             action_state: ActionState::Idle,
             instruction_guard: InstructionGuard::new(per_tick_instruction_limit),
@@ -223,6 +261,26 @@ impl Entity {
             );
         }
         self.mass = clamped;
+    }
+
+    /// 绑定契约档位（#034 修订四）
+    pub fn binding(&self) -> i32 {
+        self.binding
+    }
+
+    /// 设置绑定契约（import 层已 clamp_binding，此处直存）
+    pub fn set_binding(&mut self, binding: i32) {
+        self.binding = binding;
+    }
+
+    /// 绑定对象（fade_on_death 的"主人"）
+    pub fn bound_to(&self) -> Option<EntityId> {
+        self.bound_to
+    }
+
+    /// 设置绑定对象
+    pub fn set_bound_to(&mut self, owner: Option<EntityId>) {
+        self.bound_to = owner;
     }
 
     /// 设置坐标（物理规则校验与变换管线由 space/physics 模块负责，此处只存）
@@ -508,5 +566,57 @@ mod tests {
         assert_eq!(e.code_hash, back.code_hash);
         assert_eq!(e.action_state(), back.action_state());
         assert!(back.is_alive());
+    }
+
+    // === 绑定契约（#034 修订四：出生声明写进造物数据）===
+
+    #[test]
+    fn entity_binding_defaults_to_unbound() {
+        // 创建：新实体默认 unbound（现状语义：离体之物独立存在，同生不共死）
+        let e = sample_entity();
+        assert_eq!(e.binding(), BINDING_UNBOUND);
+        assert_eq!(e.bound_to(), None);
+    }
+
+    #[test]
+    fn entity_binding_survives_serialize_roundtrip() {
+        // 读写：契约与绑定对象序列化往返保留
+        let mut e = sample_entity();
+        e.set_binding(BINDING_FADE_ON_DEATH);
+        e.set_bound_to(Some(crate::entity::EntityId(uuid::Uuid::from_u128(42))));
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.binding(), BINDING_FADE_ON_DEATH);
+        assert_eq!(back.bound_to(), Some(crate::entity::EntityId(uuid::Uuid::from_u128(42))));
+    }
+
+    #[test]
+    fn entity_binding_serde_backcompat_old_snapshot() {
+        // 边界：旧快照（无 binding/bound_to 字段）反序列化回退 unbound/None（存储向后兼容）
+        // 构造法：序列化真实体后删掉这两个键，等价旧版本存储的字段面
+        let mut obj: serde_json::Value =
+            serde_json::to_value(sample_entity()).unwrap();
+        obj.as_object_mut().unwrap().remove("binding");
+        obj.as_object_mut().unwrap().remove("bound_to");
+        let json = serde_json::to_string(&obj).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.binding(), BINDING_UNBOUND, "旧快照应回退 unbound");
+        assert_eq!(back.bound_to(), None);
+    }
+
+    #[test]
+    fn clamp_binding_passes_valid_values() {
+        // 校验：三档合法值原样通过
+        assert_eq!(clamp_binding(0), BINDING_UNBOUND);
+        assert_eq!(clamp_binding(1), BINDING_FADE_ON_DEATH);
+        assert_eq!(clamp_binding(2), BINDING_GRACE_OWNER);
+    }
+
+    #[test]
+    fn clamp_binding_rejects_invalid_to_unbound() {
+        // 校验：非法值钳 unbound（出生声明坏值不进世界，回退最保守现状语义）
+        assert_eq!(clamp_binding(9), BINDING_UNBOUND);
+        assert_eq!(clamp_binding(-1), BINDING_UNBOUND);
+        assert_eq!(clamp_binding(i32::MAX), BINDING_UNBOUND);
     }
 }

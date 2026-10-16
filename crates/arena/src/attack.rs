@@ -22,6 +22,11 @@ pub struct PendingAttack {
     /// 才砍得着）；弹丸命中结算不走本门——弹丸撞身体本身就是接触事实，离体之物是
     /// 攻击者手臂的延伸（env.attack_at 传 false，弹丸结算传 true）。
     pub contact_exempt: bool,
+    /// #034 修订四攻击豁免条款（声明式）：true=弹丸结算命中发射者本人时豁免
+    /// （落地不砸自己；飞行撞体本就全程豁免发射者，#034 既有口径）。
+    /// 由弹丸绑定契约 grace_owner 携带；unbound 弹落地砸自己合法（世界不豁免，
+    /// 豁免是声明）
+    pub grace_owner: bool,
 }
 
 impl PendingAttack {
@@ -32,16 +37,24 @@ impl PendingAttack {
             target_pos,
             payload,
             contact_exempt: false,
+            grace_owner: false,
         }
     }
 
-    /// 弹丸命中结算（#034：接触事实已由弹丸完成，豁免贴身判距）
-    pub fn projectile_strike(attacker: EntityId, target_pos: (f64, f64), payload: Vec<u8>) -> Self {
+    /// 弹丸命中结算（#034：接触事实已由弹丸完成，豁免贴身判距）。
+    /// `grace_owner`：发射者是否声明了对自己的豁免（绑定契约 grace_owner）
+    pub fn projectile_strike(
+        attacker: EntityId,
+        target_pos: (f64, f64),
+        payload: Vec<u8>,
+        grace_owner: bool,
+    ) -> Self {
         Self {
             attacker,
             target_pos,
             payload,
             contact_exempt: true,
+            grace_owner,
         }
     }
 }
@@ -74,12 +87,21 @@ mod tests {
         assert_eq!(atk.target_pos, (5.0, 5.0));
         assert_eq!(atk.payload, vec![1, 2, 3]);
         assert!(!atk.contact_exempt, "普通出刀走接触门");
+        assert!(!atk.grace_owner, "普通出刀无发射者豁免");
         let proj = PendingAttack::projectile_strike(
             EntityId(Uuid::from_u128(2)),
             (6.0, 6.0),
             vec![],
+            false,
         );
         assert!(proj.contact_exempt, "弹丸命中豁免贴身判距");
+        let grace = PendingAttack::projectile_strike(
+            EntityId(Uuid::from_u128(2)),
+            (6.0, 6.0),
+            vec![],
+            true,
+        );
+        assert!(grace.grace_owner, "弹丸契约可携带发射者豁免");
     }
 
     #[test]
