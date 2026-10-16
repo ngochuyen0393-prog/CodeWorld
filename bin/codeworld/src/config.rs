@@ -54,6 +54,11 @@ pub struct Config {
     /// 下线处置等待拍数（#025 期五第一刀：操控连接意外断开后角色留场等待处置
     /// 的窗口），默认 30。0 = 断开即默认带走（不等待）。CODEWORLD_DISPOSE_WAIT 覆盖。
     pub dispose_wait_ticks: u64,
+    /// 阻力常量（#034 世界基石参数，与重力同级），默认 0.05。
+    /// 阻力定律：v = v - drag*v/mass（线性阻力，方向不变模衰减）。
+    /// 标定判据：默认参数下标准上抛弹（vx=4/vy=+9.8/mass=1.0）射程 5~15 格。
+    /// CODEWORLD_DRAG 覆盖。
+    pub drag_coefficient: f64,
 }
 
 impl Default for Config {
@@ -75,6 +80,7 @@ impl Default for Config {
             max_entities: 64,
             ws_port: 8080,
             dispose_wait_ticks: 30,
+            drag_coefficient: 0.05,
         }
     }
 }
@@ -120,6 +126,18 @@ impl Config {
         }
         if let Some(t) = env_u64("CODEWORLD_DISPOSE_WAIT") {
             cfg.dispose_wait_ticks = t;
+        }
+        if let Some(d) = env_f64("CODEWORLD_DRAG") {
+            // 护栏（审查修正）：负阻力=弹丸加速器（factor 1-drag/mass 发散），钳 0；
+            // 非有限值进除法公式污染世界，回退默认
+            if !d.is_finite() {
+                tracing::warn!(value = d, "[config] CODEWORLD_DRAG 非有限值，回退默认 0.05");
+            } else if d < 0.0 {
+                tracing::warn!(value = d, "[config] CODEWORLD_DRAG 负值（弹丸加速器），钳到 0");
+                cfg.drag_coefficient = 0.0;
+            } else {
+                cfg.drag_coefficient = d;
+            }
         }
         // 布尔类开关："0"/"false"（大小写不敏感）= 关闭，缺失或其他值 = 默认开启
         if let Ok(v) = std::env::var("CODEWORLD_H_ENABLED") {
@@ -458,5 +476,47 @@ mod tests {
         let c = Config::load();
         std::env::remove_var("CODEWORLD_DISPOSE_WAIT");
         assert_eq!(c.dispose_wait_ticks, 30, "非法值应回退默认处置等待");
+    }
+
+    // === 阻力常量（#034 世界基石参数）===
+
+    #[test]
+    fn default_drag_is_point_zero_five() {
+        // 创建：阻力默认 0.05（标定判据：默认参数标准上抛弹射程 5~15 格，
+        // physics crate projectile_range_calibration_default_drag 测试锚定）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CODEWORLD_DRAG");
+        let c = Config::load();
+        assert_eq!(c.drag_coefficient, 0.05, "阻力默认应为 0.05");
+    }
+
+    #[test]
+    fn load_drag_env_overrides_default() {
+        // 修改：CODEWORLD_DRAG 覆盖默认阻力（世界基石参数可调）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_DRAG", "0.2");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_DRAG");
+        assert_eq!(c.drag_coefficient, 0.2, "环境变量应覆盖阻力常量");
+    }
+
+    #[test]
+    fn load_drag_non_finite_falls_back_to_default() {
+        // 边界：非有限值（NaN/inf）-> 回退默认 0.05（阻力进除法公式，坏值不进世界）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_DRAG", "nan");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_DRAG");
+        assert_eq!(c.drag_coefficient, 0.05, "非有限值应回退默认阻力");
+    }
+
+    #[test]
+    fn load_drag_negative_clamps_to_zero() {
+        // 边界（审查修正）：负阻力 = 弹丸加速器（factor 1-drag/mass 逐拍发散）-> 钳 0
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_DRAG", "-1.0");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_DRAG");
+        assert_eq!(c.drag_coefficient, 0.0, "负阻力应钳到 0（无阻力，不放大力）");
     }
 }

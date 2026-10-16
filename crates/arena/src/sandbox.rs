@@ -25,6 +25,10 @@ pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 /// MVP 一刀切的简单规则；规则由宪法允许后续玩法化（decisions.md #012）。
 pub const SPAWN_RANGE: f64 = 10.0;
 
+/// shoot 初速模长上限（#034：防一拍穿世界——弹丸一拍一步，初速 50 即一拍最多
+/// 飞 50 格≈半个视口；工程护栏非玩法裁定）
+pub const MAX_SHOOT_SPEED: f64 = 50.0;
+
 /// spawn 外观字符串（glyph/color，NUL 结尾）最大字节数
 ///
 /// import 层扫描上限：内存里没有 NUL 时最多读这么多字节就拒绝，
@@ -50,8 +54,29 @@ pub struct PendingSpawn {
     /// 身体半径（#030 spawn 第 7 参；import 层已校验钳制 0.05..=25.0；
     /// creation 身体=占地格 AABB 不用它，快照协议携带）
     pub radius: f64,
+    /// 质量（#034 spawn 第 8 参；import 层已钳制 0.05..=100.0，物理人格属性）
+    pub mass: f64,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
+}
+
+/// 本 tick 排队的射击请求（#034 env.shoot 推入，阶段二收集统一处理）
+///
+/// import 层只做零 world 校验（限流 1 发/tick、速度模长 ≤50、mass 钳制、
+/// payload ≤1MB）；发射位置在阶段二读发射者当拍坐标（阶段一快照坐标会被
+/// move_by 移动更新，从哪里出手以移动后的实况为准——与攻击坐标解析同哲学）。
+#[derive(Debug, Clone)]
+pub struct PendingShoot {
+    /// 发射者（沙箱所属实体）
+    pub shooter: EntityId,
+    /// 初速 x 分量（import 层已校验：有限、模长 ≤50）
+    pub vx: f64,
+    /// 初速 y 分量
+    pub vy: f64,
+    /// 弹丸质量（import 层已钳制 0.05..=100.0）
+    pub mass: f64,
+    /// 弹丸携带的攻击字节（同 attack_at payload 语义：空=默认击杀模块）
+    pub payload: Vec<u8>,
 }
 
 /// 本 tick 排队的 destroy 请求（env.destroy 推入，阶段二产权校验后应用）
@@ -118,6 +143,11 @@ pub struct SandboxData {
     pub pending_spawns: Vec<PendingSpawn>,
     /// 本 tick 排队的销毁请求（env.destroy 推入，阶段二产权校验后 drain 清空）
     pub pending_destroys: Vec<PendingDestroy>,
+    /// 本 tick 排队的射击请求（#034 env.shoot 推入，阶段二收集后 drain 清空；
+    /// 每实体每拍限 1 发在 import 层保证）
+    pub pending_shoots: Vec<PendingShoot>,
+    /// 该沙箱累计已成功排队的射击发数（#034 shoot 返回值：弹丸序号，跨拍递增）
+    pub shots_fired: i32,
     /// 本 tick 的悬停声明（env.hover 置位，host 阶段一收件并入免重力集合后清空；
     /// 每拍重申语义——玩家代码要持续对抗世界规则，上一拍声明不延续）
     pub hover_declared: bool,
@@ -362,11 +392,10 @@ impl SandboxManager {
                 }
                 let payload = read_payload_from_caller(&mut caller, ptr, len);
                 let payload_len = payload.len(); // 实际读取到的字节数（非调用方声称的 len）
-                caller.data_mut().pending_attacks.push(PendingAttack {
-                    attacker,
-                    target_pos: (x, y),
-                    payload,
-                });
+                caller
+                    .data_mut()
+                    .pending_attacks
+                    .push(PendingAttack::strike(attacker, (x, y), payload));
                 tracing::info!(
                     attacker = %attacker.0,
                     x,
@@ -565,7 +594,7 @@ impl SandboxManager {
                 }
             },
         )?;
-        // env.spawn(code_ptr, code_len, x, y, glyph_ptr, color_ptr) -> i32：造物
+        // env.spawn(code_ptr, code_len, x, y, glyph_ptr, color_ptr, radius, mass) -> i32：造物
         //（门二开放，world-foundation 门二 + decisions.md #012 能力统一：造物再造造物合法）。
         // 玩家代码提交一段 WAT 文本 + 出生坐标 + 外观，请求造一个新实体。
         // import 层只做零 world 校验（同 move_by 模式：快照坐标 host 填充，玩家伪造不了）：
@@ -576,6 +605,8 @@ impl SandboxManager {
         //     防远程投射刷屏；规则由宪法允许后续玩法化）
         //   - 外观：glyph/color 从 memory 读 NUL 结尾字符串（≤ MAX_META_LEN），
         //     glyph 恰 1 字符、color 非空
+        //   - radius 第 7 参钳制 0.05..=25.0（#030）；mass 第 8 参钳制 0.05..=100.0
+        //     （#034 物理人格属性，除零护栏）
         // 产权链 owner 继承、世界实体上限、WAT 编译都在阶段二判（返回 1=已排队，
         // 阶段二拒绝以日志为准，api.md 载明）。
         linker.func_wrap(
@@ -588,7 +619,8 @@ impl SandboxManager {
              y: f64,
              glyph_ptr: i32,
              color_ptr: i32,
-             radius: f64|
+             radius: f64,
+             mass: f64|
              -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
@@ -673,12 +705,15 @@ impl SandboxManager {
                 let fuel_limit = caller.data().fuel_limit;
                 // #030 第 7 参 radius 校验钳制（0.05..=25.0，非有限回退 0.5，超界 warn）
                 let radius = codeworld_core::collision::clamp_radius(radius);
+                // #034 第 8 参 mass 校验钳制（0.05..=100.0，非有限回退 1.0，超界 warn）
+                let mass = codeworld_core::collision::clamp_mass(mass);
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
                     glyph = %glyph,
                     color = %color,
                     radius,
+                    mass,
                     code_len = code.len(),
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
@@ -692,9 +727,93 @@ impl SandboxManager {
                         glyph,
                         color,
                         radius,
+                        mass,
                         fuel_limit,
                     });
                 1
+            },
+        )?;
+        // env.shoot(vx, vy, mass, payload_ptr, payload_len) -> i32：射击（#034 第 12 个
+        // 玩家 import，弹道系统）：从调用者当前位置发射弹丸。初速/质量由代码定，
+        // payload 同 attack_at 语义（空=默认击杀模块）。离体即世界物体（#034 立法第 1 条）。
+        // import 层只做零 world 校验（排队模式同 attack_at）：
+        //   - 限流：每实体每 tick 最多 1 发（防弹幕灌爆）
+        //   - 速度：vx/vy 有限且模长 ≤ 50（防一拍穿世界）
+        //   - mass：钳制 0.05..=100.0（除零护栏，#034）
+        //   - payload：len > MAX_PAYLOAD_LEN 直接拒绝（同 attack_at）
+        //   - 返回：弹丸序号（该实体累计第几发，1 起）或 0=拒绝。
+        //     发射位置与世界实体上限在阶段二判（import 拿不到 world）。
+        linker.func_wrap(
+            "env",
+            "shoot",
+            |mut caller: Caller<SandboxData>,
+             vx: f64,
+             vy: f64,
+             mass: f64,
+             payload_ptr: i32,
+             payload_len: i32|
+             -> i32 {
+                caller.data_mut().api_calls.push("shoot".to_string());
+                let shooter = caller.data().entity_id;
+                // 限流：同实体一拍至多 1 发
+                if !caller.data().pending_shoots.is_empty() {
+                    tracing::warn!(
+                        entity_id = %shooter.0,
+                        "[shoot] 本 tick 已射击，限流拒绝（1 发/tick）"
+                    );
+                    return 0;
+                }
+                // 速度校验：有限 + 模长 ≤ 50
+                if !vx.is_finite() || !vy.is_finite() {
+                    tracing::warn!(
+                        entity_id = %shooter.0,
+                        vx,
+                        vy,
+                        "[shoot] 初速非有限，拒绝"
+                    );
+                    return 0;
+                }
+                let speed2 = vx * vx + vy * vy;
+                if speed2 > MAX_SHOOT_SPEED * MAX_SHOOT_SPEED {
+                    tracing::warn!(
+                        entity_id = %shooter.0,
+                        speed = speed2.sqrt(),
+                        max = MAX_SHOOT_SPEED,
+                        "[shoot] 初速超上限，拒绝（防一拍穿世界）"
+                    );
+                    return 0;
+                }
+                // payload 超限拒绝：在读 memory 之前拦下（同 attack_at）
+                if payload_len > 0 && payload_len as usize > MAX_PAYLOAD_LEN {
+                    tracing::warn!(
+                        entity_id = %shooter.0,
+                        actual_len = payload_len,
+                        max = MAX_PAYLOAD_LEN,
+                        "[shoot] payload 超限，拒绝入队"
+                    );
+                    return 0;
+                }
+                let payload = read_payload_from_caller(&mut caller, payload_ptr, payload_len);
+                // mass 钳制（除零护栏，#034）
+                let mass = codeworld_core::collision::clamp_mass(mass);
+                caller.data_mut().shots_fired += 1;
+                let serial = caller.data().shots_fired;
+                caller.data_mut().pending_shoots.push(PendingShoot {
+                    shooter,
+                    vx,
+                    vy,
+                    mass,
+                    payload,
+                });
+                tracing::info!(
+                    entity_id = %shooter.0,
+                    vx,
+                    vy,
+                    mass,
+                    serial,
+                    "[shoot] 射击已排队（阶段二统一发射）"
+                );
+                serial
             },
         )?;
         // env.destroy(id_lo: i64, id_hi: i64) -> i32：销毁（门二开放，产权链 #015）。
@@ -1993,7 +2112,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -2004,6 +2123,7 @@ mod tests {
     {x} {y}
     i32.const 8192 i32.const 8256
     f64.const 0.5
+    f64.const 1.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -2019,7 +2139,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
@@ -2031,11 +2151,13 @@ mod tests {
     f64.const 1.0 f64.const 1.0
     i32.const 8192 i32.const 8256
     f64.const 0.5
+    f64.const 1.0
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
     i32.const 8192 i32.const 8256
     f64.const 0.5
+    f64.const 1.0
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
@@ -2047,7 +2169,7 @@ mod tests {
 
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
@@ -2057,6 +2179,7 @@ mod tests {
     f64.const 1.0 f64.const 1.0
     i32.const 8192 i32.const 8256
     f64.const 0.5
+    f64.const 1.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -2066,7 +2189,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -2077,6 +2200,7 @@ mod tests {
     f64.const 1.0 f64.const 1.0
     i32.const 8192 i32.const 8256
     f64.const 0.5
+    f64.const 1.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -2111,10 +2235,198 @@ mod tests {
         assert_eq!(s.glyph, "T", "字形应从 memory 读取");
         assert_eq!(s.color, "cyan", "颜色应从 memory 读取");
         assert_eq!(s.fuel_limit, 100_000, "fuel 配额应继承创造者沙箱的 fuel_limit");
+        assert_eq!(s.mass, 1.0, "#034 第 8 参 mass 应透传（import 层已钳制）");
         assert!(
             handle.store.data().api_calls.contains(&"spawn".to_string()),
             "spawn 调用应记入 api_calls 元数据"
         );
+    }
+
+    #[test]
+    fn spawn_import_clamps_mass_out_of_bounds() {
+        // #034 第 8 参 mass 护栏：1000 超上限钳到 100，0.001 低下限钳到 0.05（除零护栏）
+        let mgr = SandboxManager::new().unwrap();
+        let escaped = wat_escape(SPAWNED_CODE);
+        // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
+        let wat_text = format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const 1.0 f64.const 1.0
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1000.0
+    call $spawn drop)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = SPAWNED_CODE.len(),
+        );
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(808))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].mass, 100.0, "超上限 mass 应钳到 100.0");
+    }
+
+    // === env.shoot import（#034 第 12 个玩家 import：发射弹丸）===
+
+    /// 射手 WAT 生成器：on_tick 调 shoot(vx, vy, mass, 0, payload_len)（payload 从
+    /// data 段 [0..4) 读 [1,2,3,4]），返回值存全局 get_ret。
+    fn shooter_wat(vx: &str, vy: &str, mass: &str, payload_len: &str) -> String {
+        format!(
+            r#"(module
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "\01\02\03\04")
+  (func (export "on_tick")
+    {vx} {vy} {mass} i32.const 0 i32.const {payload_len}
+    call $shoot global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#,
+            vx = vx,
+            vy = vy,
+            mass = mass,
+            payload_len = payload_len,
+        )
+    }
+
+    #[test]
+    fn shoot_import_queues_pending_shoot() {
+        // env.shoot：合法请求（速度/质量合法、限流未满）-> 排队 PendingShoot，
+        // 返回弹丸序号（该实体累计第 1 发）
+        let mgr = SandboxManager::new().unwrap();
+        let shooter_id = id(901);
+        let wat_text = shooter_wat("f64.const 3.0", "f64.const 4.0", "f64.const 0.5", "4");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, shooter_id)
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "首发射击序号应为 1");
+        let shoots = &handle.store.data().pending_shoots;
+        assert_eq!(shoots.len(), 1, "应排队 1 次射击");
+        let s = &shoots[0];
+        assert_eq!(s.shooter, shooter_id, "shooter 应为沙箱绑定实体");
+        assert_eq!(s.vx, 3.0);
+        assert_eq!(s.vy, 4.0);
+        assert_eq!(s.mass, 0.5, "#034 弹丸质量由代码定（0.5 合法域内透传）");
+        assert_eq!(s.payload, vec![1, 2, 3, 4], "payload 应从 memory data 段读取");
+        assert!(
+            handle.store.data().api_calls.contains(&"shoot".to_string()),
+            "shoot 调用应记入 api_calls 元数据"
+        );
+    }
+
+    #[test]
+    fn shoot_import_rejects_second_shot_same_tick() {
+        // 限流：同实体一拍至多 1 发（防弹幕灌爆），第二次返回 0 不入队
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = r#"(module
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
+  (global $r1 (mut i32) (i32.const -1))
+  (global $r2 (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 0 call $shoot global.set $r1
+    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 0 call $shoot global.set $r2)
+  (func (export "get_r1") (result i32) global.get $r1)
+  (func (export "get_r2") (result i32) global.get $r2)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let mut handle = mgr
+            .create_sandbox(&wasm(wat_text), 100_000, id(902))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_r1"), 1, "首发应排队成功");
+        assert_eq!(call_i32_export(&mut handle, "get_r2"), 0, "同拍第二发应被限流拒绝");
+        assert_eq!(handle.store.data().pending_shoots.len(), 1, "同拍只应有 1 发入队");
+    }
+
+    #[test]
+    fn shoot_import_serial_increments_across_ticks() {
+        // 序号跨拍递增：tick1 返 1、drain 后 tick2 返 2（该实体累计第几发）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = shooter_wat("f64.const 1.0", "f64.const 9.8", "f64.const 1.0", "0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(903))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1);
+        handle.store.data_mut().pending_shoots.clear(); // 主程序收集后清空（drain 语义）
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 2, "次拍射击序号应递增");
+    }
+
+    #[test]
+    fn shoot_import_rejects_overspeed() {
+        // 速度模长上限 50（防一拍穿世界）：(40, 40) 模长 ~56.6 > 50 -> 拒绝
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = shooter_wat("f64.const 40.0", "f64.const 40.0", "f64.const 1.0", "0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(904))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超速射击应被拒绝");
+        assert!(handle.store.data().pending_shoots.is_empty(), "超速请求不应入队");
+    }
+
+    #[test]
+    fn shoot_import_rejects_non_finite_velocity() {
+        // NaN 初速（0/0 除零）-> 拒绝，防污染世界状态
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = shooter_wat(
+            "f64.const 0.0 f64.const 0.0 f64.div",
+            "f64.const 1.0",
+            "f64.const 1.0",
+            "0",
+        );
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(905))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "NaN 初速应被拒绝");
+        assert!(handle.store.data().pending_shoots.is_empty());
+    }
+
+    #[test]
+    fn shoot_import_clamps_mass_out_of_bounds() {
+        // mass 护栏（与 spawn 第 8 参同口径）：0.001 -> 0.05，1000 -> 100
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = shooter_wat("f64.const 1.0", "f64.const 0.0", "f64.const 0.001", "0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(906))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1);
+        assert_eq!(handle.store.data().pending_shoots[0].mass, 0.05, "低下限应钳到 0.05");
+    }
+
+    #[test]
+    fn shoot_import_rejects_oversized_payload() {
+        // payload 超限（>1MB）-> 拒绝不入队（与 attack_at 同上限 MAX_PAYLOAD_LEN）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = r#"(module
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 24)
+  (func (export "on_tick")
+    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 1048577
+    call $shoot global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let mut handle = mgr
+            .create_sandbox(&wasm(wat_text), 100_000, id(907))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超限 payload 应被拒绝");
+        assert!(handle.store.data().pending_shoots.is_empty());
     }
 
     #[test]

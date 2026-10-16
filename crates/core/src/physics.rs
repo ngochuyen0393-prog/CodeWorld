@@ -98,16 +98,28 @@ pub struct DefaultPhysics {
     pub collision_enabled: bool,
     /// 最大移动速度
     pub max_velocity: f64,
+    /// 阻力常量（#034 世界基石参数，与重力同级：对一切离体之物生效不豁免不分类）。
+    /// 阻力定律：v = v - drag*v/mass（线性阻力，方向不变模衰减）。
+    /// 默认 0.05（标定判据：默认参数下标准斜抛 45°/v0=10/mass=1.0 射程 5~15 格，
+    /// physics crate projectile_range_calibration_default_drag 测试锚定）。
+    /// serde default：旧参数快照无此字段回退 0.05。
+    #[serde(default = "default_drag")]
+    pub drag_coefficient: f64,
+}
+
+fn default_drag() -> f64 {
+    0.05
 }
 
 impl DefaultPhysics {
-    /// 默认物理参数：gravity=-9.8, ground_y=0.0, collision_enabled=true, max_velocity=100.0
+    /// 默认物理参数：gravity=-9.8, ground_y=0.0, collision_enabled=true, max_velocity=100.0, drag=0.05
     pub fn default_values() -> Self {
         Self {
             gravity: -9.8,
             ground_y: 0.0,
             collision_enabled: true,
             max_velocity: 100.0,
+            drag_coefficient: default_drag(),
         }
     }
 }
@@ -120,6 +132,7 @@ impl Default for DefaultPhysics {
             ground_y = p.ground_y,
             collision_enabled = p.collision_enabled,
             max_velocity = p.max_velocity,
+            drag = p.drag_coefficient,
             "DefaultPhysics 创建"
         );
         p

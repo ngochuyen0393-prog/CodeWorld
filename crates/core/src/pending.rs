@@ -5,7 +5,12 @@
 use crate::entity::EntityId;
 
 /// 延迟变更（架构文档 4.1 节 PendingChanges 队列元素）
+///
+/// #034 后 Spawn 变体（整个 Entity，含 mass 字段）与 SetPos 变体的大小差越过
+/// clippy large_enum_variant 阈值——队列是瞬时数据非长期持有，Box 化只会扩散
+/// 构造点改动，allow 留档。
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum PendingChange {
     /// 生成新实体（实体数据放入队列，阶段二插入 WorldState）
     Spawn {

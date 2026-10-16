@@ -16,7 +16,7 @@
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
 
   (memory (export "memory") 1)
 
@@ -60,7 +60,8 @@
             (f64.const 0.0)                                   ;; 塔的 y（地面）
             (i32.const 8192)                                  ;; glyph "T"
             (i32.const 8256)                                  ;; color "cyan"
-            (f64.const 0.5)))                                 ;; radius（#030 第7参，默认 0.5）
+            (f64.const 0.5)                                   ;; radius（#030 第7参，默认 0.5）
+            (f64.const 1.0)))                                 ;; mass（#034 第8参，默认 1.0；闭合 drop）
         (i32.const 5) (call $log)                             ;; marker 5 = 立塔信号
         (global.set $tower_done (i32.const 1))
         (return)))

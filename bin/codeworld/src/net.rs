@@ -107,11 +107,13 @@ pub(crate) struct EntitySnapshot {
 }
 
 /// kind 判定（纯映射，任务书定案）：开局四生物=npc；creation=造物；
-/// players 目录在线名（或残影躯壳）=player；其余未知 code_hash 兜底 npc。
+/// 弹丸=projectile（#034 弹道系统：前端画小圆点+尾迹）；players 目录在线名
+/// （或残影躯壳）=player；其余未知 code_hash 兜底 npc。
 fn entity_kind(code_hash: &str, entity_id: EntityId, players: &PlayerDirectory) -> &'static str {
     match code_hash {
         crate::ATTACKER_CODE | crate::DEFENDER_CODE | crate::HUNTER_CODE | crate::SPY_CODE => "npc",
         "creation" => "creation",
+        codeworld_core::collision::PROJECTILE_CODE => "projectile",
         name if players.is_online(name) => "player",
         _ if players.is_ghost(&entity_id) => "player",
         _ => "npc",

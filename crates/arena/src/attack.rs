@@ -18,6 +18,32 @@ pub struct PendingAttack {
     pub target_pos: (f64, f64),
     /// 攻击 payload：WASM 模块字节码（路线A整模块替换）。空=用 DEFAULT_KILL_WASM 默认击杀
     pub payload: Vec<u8>,
+    /// #034 接触门豁免：贴身刀判距只约束 attack_at 直出之手（出手者与目标身体相触
+    /// 才砍得着）；弹丸命中结算不走本门——弹丸撞身体本身就是接触事实，离体之物是
+    /// 攻击者手臂的延伸（env.attack_at 传 false，弹丸结算传 true）。
+    pub contact_exempt: bool,
+}
+
+impl PendingAttack {
+    /// 普通出刀（attack_at/操控攻击：走 #034 接触门）
+    pub fn strike(attacker: EntityId, target_pos: (f64, f64), payload: Vec<u8>) -> Self {
+        Self {
+            attacker,
+            target_pos,
+            payload,
+            contact_exempt: false,
+        }
+    }
+
+    /// 弹丸命中结算（#034：接触事实已由弹丸完成，豁免贴身判距）
+    pub fn projectile_strike(attacker: EntityId, target_pos: (f64, f64), payload: Vec<u8>) -> Self {
+        Self {
+            attacker,
+            target_pos,
+            payload,
+            contact_exempt: true,
+        }
+    }
 }
 
 /// 默认击杀 WAT 文本：life()=false 的最小模块（payload 为空时框架用此替换目标沙箱）
@@ -38,15 +64,22 @@ mod tests {
 
     #[test]
     fn pending_attack_stores_fields() {
-        // 创建：PendingAttack 字段正确存取（attacker/坐标/payload）
-        let atk = PendingAttack {
-            attacker: EntityId(Uuid::from_u128(1)),
-            target_pos: (5.0, 5.0),
-            payload: vec![1, 2, 3],
-        };
+        // 创建：PendingAttack 字段正确存取（attacker/坐标/payload/接触门豁免）
+        let atk = PendingAttack::strike(
+            EntityId(Uuid::from_u128(1)),
+            (5.0, 5.0),
+            vec![1, 2, 3],
+        );
         assert_eq!(atk.attacker, EntityId(Uuid::from_u128(1)));
         assert_eq!(atk.target_pos, (5.0, 5.0));
         assert_eq!(atk.payload, vec![1, 2, 3]);
+        assert!(!atk.contact_exempt, "普通出刀走接触门");
+        let proj = PendingAttack::projectile_strike(
+            EntityId(Uuid::from_u128(2)),
+            (6.0, 6.0),
+            vec![],
+        );
+        assert!(proj.contact_exempt, "弹丸命中豁免贴身判距");
     }
 
     #[test]

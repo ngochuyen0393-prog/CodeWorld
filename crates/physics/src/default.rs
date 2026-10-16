@@ -23,6 +23,47 @@ pub struct CollisionPair {
     pub pos: (f64, f64),
 }
 
+/// 弹丸寿命上限（拍）。防永飞兜底：飞出 viewport 的弹丸沿此路径超时消亡。
+/// 超时消亡 = 哑弹（INFO 日志在主程序事件消费侧打，物理步只产出事件）
+pub const PROJECTILE_MAX_AGE_TICKS: u64 = 30;
+
+/// 弹丸步进事件（物理步只检测，结算归主程序管线）
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectileEvent {
+    /// 撞身体：命中目标（结算由主程序走 deliver_attacks 管线，弹丸照亡）
+    HitBody {
+        projectile: EntityId,
+        target: EntityId,
+        /// 命中点（目标坐标，主程序拿它过 find_hit_target 复用 #031 解析）
+        point: (f64, f64),
+    },
+    /// 落地：触地消亡，payload 在落点做点命中（打不中任何身体 = 哑弹）
+    Landed { projectile: EntityId, point: (f64, f64) },
+    /// 超时哑弹：达到 PROJECTILE_MAX_AGE_TICKS 上限消亡
+    Expired { projectile: EntityId },
+}
+
+/// 阻力定律（#034 立法第 3 条：阻力减速 = 阻力 ÷ 质量，除法是定律质量为分母）
+///
+/// v = v - drag * v / mass：线性阻力模型，方向不变模衰减。
+/// 极端参数（质量 < 阻力）下裸公式会越过零点反向——钳到 0（方向永不翻转，
+/// "方向不变模衰减"的物理诚实实现）。
+/// MVP 只作用于弹丸（唯一有速度矢量的物体）；普通实体速度恒 (0,0)，
+/// 公式为恒等变换，行为零变化（#034 零回归锚）。
+pub fn apply_drag(v: (f64, f64), mass: f64, drag: f64) -> (f64, f64) {
+    let factor = 1.0 - drag / mass;
+    let decay = |comp: f64| -> f64 {
+        let next = comp * factor;
+        // 符号翻转 = 衰减越过零点 = 钳到零
+        if comp != 0.0 && next.signum() != comp.signum() {
+            0.0
+        } else {
+            next
+        }
+    };
+    (decay(v.0), decay(v.1))
+}
+
 /// 默认物理规则引擎（架构文档 4.1 b 步 + 8.1 节）
 ///
 /// 持有默认物理参数，每 tick 对实体执行重力落点解析/速度限制计算。
@@ -77,9 +118,14 @@ impl DefaultPhysicsEngine {
     /// 接触扫描（#030：替代旧"同坐标精确相等"）：所有存活实体两两
     /// body_touching（≤，相切即接触）判定，O(n²)，pair 内 a.id < b.id（确定序）。
     /// collision_enabled=false 时调用方跳过本扫描。
+    /// 弹丸不参与（#034：弹丸撞身体的结算走弹道步的 HitBody 事件，
+    /// 不开接触沙箱通道——弹丸是物体不是生物）。
     pub fn detect_touching(&self, entities: &HashMap<EntityId, Entity>) -> Vec<CollisionPair> {
         let mut pairs = Vec::new();
-        let mut list: Vec<&Entity> = entities.values().filter(|e| e.is_alive()).collect();
+        let mut list: Vec<&Entity> = entities
+            .values()
+            .filter(|e| e.is_alive() && !codeworld_core::collision::is_projectile(e))
+            .collect();
         list.sort_by_key(|e| e.id.0); // EntityId(Uuid) 升序，pair 定向 + 扫描顺序确定
         for i in 0..list.len() {
             for j in (i + 1)..list.len() {
@@ -96,6 +142,126 @@ impl DefaultPhysicsEngine {
             }
         }
         pairs
+    }
+
+    /// 弹丸步进（#034 弹道系统：离体之物的世界物理）
+    ///
+    /// 每拍对每个弹丸（EntityId 升序确定序）执行：
+    /// 1. 寿命检查：age（current_tick - created_tick）≥ PROJECTILE_MAX_AGE_TICKS
+    ///    -> Expired 事件 + 消亡（哑弹，不再积分）
+    /// 2. 重力：vy += gravity（弹丸吃满重力，无 aloft 豁免——它就是要落地的）
+    /// 3. 阻力：apply_drag 定律（v = v - drag*v/mass，方向不变模衰减）
+    /// 4. 位移：pos += v（一拍一步，与世界的拍节奏一致）
+    /// 5. 撞身体：与所有活体做圆判据（严格 <，含造物 AABB；跳过发射者——
+    ///    出生拍起豁免；跳过其他弹丸——互撞 MVP 不做，弹丸互穿）。
+    ///    命中即 HitBody 事件 + 弹丸消亡（结算归主程序 deliver_attacks 管线）
+    /// 6. 落地：y < radius 触地 -> Landed 事件 + 消亡（主程序对落点做点命中
+    ///    #031 判据复用，打不中 = 哑弹）
+    ///
+    /// - `shooters`：弹丸 -> 发射者映射（主程序持有；出生拍起豁免发射者的数据源）
+    /// - 返回事件按弹丸 id 升序（确定序，主程序结算不依赖遍历随机性）
+    pub fn step_projectiles(
+        &self,
+        world: &mut WorldState,
+        current_tick: u64,
+        shooters: &HashMap<EntityId, EntityId>,
+    ) -> Vec<ProjectileEvent> {
+        let mut events = Vec::new();
+        let mut ids: Vec<EntityId> = world
+            .entities
+            .iter()
+            .filter(|(_, e)| e.is_alive() && codeworld_core::collision::is_projectile(e))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_by_key(|id| id.0);
+        for pid in ids {
+            // 先读弹丸状态（积分与事件检测需要）
+            let (before, mut vel, mass, radius, birth) = {
+                let Some(p) = world.entities.get(&pid) else {
+                    continue;
+                };
+                (p.pos(), p.velocity(), p.mass(), p.radius(), p.created_tick)
+            };
+            // 1. 寿命检查（先于积分：寿命尽了不再飞）
+            if current_tick.saturating_sub(birth) >= PROJECTILE_MAX_AGE_TICKS {
+                if let Some(p) = world.entities.get_mut(&pid) {
+                    p.kill();
+                }
+                tracing::debug!(projectile = %pid.0, age = current_tick.saturating_sub(birth), "[projectile] 超时哑弹");
+                events.push(ProjectileEvent::Expired { projectile: pid });
+                continue;
+            }
+            // 2. 重力（吃满，无 aloft 豁免）
+            vel.1 += self.params.gravity;
+            // 3. 阻力定律（质量为分母）
+            vel = apply_drag(vel, mass, self.params.drag_coefficient);
+            // 4. 位移（一拍一步）
+            let after = (before.0 + vel.0, before.1 + vel.1);
+            if let Some(p) = world.entities.get_mut(&pid) {
+                p.set_velocity(vel);
+                p.set_pos(after);
+            }
+            // 5. 撞身体：与所有活体圆判据（严格 <；跳过自己/发射者/其他弹丸）
+            let shooter = shooters.get(&pid).copied();
+            let mut hit: Option<EntityId> = None;
+            let mut others: Vec<EntityId> = world
+                .entities
+                .iter()
+                .filter(|(oid, e)| {
+                    e.is_alive()
+                        && **oid != pid
+                        && !codeworld_core::collision::is_projectile(e)
+                        && Some(**oid) != shooter
+                })
+                .map(|(oid, _)| *oid)
+                .collect();
+            others.sort_by_key(|id| id.0); // 确定序：同拍多目标命中取 id 最小者
+            for oid in others {
+                let Some(target) = world.entities.get(&oid) else {
+                    continue;
+                };
+                if body_overlap(
+                    &Body::Circle {
+                        center: after,
+                        radius,
+                    },
+                    &body_of(target),
+                ) {
+                    hit = Some(oid);
+                    break;
+                }
+            }
+            if let Some(tid) = hit {
+                let point = world.entities.get(&tid).map(|e| e.pos()).unwrap_or(after);
+                if let Some(p) = world.entities.get_mut(&pid) {
+                    p.kill();
+                }
+                tracing::debug!(projectile = %pid.0, target = %tid.0, "[projectile] 撞身体");
+                events.push(ProjectileEvent::HitBody {
+                    projectile: pid,
+                    target: tid,
+                    point,
+                });
+                continue;
+            }
+            // 6. 落地：y < radius 触地消亡（落点=触地时的地面线：x 取积分值、y 钳回
+            // 半径线——弹丸触地在地面，不在地下；落点点命中才打得中地面目标，
+            // 审查修正：裸积分落点在地下深处，#031 点命中永远够不着地面身体）
+            if after.1 < radius {
+                if let Some(p) = world.entities.get_mut(&pid) {
+                    p.kill();
+                }
+                tracing::debug!(projectile = %pid.0, pos = ?after, "[projectile] 触地");
+                events.push(ProjectileEvent::Landed {
+                    projectile: pid,
+                    point: (after.0, radius),
+                });
+            }
+        }
+        if !events.is_empty() {
+            tracing::debug!(event_count = events.len(), "[projectile] 弹道步完成");
+        }
+        events
     }
 
     /// 圆实体落点解析：从 from_y 以重力步长下落，返回落点 y。
@@ -159,6 +325,8 @@ impl DefaultPhysicsEngine {
     /// - 圆实体：落点解析（地面=半径线 / 落在身体上=接触即停，见 circle_landing_y）
     /// - 造物（creation，格对齐 AABB）：直落地面（y≥ground_y），落点身体重叠则
     ///   悬停原位下拍重试（造物运动罕见，MVP 不做 AABB 堆叠解析）
+    /// - 弹丸（#034）：跳过——弹丸是速度积分制物体，由 step_projectiles 接管；
+    ///   本步的位置重力制（落到半径线）会瞬移弹丸
     /// - 实体按 EntityId 升序处理（确定序，与移动裁决同源）
     pub fn step(&self, world: &mut WorldState, aloft: &HashSet<EntityId>) -> Vec<PhysicsChange> {
         let mut changes = Vec::new();
@@ -167,7 +335,7 @@ impl DefaultPhysicsEngine {
         ids.sort_by_key(|id| id.0);
         for id in ids {
             // 先读实体数据（落下借再用），落点计算借 world 不可变引用
-            let (alive, aloft_skip, is_creation, before, me_r) = {
+            let (alive, aloft_skip, is_creation, is_proj, before, me_r) = {
                 let Some(entity) = world.entities.get(&id) else {
                     continue;
                 };
@@ -175,12 +343,18 @@ impl DefaultPhysicsEngine {
                     entity.is_alive(),
                     aloft.contains(&id),
                     entity.code_hash == codeworld_core::collision::CREATION_CODE,
+                    codeworld_core::collision::is_projectile(entity),
                     entity.pos(),
                     entity.radius(),
                 )
             };
             if !alive {
                 continue; // 死亡实体不受物理影响
+            }
+            // #034：弹丸不进位置重力步（速度积分制，step_projectiles 全权接管）
+            if is_proj {
+                tracing::debug!(entity_id = %id.0, "[step] 弹丸由弹道步接管，跳过位置重力");
+                continue;
             }
             if aloft_skip {
                 tracing::debug!(entity_id = %id.0, "[step] 悬停中，本拍免重力");
@@ -332,6 +506,7 @@ mod tests {
             ground_y: 10.0,
             collision_enabled: false,
             max_velocity: 50.0,
+            drag_coefficient: 0.1,
         };
         let engine = DefaultPhysicsEngine::new_with_params(p);
         assert_eq!(engine.params().gravity, -5.0);
@@ -652,5 +827,253 @@ mod tests {
         assert_eq!(changes[0].reason, PhysicsReason::Collision);
         assert_eq!(entities.get(&id2).unwrap().pos(), (6.0, 5.0)); // 后创建被挤
         assert_eq!(entities.get(&id1).unwrap().pos(), (5.0, 5.0)); // 先创建不动
+    }
+
+    // === #034 弹道系统：阻力定律 + 弹丸物理步 ===
+
+    use crate::default::{ProjectileEvent, PROJECTILE_MAX_AGE_TICKS};
+    use codeworld_core::collision::PROJECTILE_CODE;
+
+    fn make_projectile(id_u: u128, pos: (f64, f64), vel: (f64, f64), created_tick: u64) -> Entity {
+        let mut e = Entity::new(
+            EntityId(Uuid::from_u128(id_u)),
+            codeworld_core::entity::PlayerId(Uuid::from_u128(7)),
+            PROJECTILE_CODE.to_string(),
+            pos,
+            Appearance::new(".".to_string(), "red".to_string(), 1.0),
+            created_tick,
+            1_000_000,
+        );
+        e.set_radius(codeworld_core::collision::PROJECTILE_RADIUS);
+        e.set_mass(1.0);
+        e.set_velocity(vel);
+        e
+    }
+
+    #[test]
+    fn drag_law_scales_by_one_minus_drag_over_mass() {
+        // 阻力定律（#034 立法第 3 条）：v = v - drag*v/mass（方向不变模衰减，线性模型）
+        // mass=1.0, drag=0.05：每拍衰 5%
+        let v = crate::default::apply_drag((4.0, -3.0), 1.0, 0.05);
+        assert!((v.0 - 3.8).abs() < 1e-9 && (v.1 + 2.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn drag_law_heavy_decays_less_light_decays_more() {
+        // 质量为分母：重弹衰减少（弹道平直远），轻弹衰减多（短距弯垂）
+        let heavy = crate::default::apply_drag((10.0, 0.0), 10.0, 0.05); // 衰 0.5%
+        let light = crate::default::apply_drag((10.0, 0.0), 0.5, 0.05); // 衰 10%
+        assert!(heavy.0 > 9.9);
+        assert!(light.0 < 9.05);
+        // 方向都不变（模衰减不是反向）
+        assert!(heavy.0 > 0.0 && light.0 > 0.0);
+    }
+
+    #[test]
+    fn drag_law_zero_clamped_when_decay_exceeds_velocity() {
+        // 极端参数（质量低于阻力）：衰减会越过零点——钳到 0，方向永不翻转
+        // mass=0.05, drag=0.1：factor = 1-2 = -1，裸公式会反向
+        let v = crate::default::apply_drag((4.0, -3.0), 0.05, 0.1);
+        assert_eq!(v, (0.0, 0.0), "衰减超过速度模长时钳到零，不反向");
+    }
+
+    #[test]
+    fn projectile_gravity_parabola_two_ticks() {
+        // 固定初速 (4, 9.8) mass 1.0 @ (0,10)：重力+阻力+位移逐拍断言（vy 先加 g 再阻力再位移）
+        // tick1: vy=9.8-9.8=0 -> 阻力 x0.95 -> v=(3.8,0) -> pos=(3.8,10)
+        // tick2: vy=-9.8 -> x0.95 -> v=(3.61,-9.31) -> pos=(7.41,0.69) 仍在飞
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let p = make_projectile(1, (0.0, 10.0), (4.0, 9.8), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        assert!(events.is_empty(), "前两拍无事件（还在飞）");
+        assert!(near(world.entities.get(&pid).unwrap().pos(), (3.8, 10.0)));
+        engine.step_projectiles(&mut world, 2, &HashMap::new());
+        assert!(near(world.entities.get(&pid).unwrap().pos(), (7.41, 0.69)));
+    }
+
+    #[test]
+    fn projectile_lands_at_ground_and_dies() {
+        // 落地消亡：y < radius 触地 -> Landed 事件（落点钳在地面半径线）+ 弹丸标记死亡。
+        // 审查修正：裸积分落点在地下深处，#031 落点点命中永远够不着地面身体——
+        // 落点 y 钳回半径线（弹丸触地在地面），x 保积分值
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        // 一拍内必落地：vy=-9.8 从 y=0.2 直坠
+        let p = make_projectile(1, (3.0, 0.2), (1.0, 0.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ProjectileEvent::Landed { projectile, point } => {
+                assert_eq!(*projectile, pid);
+                assert!(
+                    (point.1 - codeworld_core::collision::PROJECTILE_RADIUS).abs() < 1e-9,
+                    "落点钳在地面半径线 y=0.15，实际 {point:?}"
+                );
+            }
+            other => panic!("应落地事件，实际 {other:?}"),
+        }
+        assert!(!world.entities.get(&pid).unwrap().is_alive(), "落地弹丸消亡");
+    }
+
+    #[test]
+    fn projectile_expires_at_max_age_dumb_shell() {
+        // 超时哑弹：age 达 PROJECTILE_MAX_AGE_TICKS 上限 -> Expired 事件 + 消亡（不再积分）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let p = make_projectile(1, (0.0, 10.0), (5.0, 9.8), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let events = engine.step_projectiles(&mut world, PROJECTILE_MAX_AGE_TICKS + 1, &HashMap::new());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0], ProjectileEvent::Expired { projectile: pid });
+        assert!(!world.entities.get(&pid).unwrap().is_alive());
+        // 哑弹不积分：坐标保持原位
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (0.0, 10.0));
+    }
+
+    #[test]
+    fn projectile_hits_body_and_dies_without_killing_target() {
+        // 撞身体：飞行途中圆判据命中（严格 <）-> HitBody 事件（带目标）+ 弹丸消亡；
+        // 结算（on_attack 询问/换血）是主程序管线的事，物理步只检测不动目标。
+        // 弹道（重力逐拍 -9.8 很凶，用上抛抛物线设计两拍拦截）：
+        //   v0=(1.8,19.6) @ (0,10)：tick1 v=(1.71,9.31) pos=(1.71,19.31)；
+        //   tick2 v=(1.6245,-0.4655) pos=(3.3345,18.8445)——目标放 (3.7,19.21)：
+        //   tick1 距 1.99 未中，tick2 距 0.517 < 0.65 命中
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let target = make_entity(2, 3.7, 19.21, 0);
+        let tid = target.id;
+        world.entities.insert(tid, target);
+        let p = make_projectile(1, (0.0, 10.0), (1.8, 19.6), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        assert!(events.is_empty(), "第一拍未接触");
+        let events = engine.step_projectiles(&mut world, 2, &HashMap::new());
+        assert_eq!(events.len(), 1, "第二拍接触命中");
+        match &events[0] {
+            ProjectileEvent::HitBody { projectile, target, .. } => {
+                assert_eq!(*projectile, pid);
+                assert_eq!(*target, tid);
+            }
+            other => panic!("应命中事件，实际 {other:?}"),
+        }
+        assert!(!world.entities.get(&pid).unwrap().is_alive(), "命中弹丸消亡");
+        assert!(world.entities.get(&tid).unwrap().is_alive(), "物理步不动目标（结算归主程序）");
+    }
+
+    #[test]
+    fn projectile_never_hits_its_shooter() {
+        // 不撞 owner：出生拍起豁免发射者（往回打/穿过发射者都不命中）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let shooter = make_entity(9, 10.0, 10.0, 0);
+        let sid = shooter.id;
+        world.entities.insert(sid, shooter);
+        // 弹丸从发射者身上出生、初速向后（穿过发射者）
+        let p = make_projectile(1, (10.0, 10.0), (-2.0, 0.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let mut shooters = HashMap::new();
+        shooters.insert(pid, sid);
+        for t in 1..=6 {
+            let events = engine.step_projectiles(&mut world, t, &shooters);
+            assert!(
+                events.iter().all(|e| !matches!(e, ProjectileEvent::HitBody { .. })),
+                "第 {t} 拍不应命中发射者"
+            );
+        }
+    }
+
+    #[test]
+    fn projectiles_pass_through_each_other() {
+        // 弹丸互撞 MVP 不做：两弹相向交叉飞行互不命中（穿透）。
+        // vy0=+9.8 顶住重力让两弹在高空交叉两拍（重力逐拍 -9.8，平射一拍即坠）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let p1 = make_projectile(1, (5.0, 10.0), (2.0, 9.8), 0);
+        let p2 = make_projectile(2, (9.0, 10.0), (-2.0, 9.8), 0);
+        world.entities.insert(p1.id, p1);
+        world.entities.insert(p2.id, p2);
+        for t in 1..=2 {
+            let events = engine.step_projectiles(&mut world, t, &HashMap::new());
+            assert!(events.is_empty(), "第 {t} 拍弹丸互穿不应有事件");
+        }
+        // 第三拍双双坠地（Landed），但仍无任何 HitBody（互穿语义）
+        let events = engine.step_projectiles(&mut world, 3, &HashMap::new());
+        assert!(
+            events.iter().all(|e| !matches!(e, ProjectileEvent::HitBody { .. })),
+            "弹丸互穿：坠地不算互撞，实际 {events:?}"
+        );
+    }
+
+    #[test]
+    fn step_projectiles_leaves_normal_entities_untouched() {
+        // 回归锚：弹丸步只动弹丸——普通实体（生物/造物）坐标零变化
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let normal = make_entity(5, 8.0, 0.5, 0);
+        let nid = normal.id;
+        let creation = make_creation(6, 12.0, 0.0);
+        let cid = creation.id;
+        world.entities.insert(nid, normal);
+        world.entities.insert(cid, creation);
+        let p = make_projectile(1, (0.0, 10.0), (3.0, 0.0), 0);
+        world.entities.insert(p.id, p);
+        engine.step_projectiles(&mut world, 1, &HashMap::new());
+        assert_eq!(world.entities.get(&nid).unwrap().pos(), (8.0, 0.5), "普通实体不动");
+        assert_eq!(world.entities.get(&cid).unwrap().pos(), (12.0, 0.0), "造物不动");
+    }
+
+    #[test]
+    fn step_gravity_skips_projectiles() {
+        // 回归锚：通用物理步不碰弹丸——弹丸是速度积分制（step_projectiles 接管），
+        // 位置重力制（circle_landing_y 落到半径线）会瞬移弹丸，必须跳过
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let p = make_projectile(1, (0.0, 10.0), (3.0, 0.0), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        engine.step(&mut world, &HashSet::new());
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (0.0, 10.0),
+            "通用物理步不应对弹丸做位置重力"
+        );
+    }
+
+    #[test]
+    fn projectile_range_calibration_default_drag() {
+        // 射程调参判据（阻力默认值的标定锚）：默认参数（drag=0.05）下，
+        // 标准上抛弹（vx=4, vy=+9.8, mass=1.0 地面发射——vy 顶一拍重力再坠）
+        // 水平射程落在 5~15 格。实测约 7.4 格（两拍弧线）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let x0 = 50.0; // 远离边界，排除 viewport 干扰
+        let p = make_projectile(1, (x0, 0.5), (4.0, 9.8), 0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        let mut range = None;
+        for t in 1..=60 {
+            let events = engine.step_projectiles(&mut world, t, &HashMap::new());
+            if let Some(ProjectileEvent::Landed { point, .. }) = events.first() {
+                range = Some(point.0 - x0);
+                break;
+            }
+        }
+        let range = range.expect("60 拍内必落地");
+        assert!(
+            (5.0..=15.0).contains(&range),
+            "标准上抛弹射程应 5~15 格，实际 {range}"
+        );
+    }
+
+    fn near(a: (f64, f64), b: (f64, f64)) -> bool {
+        (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9
     }
 }

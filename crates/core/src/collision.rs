@@ -14,6 +14,33 @@ use crate::entity::Entity;
 /// 创造物 code_hash 标识（process_spawns 写入，本模块/net.rs 共用同一常量）
 pub const CREATION_CODE: &str = "creation";
 
+/// 弹丸 code_hash 标识（#034 离体之物：shoot 产出的飞行体，无沙箱无 on_tick，
+/// 物理由 physics step_projectiles 接管；本模块/net.rs 共用同一常量）
+pub const PROJECTILE_CODE: &str = "projectile";
+
+/// 贴身刀判距冗余（#034 attack_at 接触化）：出手判距 = r攻 + r目 + 0.5。
+/// 这 0.5 是"胳膊长度"物理判距常量，不是射程属性（射程不立法，全部物理涌现——
+/// design-ballistics.md 否决清单：attack_at 加射程属性已被土豆否决）
+pub const MELEE_REACH: f64 = 0.5;
+
+/// 弹丸身体半径（#034：弹丸是小圆点，身体半径固定 0.15——shoot 无半径参，
+/// 弹丸碰撞判据 = 弹丸中心距实体中心 < r弹(0.15) + r实）
+pub const PROJECTILE_RADIUS: f64 = 0.15;
+
+/// 实体是否是弹丸（#034 离体之物识别；与 CREATION_CODE 同款 code_hash 判据）
+pub fn is_projectile(e: &Entity) -> bool {
+    e.code_hash == PROJECTILE_CODE
+}
+
+/// 贴身刀判据（#034 接触化）：dist(攻,目) < r攻 + r目 + MELEE_REACH，严格 <。
+/// 恰好等于判距 = 落空（与重叠判据同款严格约定，审查锚定）
+pub fn melee_in_reach(a_pos: (f64, f64), a_r: f64, b_pos: (f64, f64), b_r: f64) -> bool {
+    let dx = a_pos.0 - b_pos.0;
+    let dy = a_pos.1 - b_pos.1;
+    let s = a_r + b_r + MELEE_REACH;
+    dx * dx + dy * dy < s * s
+}
+
 /// 身体形状：世界里的实体要么是圆（活动实体），要么是格对齐方块（造物）
 #[derive(Debug, Clone, PartialEq)]
 pub enum Body {
@@ -203,6 +230,28 @@ pub fn clamp_radius(r: f64) -> f64 {
         return MAX;
     }
     r
+}
+
+/// 质量校验钳制（#034 spawn 第 8 参 / shoot 第 3 参口径）：0.05 ≤ mass ≤ 100，
+/// 超界 warn 并钳制；非有限值（NaN/无穷）回退默认 1.0 并 warn。
+/// 这是除零护栏（阻力定律 mass 做分母），不是玩法裁定（#034 立法第 4 条）。
+pub fn clamp_mass(m: f64) -> f64 {
+    const MIN: f64 = 0.05;
+    const MAX: f64 = 100.0;
+    const DEFAULT: f64 = 1.0;
+    if !m.is_finite() {
+        tracing::warn!(value = m, "[mass] 非有限值，回退默认 1.0");
+        return DEFAULT;
+    }
+    if m < MIN {
+        tracing::warn!(value = m, clamped = MIN, "[mass] 低于下限，钳制");
+        return MIN;
+    }
+    if m > MAX {
+        tracing::warn!(value = m, clamped = MAX, "[mass] 超过上限，钳制");
+        return MAX;
+    }
+    m
 }
 
 /// 圆心到 AABB 的最近点偏移（dx, dy）——圆-AABB 判定的共享实现：
@@ -452,5 +501,59 @@ mod tests {
     fn clamp_radius_non_finite_falls_back() {
         assert_eq!(clamp_radius(f64::NAN), 0.5);
         assert_eq!(clamp_radius(f64::INFINITY), 0.5);
+    }
+
+    // === clamp_mass（#034 spawn/shoot 第 mass 参校验口径）===
+
+    #[test]
+    fn clamp_mass_passes_valid() {
+        assert_eq!(clamp_mass(1.0), 1.0);
+        assert_eq!(clamp_mass(0.05), 0.05, "下限含边界");
+        assert_eq!(clamp_mass(100.0), 100.0, "上限含边界");
+        assert_eq!(clamp_mass(0.5), 0.5);
+    }
+
+    #[test]
+    fn clamp_mass_clamps_out_of_bounds() {
+        assert_eq!(clamp_mass(0.01), 0.05, "低于下限钳到 0.05");
+        assert_eq!(clamp_mass(1000.0), 100.0, "超上限钳到 100.0");
+    }
+
+    #[test]
+    fn clamp_mass_non_finite_falls_back() {
+        // 除零护栏：NaN/无穷回退默认 1.0（#034 铁律：mass 只做物理分母，非有限值进公式会污染世界）
+        assert_eq!(clamp_mass(f64::NAN), 1.0);
+        assert_eq!(clamp_mass(f64::INFINITY), 1.0);
+        assert_eq!(clamp_mass(f64::NEG_INFINITY), 1.0);
+    }
+
+    // === melee_in_reach（#034 attack_at 接触化判据：dist < r1+r2+MELEE_REACH 严格）===
+
+    #[test]
+    fn melee_in_reach_strict_less_than() {
+        // 两半径和 1.0 + 冗余 0.5 = 1.5：恰在 1.5 = 落空（严格 <，审查锚定）
+        assert!(melee_in_reach((0.0, 0.0), 0.5, (1.49, 0.0), 0.5));
+        assert!(!melee_in_reach((0.0, 0.0), 0.5, (1.5, 0.0), 0.5), "恰好等于判距=落空");
+        assert!(!melee_in_reach((0.0, 0.0), 0.5, (1.51, 0.0), 0.5));
+    }
+
+    #[test]
+    fn melee_in_reach_reach_is_arm_not_range() {
+        // 冗余 0.5 是"胳膊"不是射程：大身体判距=半径和+0.5，够得着更远但仍是贴身语义
+        assert!(melee_in_reach((0.0, 0.0), 0.5, (1.0, 0.0), 0.5));
+        assert!(melee_in_reach((0.0, 0.0), 2.0, (2.9, 0.0), 0.5));
+        assert!(!melee_in_reach((0.0, 0.0), 2.0, (3.0, 0.0), 0.5));
+    }
+
+    // === 弹丸身份（#034 离体之物识别：body_of 同款 code_hash 常量判据）===
+
+    #[test]
+    fn is_projectile_by_code_hash() {
+        let p = make_entity(1, "projectile", (0.0, 5.0));
+        assert!(is_projectile(&p), "code_hash=projectile 是弹丸");
+        let b = make_entity(2, "attacker", (1.0, 0.5));
+        assert!(!is_projectile(&b), "普通生物不是弹丸");
+        let t = make_entity(3, "creation", (10.0, 0.0));
+        assert!(!is_projectile(&t), "造物不是弹丸");
     }
 }

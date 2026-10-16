@@ -105,6 +105,12 @@ pub struct Entity {
     #[serde(default = "default_radius")]
     radius: f64,
 
+    // 质量（#034 物理人格属性：与 radius 并列；阻力定律分母，弹道/动量涌现的根基。
+    // 铁律：mass 只参与物理反应，永不参与攻击结算——攻杀仍是代码对代码）
+    /// serde default：旧快照无此字段时回退 1.0（存储向后兼容，抄 radius 先例）
+    #[serde(default = "default_mass")]
+    mass: f64,
+
     // 外观与动作状态
     /// 渲染数据
     pub appearance: Appearance,
@@ -125,6 +131,11 @@ pub struct Entity {
 /// radius 默认值（新实体与旧快照回退共用：四生物/玩家/测试构造器全兼容）
 fn default_radius() -> f64 {
     0.5
+}
+
+/// mass 默认值（#034：新实体与旧快照回退共用）
+fn default_mass() -> f64 {
+    1.0
 }
 
 impl Entity {
@@ -150,6 +161,7 @@ impl Entity {
             pos,
             velocity: (0.0, 0.0),
             radius: default_radius(),
+            mass: default_mass(),
             appearance,
             action_state: ActionState::Idle,
             instruction_guard: InstructionGuard::new(per_tick_instruction_limit),
@@ -191,6 +203,26 @@ impl Entity {
             );
         }
         self.radius = clamped;
+    }
+
+    /// 质量（#034 物理人格属性：阻力定律分母，只参与物理反应永不参与攻击结算）
+    pub fn mass(&self) -> f64 {
+        self.mass
+    }
+
+    /// 设置质量（超界 warn 并钳制到 0.05..=100.0，非有限值回退 1.0——
+    /// 与 spawn 第 8 参/shoot 第 3 参校验同口径，clamp 逻辑唯一实现在 collision::clamp_mass）
+    pub fn set_mass(&mut self, mass: f64) {
+        let clamped = crate::collision::clamp_mass(mass);
+        if clamped != mass {
+            tracing::warn!(
+                entity_id = %self.id.0,
+                requested = mass,
+                clamped,
+                "实体质量校验钳制"
+            );
+        }
+        self.mass = clamped;
     }
 
     /// 设置坐标（物理规则校验与变换管线由 space/physics 模块负责，此处只存）
@@ -428,6 +460,41 @@ mod tests {
         json = v.to_string();
         let back: Entity = serde_json::from_str(&json).unwrap();
         assert_eq!(back.radius(), 0.5);
+    }
+
+    // === mass（#034 物理人格属性）===
+
+    #[test]
+    fn entity_default_mass_is_one() {
+        // 创建：mass 默认 1.0（四生物/玩家/测试构造器全兼容）
+        let e = sample_entity();
+        assert_eq!(e.mass(), 1.0);
+    }
+
+    #[test]
+    fn entity_set_mass_clamps_to_bounds() {
+        // 校验：0.05 ≤ mass ≤ 100，超界钳制（spawn 第 8 参/shoot 第 3 参同口径）
+        let mut e = sample_entity();
+        e.set_mass(2.5);
+        assert_eq!(e.mass(), 2.5);
+        e.set_mass(1000.0);
+        assert_eq!(e.mass(), 100.0, "超上限钳到 100.0");
+        e.set_mass(0.001);
+        assert_eq!(e.mass(), 0.05, "低于下限钳到 0.05");
+        e.set_mass(f64::NAN);
+        assert_eq!(e.mass(), 1.0, "非有限值回退默认 1.0");
+    }
+
+    #[test]
+    fn entity_mass_serde_backward_compat() {
+        // 读写：旧快照 JSON 无 mass 字段 → 反序列化回退默认 1.0（存储兼容，抄 radius 先例）
+        let e = sample_entity();
+        let mut json = serde_json::to_string(&e).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("mass");
+        json = v.to_string();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mass(), 1.0);
     }
 
     #[test]
