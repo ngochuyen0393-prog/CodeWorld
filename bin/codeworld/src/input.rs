@@ -33,6 +33,9 @@ pub enum Intent {
     WsAttack { x: f64, y: f64 },
     /// 停止（#027 右键/浏览器 S 键：清除点击走位目标，站住不动）
     Stop,
+    /// 登出处置（#025 期五第一刀：WS logout 上行经同一意图单入口入队，tick 侧
+    /// 先分流给处置状态机，不进 route_intents；路由分支是漏分流的防御性兜底）
+    Logout { choice: crate::dispose::LogoutChoice },
 }
 
 /// 按键 -> 意图映射全表（纯函数；crossterm KeyEvent 可在测试中直接构造）
@@ -197,6 +200,10 @@ pub fn route_intents(
                 }
             }
             Intent::Quit => {}
+            Intent::Logout { .. } => {
+                // 防御性兜底：Logout 在 tick 侧已分流给处置状态机，不应到达路由
+                tracing::debug!("[input] Logout 意图漏分流到路由，忽略（处置归 dispose 状态机）");
+            }
         }
     }
     // 持续目标执行：本拍无其他行动且点击目标在册 -> 向目标走一步；到达（格距≤0.5）清除站住
@@ -541,6 +548,38 @@ mod tests {
         // 无玩家进场 = 按键仅 Quit 生效（Quit 不进路由），路由无目标
         let intents = vec![Intent::Move { dx: 1.0, dy: 0.0 }, Intent::Attack];
         assert_eq!(route(&intents, None, None, None), None);
+    }
+
+    #[test]
+    fn logout_intent_routes_as_noop_and_keeps_move_target() {
+        // #025 下线处置：Logout 不走走位/攻击路由（tick 侧先分流给处置状态机）；
+        // 防御性兜底——若漏分流的 Logout 到达路由，自身零动作、不清在册走位目标
+        let target = eid(1);
+        let logout = Intent::Logout {
+            choice: crate::dispose::LogoutChoice::StayAuto,
+        };
+        let mut mt: Option<(EntityId, (f64, f64))> = None;
+        let action = route_intents(
+            &[logout],
+            Some(target),
+            None,
+            Some((30.0, 0.5)),
+            0.5,
+            &mut mt,
+        );
+        assert!(action.is_none(), "Logout 自身不产生操控行动");
+        assert_eq!(mt, None, "Logout 不改动走位目标状态");
+        // 在册目标不被 Logout 清除（持续目标执行照旧，与 Logout 无关）
+        let mut mt2: Option<(EntityId, (f64, f64))> = Some((target, (5.0, 0.0)));
+        let _ = route_intents(
+            &[logout],
+            Some(target),
+            None,
+            Some((30.0, 0.5)),
+            0.5,
+            &mut mt2,
+        );
+        assert!(mt2.is_some(), "Logout 不清除在册走位目标");
     }
 
     #[test]

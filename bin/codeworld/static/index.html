@@ -69,7 +69,47 @@
     background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
     font: inherit; padding: 0 8px; cursor: pointer;
   }
-  #camBtn:hover { border-color: #8b949e; }
+  #camBtn:hover, #logoutBtn:hover { border-color: #8b949e; }
+  #logoutBtn {
+    background: #21262d; border: 1px solid #30363d; color: #f85149;
+    font: inherit; padding: 0 8px; cursor: pointer;
+  }
+  /* 登出处置面板：登出是主动行为，三选一离开（#025 下线处置权） */
+  #logoutPanel {
+    position: absolute; inset: 0; z-index: 5;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(14, 17, 22, 0.72);
+  }
+  #logoutPanel .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 18px 20px; width: 340px;
+  }
+  #logoutPanel .title { color: #e6edf3; margin-bottom: 12px; }
+  #logoutPanel .disp {
+    display: block; width: 100%; text-align: left; margin-bottom: 8px;
+    background: #21262d; border: 1px solid #30363d; border-radius: 6px;
+    color: #c9d1d9; font: inherit; padding: 8px 12px; cursor: pointer;
+  }
+  #logoutPanel .disp:hover { border-color: #3fb950; }
+  #logoutPanel .disp b { color: #e6edf3; font-weight: 700; }
+  #logoutPanel .disp span { display: block; font-size: 12px; color: #8b949e; margin-top: 2px; }
+  #logoutPanel .cancel {
+    width: 100%; background: none; border: none; color: #8b949e;
+    font: inherit; padding: 6px; cursor: pointer; margin-top: 2px;
+  }
+  #logoutPanel .cancel:hover { color: #c9d1d9; }
+  /* 已登出横幅：非阻塞（世界继续直播），含重新进入入口 */
+  #logoutBanner {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    z-index: 4; display: flex; gap: 12px; align-items: center;
+    background: rgba(22, 27, 34, 0.92); border: 1px solid #30363d;
+    border-radius: 6px; padding: 8px 14px; color: #e6edf3; white-space: nowrap;
+  }
+  #reenterBtn {
+    background: #238636; border: 1px solid #2ea043; color: #fff;
+    font: inherit; padding: 2px 10px; cursor: pointer; border-radius: 4px;
+  }
+  #reenterBtn:hover { background: #2ea043; }
 </style>
 </head>
 <body>
@@ -77,6 +117,19 @@
 <div id="stage">
   <canvas id="cv"></canvas>
   <div id="tip" hidden></div>
+  <div id="logoutPanel" hidden>
+    <div class="card">
+      <div class="title">登出——你的角色怎么处置？</div>
+      <button class="disp" type="button" data-d="take"><b>带走</b><span>角色立刻离开世界；下次进来重新出生</span></button>
+      <button class="disp" type="button" data-d="stay_auto"><b>留下 · 自主</b><span>角色留在世界，用它自己的代码继续活动</span></button>
+      <button class="disp" type="button" data-d="stay_ai"><b>留下 · 等 AI</b><span>角色原地待命，等外部 AI 接管（接口预留）</span></button>
+      <button class="cancel" type="button" id="logoutCancel">取消（回到世界）</button>
+    </div>
+  </div>
+  <div id="logoutBanner" hidden>
+    <span id="bannerText"></span>
+    <button id="reenterBtn" type="button">重新进入世界</button>
+  </div>
 </div>
 <div id="bar">
   <span id="conn" class="wait">连接中……</span>
@@ -85,6 +138,7 @@
   <span>帧间隔 <b id="itv">-</b>ms</span>
   <span>左键移动 · 右键停止 · 点击敌人攻击 · F 切镜头</span>
   <button id="camBtn" type="button">镜头：跟随</button>
+  <button id="logoutBtn" type="button">登出</button>
   <span id="mouse">x=- , y=-</span>
 </div>
 <script>
@@ -114,6 +168,12 @@
   var mouseEl = document.getElementById('mouse');
   var tipEl = document.getElementById('tip');
   var camBtnEl = document.getElementById('camBtn');
+  var logoutBtnEl = document.getElementById('logoutBtn');
+  var logoutPanelEl = document.getElementById('logoutPanel');
+  var logoutCancelEl = document.getElementById('logoutCancel');
+  var logoutBannerEl = document.getElementById('logoutBanner');
+  var bannerTextEl = document.getElementById('bannerText');
+  var reenterBtnEl = document.getElementById('reenterBtn');
 
   // ---- 状态 ----
   var buf = [];                 // 快照缓冲 [{t:接收时刻, tick, caption, viewport, ents:Map(id->e)}]
@@ -141,6 +201,8 @@
   var cam = null;               // 相机中心（世界坐标，lerp 平滑）
   var camEdges = null;          // 相机贴边标记 {l,r,b,t}（viewport 边界线可视化用）
   var view = null;              // 当前可视世界窗口（全景=viewport；跟随=相机窗口）
+  var loggedOut = null;         // 已登出的处置（'take'|'stay_auto'|'stay_ai'，#025）；null=未登出
+                                // 登出后连接降级观战继续直播；此时断线不自动重连（重连=抢回操控）
 
   // ---- 快照接收：入缓冲 + 帧间隔滚动平均 ----
   function onMessage(ev) {
@@ -293,6 +355,7 @@
         ents.set(id, {
           id: id, glyph: b.glyph, color: b.color, kind: b.kind, name: b.name,
           controlled: b.controlled === true, owner: b.owner,
+          disposition: b.disposition, wait_left: b.wait_left,
           x: a.x + (b.x - a.x) * alpha,
           y: a.y + (b.y - a.y) * alpha
         });
@@ -410,6 +473,22 @@
       if (e.controlled === true) me = e;
     });
     return me;
+  }
+
+  // 登出处置选项 -> 大白话文案（面板/横幅共用；非法值原样兜底）
+  function logoutChoiceLabel(d) {
+    return { take: '带走', stay_auto: '留下 · 自主', stay_ai: '留下 · 等 AI' }[d] || d;
+  }
+
+  // 实体头顶处置标注（#025 快照 disposition 字段；null=在线态无标注）。
+  // dispose_wait 带倒数（意外断线的抢救窗口），auto/ai-await 是状态签
+  function disposeTag(e) {
+    if (e.disposition === 'dispose_wait') {
+      return '处置等待中 ' + (e.wait_left !== undefined && e.wait_left !== null ? e.wait_left : '?') + ' 拍';
+    }
+    if (e.disposition === 'auto') return '自主活动中';
+    if (e.disposition === 'ai-await') return 'AI 待接入';
+    return null;
   }
 
   // ==== [PURE-END] ====
@@ -589,6 +668,18 @@
       ctx.fillText(e.glyph, p.x, p.y);
     });
 
+    // 处置状态头顶标注（#025 期五第一刀）：处置等待=黄色倒数（抢救窗口），
+    // 自主活动中 / AI 待接入=灰色状态签。第二遍画避免污染实体字号
+    ctx.font = '12px Consolas, monospace';
+    state.ents.forEach(function (e) {
+      var tag = disposeTag(e);
+      if (!tag) return;
+      var p = worldToScreen(e.x, e.y);
+      if (p.x < -cell || p.x > viewW + cell || p.y < -cell || p.y > viewH + cell) return;
+      ctx.fillStyle = e.disposition === 'dispose_wait' ? '#d29922' : '#8b949e';
+      ctx.fillText(tag, p.x, p.y - half - 12);
+    });
+
     // 点击走位可视化（#027）：操控实体 -> 目标 虚线 + 目标点标记（本地提示，服务器权威；
     // 操控实体取的是预测后的渲染位置，虚线跟着预测走）。
     // 空中目标（第五刀）：目标向地面投影一条垂直参考线 + 地面落点小十字——高度感，
@@ -760,8 +851,57 @@
     if (ev.key === 'f' || ev.key === 'F') {
       toggleCamera();
     }
+    // 登出处置（#025）：L 键/底部按钮开面板，Esc 取消
+    if (ev.key === 'l' || ev.key === 'L') {
+      showLogoutPanel();
+    }
+    if (ev.key === 'Escape') {
+      logoutPanelEl.hidden = true;
+    }
   });
   camBtnEl.addEventListener('click', toggleCamera);
+
+  // ---- 登出处置（#025 期五第一刀）：主动行为三选一，区别于断线 ----
+  function showLogoutPanel() {
+    if (loggedOut) return; // 已登出不重复开面板
+    logoutPanelEl.hidden = false;
+  }
+
+  // 选项落地：发 logout 消息（服务器释放操控令牌，本连接降级观战——世界继续
+  // 直播，P 的自主活动照常可见）；横幅给"重新进入世界"入口（重连=重新认领操控）
+  Array.prototype.forEach.call(
+    document.querySelectorAll('#logoutPanel .disp'),
+    function (btn) {
+      btn.addEventListener('click', function () {
+        var d = btn.getAttribute('data-d');
+        loggedOut = d;
+        sendMsg({ type: 'logout', disposition: d });
+        logoutPanelEl.hidden = true;
+        bannerTextEl.textContent = '已登出（处置：' + logoutChoiceLabel(d) + '）· 世界直播中';
+        logoutBannerEl.hidden = false;
+        moveTarget = null;
+        clearPrediction(); // 已无操控：预测态清空（重进后从服务器快照重来）
+      });
+    }
+  );
+  logoutBtnEl.addEventListener('click', showLogoutPanel);
+  logoutCancelEl.addEventListener('click', function () {
+    logoutPanelEl.hidden = true;
+  });
+
+  // 重新进入世界：关掉观战连接 -> 全新连接（第一连接=操控端，重新认领）。
+  // take 处置下服务器会重生角色；stay_* 处置下直接抢回操控（接管者被顶掉）
+  reenterBtnEl.addEventListener('click', function () {
+    loggedOut = null;
+    logoutBannerEl.hidden = true;
+    if (wsSock) {
+      var old = wsSock;
+      wsSock = null;
+      old.onclose = null; // 老连接的断开回调作废（防调度自动重连）
+      try { old.close(); } catch (e) { /* 已断则忽略 */ }
+    }
+    connect();
+  });
 
   // 镜头切换（第四刀 C3）：跟随/全景；P 不存在时自动回落全景（loop 里生效）
   function toggleCamera() {
@@ -812,6 +952,13 @@
       attackLines = [];
       killFx = [];
       connState = 'bad';
+      // 已登出（#025）：不自动重连——重连=重新认领操控（顶掉接管者），
+      // 这是"重新进入世界"按钮的显式动作；横幅保留，连接状态如实显示
+      if (loggedOut) {
+        connEl.textContent = '已登出 · 连接已断（点「重新进入世界」回来）';
+        connEl.className = 'bad';
+        return;
+      }
       renderConn();
       if (reconnectTimer !== null) return; // 防双调度（onerror 后紧跟 onclose）
       reconnectTimer = setTimeout(function () {

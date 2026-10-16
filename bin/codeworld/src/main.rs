@@ -12,6 +12,7 @@
 //! 4. sleep 到下一个 tick
 
 mod config;
+mod dispose;
 mod input;
 mod net;
 mod players;
@@ -76,6 +77,9 @@ struct EntitySandboxMap {
     /// 点击走位停滞检测窗口（期四第七刀）：目标变更即重开窗，测"当前目标"的
     /// 走位进度；2 拍净位移 < 0.01 = 贴障蹭动/全挡，视为到达清目标
     move_stall: Option<input::MoveStallTrack>,
+    /// 本拍连接事件（#025 期五第一刀：WS 操控令牌翻转沿，main 循环每拍写入、
+    /// tick ②5 消费清空；WS 禁用/无翻转= None）。处置状态机的触发源
+    conn_event: Option<net::ConnEvent>,
 }
 
 impl EntitySandboxMap {
@@ -98,6 +102,7 @@ impl EntitySandboxMap {
             flight_phase: None,
             last_touching: std::collections::HashSet::new(),
             move_stall: None,
+            conn_event: None,
         })
     }
 
@@ -229,13 +234,22 @@ impl EntitySandboxMap {
             // 操控接管本拍（#022 操控优先于自主）：跳过被操控实体的 on_tick——自主
             // 移动/攻击都不跑。取舍：MVP 完全接管（语义清晰"按键=这拍听我的"、实现
             // 最简），细粒度"仅抑制移动副作用"待挂机AI需要持续输出时再做。
-            // life() 照常调用（存在合同不受操控影响——操控停，代码层心跳不停）。
-            if control_override != Some(entity_id) {
+            // #025 处置抑制：处置等待/AI 待接入的实体同样跳过 on_tick（站着等处置/
+            // 等 AI——活角色，life()/防守照常）；Auto 处置=自主恢复（不抑制）。
+            // life() 照常调用（存在合同不受操控/处置影响——代码层心跳不停）。
+            let disposition_suppressed = world
+                .entities
+                .get(&entity_id)
+                .map(|e| self.players.dispose.suppresses(&e.code_hash))
+                .unwrap_or(false);
+            if control_override != Some(entity_id) && !disposition_suppressed {
                 if let Err(e) = self.manager.call_on_tick(handle) {
                     tracing::warn!(entity_id = %entity_id.0, error = %e, "on_tick 执行失败");
                 }
-            } else {
+            } else if control_override == Some(entity_id) {
                 tracing::debug!(entity_id = %entity_id.0, "[control] 本拍操控接管，跳过自主 on_tick");
+            } else {
+                tracing::debug!(entity_id = %entity_id.0, "[dispose] 处置抑制本拍 on_tick（等待处置/待 AI）");
             }
             // 窗口关闭：置空桥指针（SAFETY 契约，防后续 life 调用期悬垂）
             handle.store.data_mut().probe_bridge = std::ptr::null_mut();
@@ -503,12 +517,14 @@ impl EntitySandboxMap {
         if !self.players.is_enabled() {
             return;
         }
-        // 1. 目录轮询：新 .wat 进场 / 消失的文件名下线进残影 / 黑名单解除
+        // 1. 目录轮询：新 .wat 进场 / 消失的文件名下线进残影 / 黑名单解除。
+        //    #025：会话级离场（登出带走）的名字跳过重生——重生=重连认领解除标记
         match self.players.scan_dir() {
             Ok(stems) => {
                 for name in &stems {
                     if !self.players.is_online(name)
                         && !self.players.is_failed(name)
+                        && !self.players.is_absent(name)
                         && !self.spawn_player(world, name, current_tick)
                     {
                         self.players.mark_failed(name);
@@ -525,6 +541,11 @@ impl EntitySandboxMap {
                             "玩家下线：{name}（{kind}残影 {} 拍）",
                             ev.ghost_ticks
                         );
+                        // #025 两条下线路径不互相踩：文件锚删除=账号级下线（残影路径
+                        // #013 接管），处置状态让位清除
+                        if self.players.dispose.clear(&name) {
+                            tracing::info!("[dispose] 文件锚删除，处置状态让位残影路径 player={name}");
+                        }
                     }
                 }
                 // 文件消失的失败名解除黑名单（"删了再放"可重试）
@@ -542,8 +563,10 @@ impl EntitySandboxMap {
                 entity.kill();
             }
         }
-        // 3. 记录打扫：残影期被击杀等已不在世界的实体，清残影/参战记录（防无界增长）
+        // 3. 记录打扫：残影期被击杀等已不在世界的实体，清残影/参战记录（防无界增长）；
+        //    处置账本同理只留在场玩家（防无界增长）
         self.players.prune(&world.entities);
+        self.players.prune_dispose();
     }
 }
 
@@ -594,6 +617,8 @@ fn main() -> Result<()> {
     // 门一进场（world-foundation 二）：装配玩家目录（启动扫描 + 每 tick 在线锚轮询）。
     // 目录不存在自动创建；空目录 = 无玩家进场，原四生物剧本照跑。
     sandbox_map.players = PlayerDirectory::new(&config.players_dir);
+    // #025 处置等待窗口装配（CODEWORLD_DISPOSE_WAIT；0=断开即默认带走）
+    sandbox_map.players.set_dispose_wait(config.dispose_wait_ticks);
     if let Err(e) = sandbox_map.load_players_initial(&mut world) {
         tracing::warn!(error = %e, "players/ 目录初始加载失败，进场门暂不可用（世界继续）");
     }
@@ -624,7 +649,21 @@ fn main() -> Result<()> {
     let ws_snapshots = net::init(&config, intent_sink);
 
     tracing::info!("tick 循环开始（WASD/方向键操控，空格攻击，q/Enter/Ctrl+C 退出）");
+    // #025：操控令牌上拍值（翻转沿检测；WS 禁用时恒 false，处置永不触发）
+    let mut conn_prev = false;
     while running.load(Ordering::SeqCst) {
+        // #025 下线处置触发源：操控令牌翻转沿检测（重连认领=Claimed / 意外断开=Released；
+        // 主动登出沿由 tick 侧 logout_handled 抑制——登出意图与释放沿同拍到达）
+        sandbox_map.conn_event = ws_snapshots.as_ref().and_then(|h| {
+            let now = h.ctrl_taken.load(Ordering::SeqCst);
+            let ev = match (conn_prev, now) {
+                (false, true) => Some(net::ConnEvent::Claimed),
+                (true, false) => Some(net::ConnEvent::Released),
+                _ => None,
+            };
+            conn_prev = now;
+            ev
+        });
         // 操控层 v0：每拍开头 drain 意图队列（输入线程生产 -> tick 主线程消费）
         let intents = intent_queue.drain();
         tick_with_intents(
@@ -639,9 +678,9 @@ fn main() -> Result<()> {
         );
         // 期四第一刀：每拍快照推 WS（渲染步骤旁组装；禁用时 None 完全跳过——不组装不发；
         // 无浏览器连接时 push_snapshot 内部跳过组装，同样零开销）
-        if let Some(snapshots) = &ws_snapshots {
+        if let Some(handle) = &ws_snapshots {
             net::push_snapshot(
-                snapshots,
+                &handle.snapshots,
                 &world,
                 renderer.caption_line(),
                 renderer.viewport(),
@@ -747,12 +786,94 @@ fn tick_with_intents(
     //    - 意图在拍首路由（坐标取拍首快照），本拍行动立即定案
     let env_me = std::env::var("CODEWORLD_ME").ok();
     let me = players::read_me_declaration(env_me.as_deref(), sandbox_map.players.dir());
+
+    // ── #025 下线处置（期五第一刀）：会话级登出/断开的三选一状态机 ──
+    // 顺序：登出落地 > 连接事件（认领/断开）> 等待超时清算 > 控制解析。
+    // 意图分流：Logout 不走走位/攻击路由（不是操控动作），先于控制解析处理
+    let mut logout_handled = false;
+    let mut ctrl_intents: Vec<input::Intent> = Vec::with_capacity(intents.len());
+    for it in intents {
+        if let input::Intent::Logout { choice } = *it {
+            logout_handled = true;
+            match me.as_deref() {
+                Some(name) if sandbox_map.players.is_online(name) => {
+                    tracing::info!(
+                        player = name,
+                        choice = choice.wire_name(),
+                        "[dispose] 收到登出消息"
+                    );
+                    dispose_apply_logout(sandbox_map, world, name, choice);
+                }
+                _ => {
+                    tracing::warn!("[dispose] 登出消息无法落地（无 me 声明或声明玩家不在线），忽略");
+                }
+            }
+        } else {
+            ctrl_intents.push(*it);
+        }
+    }
+    // 连接事件（WS 操控令牌翻转沿；WS 禁用/无翻转=None，take 后清空防跨拍残留）
+    let conn_event = sandbox_map.conn_event.take();
+    match conn_event {
+        Some(net::ConnEvent::Claimed) => {
+            // 重连认领：me 声明玩家的处置/离场标记一律清除（操控回归/重新进场，
+            // #025 令牌语义：主动登出释放令牌，重连的第一个连接重新认领）
+            if let Some(name) = me.as_deref() {
+                if let Some(prev) = sandbox_map.players.dispose.clear_all(name) {
+                    match prev {
+                        dispose::DisposeState::Auto => {
+                            tracing::info!(
+                                player = name,
+                                "[dispose] 接管者被顶掉（我的角色我随时拿回，操控独占恢复）"
+                            );
+                        }
+                        _ => {
+                            tracing::info!("[dispose] 重连取消处置（操控恢复）player={name}");
+                        }
+                    }
+                }
+                if sandbox_map.players.clear_absent(name) {
+                    tracing::info!("[dispose] 重新进场 player={name}（离场标记解除，目录扫描重生角色）");
+                }
+            }
+        }
+        Some(net::ConnEvent::Released) if !logout_handled => {
+            // 意外断开（浏览器直接关掉，非主动登出）：进入处置等待窗口；
+            // 主动登出的令牌释放沿被 logout_handled 抑制（登出已有明确处置）
+            if let Some(name) = me.as_deref() {
+                if sandbox_map.players.is_online(name) {
+                    match sandbox_map.players.dispose.begin_wait(name, current_tick) {
+                        dispose::WaitOutcome::Waiting => tracing::info!(
+                            player = name,
+                            wait_ticks = sandbox_map.players.dispose.wait_ticks(),
+                            "[dispose] 处置等待开始（超时默认带走）"
+                        ),
+                        dispose::WaitOutcome::TakeNow => {
+                            tracing::info!("[dispose] 处置等待=0 拍，立即默认 take player={name}");
+                            dispose_take(sandbox_map, world, name, "等待窗口为 0 拍");
+                        }
+                        dispose::WaitOutcome::Skipped => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    // 等待超时：默认 take（宪法 #025：世界不等人，超时=玩家没选=带走）
+    for name in sandbox_map.players.dispose.expire_due(current_tick) {
+        tracing::info!("[dispose] 等待超时，默认 take player={name}");
+        dispose_take(sandbox_map, world, &name, "等待超时");
+    }
+
     // 上一拍操控的目标本拍不在线 = 操控目标下线（#024：warn 一次 + latch；
-    // me.txt 中途改声明他人不触发——那是显式换人，不是断线）
+    // me.txt 中途改声明他人不触发——那是显式换人，不是断线）。
+    // #025 豁免：会话级离场（登出带走）不算"下线消失"——不触发观战 latch
+    //（重新进场解除标记后操控直接恢复，重启 latch 语义专指文件锚下线）
     if let Some(prev) = sandbox_map.last_controlled.clone() {
         if !sandbox_map.controlled_offline_latched
             && me.as_deref() == Some(prev.as_str())
             && !sandbox_map.players.is_online(&prev)
+            && !sandbox_map.players.is_absent(&prev)
         {
             tracing::warn!(
                 player = %prev,
@@ -764,7 +885,12 @@ fn tick_with_intents(
     let online = if sandbox_map.controlled_offline_latched {
         None
     } else {
-        sandbox_map.players.controlled_target(me.as_deref())
+        // #025：处置中的玩家不被 me 声明重认领（Auto=接管者拥有/AiAwait=站桩等 AI/
+        // Wait=等处置）——抢回操控必须走重连认领（conn Claimed 沿清账）
+        sandbox_map
+            .players
+            .controlled_target(me.as_deref())
+            .filter(|(name, _)| !sandbox_map.players.dispose.has(name))
     };
     sandbox_map.last_controlled = online.as_ref().map(|(name, _)| name.clone());
     let control_target = online
@@ -816,7 +942,7 @@ fn tick_with_intents(
     // "当前目标"的逐拍走位进度，旧目标的蹭动历史不带入
     let prev_ws_target = sandbox_map.ws_move_target;
     let action = input::route_intents(
-        intents,
+        &ctrl_intents,
         control_target,
         nearest,
         entity_pos,
@@ -828,15 +954,24 @@ fn tick_with_intents(
             .ws_move_target
             .and_then(|_| entity_pos.map(input::MoveStallTrack::start));
     }
-    // 字幕 ctrl 段（#024 三态）：操控中 = ctrl:字形；观战（有人但不是你 / 操控目标
-    // 下线 latch）= ctrl:--；无玩家在线且从未 latch（四生物基线）= 不显示 ctrl 段
+    // 字幕 ctrl 段（#024 三态 + #025 处置扩展）：操控中 = ctrl:字形；
+    // 处置接管 = ctrl:auto（stay_auto 自主活动）/ ctrl:ai-await（站桩等 AI）；
+    // 观战（有人但不是你 / 操控目标下线 latch / 处置等待）= ctrl:--；
+    // 无玩家在线且从未 latch（四生物基线）= 不显示 ctrl 段
     let ctrl = if sandbox_map.players.has_online() || sandbox_map.controlled_offline_latched {
-        Some(
-            control_target
-                .and(online.as_ref())
-                .map(|(name, _)| players::glyph_for(name))
-                .unwrap_or_else(|| "--".to_string()),
-        )
+        let base = control_target
+            .and(online.as_ref())
+            .map(|(name, _)| players::glyph_for(name))
+            .unwrap_or_else(|| "--".to_string());
+        // 处置状态签优先于观战占位（登出后仍在场：世界知道角色处于什么接管状态）
+        let disposed = me
+            .as_deref()
+            .and_then(|name| sandbox_map.players.dispose.get(name));
+        Some(match disposed {
+            Some(dispose::DisposeState::Auto) => "auto".to_string(),
+            Some(dispose::DisposeState::AiAwait) => "ai-await".to_string(),
+            _ => base,
+        })
     } else {
         None
     };
@@ -1036,6 +1171,13 @@ fn tick_with_intents(
         .collect();
     for id in &dead_ids {
         sandbox_map.remove(id);
+        // #025：处置中的实体死亡（等待期/站桩期被杀）——处置状态一并清
+        //（掠夺照常：停留的风险，玩家自己选的）
+        if let Some(e) = world.entities.get(id) {
+            if sandbox_map.players.dispose.clear(&e.code_hash) {
+                tracing::info!("[dispose] 实体死亡，处置状态清理 player={}", e.code_hash);
+            }
+        }
     }
     let before = world.entities.len();
     world.entities.retain(|_, e| e.is_alive());
@@ -1112,6 +1254,61 @@ fn tick_with_intents(
             "tick 运行中"
         );
     }
+}
+
+/// #025 登出三选一落地（期五第一刀）
+///
+/// - take：会话级带走——在场登记摘除（不走残影）+ 实体 kill（本拍死亡清理链移除）
+///   + 离场标记（scan 不再自动重生，重连认领=重新进场）；文件锚不动
+/// - stay_auto：登记 Auto 处置（on_tick 恢复，操控独占随控制解析释放）
+/// - stay_ai：登记 AiAwait 处置（站桩，on_tick 抑制，#014 外部 AI 端点协议留后）
+fn dispose_apply_logout(
+    sandbox_map: &mut EntitySandboxMap,
+    world: &mut WorldState,
+    name: &str,
+    choice: dispose::LogoutChoice,
+) {
+    match choice {
+        dispose::LogoutChoice::Take => dispose_take(sandbox_map, world, name, "主动登出带走"),
+        dispose::LogoutChoice::StayAuto => {
+            sandbox_map
+                .players
+                .dispose
+                .apply(name, dispose::DisposeState::Auto);
+            tracing::info!("[dispose] 处置完成：stay_auto player={name}");
+            tracing::info!("[ctrl] 下线处置：停留+自主接管（on_tick 恢复）player={name}");
+        }
+        dispose::LogoutChoice::StayAi => {
+            sandbox_map
+                .players
+                .dispose
+                .apply(name, dispose::DisposeState::AiAwait);
+            tracing::info!(
+                "[dispose] 处置完成：stay_ai player={name}（站桩待外部 AI 接入，#014 端点协议留后）"
+            );
+        }
+    }
+}
+
+/// #025 take 落地：角色带走（会话级离场，与残影路径并存的下线方式）
+///
+/// 在场登记摘除（remove_online，非 note_offline——不走残影）+ 实体 kill
+///（本拍死亡清理步移除实体+销毁沙箱）+ 离场标记（scan 跳过）+ 处置清账。
+/// 死亡清理若再触发同名的处置清除是无害幂等（clear 返回 false 不刷日志）。
+fn dispose_take(
+    sandbox_map: &mut EntitySandboxMap,
+    world: &mut WorldState,
+    name: &str,
+    reason: &str,
+) {
+    if let Some(id) = sandbox_map.players.remove_online(name) {
+        if let Some(e) = world.entities.get_mut(&id) {
+            e.kill();
+        }
+    }
+    sandbox_map.players.mark_absent(name);
+    sandbox_map.players.dispose.clear(name);
+    tracing::info!("[dispose] 处置完成：take player={name}（{reason}；角色已移除，文件锚保留）");
 }
 
 /// 应用延迟变更队列（架构文档 4.1 节阶段二 a 步 + #030 半径物理移动裁决）
@@ -3226,6 +3423,9 @@ mod tests {
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         let pid = make_entity_with_sandbox(&mut world, &mut map, 1, (30.0, 0.5), player_wat);
+        // #025：代码身份对齐玩家名（处置账本按 code_hash 查表抑制 on_tick，
+        // 生产里玩家实体 code_hash=玩家名，测试实体默认 "test" 需对齐）
+        world.entities.get_mut(&pid).unwrap().code_hash = "p1".to_string();
         let dir = temp_players_dir("control");
         std::fs::write(dir.join("p1.wat"), player_wat).unwrap();
         std::fs::write(dir.join("me.txt"), "p1").unwrap();
@@ -3347,6 +3547,385 @@ mod tests {
             &mut map,
         );
         assert!(!map.ctrl_exclusive_active, "声明失效 -> 操控释放（自主恢复）");
+    }
+
+    // === 下线处置权（#025 期五第一刀）：登出三选一 + 处置等待 + 重连认领 ===
+
+    use net::ConnEvent;
+
+    /// 给 map 注入本拍连接事件（WS 令牌翻转沿；生产由 main 循环每拍写入）
+    fn set_conn(map: &mut EntitySandboxMap, ev: Option<ConnEvent>) {
+        map.conn_event = ev;
+    }
+
+    #[test]
+    fn logout_take_removes_entity_and_blocks_auto_respawn() {
+        // A1 take：角色立即移除（kill 走本拍死亡清理链）+ 在场登记摘除 + 会话离场标记
+        // ——文件锚仍在但 scan 不再自动重生（重新进场=重连认领解除标记）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let intents = vec![input::Intent::Logout {
+            choice: dispose::LogoutChoice::Take,
+        }];
+        tick_with_intents(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map,
+            &intents,
+        );
+        assert!(!world.entities.contains_key(&pid), "角色已移除（本拍死亡清理）");
+        assert!(!map.players.is_online("p1"), "在场登记已摘除（目录锚同步）");
+        assert!(map.players.is_absent("p1"), "会话离场标记在册");
+        assert!(!map.players.dispose.has("p1"), "take 无残留处置状态");
+        // 下一拍：文件锚仍在，但离场标记阻止自动重生（重生=重新进场，不是 scan 顺手捞回）
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(!map.players.is_online("p1"), "离场标记阻止 scan 自动重生");
+    }
+
+    #[test]
+    fn logout_take_then_reclaim_respawns_player() {
+        // 重新进场闭环：take 离场 -> 重连认领解除标记 -> 目录扫描重生角色 -> 恢复可操控
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, _pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let logout = vec![input::Intent::Logout {
+            choice: dispose::LogoutChoice::Take,
+        }];
+        tick_with_intents(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map,
+            &logout,
+        );
+        set_conn(&mut map, Some(ConnEvent::Claimed));
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(!map.players.is_absent("p1"), "重连认领解除离场标记（重新进场）");
+        assert!(map.players.is_online("p1"), "目录扫描重生角色（新实体进场）");
+        // 时序：认领拍先重生（d0 在控制解析之后），控制解析下一拍才拿到新实体
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(map.ctrl_exclusive_active, "me 声明恢复，操控独占重建");
+    }
+
+    #[test]
+    fn logout_stay_auto_resumes_autonomy_same_tick() {
+        // A1 stay_auto：处置落地拍 on_tick 即恢复（pioneer 东行一步）——
+        // headless 冒烟等价物：move_by 队列重现=battle.log 自主恢复证据；
+        // 字幕 ctrl 段从字形切到 auto
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let intents = vec![input::Intent::Logout {
+            choice: dispose::LogoutChoice::StayAuto,
+        }];
+        tick_with_intents(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map,
+            &intents,
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (31.0, 0.5),
+            "stay_auto 落地拍自主 on_tick 恢复（东行一步，30->31）"
+        );
+        assert_eq!(
+            map.players.dispose.get("p1"),
+            Some(dispose::DisposeState::Auto),
+            "处置状态登记为 auto"
+        );
+        assert!(!map.ctrl_exclusive_active, "操控独占释放");
+        assert!(
+            renderer.caption_line().contains("ctrl:auto"),
+            "字幕 ctrl 段切自主接管：{}",
+            renderer.caption_line()
+        );
+    }
+
+    #[test]
+    fn logout_stay_ai_stands_still_registered() {
+        // A1 stay_ai：角色留存+登记 AI 待接入（本刀只立状态：站桩，on_tick 抑制，
+        // 外部 AI 端点协议是 #014 未来端点不实现）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let intents = vec![input::Intent::Logout {
+            choice: dispose::LogoutChoice::StayAi,
+        }];
+        tick_with_intents(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map,
+            &intents,
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (30.0, 0.5),
+            "stay_ai 站桩（on_tick 抑制，等 AI 接入）"
+        );
+        assert_eq!(
+            map.players.dispose.get("p1"),
+            Some(dispose::DisposeState::AiAwait),
+            "处置状态登记为 ai-await"
+        );
+        assert!(
+            renderer.caption_line().contains("ctrl:ai-await"),
+            "字幕 ctrl 段显示 AI 待接入：{}",
+            renderer.caption_line()
+        );
+    }
+
+    #[test]
+    fn disconnect_starts_wait_reconnect_cancels_and_restores_control() {
+        // A2 处置窗口：意外断开（非主动登出）-> 等待 30 拍（on_tick 抑制=站着等，
+        // 照常在场）；重连=取消处置+操控独占恢复（A3 重连抢回）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        set_conn(&mut map, Some(ConnEvent::Released));
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert_eq!(
+            map.players.dispose.get("p1"),
+            Some(dispose::DisposeState::Wait { deadline_tick: 31 }),
+            "断开拍进入处置等待（当前拍1 + 30拍窗口）"
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (30.0, 0.5),
+            "等待期 on_tick 抑制（站着不动等处置，非残影）"
+        );
+        assert!(world.entities.get(&pid).unwrap().is_alive(), "等待期角色活着在场");
+        // 重连：取消处置，操控恢复
+        set_conn(&mut map, Some(ConnEvent::Claimed));
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(!map.players.dispose.has("p1"), "重连取消处置");
+        assert!(map.ctrl_exclusive_active, "操控独占恢复");
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (30.0, 0.5));
+    }
+
+    #[test]
+    fn wait_timeout_defaults_to_take() {
+        // A2 超时：30 拍未选择 = 默认 take（带走）+ 离场标记
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        set_conn(&mut map, Some(ConnEvent::Released));
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        ); // 拍1 进入等待，deadline=31
+        for _ in 0..29 {
+            tick(
+                &mut world,
+                &mut time,
+                &physics,
+                &mut renderer,
+                &mut storage,
+                &mut pending,
+                &mut map,
+            );
+        }
+        assert!(
+            world.entities.contains_key(&pid),
+            "拍 30 仍未到期（deadline 31），角色还在"
+        );
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        ); // 拍 31 到期清算
+        assert!(!world.entities.contains_key(&pid), "等待超时默认 take（角色移除）");
+        assert!(map.players.is_absent("p1"), "超时带走=会话离场");
+        assert!(!map.players.dispose.has("p1"), "清算后无残留");
+    }
+
+    #[test]
+    fn wait_entity_can_be_attacked_and_killed_disposition_cleared() {
+        // A2/A3：等待期角色照常可被攻击可被杀（世界不等人，存在即暴露）；
+        // 被杀≠会话离场（无离场标记），死亡清理把处置状态一并清
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        set_conn(&mut map, Some(ConnEvent::Released));
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(map.players.dispose.has("p1"), "前置：处于处置等待");
+        // 攻击者对 P 出空 payload 刀（默认击杀，#031 点命中制：打 P 坐标）
+        let attacker = make_entity_with_sandbox(&mut world, &mut map, 7, (35.0, 0.5), PLAYER_WAT);
+        let attacks = vec![PendingAttack {
+            attacker,
+            target_pos: (30.0, 0.5),
+            payload: vec![],
+        }];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert!(
+            !world.entities.get(&pid).unwrap().is_alive(),
+            "等待期角色可被击杀（不无敌）"
+        );
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(!world.entities.contains_key(&pid), "死亡清理移除实体");
+        assert!(!map.players.dispose.has("p1"), "死亡清理把处置状态一并清");
+        assert!(!map.players.is_absent("p1"), "被杀≠会话离场（离场标记只在登出 take/超时）");
+    }
+
+    #[test]
+    fn logout_suppresses_disconnect_wait_same_tick() {
+        // 边界：主动登出与令牌释放沿同拍到达（logout 入队即释放令牌）——
+        // 登出处置落地，断开沿被抑制（不把处置等待叠加在登出之上）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        set_conn(&mut map, Some(ConnEvent::Released));
+        let intents = vec![input::Intent::Logout {
+            choice: dispose::LogoutChoice::StayAuto,
+        }];
+        tick_with_intents(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map,
+            &intents,
+        );
+        assert_eq!(
+            map.players.dispose.get("p1"),
+            Some(dispose::DisposeState::Auto),
+            "登出处置落地（stay_auto），未被等待覆盖"
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (31.0, 0.5),
+            "自主恢复照常（无等待叠加）"
+        );
+    }
+
+    #[test]
+    fn stay_auto_reclaim_supersedes_takeover() {
+        // A3 接管者被顶掉：stay_auto 后 me 重声明+重连=重新抢回操控
+        //（操控权=me 声明+连接在，#024 精神——"我的角色我随时拿回"）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let logout = vec![input::Intent::Logout {
+            choice: dispose::LogoutChoice::StayAuto,
+        }];
+        tick_with_intents(
+            &mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map,
+            &logout,
+        );
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (31.0, 0.5), "前置：自主东行");
+        // 重连：接管者被顶掉，操控独占恢复，自主再次被抑制
+        set_conn(&mut map, Some(ConnEvent::Claimed));
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(!map.players.dispose.has("p1"), "auto 处置被顶掉清账");
+        assert!(map.ctrl_exclusive_active, "操控独占恢复（抢回）");
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos(),
+            (31.0, 0.5),
+            "抢回拍 on_tick 抑制（P 站定听指挥）"
+        );
+    }
+
+    #[test]
+    fn file_delete_during_disposition_yields_to_ghost_path() {
+        // 两条下线路径不互相踩：处置等待中文件锚被删（账号级下线）——
+        // 处置状态让位残影旧路（#013），不互相覆盖
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        set_conn(&mut map, Some(ConnEvent::Released));
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(map.players.dispose.has("p1"), "前置：处置等待中");
+        std::fs::remove_file(me_dir.join("p1.wat")).unwrap();
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(!map.players.dispose.has("p1"), "处置状态让位（文件锚路径接管）");
+        assert!(map.players.is_ghost(&pid), "文件锚删除走残影旧路（#013 语义不变）");
+    }
+
+    #[test]
+    fn no_logout_no_event_disposition_never_triggers() {
+        // 回归锚：无登出无连接事件（纯终端模式/浏览器从未连过）——处置永不触发，
+        // 操控独占照旧（#025 在线独占语义不被本刀扰动）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert!(!map.players.dispose.has("p1"), "无事件无处置");
+        assert!(map.ctrl_exclusive_active, "操控独占照旧");
+        assert_eq!(world.entities.get(&pid).unwrap().pos(), (30.0, 0.5));
     }
 
     #[test]
@@ -3868,7 +4447,7 @@ mod tests {
         let new_id = world
             .entities
             .values()
-            .find(|e| e.code_hash == "p1")
+            .find(|e| e.code_hash == "p1" && e.id != pid)
             .expect("重新进场的 p1 实体应存在")
             .id;
         assert_ne!(new_id, pid, "重新进场是新实体（新 EntityId）");

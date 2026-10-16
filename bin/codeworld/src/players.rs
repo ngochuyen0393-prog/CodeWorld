@@ -12,6 +12,8 @@ use codeworld_core::entity::EntityId;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::dispose::{DisposeBook, DEFAULT_DISPOSE_WAIT_TICKS};
+
 /// 玩家颜色轮（按进场顺序轮转；A红/D青/H黄/S紫 已占用，玩家从 green 起轮）
 pub(crate) const COLOR_WHEEL: [&str; 7] = [
     "red", "cyan", "yellow", "purple", "green", "magenta", "blue",
@@ -110,6 +112,11 @@ pub(crate) struct PlayerDirectory {
     combat: HashMap<EntityId, u64>,
     /// 编译失败黑名单：进场失败不再逐拍重试刷屏；文件消失即解除（删了重放可重试）
     failed: HashSet<String>,
+    /// 会话级离场标记（#025 登出带走）：在册名字不参与目录自动重生；
+    /// 操控连接重新认领时解除（重新进场）。文件锚语义不动（文件在=声明在）
+    absent: HashSet<String>,
+    /// 下线处置账本（#025 期五第一刀，dispose.rs 状态机；会话级不持久化）
+    pub(crate) dispose: DisposeBook,
     /// 累计进场人次（颜色/出生点轮转计数）
     join_count: usize,
 }
@@ -124,6 +131,8 @@ impl PlayerDirectory {
             ghosts: HashMap::new(),
             combat: HashMap::new(),
             failed: HashSet::new(),
+            absent: HashSet::new(),
+            dispose: DisposeBook::new(DEFAULT_DISPOSE_WAIT_TICKS),
             join_count: 0,
         }
     }
@@ -138,6 +147,8 @@ impl PlayerDirectory {
             ghosts: HashMap::new(),
             combat: HashMap::new(),
             failed: HashSet::new(),
+            absent: HashSet::new(),
+            dispose: DisposeBook::new(DEFAULT_DISPOSE_WAIT_TICKS),
             join_count: 0,
         }
     }
@@ -163,6 +174,41 @@ impl PlayerDirectory {
     /// 玩家名是否在编译失败黑名单中
     pub(crate) fn is_failed(&self, name: &str) -> bool {
         self.failed.contains(name)
+    }
+
+    // === 会话级离场标记（#025 登出带走；与文件锚并存的两条下线路径之一）===
+
+    /// 装配处置等待拍数（main 启动时从 CODEWORLD_DISPOSE_WAIT 配置）
+    pub(crate) fn set_dispose_wait(&mut self, ticks: u64) {
+        self.dispose.set_wait_ticks(ticks);
+    }
+
+    /// 名字是否处于会话级离场（登出带走后、重新认领前）
+    pub(crate) fn is_absent(&self, name: &str) -> bool {
+        self.absent.contains(name)
+    }
+
+    /// 标记会话级离场（take 落地时调用；目录扫描跳过该名字不自动重生）
+    pub(crate) fn mark_absent(&mut self, name: &str) {
+        self.absent.insert(name.to_string());
+    }
+
+    /// 解除会话级离场（操控连接重新认领=重新进场）；返回此前是否有标记
+    pub(crate) fn clear_absent(&mut self, name: &str) -> bool {
+        self.absent.remove(name)
+    }
+
+    /// 摘除在场登记（#025 会话级 take 专用）：不走残影（区别于 note_offline），
+    /// 返回被摘除的实体 ID 供调用方清算。文件锚不动（文件在=声明在）
+    pub(crate) fn remove_online(&mut self, name: &str) -> Option<EntityId> {
+        let id = self.online.remove(name)?;
+        tracing::debug!(name, entity_id = %id.0, "[players] 在场登记摘除（会话级离场）");
+        Some(id)
+    }
+
+    /// 处置账本房间打扫：只留在场玩家的处置记录（#025，防无界增长）
+    pub(crate) fn prune_dispose(&mut self) {
+        self.dispose.prune(&self.online);
     }
 
     /// 扫描目录，返回 .wat 文件名列表（去扩展名，按文件名排序保证确定性）。

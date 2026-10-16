@@ -51,6 +51,9 @@ pub struct Config {
     /// 0 = 禁用 WS（不启动 WS 线程、tick 不组装快照，终端体验完全不变）。
     /// CODEWORLD_WS_PORT 覆盖；监听失败仅 warn 不影响主循环。
     pub ws_port: u16,
+    /// 下线处置等待拍数（#025 期五第一刀：操控连接意外断开后角色留场等待处置
+    /// 的窗口），默认 30。0 = 断开即默认带走（不等待）。CODEWORLD_DISPOSE_WAIT 覆盖。
+    pub dispose_wait_ticks: u64,
 }
 
 impl Default for Config {
@@ -71,6 +74,7 @@ impl Default for Config {
             players_dir: "./players".to_string(),
             max_entities: 64,
             ws_port: 8080,
+            dispose_wait_ticks: 30,
         }
     }
 }
@@ -113,6 +117,9 @@ impl Config {
         }
         if let Some(p) = env_u16("CODEWORLD_WS_PORT") {
             cfg.ws_port = p;
+        }
+        if let Some(t) = env_u64("CODEWORLD_DISPOSE_WAIT") {
+            cfg.dispose_wait_ticks = t;
         }
         // 布尔类开关："0"/"false"（大小写不敏感）= 关闭，缺失或其他值 = 默认开启
         if let Ok(v) = std::env::var("CODEWORLD_H_ENABLED") {
@@ -410,5 +417,46 @@ mod tests {
         let c2 = Config::load();
         std::env::remove_var("CODEWORLD_WS_PORT");
         assert_eq!(c2.ws_port, 8080, "超 u16 范围应回退默认 WS 端口");
+    }
+
+    // === 下线处置等待拍数（#025 期五第一刀）===
+
+    #[test]
+    fn default_dispose_wait_is_thirty() {
+        // 创建：处置等待默认 30 拍（宪法 #025：世界不等人，窗口够玩家重开浏览器救场）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CODEWORLD_DISPOSE_WAIT");
+        let c = Config::load();
+        assert_eq!(c.dispose_wait_ticks, 30, "处置等待默认应为 30 拍");
+    }
+
+    #[test]
+    fn load_dispose_wait_env_overrides_default() {
+        // 修改：CODEWORLD_DISPOSE_WAIT 覆盖等待窗口（配置化）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_DISPOSE_WAIT", "10");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_DISPOSE_WAIT");
+        assert_eq!(c.dispose_wait_ticks, 10, "环境变量应覆盖处置等待");
+    }
+
+    #[test]
+    fn load_dispose_wait_zero_means_take_immediately() {
+        // 修改：0 = 断开即默认带走（不等待，急性子/无人值守服务器场景）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_DISPOSE_WAIT", "0");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_DISPOSE_WAIT");
+        assert_eq!(c.dispose_wait_ticks, 0, "0 应原样保留（立即 take 语义）");
+    }
+
+    #[test]
+    fn load_dispose_wait_invalid_falls_back_to_default() {
+        // 边界：非法值（非整数）-> 回退默认 30（容错语义同数值类）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_DISPOSE_WAIT", "soon");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_DISPOSE_WAIT");
+        assert_eq!(c.dispose_wait_ticks, 30, "非法值应回退默认处置等待");
     }
 }

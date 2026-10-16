@@ -29,7 +29,7 @@ pub(crate) const SNAPSHOT_CHANNEL_CAP: usize = 16;
 
 // ---- 上行意图协议（docs/net-protocol.md v1.2 客户端 -> 服务器，#027）----
 
-/// 客户端上行消息（三型）：点击走位 / 点击出刀 / 停止。
+/// 客户端上行消息（四型）：点击走位 / 点击出刀 / 停止 / 登出处置（v1.7，#025）。
 /// 坐标一律世界坐标（快照 viewport 域内），非法值解析层拒绝。
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -37,6 +37,12 @@ pub(crate) enum ClientMessage {
     Move { x: f64, y: f64 },
     Attack { x: f64, y: f64 },
     Stop,
+    /// 登出处置三选一（#025）：take/stay_auto/stay_ai；仅操控连接生效，
+    /// 处置由 tick 侧状态机落地（本层只转发意图+释放令牌）
+    Logout {
+        #[serde(rename = "disposition")]
+        choice: crate::dispose::LogoutChoice,
+    },
 }
 
 /// 上行文本 -> 客户端消息（纯函数；Err 带原因供 warn 丢弃，不 panic 不部分接受）
@@ -46,7 +52,7 @@ pub(crate) fn parse_client_message(text: &str) -> Result<ClientMessage, String> 
     let finite = |v: f64| v.is_finite();
     let coords_ok = match &msg {
         ClientMessage::Move { x, y } | ClientMessage::Attack { x, y } => finite(*x) && finite(*y),
-        ClientMessage::Stop => true,
+        ClientMessage::Stop | ClientMessage::Logout { .. } => true,
     };
     if !coords_ok {
         return Err("坐标非有限值（NaN/无穷）".to_string());
@@ -78,6 +84,8 @@ pub(crate) struct ViewportInfo {
 /// name 恒有（v1.1，= code_hash 代码身份）；npc 无可选字段（skip_serializing_if 保持 JSON 干净）。
 /// radius（v1.5，#030）：活动实体圆半径（前端按它画身体圆）；creation 是格对齐
 /// 方块，radius 无意义（前端按 kind=creation 画方格底衬）。
+/// disposition/wait_left（v1.7，#025）：处置状态签与等待倒数（仅处置中的玩家有；
+/// 字段缺席=online 在线态）。
 #[derive(Debug, Serialize)]
 pub(crate) struct EntitySnapshot {
     pub id: String,
@@ -92,6 +100,10 @@ pub(crate) struct EntitySnapshot {
     pub controlled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_left: Option<u64>,
 }
 
 /// kind 判定（纯映射，任务书定案）：开局四生物=npc；creation=造物；
@@ -116,12 +128,16 @@ pub(crate) fn build_snapshot(
 ) -> WorldSnapshot {
     let (min_x, max_x) = viewport.world_x_range();
     let (min_y, max_y) = viewport.world_y_range();
+    let now = world.tick();
     let mut entities: Vec<EntitySnapshot> = world
         .entities
         .values()
         .map(|e| {
             let kind = entity_kind(&e.code_hash, e.id, players);
             let (x, y) = e.pos();
+            // 处置状态签（v1.7，#025）：账本命中的实体带 disposition/wait_left
+            //（账本只收玩家名，npc/creation 天然缺席）；字段缺席=online 在线态
+            let disposed = players.dispose.get(&e.code_hash);
             EntitySnapshot {
                 id: e.id.0.to_string(),
                 glyph: e.appearance.glyph.clone(),
@@ -133,6 +149,8 @@ pub(crate) fn build_snapshot(
                 name: e.code_hash.clone(),
                 controlled: (kind == "player").then(|| Some(e.id) == controlled),
                 owner: (kind == "creation").then(|| e.owner.0.to_string()),
+                disposition: disposed.map(|s| s.wire_name()),
+                wait_left: disposed.and_then(|s| s.wait_left(now)),
             }
         })
         .collect();
@@ -163,9 +181,25 @@ pub(crate) struct WsState {
     pub(crate) ctrl_taken: Arc<AtomicBool>,
 }
 
+/// 主循环持有的 WS 句柄：快照推送端 + 操控令牌观测（#025 期五第一刀）。
+/// 主循环每拍读 ctrl_taken 做翻转沿检测（Claimed/Released），作为处置状态机触发源。
+pub(crate) struct WsHandle {
+    pub(crate) snapshots: broadcast::Sender<String>,
+    pub(crate) ctrl_taken: Arc<AtomicBool>,
+}
+
+/// 操控连接令牌翻转事件（主循环每拍沿检测；WS 禁用时恒 None）——
+/// #025 处置状态机的两条触发源：Claimed=重连认领（取消处置/重新进场），
+/// Released=意外断开（进入处置等待；主动登出沿由 tick 侧 logout_handled 抑制）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnEvent {
+    Claimed,
+    Released,
+}
+
 /// 生产装配：WS 启用（端口≠0）则起独立 ws-server 线程（内含 tokio runtime），
-/// 返回快照发送端供主循环每拍推送；禁用（端口 0）返回 None = 主循环零开销分支。
-pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Option<broadcast::Sender<String>> {
+/// 返回句柄（快照推送端 + 操控令牌观测）供主循环使用；禁用（端口 0）返回 None。
+pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Option<WsHandle> {
     if config.ws_port == 0 {
         tracing::info!("[ws] CODEWORLD_WS_PORT=0，WS 快照推送禁用（纯终端模式）");
         return None;
@@ -177,6 +211,10 @@ pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Optio
         intents,
         ctrl_taken: Arc::new(AtomicBool::new(false)),
     });
+    let handle = WsHandle {
+        snapshots: tx,
+        ctrl_taken: state.ctrl_taken.clone(),
+    };
     let spawned = std::thread::Builder::new()
         .name("ws-server".to_string())
         .spawn(move || run_ws_thread(port, state));
@@ -186,7 +224,7 @@ pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Optio
                 port,
                 "[ws] WS 快照推送已启动（浏览器打开 http://localhost:{port} 看世界；第一连接=操控端）"
             );
-            Some(tx)
+            Some(handle)
         }
         Err(e) => {
             tracing::warn!(error = %e, "[ws] WS 线程启动失败，降级纯终端模式（世界不受影响）");
@@ -273,7 +311,7 @@ async fn ws_handler(
 /// 循环退出即连接清理（socket/rx 随任务结束释放，无泄漏）。
 async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     // 操控权认领（#027 单连接假设）：第一连接=操控端，后来者=观战（上行丢弃）
-    let controller = state
+    let mut controller = state
         .ctrl_taken
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok();
@@ -315,6 +353,19 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                         }
                         Ok(ClientMessage::Stop) => {
                             state.intents.send(crate::input::Intent::Stop);
+                        }
+                        Ok(ClientMessage::Logout { choice }) => {
+                            // #025 登出处置：意图入共享队列（与键盘/鼠标单入口），
+                            // 处置三选一由 tick 侧状态机落地；本层只做令牌语义——
+                            // 主动登出=立即释放操控令牌（重连的第一个连接重新认领），
+                            // 本连接降级观战：下行快照继续（登出后世界还能看），上行丢弃
+                            tracing::info!(
+                                choice = choice.wire_name(),
+                                "[dispose] WS 收到登出消息（令牌释放，连接降级观战）"
+                            );
+                            state.intents.send(crate::input::Intent::Logout { choice });
+                            state.ctrl_taken.store(false, Ordering::SeqCst);
+                            controller = false;
                         }
                         Err(reason) => {
                             tracing::warn!(raw = %text, reason, "[ws] 非法上行消息丢弃");
@@ -1002,5 +1053,152 @@ mod tests {
     fn parse_malformed_json_rejected() {
         assert!(parse_client_message("not json").is_err());
         assert!(parse_client_message(r#"[]"#).is_err(), "非对象 JSON 拒绝");
+    }
+
+    // ---- 登出处置（#025 期五第一刀，net-protocol.md v1.7）----
+
+    #[test]
+    fn parse_logout_message_three_dispositions() {
+        // 契约：{"type":"logout","disposition":"take"|"stay_auto"|"stay_ai"} 三选一
+        assert_eq!(
+            parse_client_message(r#"{"type":"logout","disposition":"take"}"#).unwrap(),
+            ClientMessage::Logout {
+                choice: crate::dispose::LogoutChoice::Take
+            }
+        );
+        assert_eq!(
+            parse_client_message(r#"{"type":"logout","disposition":"stay_auto"}"#).unwrap(),
+            ClientMessage::Logout {
+                choice: crate::dispose::LogoutChoice::StayAuto
+            }
+        );
+        assert_eq!(
+            parse_client_message(r#"{"type":"logout","disposition":"stay_ai"}"#).unwrap(),
+            ClientMessage::Logout {
+                choice: crate::dispose::LogoutChoice::StayAi
+            }
+        );
+    }
+
+    #[test]
+    fn parse_logout_invalid_disposition_rejected() {
+        // 非法 disposition 值 / 缺字段：解析层拒绝（warn 丢弃不入队）
+        assert!(parse_client_message(r#"{"type":"logout","disposition":"dance"}"#).is_err());
+        assert!(parse_client_message(r#"{"type":"logout"}"#).is_err(), "缺 disposition 拒绝");
+    }
+
+    #[test]
+    fn snapshot_player_disposition_fields_match_book() {
+        // 契约 v1.7：player 实体新增可选 disposition/wait_left——
+        // 处置等待带剩余拍数；auto/ai-await 只带状态签；在线（无处置）字段缺席
+        let mut world = WorldState::new();
+        let (pid, _) = put_entity(&mut world, "pioneer", "P", "green", (30.0, 0.5));
+        let mut dir = PlayerDirectory::new("unused");
+        dir.register_online("pioneer", pid);
+        world.advance_tick();
+        let now = world.tick();
+
+        // 无处置：字段缺席
+        let json = build(&world, &dir, Some(pid));
+        let p = &json["entities"][0];
+        assert!(p.get("disposition").is_none(), "在线玩家无 disposition 字段");
+        assert!(p.get("wait_left").is_none());
+
+        // 处置等待：disposition=dispose_wait + wait_left 倒数
+        dir.dispose.apply(
+            "pioneer",
+            crate::dispose::DisposeState::Wait {
+                deadline_tick: now + 30,
+            },
+        );
+        let json = build(&world, &dir, None);
+        let p = &json["entities"][0];
+        assert_eq!(p["disposition"], "dispose_wait");
+        assert_eq!(p["wait_left"], 30, "等待开始剩 30 拍");
+
+        // 自主接管：只带状态签，无剩余拍数
+        dir.dispose.apply("pioneer", crate::dispose::DisposeState::Auto);
+        let json = build(&world, &dir, None);
+        let p = &json["entities"][0];
+        assert_eq!(p["disposition"], "auto");
+        assert!(p.get("wait_left").is_none(), "auto 无 wait_left");
+
+        // AI 待接入
+        dir.dispose.apply("pioneer", crate::dispose::DisposeState::AiAwait);
+        let json = build(&world, &dir, None);
+        let p = &json["entities"][0];
+        assert_eq!(p["disposition"], "ai-await");
+    }
+
+    #[test]
+    fn snapshot_npc_and_creation_never_carry_disposition() {
+        // 边界：npc/creation 无处置概念，字段恒缺席（账本只收玩家名）
+        let mut world = WorldState::new();
+        put_entity(&mut world, "attacker", "A", "red", (12.0, 0.0));
+        put_entity(&mut world, "creation", "T", "cyan", (40.0, 0.0));
+        let dir = PlayerDirectory::disabled();
+        let json = build(&world, &dir, None);
+        for e in json["entities"].as_array().unwrap() {
+            assert!(e.get("disposition").is_none(), "非 player 实体无 disposition");
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_message_releases_token_and_demotes_to_spectator() {
+        // #025 令牌语义：主动登出=立即释放操控令牌+本连接降级观战——
+        // ① Logout 意图入共享队列（处置由 tick 侧落地）；
+        // ② 令牌释放后新连接成为操控端（重连的第一个连接重新认领）；
+        // ③ 登出后的原连接降级观战：上行丢弃、下行快照照收（登出后世界还能看）
+        let static_dir = temp_static_dir("logout");
+        let (addr, tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
+        let mut c1 = connect_client(addr).await;
+
+        c1.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"logout","disposition":"stay_auto"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        // ① Logout 意图入队（不走 move/attack 路由）
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::Logout {
+                choice: crate::dispose::LogoutChoice::StayAuto
+            },
+            "登出意图经单入口入共享队列"
+        );
+
+        // ② 新连接拿到操控权（c1 已释放令牌）
+        let mut c2 = connect_client(addr).await;
+        c2.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":1.0,"y":0.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut backlog2 = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog2).await,
+            crate::input::Intent::WsMove { x: 1.0, y: 0.0 },
+            "登出后新连接成为操控端（重连认领）"
+        );
+
+        // ③ c1 降级观战：再发 move 被丢弃（不入队）；下行快照照收
+        c1.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":99.0,"y":99.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(queue.drain().is_empty(), "登出连接的后续上行已丢弃");
+        let mut world = WorldState::new();
+        world.advance_tick();
+        let dir = PlayerDirectory::disabled();
+        let vp = default_viewport();
+        push_snapshot(&tx, &world, "after-logout", &vp, &dir, None);
+        let frame: serde_json::Value = serde_json::from_str(&next_text(&mut c1).await).unwrap();
+        assert_eq!(frame["caption"], "after-logout", "登出连接下行快照照收（观战）");
+
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
     }
 }
