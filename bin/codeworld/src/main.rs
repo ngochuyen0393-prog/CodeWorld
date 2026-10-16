@@ -36,6 +36,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing_subscriber::filter::LevelFilter;
 
+/// 发射痕迹强弹动能阈值（#034 修订三）：动能（速度×质量）> 50 的弹丸算"强弹"，
+/// 痕迹寿命 1 拍加到 3 拍封顶。标定参照：H 标准抛射约 7.8（弱弹 1 拍），
+/// mass=10 中速直射 200（强弹 3 拍）。
+const TRACE_STRONG_KE: f64 = 50.0;
+
+/// 发射痕迹（#034 修订三：发射即暴露——攻击自由，但攻击留下痕迹）。
+/// 痕迹不是实体：不进 world.entities、不占碰撞/沙箱/名额，是主程序持有的
+/// 独立标记表；探测面 = 眼睛层 visible 列表 + probe 命中坐标返回发射者身份。
+#[derive(Debug, Clone)]
+struct LaunchTrace {
+    /// 痕迹 id（visible/probe 桥里的身份；独立生成，与实体 id 无关）
+    trace_id: EntityId,
+    /// 发射点（=弹丸出手位置）
+    pos: (f64, f64),
+    /// 发射者
+    shooter: EntityId,
+    /// 发射拍号
+    birth_tick: u64,
+    /// 寿命（拍）：1 拍基础，动能超阈值 +2（封顶 3）
+    ttl: u32,
+}
+
 /// 实体-沙箱映射表（架构文档 4.1 阶段一）
 ///
 /// 把 EntityId 映射到 SandboxHandle，tick 阶段一据此逐个实体执行玩家代码。
@@ -78,6 +100,9 @@ struct EntitySandboxMap {
     /// Entity 本体只存物理（质量/速度/半径），发射者豁免与结算 payload 归账本；
     /// 弹丸消亡（命中/落地/超时）时一并清理。不持久化（跨重启按哑弹清场）
     projectiles: HashMap<EntityId, ProjectileMeta>,
+    /// 发射痕迹表（#034 修订三：发射即暴露）。独立标记非实体；expire_traces
+    /// 每拍清算，寿命尽消亡。不持久化（痕迹最长 3 拍，重启窗口即自然过期）
+    traces: Vec<LaunchTrace>,
     /// 点击走位停滞检测窗口（期四第七刀）：目标变更即重开窗，测"当前目标"的
     /// 走位进度；2 拍净位移 < 0.01 = 贴障蹭动/全挡，视为到达清目标
     move_stall: Option<input::MoveStallTrack>,
@@ -113,7 +138,23 @@ impl EntitySandboxMap {
             move_stall: None,
             conn_event: None,
             projectiles: HashMap::new(),
+            traces: Vec::new(),
         })
+    }
+
+    /// 发射痕迹清算（#034 修订三）：寿命尽的痕迹消亡。
+    /// 时序语义：诞生拍（阶段二诞生，当拍清算不消）→ 次拍起的眼睛层可见 →
+    /// 可见拍数耗尽后的清算拍消亡——弱弹恰好可见一拍
+    fn expire_traces(&mut self, current_tick: u64) {
+        let before = self.traces.len();
+        self.traces
+            .retain(|t| current_tick < t.birth_tick + t.ttl as u64);
+        if self.traces.len() != before {
+            tracing::debug!(
+                expired = before - self.traces.len(),
+                "[trace] 发射痕迹消散"
+            );
+        }
     }
 
     /// 填充可见实体快照（三层感知 Phase A 眼睛层，阶段一执行玩家代码【前】调用）
@@ -133,6 +174,15 @@ impl EntitySandboxMap {
             .map(|e| (e.id, e.pos()))
             .collect();
         visible.sort_by_key(|a| a.0 .0);
+        // 发射痕迹并入可见列表（#034 修订三：发射即暴露，痕迹排在实体之后——
+        // probe 侧同坐标实体优先）。痕迹非实体：只进感知列表，不进渲染/物理
+        let trace_entries: Vec<(EntityId, (f64, f64))> = self
+            .traces
+            .iter()
+            .filter(|t| viewport.contains(t.pos.0, t.pos.1))
+            .map(|t| (t.trace_id, t.pos))
+            .collect();
+        visible.extend(trace_entries);
         self.visible_ids = visible.iter().map(|(id, _)| *id).collect();
         self.visible_positions = visible.iter().map(|(_, p)| *p).collect();
         for (id, handle) in self.sandboxes.iter_mut() {
@@ -185,6 +235,15 @@ impl EntitySandboxMap {
         let manager_ptr: *const SandboxManager = &self.manager;
         let bridge_ids = self.visible_ids.clone();
         let bridge_positions = self.visible_positions.clone();
+        let bridge_traces: Vec<codeworld_arena::sandbox::TraceProbe> = self
+            .traces
+            .iter()
+            .map(|t| codeworld_arena::sandbox::TraceProbe {
+                trace_id: t.trace_id,
+                shooter: t.shooter,
+                birth_tick: t.birth_tick,
+            })
+            .collect();
         let probe_fuel = self.probe_fuel;
         for entity_id in entity_ids {
             // 防御：只处理存活实体（架构 4.1"把所有存活实体放进任务队列"）。
@@ -225,6 +284,7 @@ impl EntitySandboxMap {
                 manager: manager_ptr,
                 caller_id: entity_id,
                 probe_fuel,
+                traces: bridge_traces.clone(),
             };
             handle.store.data_mut().probe_bridge = &mut bridge;
             // 重置本 tick 指令配额（架构 4.1：每 tick 重置指令配额）。
@@ -1146,6 +1206,9 @@ fn tick_with_intents(
     //       ② 整场积分：弹丸吃重力/阻力/位移（速度积分制，弹丸不吃 aloft——它就是要落地的），
     //          撞身体/落地/超时产出事件（飞行中归世界）
     process_shoots(world, sandbox_map, current_tick);
+    // 发射痕迹清算（#034 修订三）：寿命尽的痕迹消亡（排在 process_shoots 之后——
+    // 本拍刚诞生的痕迹当拍不清，次拍起的眼睛层可见一至三拍）
+    sandbox_map.expire_traces(current_tick);
     let projectile_events = {
         let shooters: HashMap<EntityId, EntityId> = sandbox_map
             .projectiles
@@ -1727,6 +1790,19 @@ fn process_shoots(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
                 payload: req.payload,
             },
         );
+        // 发射痕迹（#034 修订三：发射即暴露——攻击自由，但攻击留下痕迹）。
+        // 痕迹寿命 1 拍基础，动能（速度×质量）超阈值加到 3 拍封顶：强弹痕迹更长，
+        // 反制手段（哨塔网/痕迹追踪反击）玩家自己长，世界只保证"打了就有记录"
+        let speed = (req.vx * req.vx + req.vy * req.vy).sqrt();
+        let kinetic_energy = speed * req.mass;
+        let ttl: u32 = if kinetic_energy > TRACE_STRONG_KE { 3 } else { 1 };
+        sandbox_map.traces.push(LaunchTrace {
+            trace_id: EntityId::new(),
+            pos: birth_pos,
+            shooter: req.shooter,
+            birth_tick: current_tick,
+            ttl,
+        });
         world.entities.insert(projectile_id, projectile);
         tracing::info!(
             projectile = %projectile_id.0,
@@ -1735,7 +1811,9 @@ fn process_shoots(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
             vx = req.vx,
             vy = req.vy,
             mass = req.mass,
-            "[弹丸诞生] 离体即世界物体（出手前归代码，飞行中归世界）"
+            kinetic_energy,
+            trace_ttl = ttl,
+            "[shoot] 弹丸发射+痕迹留下（离体即世界物体：出手前归代码，飞行中归世界）"
         );
     }
 }
@@ -6593,6 +6671,91 @@ mod tests {
         assert_eq!(meta.payload, vec![1, 2, 3], "账本记 payload");
         let _ = pid;
     }
+
+    // === 发射痕迹（#034 修订三：发射即暴露，世界只保证"打了就有记录"）===
+
+    fn push_shoot(map: &mut EntitySandboxMap, shooter: EntityId, vx: f64, vy: f64, mass: f64) {
+        map.sandboxes
+            .get_mut(&shooter)
+            .unwrap()
+            .store
+            .data_mut()
+            .pending_shoots
+            .push(codeworld_arena::sandbox::PendingShoot {
+                shooter,
+                vx,
+                vy,
+                mass,
+                payload: vec![],
+            });
+    }
+
+    #[test]
+    fn shoot_leaves_one_tick_trace_for_weak_shell() {
+        // 弱弹（动能 5 = 速度5×质量1 < 阈值50）痕迹 1 拍：位置=发射点、记发射者与拍号
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+        push_shoot(&mut map, shooter, 3.0, 4.0, 1.0);
+        process_shoots(&mut world, &mut map, 7);
+        assert_eq!(map.traces.len(), 1, "发射应留痕迹");
+        let t = &map.traces[0];
+        assert_eq!(t.pos, (5.0, 0.5), "痕迹位置=发射点");
+        assert_eq!(t.shooter, shooter, "痕迹记发射者");
+        assert_eq!(t.birth_tick, 7, "痕迹记发射拍号");
+        assert_eq!(t.ttl, 1, "弱弹痕迹寿命 1 拍");
+        // 痕迹不是实体：不进世界账面、不占碰撞
+        assert!(world
+            .entities
+            .values()
+            .all(|e| e.id != t.trace_id), "痕迹实体不进 world");
+    }
+
+    #[test]
+    fn shoot_leaves_three_tick_trace_for_high_kinetic_shell() {
+        // 强弹（动能 200 = 速度20×质量10 > 阈值50）痕迹 3 拍封顶
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+        push_shoot(&mut map, shooter, 20.0, 0.0, 10.0);
+        process_shoots(&mut world, &mut map, 7);
+        assert_eq!(map.traces[0].ttl, 3, "强弹痕迹寿命封顶 3 拍");
+    }
+
+    #[test]
+    fn launch_trace_expires_after_ttl() {
+        // 寿命：诞生拍（阶段二）存续，之后每拍结算递减——弱弹在诞生次拍清算后消失
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+        push_shoot(&mut map, shooter, 3.0, 4.0, 1.0);
+        process_shoots(&mut world, &mut map, 7);
+        map.expire_traces(7);
+        assert_eq!(map.traces.len(), 1, "诞生拍清算不消（还没被任何一拍看见过）");
+        map.expire_traces(8);
+        assert!(map.traces.is_empty(), "次拍清算消亡（恰好可见一拍：第 8 拍的眼睛层）");
+    }
+
+    #[test]
+    fn launch_trace_enters_visible_lists() {
+        // 可探测：痕迹进 visible 列表（眼睛层），对所有沙箱可见（含发射者自己——
+        // 自己当然知道自己开过火）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+        push_shoot(&mut map, shooter, 3.0, 4.0, 1.0);
+        process_shoots(&mut world, &mut map, 7);
+        let bb = BoundingBox::new(-50.0, -25.0, 50.0, 25.0);
+        map.fill_visible_snapshots(&world, &bb);
+        let vis = map.sandboxes[&shooter].store.data().visible.clone();
+        assert!(
+            vis.contains(&(5.0, 0.5)),
+            "痕迹坐标应出现在可见列表（发射者自己视角）"
+        );
+        // probe 桥的数据源同样带痕迹（traces 摘要与 visible 平行）
+        assert_eq!(map.traces.len(), 1);
+    }
+
 
     #[test]
     fn process_shoots_dead_shooter_and_cap_void_requests() {

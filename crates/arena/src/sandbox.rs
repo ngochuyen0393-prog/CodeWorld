@@ -166,6 +166,17 @@ impl SandboxData {
     }
 }
 
+/// 发射痕迹摘要（#034 修订三：痕迹不是实体不进沙箱表，probe 桥携带的最小证据）
+#[derive(Debug, Clone, Copy)]
+pub struct TraceProbe {
+    /// 痕迹 id（与 visible_ids 中该痕迹的条目对应）
+    pub trace_id: EntityId,
+    /// 发射者
+    pub shooter: EntityId,
+    /// 发射拍号
+    pub birth_tick: u64,
+}
+
 /// probe 通路桥（三层感知 Phase A：import 闭包访问目标沙箱的桥接上下文）
 ///
 /// 为什么需要：import 闭包是 'static 的，无法持有 host 引用；probe 又必须同步
@@ -181,7 +192,8 @@ impl SandboxData {
 ///   HashMap 不同 entry 的值指向互不重叠的独立分配。
 pub struct ProbeBridge {
     /// 可见实体 id 列表（viewport 过滤 + 存活 + EntityId 升序；含 caller 自己——
-    /// probe 的坐标查找在此列表上排除自己，作为 host 快照遗漏时的第二道防线）
+    /// probe 的坐标查找在此列表上排除自己，作为 host 快照遗漏时的第二道防线。
+    /// #034 修订三起也包含发射痕迹的条目——痕迹坐标后追加）
     pub visible_ids: Vec<EntityId>,
     /// 与 visible_ids 一一平行的坐标列表
     pub visible_positions: Vec<(f64, f64)>,
@@ -193,6 +205,9 @@ pub struct ProbeBridge {
     pub caller_id: EntityId,
     /// on_probe 独立小 fuel 预算（架构 3.3 probe_target_instruction_limit，config 可调）
     pub probe_fuel: u64,
+    /// 本拍可见的发射痕迹（#034 修订三；probe 命中痕迹坐标返回发射者身份，
+    /// 与沙箱表无交集——痕迹不建沙箱）
+    pub traces: Vec<TraceProbe>,
 }
 
 /// 沙箱句柄（持有 Store + Instance）
@@ -506,17 +521,57 @@ impl SandboxManager {
                 // SAFETY: 桥仅在 run_player_code 执行窗口内非空（挂载 -> call ->
                 // 置空同一循环体作用域），本函数只在窗口内被调，ProbeBridge 存活。
                 let bridge = unsafe { &mut *bridge_ptr };
-                // 坐标查找（可见列表内 + 排除自己：host 快照已排除，此处为第二道防线）
+                // 坐标查找（可见列表内 + 排除自己：host 快照已排除，此处为第二道防线）。
+                // #034 修订三：同坐标实体与痕迹并存时实体优先（痕迹作兜底证据）
+                let is_trace_id =
+                    |id: &EntityId| bridge.traces.iter().any(|t| &t.trace_id == id);
+                let coordinate_match = |(id, p): (&EntityId, (f64, f64))| {
+                    *id != caller_id && p == (tx, ty)
+                };
                 let target_id = bridge
                     .visible_ids
                     .iter()
                     .zip(bridge.visible_positions.iter().copied())
-                    .find(|(id, p)| **id != caller_id && *p == (tx, ty))
+                    .find(|(id, p)| coordinate_match((id, *p)) && !is_trace_id(id))
+                    .or_else(|| {
+                        bridge
+                            .visible_ids
+                            .iter()
+                            .zip(bridge.visible_positions.iter().copied())
+                            .find(|(id, p)| coordinate_match((id, *p)) && is_trace_id(id))
+                    })
                     .map(|(id, _)| *id);
                 let Some(target_id) = target_id else {
                     tracing::info!(entity_id = %caller_id.0, tx, ty, "[probe] 坐标无可见实体");
                     return -1;
                 };
+                // 痕迹证据分支（#034 修订三）：坐标上是痕迹不是实体——不建沙箱，
+                // 直接构造 24 字节身份响应（发射者 id u128 LE + 发射拍号 u64 LE），
+                // 返回 -3（与 -1 无实体 / -2 无 on_probe 同族负值语义区分）
+                if let Some(trace) = bridge.traces.iter().find(|t| t.trace_id == target_id) {
+                    let mut body = Vec::with_capacity(24);
+                    body.extend_from_slice(&trace.shooter.0.as_u128().to_le_bytes());
+                    body.extend_from_slice(&trace.birth_tick.to_le_bytes());
+                    if resp_cap <= 0 {
+                        tracing::warn!(entity_id = %caller_id.0, resp_cap, "[probe] resp_cap 非正，痕迹证据丢弃");
+                        return -1;
+                    }
+                    let written = write_bytes_to_caller(&mut caller, resp_ptr, &body, resp_cap as usize);
+                    if written == 0 {
+                        tracing::warn!(entity_id = %caller_id.0, resp_ptr, "[probe] 痕迹证据写入失败（指针非法/无 memory）");
+                        return -1;
+                    }
+                    tracing::info!(
+                        prober = %caller_id.0,
+                        trace = %trace.trace_id.0,
+                        shooter = %trace.shooter.0,
+                        birth_tick = trace.birth_tick,
+                        tx,
+                        ty,
+                        "[probe] 命中发射痕迹：返回发射者身份（攻击留下痕迹）"
+                    );
+                    return -3;
+                }
                 // SAFETY: sandboxes 指针窗口内有效；目标 != caller（上一步排除），
                 // 不会与外层持有的 caller 自身 &mut handle aliasing（不同 entry）。
                 let sandboxes = unsafe { &mut *bridge.sandboxes };
@@ -1858,6 +1913,7 @@ mod tests {
   (func (export "get_resp0") (result i32) (i32.load (i32.const 200)))
   (func (export "get_resp8") (result i32) (i32.load (i32.const 208)))
   (func (export "get_resp12") (result i32) (i32.load (i32.const 212)))
+  (func (export "get_resp16") (result i32) (i32.load (i32.const 216)))
   (func (export "get_resp20") (result i32) (i32.load (i32.const 220)))
   (func (export "life") (result i32) i32.const 1))"#
         )
@@ -1893,6 +1949,7 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
+            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -1932,6 +1989,7 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
+            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -1958,6 +2016,7 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
+            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -1983,6 +2042,7 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
+            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -2023,6 +2083,7 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
+            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -2055,6 +2116,7 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
+            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -2092,6 +2154,95 @@ mod tests {
         mgr.call_on_tick(&mut prober).unwrap();
         let ret = call_i32_export(&mut prober, "get_ret");
         assert_eq!(ret, -1, "桥未挂载应返回 -1");
+    }
+
+    // === probe 命中发射痕迹（#034 修订三：痕迹不是实体，最小证据路径）===
+
+    #[test]
+    fn probe_on_trace_coordinate_returns_shooter_identity() {
+        // probe 命中痕迹坐标 -> 返回 -3，resp 前 24 字节 = 发射者 id（u128 LE 16 字节）
+        // + 发射拍号（u64 LE 8 字节）——"此处发射过弹丸"的最小证据（不建沙箱）。
+        // 断言 resp0 = shooter u128 低 32 位（=42）、resp16 = 拍号低 32 位（=7）
+        let mgr = SandboxManager::new().unwrap();
+        let mut map = std::collections::HashMap::new(); // 空沙箱表：痕迹不占沙箱
+        let mut prober = mgr
+            .create_sandbox(&wasm(&prober_wat("7.0", "8.0")), 100_000, id(1))
+            .unwrap();
+        prober.store.data_mut().visible = vec![(7.0, 8.0)];
+        let trace_id = id(77);
+        let mut bridge = ProbeBridge {
+            visible_ids: vec![id(1), trace_id],
+            visible_positions: vec![(0.0, 0.0), (7.0, 8.0)],
+            sandboxes: &mut map,
+            manager: &mgr,
+            caller_id: id(1),
+            probe_fuel: 10_000,
+            traces: vec![TraceProbe {
+                trace_id,
+                shooter: id(42),
+                birth_tick: 7,
+            }],
+        };
+        prober.store.data_mut().probe_bridge = &mut bridge;
+        mgr.call_on_tick(&mut prober).unwrap();
+        prober.store.data_mut().probe_bridge = std::ptr::null_mut();
+        drop(bridge);
+        assert_eq!(
+            call_i32_export(&mut prober, "get_ret"),
+            -3,
+            "痕迹命中应返回 -3（痕迹证据语义，与 -1 无实体/-2 无 on_probe 区分）"
+        );
+        assert_eq!(
+            call_i32_export(&mut prober, "get_resp0"),
+            42,
+            "resp[0..4] 应为发射者 id 低 32 位"
+        );
+        assert_eq!(
+            call_i32_export(&mut prober, "get_resp16"),
+            7,
+            "resp[16..20] 应为发射拍号低 32 位"
+        );
+    }
+
+    #[test]
+    fn probe_prefers_real_entity_over_trace_at_same_coordinate() {
+        // 同坐标实体与痕迹并存（发射者原地不动的常见态）：按实体结算（on_probe
+        // 假串照回），不吃痕迹证据——实体优先于痕迹
+        let mgr = SandboxManager::new().unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            id(2),
+            mgr.create_sandbox(&wasm(LIAR_WAT), 100_000, id(2)).unwrap(),
+        );
+        let mut prober = mgr
+            .create_sandbox(&wasm(&prober_wat("7.0", "8.0")), 100_000, id(1))
+            .unwrap();
+        prober.store.data_mut().visible = vec![(7.0, 8.0)];
+        let trace_id = id(77);
+        let mut bridge = ProbeBridge {
+            visible_ids: vec![id(1), id(2), trace_id],
+            visible_positions: vec![(0.0, 0.0), (7.0, 8.0), (7.0, 8.0)],
+            sandboxes: &mut map,
+            manager: &mgr,
+            caller_id: id(1),
+            probe_fuel: 10_000,
+            traces: vec![TraceProbe {
+                trace_id,
+                shooter: id(2),
+                birth_tick: 3,
+            }],
+        };
+        prober.store.data_mut().probe_bridge = &mut bridge;
+        mgr.call_on_tick(&mut prober).unwrap();
+        prober.store.data_mut().probe_bridge = std::ptr::null_mut();
+        drop(bridge);
+        let ret = call_i32_export(&mut prober, "get_ret");
+        assert_eq!(ret, 28, "同坐标并存应按实体 probe 结算（4 假串+24 体徵）");
+        assert_eq!(
+            call_i32_export(&mut prober, "get_resp0"),
+            0x3945494C,
+            "响应应是实体的假串而非痕迹证据"
+        );
     }
 
     // === env.spawn / env.destroy（门二：代码造物，decisions.md #012/#015）===
