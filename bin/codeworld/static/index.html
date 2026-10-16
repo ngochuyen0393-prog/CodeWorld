@@ -35,8 +35,19 @@
 
   手写零依赖声明：无框架、无 CDN、无构建工具、无 script src，
   单文件原生 JS + Canvas 2D（项目零前端工具链宪法）。
+
+  登出弹窗（期五第二刀）：弹窗是一次决策的场所——点任一选项/取消/Esc = 决策
+  完成 = 弹窗立刻 0.25s 淡出关门（busy 守卫防双发 logout），决策结果交给非阻塞
+  的顶部横幅。另修 [hidden] 根因：容器显式 display:flex 会压过浏览器 UA 对
+  hidden 属性的 display:none（上一刀弹窗「关不掉」的真因）。登出态镜头归属：
+  P 留场（stay_*，快照带 disposition 状态签、不再标 controlled）镜头继续跟 P，
+  P 消失（带走/被杀）才回落全景。
 -->
 <style>
+  /* hidden 属性全局兜底（期五第二刀根因修复）：本页容器显式写了 display:flex，
+     author 规则优先于浏览器 UA 样式，[hidden] 的默认 display:none 形同虚设——
+     登出弹窗/横幅 hidden=true 后照样显示（弹窗关不掉）。!important 压回 display */
+  [hidden] { display: none !important; }
   html, body { height: 100%; }
   body {
     margin: 0; overflow: hidden;
@@ -79,7 +90,14 @@
     position: absolute; inset: 0; z-index: 5;
     display: flex; align-items: center; justify-content: center;
     background: rgba(14, 17, 22, 0.72);
+    transition: opacity 0.25s ease; /* 决策即关门：0.25s 透明淡出 */
   }
+  /* 淡出中：渐隐 + 吞掉指针事件（淡出期间点不到卡片，防双发 logout） */
+  #logoutPanel.closing { opacity: 0; pointer-events: none; }
+  /* 卡片按下回执：选中高亮一拍（120ms 后开始淡出） */
+  #logoutPanel .disp.picked { border-color: #3fb950; background: #238636; }
+  #logoutPanel .disp.picked b { color: #ffffff; }
+  #logoutPanel .disp.picked span { color: #cfe8cf; }
   #logoutPanel .card {
     background: #161b22; border: 1px solid #30363d; border-radius: 8px;
     padding: 18px 20px; width: 340px;
@@ -155,6 +173,8 @@
   var BACKOFF_MAX = 30000;             // 重连退避封顶（ms）
   var CAM_LERP = 0.12;                 // 镜头跟随平滑系数（每帧，60fps；0.08-0.15 推荐域）
   var CAM_ZOOM = 2;                    // 跟随窗口 = viewport 的 1/Z（跟随模式 P 周边放大观感）
+  var PANEL_ACK_MS = 120;              // 登出卡片按下回执时长（视觉回执一拍再发消息）
+  var PANEL_FADE_MS = 250;             // 登出弹窗淡出时长（0.25s，确认弹窗关门标准）
 
   // ---- DOM ----
   var stage = document.getElementById('stage');
@@ -203,6 +223,7 @@
   var view = null;              // 当前可视世界窗口（全景=viewport；跟随=相机窗口）
   var loggedOut = null;         // 已登出的处置（'take'|'stay_auto'|'stay_ai'，#025）；null=未登出
                                 // 登出后连接降级观战继续直播；此时断线不自动重连（重连=抢回操控）
+  var logoutPanelBusy = false;  // 弹窗决策/淡出进行中：禁一切面板交互（防双发 logout）
 
   // ---- 快照接收：入缓冲 + 帧间隔滚动平均 ----
   function onMessage(ev) {
@@ -471,6 +492,18 @@
     var me = null;
     entsMap.forEach(function (e) {
       if (e.controlled === true) me = e;
+    });
+    return me;
+  }
+
+  // 登出态跟随目标（期五第二刀）：已登出且角色留在世界（stay_auto/stay_ai）时，
+  // 服务器不再标 controlled（#032：处置中的玩家不被 me 声明重认领），快照改带
+  // disposition 状态签——按状态签找自己的 P；P 消失（take 带走/被杀）返回 null，
+  // 镜头回落全景由调用方处理。dispose_wait 是意外断线的抢救窗口，不算登出留场
+  function findDisposedPlayer(entsMap) {
+    var me = null;
+    entsMap.forEach(function (e) {
+      if (e.kind === 'player' && (e.disposition === 'auto' || e.disposition === 'ai-await')) me = e;
     });
     return me;
   }
@@ -820,6 +853,7 @@
 
   // ---- 点击操控（#027）：左键 move/attack、右键 stop、S 键 stop、F 切镜头 ----
   cv.addEventListener('click', function (ev) {
+    if (loggedOut) return; // 已登出=观战（#032 上行被服务器丢弃），不再给本地假反馈
     if (!view || !lastState) return;
     var r = cv.getBoundingClientRect();
     var w = screenToWorld(ev.clientX - r.left, ev.clientY - r.top);
@@ -856,38 +890,73 @@
       showLogoutPanel();
     }
     if (ev.key === 'Escape') {
-      logoutPanelEl.hidden = true;
+      cancelLogoutPanel(); // Esc = 取消（弹窗开着且非决策/淡出中才生效）
     }
   });
   camBtnEl.addEventListener('click', toggleCamera);
 
-  // ---- 登出处置（#025 期五第一刀）：主动行为三选一，区别于断线 ----
+  // ---- 登出处置（#025 期五第一刀；期五第二刀决策即关门）----
+  // 弹窗是一次决策的场所：点任一选项/取消/Esc = 决策完成 = 弹窗立刻淡出关门，
+  // 决策结果交给非阻塞的横幅展示；busy 守卫保证一次决策只发一条 logout
   function showLogoutPanel() {
-    if (loggedOut) return; // 已登出不重复开面板
+    if (loggedOut || logoutPanelBusy) return; // 已登出不能再登出；决策/淡出中不重开
+    resetLogoutPanelVisual();
     logoutPanelEl.hidden = false;
   }
 
-  // 选项落地：发 logout 消息（服务器释放操控令牌，本连接降级观战——世界继续
-  // 直播，P 的自主活动照常可见）；横幅给"重新进入世界"入口（重连=重新认领操控）
+  // 开面板/关门后清掉按下回执与淡出残留（防复用残留样式）
+  function resetLogoutPanelVisual() {
+    logoutPanelEl.classList.remove('closing');
+    Array.prototype.forEach.call(
+      document.querySelectorAll('#logoutPanel .disp'),
+      function (btn) { btn.classList.remove('picked'); }
+    );
+  }
+
+  // 0.25s 透明淡出后收起（决策即关门）；afterFade = 关门后的收尾（如亮横幅）
+  function fadeOutLogoutPanel(afterFade) {
+    logoutPanelEl.classList.add('closing'); // CSS transition 渐隐 + pointer-events:none
+    setTimeout(function () {
+      logoutPanelEl.hidden = true;
+      resetLogoutPanelVisual();
+      logoutPanelBusy = false;
+      if (afterFade) afterFade();
+    }, PANEL_FADE_MS);
+  }
+
+  // 取消/Esc：同款淡出关门，不发任何消息
+  function cancelLogoutPanel() {
+    if (logoutPanelEl.hidden || logoutPanelBusy) return;
+    logoutPanelBusy = true;
+    fadeOutLogoutPanel(null);
+  }
+
+  // 选项落地：卡片按下高亮一拍（视觉回执）→ 发 logout 消息（服务器释放操控令牌，
+  // 本连接降级观战——世界继续直播，P 的自主活动照常可见）→ 弹窗 0.25s 淡出关门
+  // → 横幅接管（重新进入世界入口；重连=重新认领操控）
   Array.prototype.forEach.call(
     document.querySelectorAll('#logoutPanel .disp'),
     function (btn) {
       btn.addEventListener('click', function () {
+        if (logoutPanelBusy || loggedOut) return; // 决策/淡出中禁重复点击（防双发 logout）
         var d = btn.getAttribute('data-d');
-        loggedOut = d;
-        sendMsg({ type: 'logout', disposition: d });
-        logoutPanelEl.hidden = true;
-        bannerTextEl.textContent = '已登出（处置：' + logoutChoiceLabel(d) + '）· 世界直播中';
-        logoutBannerEl.hidden = false;
-        moveTarget = null;
-        clearPrediction(); // 已无操控：预测态清空（重进后从服务器快照重来）
+        logoutPanelBusy = true;
+        btn.classList.add('picked');
+        setTimeout(function () {
+          loggedOut = d; // 与发消息同拍置位：回执窗口内断线仍走自动重连（意外断开语义）
+          sendMsg({ type: 'logout', disposition: d });
+          moveTarget = null;
+          clearPrediction(); // 已无操控：预测态清空（重进后从服务器快照重来）
+          fadeOutLogoutPanel(function () {
+            bannerTextEl.textContent = '已登出（处置：' + logoutChoiceLabel(d) + '）· 世界直播中';
+            logoutBannerEl.hidden = false;
+          });
+        }, PANEL_ACK_MS);
       });
     }
   );
   logoutBtnEl.addEventListener('click', showLogoutPanel);
-  logoutCancelEl.addEventListener('click', function () {
-    logoutPanelEl.hidden = true;
-  });
+  logoutCancelEl.addEventListener('click', cancelLogoutPanel);
 
   // 重新进入世界：关掉观战连接 -> 全新连接（第一连接=操控端，重新认领）。
   // take 处置下服务器会重生角色；stay_* 处置下直接抢回操控（接管者被顶掉）
@@ -979,6 +1048,11 @@
     var meRendered = null;
     if (state) {
       var meEnt = findControlled(state.ents);
+      if (!meEnt && loggedOut) {
+        // 登出态镜头归属（期五第二刀）：角色留在世界（自主/AI 待命）就继续跟它
+        //（快照带 disposition 状态签），P 消失（带走/被杀）保持 null → 回落全景
+        meEnt = findDisposedPlayer(state.ents);
+      }
       if (meEnt) {
         if (predHold) {
           meEnt.x = predHold.x; // 停止冻结：立即站住
