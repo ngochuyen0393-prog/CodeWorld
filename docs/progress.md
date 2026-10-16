@@ -29,3 +29,9 @@
 - 三层感知 Phase A：① 眼睛层 env.visible_count/visible_at（host 阶段一前 viewport 快照，Uuid 升序排除自己）；② 探测层 env.probe（坐标寻址 + ProbeBridge raw 指针桥同步跨沙箱 + on_probe 独立 fuel 预算 CODEWORLD_PROBE_FUEL + 24 字节被动体徵尾块）；③ 伪装者 S 紫"S"（每 4 tick 侦察 marker=10 + probe 最近者，on_probe 回 "LIE9" 假串，脆皮无防守，CODEWORLD_S_ENABLED 开关）+ D 反制前 probe 看一眼（撒谎串实战可验证），四剧本冒烟全过，425 测试（2026-10-14）
 - 期一·门一进场（world-foundation 路线第 1 步）：players/ 目录进场（.wat=玩家，名字/字形/色轮 green 起/出生点 30-45 循环，CODEWORLD_PLAYERS_DIR 可覆盖，编译失败黑名单+删文件重放可重试）+ 在线锚（每 tick 轮询，新文件进场/删除下线）+ 战斗残影期 #013（参战记录 30 拍窗，残影期 max(5,30-距参战拍数)，残影完全惰性可被杀掠夺）+ docs/api.md 玩家接口宪法 v1 + players/example.wat 模板，审查 1 轮修 P1（落空刀也记参战），冒烟全链路过，452 测试（2026-10-14）
 - scan 视野化（感知回归设计稿 4.2，#019）：find_nearest_enemy 加 viewport（BoundingBox）过滤（与 fill_visible_snapshots 同 tick 同一实例，同源口径），视野内无目标返 0；TDD 红绿 5 新测试（视口内/外过滤 2 + scan 端到端 1 + 冒烟 2：默认视口四生物+E 时间线 tick4 H 死/tick12 A 死不变、缩小视口 [-10,10] 屏外 E 全程无伤且 A 锁不到屏外 D 盾不掉），A/D/H WAT 原有 scan=0 分支免改，api.md/decisions.md 同步，457 测试（2026-10-14）
+
+## 2026-10-16 期五第一刀设计定案（未开工）
+- docs/design-ballistics.md 存档：离体物理/质量物理人格/弹道涌现/物理场可调制（攻防对等）全套设计
+- 血统：Core War 拳 × Screeps 擂台 × 统一物理裁判——接口（弹丸携代码飞行）是自研核心与护城河
+- 立法草案 #032：五条纯规则零玩法；mass 只参与物理永不参与结算；攻击形态全部玩家涌现
+- attack_at 射程小刀已否决（土豆：射程应物理涌现）；期五第一刀=阻力常量+mass+shoot 弹丸+接触判定
