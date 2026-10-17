@@ -238,8 +238,10 @@
   var lastRawTick = null;       // 最新原始快照拍号（预测锚定用；插值采样是延迟视图）
   var lastRawEnts = null;       // 最新原始快照实体表（服务器权威坐标）
   var attackLines = [];         // 刀光线数组 [{x0,y0,x1,y1,born,miss}]（0.3s 生命周期，画完即剔）
-  var killFx = [];              // 击杀标记数组 [{x,y,born}]（1.5s 渐隐 ✕）
+  var killFx = [];              // 击杀标记数组 [{x,y,born}]（1.5s 渐隐 ✕；弹丸不算击杀，期五第六刀）
   var hitFlashFx = [];          // 弹丸命中闪白数组 [{x,y,born}]（#034，300ms 白框）
+  var dustFx = [];              // 哑弹落尘数组 [{x,y,born}]（期五第六刀，500ms 灰圈渐隐）
+  var noReachFx = [];           // "够不着"提示数组 [{x,y,born}]（期五第六刀，1s 灰字渐隐）
   var shootArcs = [];           // 远程射击弹道弧线预览 [{pts:[{x,y}...], born}]（#036 纯装饰 1.2s 淡出）
   var projPrev = null;          // 弹丸上一快照位置表 Map(id->{x,y})（#034 尾迹方向差分用）
   var camMode = 'follow';       // 镜头模式：'follow'=跟随 P（默认）/ 'pano'=全景
@@ -287,14 +289,17 @@
         killFx.push({ x: kills[ki].x, y: kills[ki].y, born: now });
       }
       while (killFx.length > 32) killFx.shift();
-      // 弹丸命中闪白（#034）：消失弹丸位置附近有实体 → 白框闪 300ms（前端本地效果；
-      // 超时哑弹附近无人则 nearestProjectileVictim 返 null 不闪）
-      var phits = collectProjectileHits(prevFrame.ents, ents);
-      for (var pi = 0; pi < phits.length; pi++) {
-        var pv = nearestProjectileVictim(ents, phits[pi].x, phits[pi].y);
-        if (pv) hitFlashFx.push({ x: pv.x, y: pv.y, born: now });
+      // 弹丸消亡分流（期五第六刀）：附近有身体=命中闪白；无人=哑弹落尘（灰圈
+      // 500ms，中性特效——落地哑弹不再冒击杀✕）
+      var dis = collectProjectileDissolutions(prevFrame.ents, ents);
+      for (var pi = 0; pi < dis.hits.length; pi++) {
+        hitFlashFx.push({ x: dis.hits[pi].x, y: dis.hits[pi].y, born: now });
       }
       while (hitFlashFx.length > 16) hitFlashFx.shift();
+      for (var di = 0; di < dis.dust.length; di++) {
+        dustFx.push({ x: dis.dust[di].x, y: dis.dust[di].y, born: now });
+      }
+      while (dustFx.length > 16) dustFx.shift();
     }
     // 弹丸尾迹方向锚点（#034）：记录本拍弹丸位置，绘制时与插值位置差分出速度方向
     var newProjPrev = new Map();
@@ -518,10 +523,13 @@
     return { x: x, y: y, edgeL: edgeL, edgeR: edgeR, edgeB: edgeB, edgeT: edgeT };
   }
 
-  // 击杀检测：上一帧有、新帧无的实体 = 消失（死亡/残影消散），返回最后坐标
+  // 击杀检测：上一帧有、新帧无的实体 = 消失（死亡/残影消散），返回最后坐标。
+  // 弹丸排除（期五第六刀）：弹丸消亡（命中/落地/超时）是弹道生命周期不是击杀，
+  // 落地哑弹不再冒红✕——走 collectProjectileDissolutions 的尘点/闪白分流
   function collectKills(prevEnts, newEnts) {
     var out = [];
     prevEnts.forEach(function (e, id) {
+      if (e.kind === 'projectile') return;
       if (!newEnts.has(id)) out.push({ x: e.x, y: e.y });
     });
     return out;
@@ -567,42 +575,37 @@
     return hit;
   }
 
-  // 操控定装弹参数镜像（#036；服务器 bin/codeworld/src/main.rs CTRL_SHOOT_* 常量同值
-  // ——改一处必须同步另一处，契约锚 net-protocol.md v1.9。纯前端装饰：实际弹道以
-  // 服务器物理为准）
-  var CTRL_SHOOT_SPEED = 12;          // 定装档弹速（格/拍，远低于世界极速 25）
-  var CTRL_SHOOT_ELEV = Math.PI / 3;  // 60° 仰角补偿（30° 会被重力 -9.8/拍 首拍压落地）
-  var PROJ_GRAVITY = -9.8;            // 世界重力（core DefaultPhysics 默认，预览模拟用）
-  var PROJ_DRAG = 0.05;               // 世界阻力（#034 默认；定装 mass=1.0）
+  // ==== 操控弹炮塔解算器（期五第六刀）：服务器 bin/codeworld/src/main.rs
+  // solve_launch_vector 同算法镜像（#028 镜像铁律：改一处必须同步另一处，
+  // 契约锚 net-protocol.md）。离散拍物理（重力→阻力→极速钳→位移；vy<9.8
+  // 首拍砸地）下连续闭式解失真，两侧都用「速度梯×角度扫描」模拟搜索——
+  // 解算说能打中当且仅当世界真的命中，不哑弹 ====
+  var CTRL_SHOOT_SPEED = 12;          // 基准档（驾驶档，格/拍）
+  var CTRL_SHOOT_DRAG_COMP = 1.15;    // 阻力补偿（首档=12×1.15=13.8）
+  var CTRL_SHOOT_MAX_EFF_SPEED = 22;  // 自适应火力上限（速度梯末档）
+  var CTRL_SOLVE_TOLERANCE = 0.65;    // 命中窗口=CCD 撞体判据（r弹0.15+r身0.5）
+  var CTRL_SOLVE_CLOSE_RANGE = 2.0;   // 近距一律低弧阈值
+  var CTRL_SHOOT_SPEED_LADDER = [13.8, 15, 16, 17, 18, 20, 22]; // 同 Rust 梯
+  var PROJ_GRAVITY = -9.8;            // 世界重力（core DefaultPhysics 默认）
+  var PROJ_DRAG = 0.05;               // 世界阻力（#034 默认）
   var PROJ_BODY = 0.15;               // 弹丸身体半径（落地判定线）
+  var PROJ_MASS = 1.0;                // 定装弹质量
+  var PROJ_MAX_SPEED = 25;            // 世界极速
+  var PROJ_MAX_AGE = 30;              // 弹丸寿命上限（拍）
+  var PROJ_TRAIL = 1.5;               // 弹丸尾迹世界长度（格；0.6→1.5 期五第六刀）
 
-  // 操控定装弹初速矢量（镜像 main.rs ctrl_shoot_vector 同式：瞄准单位矢量缩 cos(φ)
-  // 另加 sin(φ) 的 +y 分量——仰角恒向上抛与目标左右无关——再归一化 × 定装档速，
-  // 模长恒等于定装档不受瞄准高度影响）
-  function ctrlShootVector(sx, sy, tx, ty) {
-    var dx = tx - sx, dy = ty - sy;
-    var dist = Math.sqrt(dx * dx + dy * dy);
-    var ux = 0, uy = 1;
-    if (dist > 1e-9) { ux = dx / dist; uy = dy / dist; }
-    var cos = Math.cos(CTRL_SHOOT_ELEV), sin = Math.sin(CTRL_SHOOT_ELEV);
-    var vx = ux * cos, vy = uy * cos + sin;
-    var len = Math.sqrt(vx * vx + vy * vy);
-    return { x: CTRL_SHOOT_SPEED * vx / len, y: CTRL_SHOOT_SPEED * vy / len };
-  }
-
-  // 弹道弧线预览采样（纯装饰，实际弹道以服务器物理为准）：定装初速起步，逐拍模拟
-  // 重力+阻力+位移（与服务器弹道步同序：先重力、后阻力、再位移+极速钳制），
-  // 最多 5 个采样点，落地（y < 弹丸半径）提前截断。返回含起点的世界坐标点列
-  function previewTrajectory(sx, sy, tx, ty) {
-    var v = ctrlShootVector(sx, sy, tx, ty);
+  // 弹道模拟采样（镜像 main.rs solve_launch_vector 内 simulate_path：与
+  // crates/physics step_projectiles 同序——先重力、后阻力、再极速钳、再位移），
+  // 返回逐拍末坐标（含起点），落地 y<半径截断
+  function simTrajectory(sx, sy, vx, vy) {
     var pts = [{ x: sx, y: sy }];
-    var x = sx, y = sy, vx = v.x, vy = v.y;
-    for (var i = 0; i < 5; i++) {
+    var x = sx, y = sy;
+    for (var i = 0; i < PROJ_MAX_AGE; i++) {
       vy += PROJ_GRAVITY;
-      var f = 1 - PROJ_DRAG / 1.0; // 定装 mass=1.0
+      var f = 1 - PROJ_DRAG / PROJ_MASS;
       vx *= f; vy *= f;
       var sp = Math.sqrt(vx * vx + vy * vy);
-      if (sp > 25) { vx *= 25 / sp; vy *= 25 / sp; } // 世界极速钳制（镜像）
+      if (sp > PROJ_MAX_SPEED) { var k = PROJ_MAX_SPEED / sp; vx *= k; vy *= k; }
       x += vx; y += vy;
       pts.push({ x: x, y: y });
       if (y < PROJ_BODY) break; // 落地截断
@@ -610,10 +613,88 @@
     return pts;
   }
 
-  // 点击 -> 上行消息构造（#036 三分流）：
+  // 点到线段最小距离（弹道拍间是直线段，仅拍末采样会漏最近点——高弧命中
+  // 窗口在弹道中段下落穿过目标处，必须全程扫描，与服务器 CCD 撞体同判据）
+  function segMinDist(a, b, p) {
+    var abx = b.x - a.x, aby = b.y - a.y;
+    var l2 = abx * abx + aby * aby;
+    var t = l2 < 1e-12 ? 0 : (((p.x - a.x) * abx + (p.y - a.y) * aby) / l2);
+    t = Math.max(0, Math.min(1, t));
+    return Math.hypot(p.x - a.x - abx * t, p.y - a.y - aby * t);
+  }
+
+  // 炮塔解算器（镜像 main.rs solve_launch_vector 同算法）：给定发射点/目标点，
+  // 解出能命中目标的初速矢量；无解（超远/够不着）返回 null——前端不画弧线、
+  // 不发 shoot 消息（服务器同判据拒发，两侧一致不哑弹）。速度梯逐档×角度域
+  // 粗扫+两轮细化（低弧 [1°,45°] / 高弧 [46°,89°]，目标高于发射点取高弧、
+  // 近距一律低弧），每个候选按真实物理模拟弹道全程，全程最小距离 ≤ 命中窗口
+  // 即有解；低速度档优先（观感档位）
+  function solveLaunchVector(sx, sy, tx, ty) {
+    var dx = tx - sx, dy = ty - sy;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 1e-6) return null; // 零距离：贴身刀走 attack 分流
+    var highArc = d >= CTRL_SOLVE_CLOSE_RANGE && dy > 0;
+    var ux = dx / d;
+    function missOf(v, theta) {
+      var vx = v * Math.cos(theta) * ux, vy = v * Math.sin(theta);
+      var pts = simTrajectory(sx, sy, vx, vy);
+      var m = Infinity;
+      for (var i = 0; i < pts.length - 1; i++) {
+        m = Math.min(m, segMinDist(pts[i], pts[i + 1], { x: tx, y: ty }));
+      }
+      return m;
+    }
+    var deg = Math.PI / 180;
+    var lo = (highArc ? 46 : 1) * deg, hi = (highArc ? 89 : 45) * deg;
+    for (var li = 0; li < CTRL_SHOOT_SPEED_LADDER.length; li++) {
+      var v = CTRL_SHOOT_SPEED_LADDER[li];
+      var steps = 12, step0 = (hi - lo) / steps;
+      var bestTheta = lo, bestMiss = missOf(v, lo);
+      for (var i = 1; i <= steps; i++) {
+        var th = lo + step0 * i, m = missOf(v, th);
+        if (m < bestMiss) { bestMiss = m; bestTheta = th; }
+      }
+      var step = step0;
+      for (var r = 0; r < 2; r++) {
+        var lo2 = Math.max(bestTheta - step, lo), hi2 = Math.min(bestTheta + step, hi);
+        for (var j = 1; j <= 8; j++) {
+          var th2 = lo2 + (hi2 - lo2) * j / 8, m2 = missOf(v, th2);
+          if (m2 < bestMiss) { bestMiss = m2; bestTheta = th2; }
+        }
+        step /= 8;
+      }
+      if (bestMiss <= CTRL_SOLVE_TOLERANCE) {
+        return { x: v * Math.cos(bestTheta) * ux, y: v * Math.sin(bestTheta) };
+      }
+    }
+    return null; // 全速度梯×全角度够不着
+  }
+
+  // 弹道弧线预览采样（纯装饰，实际弹道以服务器物理为准）：解算初速起步逐拍
+  // 模拟（simTrajectory 同服务器步序），每拍 8 细分插值——折线变平滑真弧线
+  //（5 拍弹道 ≈ 40 点）。无解返回 null（调用方不画弧线+灰字"够不着"）
+  function previewTrajectory(sx, sy, tx, ty) {
+    var v = solveLaunchVector(sx, sy, tx, ty);
+    if (!v) return null;
+    var pts = simTrajectory(sx, sy, v.x, v.y);
+    var out = [];
+    for (var i = 0; i < pts.length - 1; i++) {
+      for (var s = 0; s < 8; s++) {
+        out.push({
+          x: pts[i].x + (pts[i + 1].x - pts[i].x) * s / 8,
+          y: pts[i].y + (pts[i + 1].y - pts[i].y) * s / 8,
+        });
+      }
+    }
+    out.push(pts[pts.length - 1]);
+    return out;
+  }
+
+  // 点击 -> 上行消息构造（#036 三分流 + 期五第六刀无解拦截）：
   // 点中实体 + 贴身距离内（< r我+r敌+0.5）= attack（贴身刀，#027/#034 语义不变）；
-  // 点中实体但超出贴身 = shoot（远程射击：前端只发目标坐标，弹道参数服务器算）；
-  // 无实体 = move（持续走位目标）。点击实体用其快照坐标（插值显示坐标，滞后可接受）
+  // 点中实体但超出贴身 = shoot（远程射击：先本地解算——无解=shoot-blocked 不发
+  // 消息，前端灰字"够不着"；有解才发，弹道参数服务器同步算）；无实体 = move。
+  // 点击实体用其快照坐标（插值显示坐标，滞后可接受）
   function decideClickMessage(state, wx, wy) {
     var hit = nearestEntityAtWorld(state, wx, wy);
     if (hit) {
@@ -624,6 +705,11 @@
       );
       if (inReach) {
         return { kind: 'attack', msg: { type: 'attack', x: hit.x, y: hit.y }, fx: { x: hit.x, y: hit.y }, hit: hit };
+      }
+      if (!me || !solveLaunchVector(me.x, me.y, hit.x, hit.y)) {
+        // 解算无解（目标超出定装射程）：不发消息（服务器同判据也会拒，
+        // 前置拦截省一次往返；fx 坐标供灰字提示定位）
+        return { kind: 'shoot-blocked', msg: null, fx: { x: hit.x, y: hit.y }, hit: hit };
       }
       return { kind: 'shoot', msg: { type: 'shoot', x: hit.x, y: hit.y }, fx: { x: hit.x, y: hit.y }, hit: hit };
     }
@@ -668,6 +754,29 @@
       hit = e; hd = d;
     });
     return hit;
+  }
+
+  // 弹丸消亡分流（期五第六刀）：上一帧 kind=projectile、新帧没有 = 消亡。
+  // 消亡点附近有身体 = 命中（返回 victim 坐标给闪白）；附近无人 = 落地/超时
+  // 哑弹（返回消亡点坐标给灰尘点）——弹丸生命周期不再混进击杀✕
+  function collectProjectileDissolutions(prevEnts, newEnts) {
+    var hits = [], dust = [];
+    prevEnts.forEach(function (e, id) {
+      if (e.kind !== 'projectile' || newEnts.has(id)) return;
+      var victim = nearestProjectileVictim(newEnts, e.x, e.y);
+      if (victim) hits.push({ x: victim.x, y: victim.y });
+      else dust.push({ x: e.x, y: e.y });
+    });
+    return { hits: hits, dust: dust };
+  }
+
+  // 悬浮标签锚点（期五第六刀）：贴着实体正上方水平居中（身体圆顶再留 4px），
+  // 越界 clamp 视口内。px/py=实体屏幕坐标、rPx=身体圆像素半径、tipW/tipH=标签尺寸
+  function tooltipAnchor(px, py, rPx, tipW, tipH, viewW) {
+    return {
+      left: Math.min(Math.max(px - tipW / 2, 4), viewW - tipW - 4),
+      top: Math.max(py - rPx - tipH - 4, 4),
+    };
   }
 
   // 实体表里找操控目标（controlled 标记是服务器每拍解析的 me 声明，#024）
@@ -838,7 +947,7 @@
         var dxv = prevP ? e.x - prevP.x : 0, dyv = prevP ? e.y - prevP.y : 0;
         var vl = Math.sqrt(dxv * dxv + dyv * dyv);
         if (vl > 0.01) {
-          var tl = 0.6; // 尾迹世界长度（格），方向 = 当前插值位置 - 上一快照位置
+          var tl = PROJ_TRAIL; // 尾迹世界长度（格，PURE 区常量），方向 = 当前插值位置 - 上一快照位置
           var ts = worldToScreen(e.x - dxv / vl * tl, e.y - dyv / vl * tl);
           ctx.strokeStyle = e.color || '#e6edf3';
           ctx.lineWidth = Math.max(1.5, pr * 0.8);
@@ -994,7 +1103,37 @@
       ctx.globalAlpha = 1;
     }
 
-    // 击杀标记（第四刀 B2）：快照中消失的实体在最后坐标留渐隐 ✕（1.5s）
+    // 哑弹落尘（期五第六刀）：弹丸落地/超时消亡处灰圈扩散渐隐 500ms（中性特效，
+    // 不再冒击杀✕）
+    dustFx = dustFx.filter(function (f) { return nowFx - f.born < 500; });
+    for (var ui = 0; ui < dustFx.length; ui++) {
+      var du = dustFx[ui];
+      var dp = worldToScreen(du.x, du.y);
+      var age = (nowFx - du.born) / 500;
+      ctx.globalAlpha = (1 - age) * 0.6;
+      ctx.strokeStyle = '#8b949e';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(dp.x, dp.y, 3 + age * 7, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // "够不着"提示（期五第六刀）：射击解算无解的目标旁灰字 1s 渐隐（不打哑弹）
+    noReachFx = noReachFx.filter(function (f) { return nowFx - f.born < 1000; });
+    for (var ni = 0; ni < noReachFx.length; ni++) {
+      var nr = noReachFx[ni];
+      var np = worldToScreen(nr.x, nr.y);
+      ctx.globalAlpha = 1 - (nowFx - nr.born) / 1000;
+      ctx.fillStyle = '#8b949e';
+      ctx.font = '12px Consolas, monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('够不着', np.x, np.y - cell * 0.8);
+      ctx.globalAlpha = 1;
+    }
+
+    // 击杀标记（第四刀 B2）：快照中消失的实体在最后坐标留渐隐 ✕（1.5s；弹丸
+    // 已被 collectKills 排除——哑弹落尘/命中闪白各走各的特效）
     killFx = killFx.filter(function (m) { return nowFx - m.born < 1500; });
     for (var mi = 0; mi < killFx.length; mi++) {
       var km = killFx[mi];
@@ -1031,7 +1170,7 @@
       lastState.ents.forEach(function (e) {
         var p = worldToScreen(e.x, e.y);
         var d = (p.x - mouse.x) * (p.x - mouse.x) + (p.y - mouse.y) * (p.y - mouse.y);
-        if (d <= thr2 && (!hit || d < hit.d)) hit = { e: e, d: d };
+        if (d <= thr2 && (!hit || d < hit.d)) hit = { e: e, p: p, d: d };
       });
     }
     if (!hit) {
@@ -1044,8 +1183,13 @@
     if (e.kind === 'creation' && e.owner) text += ' · owner ' + e.owner.slice(0, 8);
     tipEl.textContent = text;
     tipEl.hidden = false;
-    tipEl.style.left = Math.min(mouse.x + 14, viewW - tipEl.offsetWidth - 4) + 'px';
-    tipEl.style.top = Math.max(mouse.y - 26, 4) + 'px';
+    // 锚点=实体正上方水平居中（身体圆顶再留 4px，越界 clamp——期五第六刀；
+    // 旧版锚鼠标指针偏移，实体移动时标签漂移）
+    var cellT = Math.min(viewW / view.w, viewH / view.h);
+    var rPx = Math.max(6, cellT * (e.radius || 0.5));
+    var anch = tooltipAnchor(hit.p.x, hit.p.y, rPx, tipEl.offsetWidth, tipEl.offsetHeight, viewW);
+    tipEl.style.left = anch.left + 'px';
+    tipEl.style.top = anch.top + 'px';
   }
 
   cv.addEventListener('mousemove', function (ev) {
@@ -1071,7 +1215,7 @@
     var r = cv.getBoundingClientRect();
     var w = screenToWorld(ev.clientX - r.left, ev.clientY - r.top);
     var decision = decideClickMessage(lastState, w.x, w.y);
-    sendMsg(decision.msg);
+    if (decision.msg) sendMsg(decision.msg); // shoot-blocked 无消息可发（期五第六刀）
     if (decision.kind === 'move') {
       moveTarget = { x: w.x, y: w.y }; // 本地虚线目标（服务器权威，仅提示）
       startPrediction(moveTarget);     // 己方预测（第四刀 A1）：点击瞬间 P 就动
@@ -1088,8 +1232,14 @@
       }
       return;
     }
-    // 远程射击（#036）：定装弹道弧线预览（本地模拟纯装饰，实际弹道以服务器为准）
-    // ——从 P 当前快照坐标到目标的一道渐隐虚线弧 + 终点小圆
+    // 远程射击（#036 + 期五第六刀）：shoot-blocked=解算无解，灰字"够不着"提示、
+    // 不发消息不画弧；shoot=定装弹道弧线预览（本地模拟纯装饰，实际弹道以服务器
+    // 为准）——从 P 当前快照坐标到目标的一道渐隐虚线弧 + 终点小圆
+    if (decision.kind === 'shoot-blocked') {
+      noReachFx.push({ x: decision.fx.x, y: decision.fx.y, born: performance.now() });
+      while (noReachFx.length > 8) noReachFx.shift();
+      return;
+    }
     if (meAtk) {
       shootArcs.push({
         pts: previewTrajectory(meAtk.x, meAtk.y, decision.fx.x, decision.fx.y),
@@ -1234,6 +1384,8 @@
       clearPrediction();        // 预测状态一并清空（重连后世界可能重启，坐标不连续）
       attackLines = [];
       killFx = [];
+      dustFx = [];
+      noReachFx = [];
       shootArcs = [];           // 弧线预览一并清（#036：重连后从服务器快照重来）
       dcBannerEl.hidden = true; // #036：断线横幅消失，操控恢复
       renderConn();
@@ -1250,6 +1402,8 @@
       clearPrediction(); // 断线清预测（重连后从服务器快照重新开始）——#036 冻结的根基
       attackLines = [];
       killFx = [];
+      dustFx = [];
+      noReachFx = [];
       shootArcs = [];
       connState = 'bad';
       // 已登出（#025）：不自动重连——重连=重新认领操控（顶掉接管者），

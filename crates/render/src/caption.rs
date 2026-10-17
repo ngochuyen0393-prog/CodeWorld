@@ -9,29 +9,35 @@
 /// 计算字幕行内容（纯函数，MVP 格式）
 ///
 /// 格式（全 ASCII，理由见决策 #006）：`tick=12 | A->D dist=2.4 | D shield=7 | alive=3`
-/// - dist=None（A 或 D 不在场/已死）-> `dist=--`
+/// - dist=None 且 A 在场（D 缺席/已死）-> `dist=--`
+/// - dist=None 且 A 不在场 -> 距离段改显式 `A:阵亡`（期五第六刀：dist=--
+///   分不清谁没了，观战者需要知道 A 已出局）
 /// - shield=None（D 不在场或本局尚未上报）-> `shield=?`
 /// - 距离保留 1 位小数
 /// - ctrl=Some（操控层 v0：操控目标在线）-> 尾部追加 ` | ctrl:P`（玩家名字形）
 pub fn format_caption(
     tick: u64,
     dist: Option<f64>,
+    a_present: bool,
     shield: Option<i32>,
     alive: usize,
     ctrl: Option<&str>,
 ) -> String {
-    let dist_text = match dist {
-        Some(d) => format!("{:.1}", d),
-        None => "--".to_string(),
-    };
     let shield_text = match shield {
         Some(s) => s.to_string(),
         None => "?".to_string(),
     };
-    let base = format!(
-        "tick={} | A->D dist={} | D shield={} | alive={}",
-        tick, dist_text, shield_text, alive
-    );
+    let base = match dist {
+        Some(d) => format!(
+            "tick={} | A->D dist={:.1} | D shield={} | alive={}",
+            tick, d, shield_text, alive
+        ),
+        None if a_present => format!(
+            "tick={} | A->D dist=-- | D shield={} | alive={}",
+            tick, shield_text, alive
+        ),
+        None => format!("tick={} | A:阵亡 | D shield={} | alive={}", tick, shield_text, alive),
+    };
     match ctrl {
         Some(glyph) => format!("{base} | ctrl:{glyph}"),
         None => base,
@@ -66,14 +72,19 @@ impl CaptionState {
 
     /// 更新字幕：合并盾量上报 + 重算行内容 + 战况值变化时打一条 info 日志（不每 tick 刷屏）
     ///
+    /// - `a_present`：A 是否在场。A 已死则距离段改显式 `A:阵亡`（期五第六刀）。
     /// - `d_present`：D 是否在场。D 已死则盾显示占位符（死人不报盾），
     ///   即使此前有过上报值；D 回不来，无需清理持久状态。
     /// - `shield_report`：本 tick 的盾量上报（None = 本 tick 无上报，保持上次值）。
     /// - `ctrl`：操控目标字形（操控层 v0；None = 无玩家在线，不显示 ctrl 段）。
+    // 转发层参数随 caption 语义演进增长（期五第六刀 +a_present），打包结构体
+    // 会波及全部测试调用点，转发层留注解豁免
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         tick: u64,
         dist: Option<f64>,
+        a_present: bool,
         d_present: bool,
         shield_report: Option<i32>,
         alive: usize,
@@ -83,7 +94,7 @@ impl CaptionState {
             self.shield = Some(v);
         }
         let display_shield = if d_present { self.shield } else { None };
-        self.line = format_caption(tick, dist, display_shield, alive, ctrl);
+        self.line = format_caption(tick, dist, a_present, display_shield, alive, ctrl);
         // 距离按 0.1 精度取整判变化：微小浮点抖动（物理漂移）不算"战况变化"
         let dist_tenths = dist.map(|d| (d * 10.0).round() as i64);
         let semantic = (dist_tenths, display_shield, alive, ctrl.map(str::to_string));
@@ -112,42 +123,56 @@ mod tests {
     #[test]
     fn format_caption_full_line() {
         // 读写：全量输入 -> 完整字幕行（任务书样例内容，ASCII 化）
-        let line = format_caption(12, Some(2.44), Some(7), 3, None);
+        let line = format_caption(12, Some(2.44), true, Some(7), 3, None);
         assert_eq!(line, "tick=12 | A->D dist=2.4 | D shield=7 | alive=3");
     }
 
     #[test]
     fn format_caption_dist_none_shows_placeholder() {
-        // 负面路径：A 或 D 缺席（已死/被第三方击杀）-> 距离无意义，显示占位符
-        let line = format_caption(20, None, Some(7), 2, None);
+        // 负面路径：D 缺席（已死/被第三方击杀）且 A 在场 -> 距离无意义，显示占位符
+        let line = format_caption(20, None, true, Some(7), 2, None);
         assert_eq!(line, "tick=20 | A->D dist=-- | D shield=7 | alive=2");
+    }
+
+    #[test]
+    fn format_caption_attacker_dead_shows_down_marker() {
+        // 期五第六刀：A 阵亡时 dist=-- 语义模糊（看不出谁没了）——改显式 A:阵亡
+        let line = format_caption(20, None, false, Some(7), 2, None);
+        assert_eq!(line, "tick=20 | A:阵亡 | D shield=7 | alive=2");
+    }
+
+    #[test]
+    fn format_caption_both_dead_still_shows_attacker_marker() {
+        // 双双阵亡：距离段仍显式标 A:阵亡（占位符不回来，D 的缺席由 shield=? 兜底）
+        let line = format_caption(30, None, false, None, 1, None);
+        assert_eq!(line, "tick=30 | A:阵亡 | D shield=? | alive=1");
     }
 
     #[test]
     fn format_caption_shield_unknown_shows_placeholder() {
         // 负面路径：盾量未知（D 不在场，或 D 尚未拦截上报过）-> 占位符
-        let line = format_caption(1, Some(10.0), None, 3, None);
+        let line = format_caption(1, Some(10.0), true, None, 3, None);
         assert_eq!(line, "tick=1 | A->D dist=10.0 | D shield=? | alive=3");
     }
 
     #[test]
     fn format_caption_last_survivor() {
         // 负面路径：全场剩 1 个（无敌人可扫描）-> 距离与盾全占位
-        let line = format_caption(30, None, None, 1, None);
+        let line = format_caption(30, None, true, None, 1, None);
         assert_eq!(line, "tick=30 | A->D dist=-- | D shield=? | alive=1");
     }
 
     #[test]
     fn format_caption_zero_shield_displayed_as_zero() {
         // 边界：盾尽是合法上报值 0，不能与"未知"占位符混淆
-        let line = format_caption(11, Some(1.0), Some(0), 2, None);
+        let line = format_caption(11, Some(1.0), true, Some(0), 2, None);
         assert_eq!(line, "tick=11 | A->D dist=1.0 | D shield=0 | alive=2");
     }
 
     #[test]
     fn format_caption_appends_ctrl_when_control_target_online() {
         // 操控层 v0：操控目标在线 -> 尾部追加 ctrl:玩家字形（任务 C.1）
-        let line = format_caption(5, Some(2.4), Some(7), 3, Some("P"));
+        let line = format_caption(5, Some(2.4), true, Some(7), 3, Some("P"));
         assert_eq!(
             line,
             "tick=5 | A->D dist=2.4 | D shield=7 | alive=3 | ctrl:P",

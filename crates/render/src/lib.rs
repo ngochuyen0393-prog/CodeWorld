@@ -82,22 +82,26 @@ impl Renderer {
     /// 更新战况字幕（host 每 tick 喂入只读战况快照）
     ///
     /// - tick/距离/存活数来自 world；盾量来自玩家代码 env.log marker 上报（host 解析）。
+    /// - `a_present`：攻击者是否在场（不在场则距离段显式标 `A:阵亡`，期五第六刀）。
     /// - `d_present`：防御者是否在场（不在场则盾显示占位符）。
     /// - `shield_report`：本 tick 的盾量上报，None = 无新上报（保持上次值）。
     /// - `ctrl`：操控目标字形（操控层 v0；None = 无玩家在线，不显示 ctrl 段）。
     /// - 战况值（距离 0.1 精度/盾量/存活数/操控状态）变化时打一条 info 日志，不每 tick 刷屏。
     /// - 实际写 buffer 发生在 render()（本帧 diff 计算之前，保证变化进 diff）。
+    // 纯转发层（caption.rs CaptionState::update 同参），留注解豁免同理
+    #[allow(clippy::too_many_arguments)]
     pub fn update_caption(
         &mut self,
         tick: u64,
         dist: Option<f64>,
+        a_present: bool,
         d_present: bool,
         shield_report: Option<i32>,
         alive: usize,
         ctrl: Option<&str>,
     ) {
         self.caption
-            .update(tick, dist, d_present, shield_report, alive, ctrl);
+            .update(tick, dist, a_present, d_present, shield_report, alive, ctrl);
     }
 
     /// 完整渲染流程（三阶段），返回本帧与上帧的差异格子坐标列表
@@ -440,7 +444,7 @@ mod tests {
         // 读写：update_caption 存字幕行，render 后第 0 行显示字幕；diff 含 row 0 格子
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(12, Some(2.44), true, Some(7), 3, None);
+        r.update_caption(12, Some(2.44), true, true, Some(7), 3, None);
         let diff = r.render(&world);
         assert_eq!(
             row0_line(&r),
@@ -455,11 +459,11 @@ mod tests {
         // 修改：字幕内容变化 -> 下帧 diff 含 row 0（随 tick 更新的依据：换行即重绘）
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(1, Some(9.0), true, None, 2, None);
+        r.update_caption(1, Some(9.0), true, true, None, 2, None);
         r.render(&world);
         let mut out = Vec::new();
         r.flush_to(&mut out).unwrap(); // swap
-        r.update_caption(2, Some(8.0), true, None, 2, None);
+        r.update_caption(2, Some(8.0), true, true, None, 2, None);
         let diff = r.render(&world);
         assert!(
             diff.iter().any(|&(row, _)| row == 0),
@@ -474,11 +478,11 @@ mod tests {
         // 语义段（col>=10，"| A->D..." 起）不产生 diff（画面不闪烁，日志不刷屏同理）
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(1, Some(9.0), true, None, 2, None);
+        r.update_caption(1, Some(9.0), true, true, None, 2, None);
         r.render(&world);
         let mut out = Vec::new();
         r.flush_to(&mut out).unwrap(); // swap
-        r.update_caption(2, Some(9.0), true, None, 2, None); // 仅 tick 变化
+        r.update_caption(2, Some(9.0), true, true, None, 2, None); // 仅 tick 变化
         let diff = r.render(&world);
         assert!(
             diff.iter().all(|&(_, col)| col < 10),
@@ -492,7 +496,7 @@ mod tests {
         // 边界：字幕行超过终端列数 -> 截断到 cols，不越界、不影响其他行
         let mut r = Renderer::new(Viewport::new((5.0, 5.0), 5.0, 5.0, 10, 10));
         let world = WorldState::new();
-        r.update_caption(1, Some(1.0), true, Some(1), 1, None);
+        r.update_caption(1, Some(1.0), true, true, Some(1), 1, None);
         r.render(&world);
         let line = row0_line(&r);
         assert!(
@@ -512,7 +516,7 @@ mod tests {
             EntityId(Uuid::from_u128(1)),
             make_entity(1, (5.0, 0.0), "@", true), // y=0 -> row 0
         );
-        r.update_caption(1, Some(1.0), true, None, 1, None);
+        r.update_caption(1, Some(1.0), true, true, None, 1, None);
         r.render(&world);
         assert_eq!(
             r.buffer().get(0, 0).unwrap().glyph,
@@ -526,11 +530,11 @@ mod tests {
         // 读写：盾量只在 D 上报时更新，两次上报之间保持上次值（不闪回占位符）
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(1, Some(9.0), true, Some(9), 2, None);
+        r.update_caption(1, Some(9.0), true, true, Some(9), 2, None);
         r.render(&world);
         assert!(row0_line(&r).contains("shield=9"), "上报后应显示盾 9");
         // 下一 tick 无新上报（report=None）-> 保持 9
-        r.update_caption(2, Some(8.0), true, None, 2, None);
+        r.update_caption(2, Some(8.0), true, true, None, 2, None);
         r.render(&world);
         assert!(
             row0_line(&r).contains("shield=9"),
@@ -544,9 +548,9 @@ mod tests {
         // 负面路径：D 已死（d_present=false）-> 盾显示占位符（死人不报盾）
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(1, Some(9.0), true, Some(9), 2, None);
+        r.update_caption(1, Some(9.0), true, true, Some(9), 2, None);
         r.render(&world);
-        r.update_caption(2, None, false, None, 1, None); // D 不在场
+        r.update_caption(2, None, true, false, None, 1, None); // D 不在场
         r.render(&world);
         assert!(
             row0_line(&r).contains("shield=?"),
@@ -560,7 +564,7 @@ mod tests {
         // 操控层 v0：操控目标在线 -> 字幕尾部 ctrl:字形
         let mut r = renderer_80cols();
         let world = WorldState::new();
-        r.update_caption(5, Some(2.4), true, None, 3, Some("P"));
+        r.update_caption(5, Some(2.4), true, true, None, 3, Some("P"));
         r.render(&world);
         assert!(
             row0_line(&r).ends_with("ctrl:P"),

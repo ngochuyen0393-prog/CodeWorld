@@ -1136,25 +1136,38 @@ fn tick_with_intents(
                 tracing::info!("[input] 操控意图 Attack target={tpos:?} player={name}（操控刀优先）");
             }
             input::ControlledAction::Shoot { tx, ty } => {
-                // 操控射击（#036 定装弹）：升力独立同款——悬空射击拍照常免重力；
-                // 走位目标未清（边走边射）。弹道参数服务器定装（驾驶档）：
-                // 方向=目标方向+60° 仰角补偿（30° 会被重力首拍压落地，见常量注）、
-                // 弹速 12、mass 1.0、payload 空、unbound
+                // 操控射击（#036 + 期五第六刀炮塔解算器）：升力独立同款——悬空射击
+                // 拍照常免重力；走位目标未清（边走边射）。弹道参数按目标实时解算
+                //（驾驶档基准 12+阻力补偿，够不着爬坡封顶 18）；无解不发射（INFO
+                // 明示，不打必落空的哑弹）
                 if let Some(e) = world.entities.get(id) {
                     if e.pos().1 > e.radius() {
                         aloft.insert(*id);
                     }
-                    let (vx, vy) = ctrl_shoot_vector(e.pos(), (*tx, *ty));
-                    sandbox_map.ctrl_shoots.push(codeworld_arena::sandbox::PendingShoot {
-                        shooter: *id,
-                        vx,
-                        vy,
-                        mass: CTRL_SHOOT_MASS,
-                        binding: 0,
-                        payload: Vec::new(),
-                    });
+                    match solve_launch_vector(e.pos().0, e.pos().1, *tx, *ty, CTRL_SHOOT_SPEED) {
+                        Some((vx, vy)) => {
+                            sandbox_map
+                                .ctrl_shoots
+                                .push(codeworld_arena::sandbox::PendingShoot {
+                                    shooter: *id,
+                                    vx,
+                                    vy,
+                                    mass: CTRL_SHOOT_MASS,
+                                    binding: 0,
+                                    payload: Vec::new(),
+                                });
+                        }
+                        None => {
+                            tracing::info!(
+                                player = %name,
+                                target_x = *tx,
+                                target_y = *ty,
+                                "[ctrl] 射击解算无解（目标超出定装射程），不发射"
+                            );
+                        }
+                    }
                 }
-                tracing::info!("[input] 操控意图 Shoot target=({tx},{ty}) player={name}（定装弹：速度{CTRL_SHOOT_SPEED}/仰角60°/mass{CTRL_SHOOT_MASS}）");
+                tracing::info!("[input] 操控意图 Shoot target=({tx},{ty}) player={name}（炮塔解算：基准{CTRL_SHOOT_SPEED}×阻力补偿，上限{CTRL_SHOOT_MAX_EFF_SPEED}）");
             }
         }
     }
@@ -1390,6 +1403,7 @@ fn tick_with_intents(
     renderer.update_caption(
         current_tick,
         dist,
+        attacker.is_some(),
         defender.is_some(),
         if defender.is_some() { shield_report } else { None },
         world.entities.len(),
@@ -1795,37 +1809,171 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
     }
 }
 
-/// 操控定装弹参数（#036 驾驶档）：初速模长（格/拍）。12 远低于世界极速 25——
-/// 弹道好看（H 玩家代码抛射初速 ~15 观感良好，操控档略低更优雅），发射钳制必过。
-/// 操控层是"驾驶"：参数定档不由玩家调，自定义弹道走玩家代码 env.shoot。
+/// 操控定装弹基准炮口速度（格/拍，#036 驾驶档）。12 远低于世界极速 25——发射
+/// 钳制必过。操控层是"驾驶"：基准档不由玩家调，自定义弹道走玩家代码 env.shoot。
+/// 期五第六刀起实际初速由解算器在速度梯（见 [`CTRL_SHOOT_SPEED_LADDER`]）中
+/// 搜索确定，此值×补偿系数是梯首档（最常用的观感档）。
 const CTRL_SHOOT_SPEED: f64 = 12.0;
-/// 操控定装弹仰角补偿（弧度，60°）。任务书建议 30° 在本世界拍节奏下物理不成立：
-/// 重力 -9.8/拍，30° 仰角 vy=6 < 9.8，弹丸首拍即落地成哑弹——参考 H 实战弹
-/// 仰角 ~59°（vy=14.7 两拍回弧）定 60°，vy=10.4 两拍抛物线、射程 ~11 格
-///（标定锚：默认参数标准上抛射程 5~15 格，#034）
-const CTRL_SHOOT_ELEVATION: f64 = std::f64::consts::FRAC_PI_3;
+/// 阻力补偿系数：世界每拍速度衰 5%（drag 0.05/mass 1.0），补偿档=基准×1.15。
+const CTRL_SHOOT_DRAG_COMP: f64 = 1.15;
+/// 自适应火力上限（格/拍）= 速度梯末档。该值决定"够不着"的有效门槛：
+/// 离散拍物理（半隐式欧拉，位移=重力后末速度）下弹道顶点峰值
+/// ≈ sy + Σ(vy_n)，v=22 高弧顶点 ~12.8 格（12 格高的 S 需 vy≈21.5）、
+/// 15 格地面目标需 ~17；13.8 档射程仅 ~10 格（vy>9.8 才能飞过首拍）。
+/// 地面无解门槛 ~25 格（22 档射程），低档优先所以常规目标不受影响。
+pub const CTRL_SHOOT_MAX_EFF_SPEED: f64 = 22.0;
+/// 解算收敛容差（格）：弹道全程与目标的最小距离 ≤ 此值视为可命中。
+/// 0.65 = CCD 撞体窗口满值（r弹 0.15 + r身 0.5）——与服务器结算判据完全一致，
+/// 不是放宽（弹道扫过窗口即真实命中）。
+const CTRL_SOLVE_TOLERANCE: f64 = 0.65;
+/// 近距阈值：低于此距离一律低弧（近距高弧解近乎垂直吊射自己脑门，反直觉坏解）
+const CTRL_SOLVE_CLOSE_RANGE: f64 = 2.0;
+/// 速度搜索梯（格/拍，从低到高）：离散拍物理下速度决定可飞角度域与射程
+///（见 [`CTRL_SHOOT_MAX_EFF_SPEED`] 注），解析公式严重失真，故速度也由搜索
+/// 确定——逐档尝试，首个可行解即返回（低速度观感档位优先）。末档=火力上限。
+const CTRL_SHOOT_SPEED_LADDER: [f64; 7] = [
+    CTRL_SHOOT_SPEED * CTRL_SHOOT_DRAG_COMP, // 13.8 补偿档
+    15.0,
+    16.0,
+    17.0,
+    18.0,
+    20.0,
+    CTRL_SHOOT_MAX_EFF_SPEED,
+];
 /// 操控定装弹质量（#034：mass 只参与物理弹道，永不参与攻击结算）
 const CTRL_SHOOT_MASS: f64 = 1.0;
 
-/// 操控定装弹初速矢量（纯函数；前端弹道弧线预览同式镜像——改一处必须同步另一处，
-/// 契约锚 net-protocol.md v1.9）：瞄准方向抬升仰角后归一化 × 定装档速。
-/// 抬升 = 瞄准单位矢量缩 cos(φ) 另加 sin(φ) 的 +y 分量（仰角恒向上抛，与目标
-/// 在左在右无关），结果归一化保模长恒等于定装档（不受瞄准高度影响）。
-fn ctrl_shoot_vector(from: (f64, f64), to: (f64, f64)) -> (f64, f64) {
-    let dx = to.0 - from.0;
-    let dy = to.1 - from.1;
-    let dist = (dx * dx + dy * dy).sqrt();
-    // 零距离目标防御：方向退化为正上（归一化分母保护）
-    let (ux, uy) = if dist > 1e-9 {
-        (dx / dist, dy / dist)
-    } else {
-        (0.0, 1.0)
+/// 操控弹炮塔解算器（期五第六刀重写：不再恒定 60° 仰角——那是高空目标
+/// 四发哑弹的根因，顶点 ~9.6 够不到 12 格高的 S）。给定发射点/目标点/基准
+/// 炮口速度，解出能命中目标的初速矢量。
+///
+/// 选型说明（闭式解 vs 模拟搜索）：教科书闭式解
+/// tanθ = (v² ± √(v⁴ - g(g·d² + 2·Δy·v²))) / (g·d) 假设连续时间物理，本世界
+/// 是离散拍物理（重力先作用于整拍再位移）：vy < 9.8 的弹**首拍即砸地**，
+/// 可飞角度域/射程随速度非线性跳变（13.8 档射程 ~10 格 vs 连续公式 ~19 格），
+/// 连续解系统性失真（30° 定角方案当年也因此报废）。故本解算器用模拟搜索：
+/// 速度梯逐档 × 角度域粗扫+两轮细化，每个候选按真实物理步序（重力→阻力→
+/// 极速钳→位移，与 step_projectiles 同序）模拟弹道全程，取全程最小距离。
+/// 判据（0.65=CCD 撞体窗口）与服务器结算完全一致——解算"说能打中"当且仅当
+/// 世界物理"真的会命中"，不哑弹。每次解算 ≤5 档 ×~28 角 ×30 拍模拟，微秒级。
+///
+/// 弧线分支（决定搜索区间）：近距（<[`CTRL_SOLVE_CLOSE_RANGE`]）一律低弧
+/// [1°,45°]；否则目标高于发射点（Δy>0）取高弧 [46°,89°]（高抛观感，任务书
+/// 业界对标；双根语义：+ 号 tanθ 大 = 角陡 = 高弧），否则低弧。
+///
+/// 前端弧线预览镜像同算法（#028 镜像铁律，契约锚 net-protocol.md）——
+/// 改一处必须同步另一处。
+///
+/// 返回 None（无解）的路径：零距离目标（贴脸走 attack 分流不解算）/
+/// 全速度梯×全角度无一进入命中窗口（目标够不着或物理上打不准）。
+pub fn solve_launch_vector(
+    sx: f64,
+    sy: f64,
+    tx: f64,
+    ty: f64,
+    _base_speed: f64,
+) -> Option<(f64, f64)> {
+    let dx = tx - sx;
+    let dy = ty - sy;
+    let d = (dx * dx + dy * dy).sqrt();
+    if d < 1e-6 {
+        return None; // 零距离目标：贴身刀走 attack 通道，射击解算拒绝
+    }
+    let phys = codeworld_core::physics::DefaultPhysics::default();
+    let high_arc = d >= CTRL_SOLVE_CLOSE_RANGE && dy > 0.0;
+    // 模拟弹道全程：真实物理步序（与 crates/physics step_projectiles 同序镜像），
+    // 返回逐拍末坐标（含起点），落地 y<半径截断
+    let simulate_path = |mut vx: f64, mut vy: f64| -> Vec<(f64, f64)> {
+        let r = codeworld_core::collision::PROJECTILE_RADIUS;
+        let mut pts = vec![(sx, sy)];
+        let (mut x, mut y) = (sx, sy);
+        for _ in 0..codeworld_physics::default::PROJECTILE_MAX_AGE_TICKS {
+            vy += phys.gravity;
+            let f = 1.0 - phys.drag_coefficient / CTRL_SHOOT_MASS;
+            vx *= f;
+            vy *= f;
+            let sp = (vx * vx + vy * vy).sqrt();
+            if sp > phys.max_speed {
+                let k = phys.max_speed / sp;
+                vx *= k;
+                vy *= k;
+            }
+            x += vx;
+            y += vy;
+            pts.push((x, y));
+            if y < r {
+                break;
+            }
+        }
+        pts
     };
-    let cos = CTRL_SHOOT_ELEVATION.cos();
-    let sin = CTRL_SHOOT_ELEVATION.sin();
-    let (dx2, dy2) = (ux * cos, uy * cos + sin);
-    let len = (dx2 * dx2 + dy2 * dy2).sqrt();
-    (CTRL_SHOOT_SPEED * dx2 / len, CTRL_SHOOT_SPEED * dy2 / len)
+    // 点到线段最小距离（弹道拍间是直线段，仅拍末采样会漏最近点——
+    // 高弧命中窗口在弹道中段下落穿过目标处，必须全程扫描，与服务器 CCD 撞体同判据）
+    let seg_min_dist = |a: (f64, f64), b: (f64, f64), p: (f64, f64)| -> f64 {
+        let (abx, aby) = (b.0 - a.0, b.1 - a.1);
+        let len2 = abx * abx + aby * aby;
+        let t = if len2 < 1e-12 {
+            0.0
+        } else {
+            (((p.0 - a.0) * abx + (p.1 - a.1) * aby) / len2).clamp(0.0, 1.0)
+        };
+        ((p.0 - a.0 - abx * t).powi(2) + (p.1 - a.1 - aby * t).powi(2)).sqrt()
+    };
+    // 给定速度的角度域搜索：粗扫 12 段 + 两轮细化（每轮步长 /8）。
+    // 离散拍物理下 miss(θ) 在近距区不保证单峰（首拍砸地断崖），粗扫保底全局、
+    // 细化收精度；最优 miss ≤ 容差才有解
+    let scan_angle = |v: f64| -> Option<(f64, f64)> {
+        let ux = dx / d; // 水平方位单位矢量（解算发生在发射点→目标的垂直平面内）
+        let miss_of = |theta: f64| -> f64 {
+            let (vx, vy) = (v * theta.cos() * ux, v * theta.sin());
+            simulate_path(vx, vy)
+                .windows(2)
+                .map(|w| seg_min_dist(w[0], w[1], (tx, ty)))
+                .fold(f64::MAX, f64::min)
+        };
+        let deg = std::f64::consts::PI / 180.0;
+        let (lo, hi) = if high_arc {
+            (46.0 * deg, 89.0 * deg)
+        } else {
+            (1.0 * deg, 45.0 * deg)
+        };
+        let steps = 12;
+        let step0 = (hi - lo) / steps as f64;
+        let mut best_theta = lo;
+        let mut best_miss = miss_of(lo);
+        for i in 1..=steps {
+            let th = lo + step0 * i as f64;
+            let m = miss_of(th);
+            if m < best_miss {
+                best_miss = m;
+                best_theta = th;
+            }
+        }
+        let mut step = step0;
+        for _ in 0..2 {
+            let (lo2, hi2) = ((best_theta - step).max(lo), (best_theta + step).min(hi));
+            for i in 1..=8 {
+                let th = lo2 + (hi2 - lo2) * i as f64 / 8.0;
+                let m = miss_of(th);
+                if m < best_miss {
+                    best_miss = m;
+                    best_theta = th;
+                }
+            }
+            step /= 8.0;
+        }
+        if best_miss <= CTRL_SOLVE_TOLERANCE {
+            Some((v * best_theta.cos() * ux, v * best_theta.sin()))
+        } else {
+            None // 该速度档全角度够不着/打不准，升下一档
+        }
+    };
+    for v in CTRL_SHOOT_SPEED_LADDER {
+        if let Some(sol) = scan_angle(v) {
+            return Some(sol);
+        }
+    }
+    None // 全速度梯×全角度无一进入命中窗口 = 够不着，不发射哑弹
 }
 
 /// 发射处理（#034 弹道系统：env.shoot 排队请求 -> 弹丸实体落地成世界物体）
@@ -6817,41 +6965,145 @@ mod tests {
             .count()
     }
 
-    #[test]
-    fn ctrl_shoot_vector_keeps_fixed_muzzle_speed() {
-        // 定装弹初速：模长恒 CTRL_SHOOT_SPEED（12 < 世界极速 25，发射钳制必过）
-        for (from, to) in [
-            ((30.0, 0.5), (45.0, 0.5)),  // 正东
-            ((30.0, 0.5), (15.0, 0.5)),  // 正西
-            ((30.0, 0.5), (30.0, 12.0)), // 正上
-            ((30.0, 0.5), (30.0, 0.2)),  // 微降（贴地目标）
-        ] {
-            let (vx, vy) = ctrl_shoot_vector(from, to);
-            let speed = (vx * vx + vy * vy).sqrt();
-            assert!(
-                (speed - CTRL_SHOOT_SPEED).abs() < 1e-9,
-                "初速模长恒定 {speed} != {}（{:?} -> {:?}）",
-                CTRL_SHOOT_SPEED,
-                from,
-                to
-            );
+    // ===== 炮塔解算器（期五第六刀）：solve_launch_vector 纯函数测试 =====
+
+    /// 弹道模拟采样（测试辅助）：定装弹从 出发逐拍推演，与弹道步
+    /// step_projectiles 同序（重力→阻力→极速钳→位移），落地 y<半径截断。
+    /// 返回逐拍末坐标（含起点）。
+    fn sim_trajectory(sx: f64, sy: f64, mut vx: f64, mut vy: f64) -> Vec<(f64, f64)> {
+        let p = codeworld_core::physics::DefaultPhysics::default();
+        let r = codeworld_core::collision::PROJECTILE_RADIUS;
+        let mut pts = vec![(sx, sy)];
+        let (mut x, mut y) = (sx, sy);
+        for _ in 0..codeworld_physics::default::PROJECTILE_MAX_AGE_TICKS {
+            vy += p.gravity;
+            let f = 1.0 - p.drag_coefficient / CTRL_SHOOT_MASS;
+            vx *= f;
+            vy *= f;
+            let sp = (vx * vx + vy * vy).sqrt();
+            if sp > p.max_speed {
+                let k = p.max_speed / sp;
+                vx *= k;
+                vy *= k;
+            }
+            x += vx;
+            y += vy;
+            pts.push((x, y));
+            if y < r {
+                break;
+            }
         }
+        pts
+    }
+
+    /// 点到线段最小距离（测试辅助）：弹道拍间是直线段，仅拍末采样会漏最近点
+    fn seg_min_dist(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> f64 {
+        let (abx, aby) = (b.0 - a.0, b.1 - a.1);
+        let len2 = abx * abx + aby * aby;
+        let t = if len2 < 1e-12 {
+            0.0
+        } else {
+            (((p.0 - a.0) * abx + (p.1 - a.1) * aby) / len2).clamp(0.0, 1.0)
+        };
+        let (cx, cy) = (a.0 + abx * t, a.1 + aby * t);
+        ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
+    }
+
+    /// 弹道全程与目标的最小距离（相邻拍末点连线段到目标圆心，CCD 撞体窗口判据）
+    fn traj_min_dist(pts: &[(f64, f64)], target: (f64, f64)) -> f64 {
+        pts.windows(2)
+            .map(|w| seg_min_dist(w[0], w[1], target))
+            .fold(f64::MAX, f64::min)
     }
 
     #[test]
-    fn ctrl_shoot_vector_lifts_shot_upward_and_toward_target() {
-        // 仰角补偿（60°）：垂直分量被抬升（抛物线手感），水平分量仍朝向目标；
-        // 且 vy > |重力|（10.4 > 9.8）——弹丸真的能飞起来（30° 方案 vy=6 首拍即落地）
-        let (vx, vy) = ctrl_shoot_vector((30.0, 0.5), (45.0, 0.5));
-        assert!(vx > 0.0, "正东目标 vx 应为正，实际 {vx}");
-        assert!(vy > 9.8, "仰角补偿后 vy 应压过重力（弹道离地），实际 {vy}");
-        let (vx_w, _) = ctrl_shoot_vector((30.0, 0.5), (15.0, 0.5));
-        assert!(vx_w < 0.0, "正西目标 vx 应为负（仰角补偿不丢水平方向）");
+    fn solve_launch_vector_hits_elevated_target_via_high_arc() {
+        // bug 回归（battle.log 四发哑弹）：地面打高空 S(25,12)——60° 定角顶点
+        // ~9.6 < 12 全部落脚下；解算器高弧解顶点必须越过 S 并进入命中窗口
+        //（CCD 撞体判据：r弹0.15 + r身0.5 = 0.65）
+        let sol = solve_launch_vector(30.0, 0.5, 25.0, 12.0, CTRL_SHOOT_SPEED)
+            .expect("高空目标 S(25,12) 必须够得着（本刀修复的核心验收）");
+        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1);
+        let apex = pts.iter().map(|p| p.1).fold(f64::MIN, f64::max);
+        // 顶点 ≥ 目标高度-容差（拍末采样顶点与 CCD 线段穿高的几何余量一致）
+        assert!(
+            apex >= 12.0 - CTRL_SOLVE_TOLERANCE,
+            "弹道顶点 {apex} 必须到达 S 高度邻域 12±0.65（高弧高抛）"
+        );
+        let best = traj_min_dist(&pts, (25.0, 12.0));
+        assert!(best < 0.65, "弹道最近点 {best} 必须进入命中窗口 0.65");
+    }
+
+    #[test]
+    fn solve_launch_vector_hits_ground_target_via_low_arc() {
+        // 地面目标 D（15 格外）：低弧平飞命中（|vy| ≤ |vx|——弹道压得平）
+        let sol = solve_launch_vector(30.0, 0.5, 15.0, 0.5, CTRL_SHOOT_SPEED)
+            .expect("15 格地面目标必须够得着（剧本 D 站桩位）");
+        assert!(
+            sol.1.abs() <= sol.0.abs(),
+            "地面目标应取低弧平飞解（|vy|≤|vx|），实际 ({},{})",
+            sol.0,
+            sol.1
+        );
+        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1);
+        let best = traj_min_dist(&pts, (15.0, 0.5));
+        assert!(best < 0.65, "弹道最近点 {best} 必须进入命中窗口 0.65");
+    }
+
+    #[test]
+    fn solve_launch_vector_none_when_target_unreachable() {
+        // 超远目标：无解 None——解不出就明示，不打必落空的哑弹（业界惯例）
+        assert!(solve_launch_vector(30.0, 0.5, 80.0, 0.5, CTRL_SHOOT_SPEED).is_none());
+        // 高不可攀：火力上限内够不到的贴身高空（20 格高且水平贴脸）
+        assert!(solve_launch_vector(30.0, 0.5, 30.5, 30.0, CTRL_SHOOT_SPEED).is_none());
+        // 零距离（贴脸坐标）：不在此解算（前端走 attack 贴身刀分流）
+        assert!(solve_launch_vector(30.0, 0.5, 30.0, 0.5, CTRL_SHOOT_SPEED).is_none());
+    }
+
+    #[test]
+    fn solve_launch_vector_reasonable_for_close_target() {
+        // 近贴目标（~1.5 格）：补偿档（13.8，不爬坡）+ 弹道直达（全程进入
+        // 命中窗口）——近距高弧解（近乎垂直吊射自己脑门）是反直觉坏解，
+        // <2 格一律低弧；离散拍下"直射"体现为弹道线段扫过目标而非拍末逼近
+        let sol = solve_launch_vector(30.0, 0.5, 31.5, 0.8, CTRL_SHOOT_SPEED)
+            .expect("近贴目标应有解");
+        let v = (sol.0.powi(2) + sol.1.powi(2)).sqrt();
+        // 上界断言：斜向目标的 vx 含水平方位缩放（世界系模长 ≤ 档位值）
+        assert!(
+            v <= CTRL_SHOOT_SPEED * CTRL_SHOOT_DRAG_COMP + 1e-9,
+            "近贴目标应用补偿档（不爬坡），实际 {v}"
+        );
+        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1);
+        let best = traj_min_dist(&pts, (31.5, 0.8));
+        assert!(best < 0.65, "近贴弹道应直达目标，实际最近 {best}");
+    }
+
+    #[test]
+    fn solve_launch_vector_muzzle_speed_bounded_and_backed() {
+        // 模长下界=定装补偿档 13.8（12×1.15 阻力补偿），上界=自适应火力上限：
+        // 近距目标（补偿档射程内）用首档；高空目标（12 格高）物理上需爬坡
+        let near = solve_launch_vector(30.0, 0.5, 40.0, 0.5, CTRL_SHOOT_SPEED).unwrap();
+        let v_near = (near.0.powi(2) + near.1.powi(2)).sqrt();
+        assert!(
+            (v_near - CTRL_SHOOT_SPEED * CTRL_SHOOT_DRAG_COMP).abs() < 1e-9,
+            "10 格内地面目标应用补偿档 {v_near} != {}",
+            CTRL_SHOOT_SPEED * CTRL_SHOOT_DRAG_COMP
+        );
+        let high = solve_launch_vector(30.0, 0.5, 25.0, 12.0, CTRL_SHOOT_SPEED).unwrap();
+        let v_high = (high.0.powi(2) + high.1.powi(2)).sqrt();
+        assert!(
+            v_high > CTRL_SHOOT_SPEED * CTRL_SHOOT_DRAG_COMP,
+            "高空目标允许速度爬坡（离散拍下 13.8 档射程仅 ~10 格且 vy 峰值不足）"
+        );
+        assert!(
+            v_high <= CTRL_SHOOT_MAX_EFF_SPEED + 1e-9,
+            "不得超过自适应火力上限 {CTRL_SHOOT_MAX_EFF_SPEED}"
+        );
     }
 
     #[test]
     fn ws_shoot_intent_spawns_projectile_with_fixed_loadout() {
-        // 端到端：WsShoot 意图 -> 操控目标发射弹丸（定装：弹速 12/mass 1.0/
+        // 端到端：WsShoot 意图 -> 操控目标发射弹丸（解算初速/mass 1.0/
         // binding 0/payload 空），弹丸进世界+账本，发射位=拍末实况坐标
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
@@ -6872,20 +7124,42 @@ mod tests {
             .values()
             .find(|e| codeworld_core::collision::is_projectile(e))
             .unwrap();
-        // 初速=定装档由 ctrl_shoot_vector 纯函数锚定（E2E 里 muzzle 速度已被首拍
-        // 物理步消费：重力+阻力后弹速自然衰减）。这里锚首步落点：x = 30 + 6×0.95
-        //（弹速 12 × cos60° × 阻力衰减 0.95），y 升到半径线上方（弹道离地）
+        // 首步位置=解算初速经首拍物理（重力+阻力→位移）的消费结果——
+        // 与纯函数解算逐位一致（镜像铁律的服务器内侧锚）
+        let sol = solve_launch_vector(30.0, 0.5, 45.0, 0.5, CTRL_SHOOT_SPEED)
+            .expect("15 格地面目标应有解");
+        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1);
+        let (ex, ey) = pts[1];
         let (px, py) = p.pos();
         assert!(
-            (px - 35.7).abs() < 1e-9,
-            "首步 x=35.7（弹速12×cos60°×阻力0.95），实际 {px}"
+            (px - ex).abs() < 1e-6 && (py - ey).abs() < 1e-6,
+            "首步位置应为解算初速经首拍物理（{ex},{ey}），实际 ({px},{py})"
         );
-        assert!(py > 0.6, "首步 y 应离地上升（60° 仰角压过重力），实际 {py}");
+        assert!(py > 0.6, "首步 y 应离地上升（弹道离地），实际 {py}");
         assert_eq!(p.mass(), CTRL_SHOOT_MASS, "定装质量");
         assert_eq!(p.binding(), 0, "定装绑定=unbound");
         let meta = map.projectiles.values().next().expect("弹丸账本在册");
         assert_eq!(meta.shooter, pid, "发射者=操控目标");
         assert!(meta.payload.is_empty(), "定装 payload 空（默认击杀模块）");
+    }
+
+    #[test]
+    fn ws_shoot_intent_unreachable_target_spawns_no_projectile() {
+        // 解算无解（超远目标）-> 不发射（解不出就明示，不打必落空的哑弹）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, _pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let intents = vec![input::Intent::WsShoot { x: 90.0, y: 0.5 }];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(count_projectiles(&world), 0, "无解目标不发射弹丸");
     }
 
     #[test]
@@ -7770,7 +8044,7 @@ mod tests {
     #[test]
     fn tick_updates_caption_alive_and_distance() {
         // 集成：tick 内更新字幕——开局 alive=2 / dist=10.0；A 逼近后 dist 缩小；
-        // A 被击杀后 dist=-- / alive=1（存活数变化、缺席占位）
+        // A 被击杀后距离段显式 A:阵亡 / alive=1（期五第六刀：dist=-- 分不清谁没了）
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, a, _d) =
             battle_stage(10);
         let run = |world: &mut WorldState,
@@ -7793,7 +8067,7 @@ mod tests {
             "第 1 tick A/D 相向逼近后距离应恰 8.0，实际 {:?}",
             renderer_row0(&renderer)
         );
-        // 15 tick：A 被 D 反制击杀（默认盾 10 时间线）-> dist=-- / alive=1
+        // 15 tick：A 被 D 反制击杀（默认盾 10 时间线）-> A:阵亡 / alive=1
         for _ in 0..14 {
             run(&mut world, &mut time, &mut renderer, &mut storage, &mut pending, &mut map);
         }
@@ -7802,8 +8076,8 @@ mod tests {
             "回归前提：15 tick 时 A 应已被击杀"
         );
         assert!(
-            renderer_row0(&renderer).contains("dist=--"),
-            "A 死后距离应显示占位符，实际 {:?}",
+            renderer_row0(&renderer).contains("A:阵亡"),
+            "A 死后距离段应显式标 A:阵亡，实际 {:?}",
             renderer_row0(&renderer)
         );
         assert!(
