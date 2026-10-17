@@ -39,6 +39,10 @@ pub struct Renderer {
     /// 操控目标（#022 操控层 v0：被操控实体渲染白色高亮；渲染层特判，
     /// 不改 core 数据结构；None = 无玩家在线不高亮）
     controlled: Option<EntityId>,
+    /// 终端输出开关（#036 世界常驻：终端客户端退出后置 false——render 照常算
+    /// diff 保持缓冲状态一致，flush 静默零输出。stdout 已还原用户 shell，
+    /// 帧数据继续外泄会污染用户终端）
+    output_enabled: bool,
 }
 
 impl Renderer {
@@ -53,7 +57,13 @@ impl Renderer {
             last_diff: Vec::new(),
             caption: CaptionState::new(),
             controlled: None,
+            output_enabled: true,
         }
+    }
+
+    /// 设置终端输出开关（#036：终端客户端退出 = false，世界照常 tick 但渲染静默）
+    pub fn set_output_enabled(&mut self, enabled: bool) {
+        self.output_enabled = enabled;
     }
 
     /// 设置操控目标（#022：host 每 tick 从操控路由喂入；None = 无玩家在线）
@@ -153,6 +163,11 @@ impl Renderer {
     /// 输出 buffer 的 diff 格子（flush_diff），成功后 swap 缓冲。
     /// 输出失败则不 swap（保留 diff 状态供下帧重试）。
     pub fn flush_to<W: std::io::Write>(&mut self, out: &mut W) -> std::io::Result<()> {
+        // 输出门控（#036 世界常驻）：静默 = 零输出 + 不 swap（暂停显示不丢画面）
+        if !self.output_enabled {
+            tracing::debug!("[flush_to] 输出已关闭（终端客户端退出），静默跳过");
+            return Ok(());
+        }
         self.buffer.flush_diff(out, &self.last_diff)?;
         self.buffer.swap();
         tracing::debug!("[flush_to] 渲染输出完成并已 swap");
@@ -352,6 +367,43 @@ mod tests {
             "flush_to 应 swap 使下帧无 diff，实际 {:?}",
             second
         );
+    }
+
+    // === 输出门控（#036 世界常驻：终端客户端退出后渲染静默，世界照常 tick）===
+
+    #[test]
+    fn flush_to_writes_nothing_when_output_disabled() {
+        // #036：终端客户端退出后 stdout 已还原用户 shell，帧数据继续外泄会污染
+        // 用户终端——静默 = 零输出 + 不 swap（diff 状态保留，是"暂停显示"不是"丢画面"）
+        let mut r = renderer_10x10();
+        r.set_output_enabled(false);
+        let mut world = WorldState::new();
+        world.entities.insert(
+            EntityId(Uuid::from_u128(1)),
+            make_entity(1, (5.0, 5.0), "@", true),
+        );
+        let diff = r.render(&world);
+        assert!(!diff.is_empty(), "render 照常算 diff（静默的是输出不是渲染）");
+        let mut out = Vec::new();
+        r.flush_to(&mut out).unwrap();
+        assert!(out.is_empty(), "输出关闭时 flush_to 不应写任何字节");
+    }
+
+    #[test]
+    fn flush_to_resumes_when_output_reenabled() {
+        // 开关可逆：重新开启后输出恢复（MVP 终端客户端不回归，但开关语义可逆）
+        let mut r = renderer_10x10();
+        r.set_output_enabled(false);
+        let mut world = WorldState::new();
+        world.entities.insert(
+            EntityId(Uuid::from_u128(1)),
+            make_entity(1, (5.0, 5.0), "@", true),
+        );
+        r.render(&world);
+        r.set_output_enabled(true);
+        let mut out = Vec::new();
+        r.flush_to(&mut out).unwrap();
+        assert!(!out.is_empty(), "重新开启后 flush_to 恢复输出");
     }
 
     // === 战况字幕：update_caption + render 写第 0 行 ===

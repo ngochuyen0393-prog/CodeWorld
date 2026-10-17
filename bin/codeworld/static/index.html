@@ -42,6 +42,14 @@
   hidden 属性的 display:none（上一刀弹窗「关不掉」的真因）。登出态镜头归属：
   P 留场（stay_*，快照带 disposition 状态签、不再标 controlled）镜头继续跟 P，
   P 消失（带走/被杀）才回落全景。
+
+  断线冻结 + 远程射击（期五第五刀，#036）：与世界失联（WS 断开）即预测冻结——
+  点击一律无本地反馈（不发预测、不画虚线、P 停在最后一帧快照位置），顶部红色
+  横幅「⚠ 与世界断开——重连中(第N次)」，重连成功横幅消失操控恢复；已登出的
+  断线不受影响（观战降级是正常态）。点击分流升级三分流：点中实体+贴身距离内
+  = attack（贴身刀）、点中实体但超出贴身 = shoot 远程射击（前端只发目标坐标，
+  弹道参数服务器定装：弹速 12/仰角 60°/mass 1.0——本地弧线预览纯装饰，
+  实际弹道以服务器物理为准）、空地 = move；射击不清走位目标（边走边射）。
 -->
 <style>
   /* hidden 属性全局兜底（期五第二刀根因修复）：本页容器显式写了 display:flex，
@@ -123,6 +131,14 @@
     background: rgba(22, 27, 34, 0.92); border: 1px solid #30363d;
     border-radius: 6px; padding: 8px 14px; color: #e6edf3; white-space: nowrap;
   }
+  /* 断线横幅（#036 断线冻结）：与世界失联时顶栏醒目警示——预测已冻结，
+     点击无任何反馈，画面停在最后一帧快照；自动重连中 */
+  #dcBanner {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    z-index: 4;
+    background: rgba(133, 24, 24, 0.92); border: 1px solid #f85149;
+    border-radius: 6px; padding: 8px 14px; color: #ffebe9; white-space: nowrap;
+  }
   #reenterBtn {
     background: #238636; border: 1px solid #2ea043; color: #fff;
     font: inherit; padding: 2px 10px; cursor: pointer; border-radius: 4px;
@@ -148,13 +164,16 @@
     <span id="bannerText"></span>
     <button id="reenterBtn" type="button">重新进入世界</button>
   </div>
+  <div id="dcBanner" hidden>
+    <span id="dcBannerText"></span>
+  </div>
 </div>
 <div id="bar">
   <span id="conn" class="wait">连接中……</span>
   <span>tick <b id="tick">-</b></span>
   <span>实体 <b id="cnt">-</b></span>
   <span>帧间隔 <b id="itv">-</b>ms</span>
-  <span>左键移动 · 右键停止 · 点击敌人攻击 · F 切镜头</span>
+  <span>左键移动 · 右键停止 · 点击敌人攻击(近)/射击(远) · F 切镜头 · L 登出</span>
   <button id="camBtn" type="button">镜头：跟随</button>
   <button id="logoutBtn" type="button">登出</button>
   <span id="mouse">x=- , y=-</span>
@@ -194,6 +213,8 @@
   var logoutBannerEl = document.getElementById('logoutBanner');
   var bannerTextEl = document.getElementById('bannerText');
   var reenterBtnEl = document.getElementById('reenterBtn');
+  var dcBannerEl = document.getElementById('dcBanner');
+  var dcBannerTextEl = document.getElementById('dcBannerText');
 
   // ---- 状态 ----
   var buf = [];                 // 快照缓冲 [{t:接收时刻, tick, caption, viewport, ents:Map(id->e)}]
@@ -206,6 +227,7 @@
   var lastCaption = null;
   var connState = 'wait';       // wait=连接中 / ok=已连接 / bad=已断线
   var reconnectTimer = null;
+  var reconnectAttempts = 0;    // 断线重连计数（#036：横幅"重连中(第N次)"，连上清零）
   var backoffMs = BACKOFF_INIT;
   var wsSock = null;            // 当前 WS 连接（上行意图发送用）
   var moveTarget = null;        // 点击走位目标（本地可视化；服务器才是权威，虚线只是提示）
@@ -218,7 +240,7 @@
   var attackLines = [];         // 刀光线数组 [{x0,y0,x1,y1,born,miss}]（0.3s 生命周期，画完即剔）
   var killFx = [];              // 击杀标记数组 [{x,y,born}]（1.5s 渐隐 ✕）
   var hitFlashFx = [];          // 弹丸命中闪白数组 [{x,y,born}]（#034，300ms 白框）
-  var missFx = null;            // 出刀落空提示 {x,y,text,born}（#034 贴身判距不够，1s 灰字）
+  var shootArcs = [];           // 远程射击弹道弧线预览 [{pts:[{x,y}...], born}]（#036 纯装饰 1.2s 淡出）
   var projPrev = null;          // 弹丸上一快照位置表 Map(id->{x,y})（#034 尾迹方向差分用）
   var camMode = 'follow';       // 镜头模式：'follow'=跟随 P（默认）/ 'pano'=全景
   var cam = null;               // 相机中心（世界坐标，lerp 平滑）
@@ -516,6 +538,111 @@
     return dx * dx + dy * dy < s * s;
   }
 
+  // ---- 点击分流与远程射击（#036 期五第五刀；node 机器验证覆盖）----
+
+  // 选中容差（期四第七刀）：点击类游戏标配的选中放宽——距活动实体圆心 <1.5 格
+  // 即选中（不必点得极准）；多命中取最近；creation 仍 AABB 判定不吃容差
+  //（服务器 attack 结算仍是 #031 点命中制，容差只是前端"选谁"，命中消息带实体快照坐标）
+  var CLICK_TOLERANCE = 1.5;
+
+  // 点击处的实体选中判定（#031 + 第七刀容差）：活动实体=距圆心 < CLICK_TOLERANCE；
+  // creation=格对齐方块闭区间包含（原判据不动）；操控目标自己排除（点自己不出刀）；
+  // 弹丸排除（#034：弹丸是飞行物不是攻击目标，服务器 find_hit_target 同判据）
+  function nearestEntityAtWorld(state, wx, wy) {
+    if (!state) return null;
+    var hit = null, hd = 0;
+    state.ents.forEach(function (e) {
+      if (e.controlled === true) return;
+      if (e.kind === 'projectile') return;
+      var dx = e.x - wx, dy = e.y - wy;
+      if (e.kind === 'creation') {
+        var mx = Math.floor(e.x), my = Math.floor(e.y);
+        if (!(wx >= mx && wx <= mx + 1 && wy >= my && wy <= my + 1)) return;
+      } else {
+        if (dx * dx + dy * dy >= CLICK_TOLERANCE * CLICK_TOLERANCE) return;
+      }
+      var d = dx * dx + dy * dy;
+      if (!hit || d < hd) { hit = e; hd = d; }
+    });
+    return hit;
+  }
+
+  // 操控定装弹参数镜像（#036；服务器 bin/codeworld/src/main.rs CTRL_SHOOT_* 常量同值
+  // ——改一处必须同步另一处，契约锚 net-protocol.md v1.9。纯前端装饰：实际弹道以
+  // 服务器物理为准）
+  var CTRL_SHOOT_SPEED = 12;          // 定装档弹速（格/拍，远低于世界极速 25）
+  var CTRL_SHOOT_ELEV = Math.PI / 3;  // 60° 仰角补偿（30° 会被重力 -9.8/拍 首拍压落地）
+  var PROJ_GRAVITY = -9.8;            // 世界重力（core DefaultPhysics 默认，预览模拟用）
+  var PROJ_DRAG = 0.05;               // 世界阻力（#034 默认；定装 mass=1.0）
+  var PROJ_BODY = 0.15;               // 弹丸身体半径（落地判定线）
+
+  // 操控定装弹初速矢量（镜像 main.rs ctrl_shoot_vector 同式：瞄准单位矢量缩 cos(φ)
+  // 另加 sin(φ) 的 +y 分量——仰角恒向上抛与目标左右无关——再归一化 × 定装档速，
+  // 模长恒等于定装档不受瞄准高度影响）
+  function ctrlShootVector(sx, sy, tx, ty) {
+    var dx = tx - sx, dy = ty - sy;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    var ux = 0, uy = 1;
+    if (dist > 1e-9) { ux = dx / dist; uy = dy / dist; }
+    var cos = Math.cos(CTRL_SHOOT_ELEV), sin = Math.sin(CTRL_SHOOT_ELEV);
+    var vx = ux * cos, vy = uy * cos + sin;
+    var len = Math.sqrt(vx * vx + vy * vy);
+    return { x: CTRL_SHOOT_SPEED * vx / len, y: CTRL_SHOOT_SPEED * vy / len };
+  }
+
+  // 弹道弧线预览采样（纯装饰，实际弹道以服务器物理为准）：定装初速起步，逐拍模拟
+  // 重力+阻力+位移（与服务器弹道步同序：先重力、后阻力、再位移+极速钳制），
+  // 最多 5 个采样点，落地（y < 弹丸半径）提前截断。返回含起点的世界坐标点列
+  function previewTrajectory(sx, sy, tx, ty) {
+    var v = ctrlShootVector(sx, sy, tx, ty);
+    var pts = [{ x: sx, y: sy }];
+    var x = sx, y = sy, vx = v.x, vy = v.y;
+    for (var i = 0; i < 5; i++) {
+      vy += PROJ_GRAVITY;
+      var f = 1 - PROJ_DRAG / 1.0; // 定装 mass=1.0
+      vx *= f; vy *= f;
+      var sp = Math.sqrt(vx * vx + vy * vy);
+      if (sp > 25) { vx *= 25 / sp; vy *= 25 / sp; } // 世界极速钳制（镜像）
+      x += vx; y += vy;
+      pts.push({ x: x, y: y });
+      if (y < PROJ_BODY) break; // 落地截断
+    }
+    return pts;
+  }
+
+  // 点击 -> 上行消息构造（#036 三分流）：
+  // 点中实体 + 贴身距离内（< r我+r敌+0.5）= attack（贴身刀，#027/#034 语义不变）；
+  // 点中实体但超出贴身 = shoot（远程射击：前端只发目标坐标，弹道参数服务器算）；
+  // 无实体 = move（持续走位目标）。点击实体用其快照坐标（插值显示坐标，滞后可接受）
+  function decideClickMessage(state, wx, wy) {
+    var hit = nearestEntityAtWorld(state, wx, wy);
+    if (hit) {
+      var me = findControlled(state.ents);
+      var inReach = !!me && meleeInReach(
+        me.x, me.y, me.radius || 0.5,
+        hit.x, hit.y, hit.radius || 0.5
+      );
+      if (inReach) {
+        return { kind: 'attack', msg: { type: 'attack', x: hit.x, y: hit.y }, fx: { x: hit.x, y: hit.y }, hit: hit };
+      }
+      return { kind: 'shoot', msg: { type: 'shoot', x: hit.x, y: hit.y }, fx: { x: hit.x, y: hit.y }, hit: hit };
+    }
+    return { kind: 'move', msg: { type: 'move', x: wx, y: wy }, fx: null, hit: null };
+  }
+
+  // 断线冻结点击门（#036）：仅"已连接"允许点击产生反馈/预测——断线（bad）与
+  // 连接中（wait）一律拦截：不发预测、不画虚线、P 不动（诚实的失联画面：
+  // 世界停在最后一帧快照，点击不给任何本地假反馈）。已登出（观战降级）由
+  // 调用方另行早退——那是正常态不是断线，世界直播照收
+  function canClick(connState) {
+    return connState === 'ok';
+  }
+
+  // 断线横幅文案（#036）：醒目警示 + 重连次数
+  function dcBannerText(attempt) {
+    return '⚠ 与世界断开——重连中(第' + attempt + '次)';
+  }
+
   // 弹丸消亡检测（#034）：上一帧 kind=projectile、新帧没有 = 消亡（命中/落地/超时），
   // 返回最后坐标数组。落地哑弹也会触发闪白——表现层不区分消亡原因，闪到谁算谁
   function collectProjectileHits(prevEnts, newEnts) {
@@ -597,45 +724,8 @@
     };
   }
 
-  // ---- 鼠标操控（#027 第三刀）：纯逻辑函数（node 桩环境机器验证过）----
-
-  // 选中容差（期四第七刀）：点击类游戏标配的选中放宽——距活动实体圆心 <1.5 格
-  // 即选中（不必点得极准）；多命中取最近；creation 仍 AABB 判定不吃容差
-  //（服务器 attack 结算仍是 #031 点命中制，容差只是前端"选谁"，命中消息带实体快照坐标）
-  var CLICK_TOLERANCE = 1.5;
-
-  // 点击处的实体选中判定（#031 + 第七刀容差）：活动实体=距圆心 < CLICK_TOLERANCE；
-  // creation=格对齐方块闭区间包含（原判据不动）；操控目标自己排除（点自己不出刀）；
-  // 弹丸排除（#034：弹丸是飞行物不是攻击目标，服务器 find_hit_target 同判据）
-  function nearestEntityAtWorld(state, wx, wy) {
-    if (!state) return null;
-    var hit = null, hd = 0;
-    state.ents.forEach(function (e) {
-      if (e.controlled === true) return;
-      if (e.kind === 'projectile') return;
-      var dx = e.x - wx, dy = e.y - wy;
-      if (e.kind === 'creation') {
-        var mx = Math.floor(e.x), my = Math.floor(e.y);
-        if (!(wx >= mx && wx <= mx + 1 && wy >= my && wy <= my + 1)) return;
-      } else {
-        if (dx * dx + dy * dy >= CLICK_TOLERANCE * CLICK_TOLERANCE) return;
-      }
-      var d = dx * dx + dy * dy;
-      if (!hit || d < hd) { hit = e; hd = d; }
-    });
-    return hit;
-  }
-
-  // 点击 -> 上行消息构造（纯决策）：有实体=attack（单次出刀，服务器以坐标找人），
-  // 无实体=move（持续目标）。点击实体用其快照坐标（插值显示坐标，滞后 ≤1.5 拍可接受）。
-  // hit 带回完整实体（#034 落空反馈要用 radius 算贴身判距）
-  function decideClickMessage(state, wx, wy) {
-    var hit = nearestEntityAtWorld(state, wx, wy);
-    if (hit) {
-      return { msg: { type: 'attack', x: hit.x, y: hit.y }, fx: { x: hit.x, y: hit.y }, hit: hit };
-    }
-    return { msg: { type: 'move', x: wx, y: wy }, fx: null, hit: null };
-  }
+  // ---- 鼠标操控（#027 第三刀）：点击分流/选中判定/弹道预览等纯逻辑函数已收拢进
+  // 上方 [PURE] 区（#036 起统一 node 机器验证）----
 
   // 上行发送（尽力而为：未连接/非操控连接时服务器侧丢弃，前端不感知不报错）
   function sendMsg(obj) {
@@ -880,20 +970,28 @@
       ctx.globalAlpha = 1;
     }
 
-    // 出刀落空提示（#034）：目标上方灰字"距离不足"停 1s（贴身刀语义的物理反馈）
-    if (missFx) {
-      var mage = performance.now() - missFx.t;
-      if (mage > 1000) {
-        missFx = null;
-      } else {
-        var mp = worldToScreen(missFx.x, missFx.y);
-        ctx.font = '12px Consolas, monospace';
-        ctx.fillStyle = '#8b949e';
-        ctx.globalAlpha = mage > 700 ? (1000 - mage) / 300 : 1;
-        ctx.fillText(missFx.text, mp.x, mp.y - half - 14);
-        ctx.globalAlpha = 1;
-        ctx.font = Math.round(Math.min(32, Math.max(10, cell * 0.9))) + 'px Consolas, monospace';
+    // 远程射击弹道弧线预览（#036）：本地模拟的定装弹虚线弧+终点小圆（纯装饰，
+    // 实际弹道以服务器物理为准），1.2s 渐隐
+    shootArcs = shootArcs.filter(function (a) { return nowFx - a.born < 1200; });
+    for (var si = 0; si < shootArcs.length; si++) {
+      var arc = shootArcs[si];
+      ctx.globalAlpha = 1 - (nowFx - arc.born) / 1200;
+      ctx.strokeStyle = '#d29922';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      for (var pi = 0; pi < arc.pts.length; pi++) {
+        var ap = worldToScreen(arc.pts[pi].x, arc.pts[pi].y);
+        if (pi === 0) ctx.moveTo(ap.x, ap.y); else ctx.lineTo(ap.x, ap.y);
       }
+      ctx.stroke();
+      ctx.setLineDash([]);
+      var lastPt = arc.pts[arc.pts.length - 1];
+      var lp = worldToScreen(lastPt.x, lastPt.y);
+      ctx.beginPath();
+      ctx.arc(lp.x, lp.y, 4, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
     }
 
     // 击杀标记（第四刀 B2）：快照中消失的实体在最后坐标留渐隐 ✕（1.5s）
@@ -964,35 +1062,40 @@
     tipEl.hidden = true;
   });
 
-  // ---- 点击操控（#027）：左键 move/attack、右键 stop、S 键 stop、F 切镜头 ----
+  // ---- 点击操控（#027/#036）：左键 move/attack(近)/shoot(远)、右键 stop、S 键 stop、F 切镜头 ----
   cv.addEventListener('click', function (ev) {
-    if (loggedOut) return; // 已登出=观战（#032 上行被服务器丢弃），不再给本地假反馈
+    // #036 断线冻结：已登出=观战（上行被服务器丢弃）；断线/连接中=预测冻结——
+    // 两种情况都不给本地假反馈（不发预测、不画虚线、P 不动）
+    if (loggedOut || !canClick(connState)) return;
     if (!view || !lastState) return;
     var r = cv.getBoundingClientRect();
     var w = screenToWorld(ev.clientX - r.left, ev.clientY - r.top);
     var decision = decideClickMessage(lastState, w.x, w.y);
     sendMsg(decision.msg);
-    if (decision.fx) {
-      // #034 落空预告：出刀前本地算贴身判距（与 collision.rs melee_in_reach 同判据）——
-      // 够得着=红框红线；够不着=灰框灰线+"距离不足"提示（服务器裁决仍是权威，
-      // 镜像漂移只影响预告颜色不影响结果）
-      var meAtk = findControlled(lastState.ents);
-      var inReach = meAtk && decision.hit && meleeInReach(
-        meAtk.x, meAtk.y, meAtk.radius || 0.5,
-        decision.hit.x, decision.hit.y, decision.hit.radius || 0.5
-      );
-      attackFx = { x: decision.fx.x, y: decision.fx.y, t: performance.now(), miss: !inReach };
-      // 刀光线（第四刀 B1）：从 P 当前渲染位置到目标的一道淡出攻击线
-      if (meAtk) {
-        attackLines.push({ x0: meAtk.x, y0: meAtk.y, x1: decision.fx.x, y1: decision.fx.y, born: performance.now(), miss: !inReach });
-        if (attackLines.length > 8) attackLines.shift();
-      }
-      if (!inReach) {
-        missFx = { x: decision.fx.x, y: decision.fx.y, text: '距离不足（贴身才砍得着）', t: performance.now() };
-      }
-    } else {
+    if (decision.kind === 'move') {
       moveTarget = { x: w.x, y: w.y }; // 本地虚线目标（服务器权威，仅提示）
       startPrediction(moveTarget);     // 己方预测（第四刀 A1）：点击瞬间 P 就动
+      return;
+    }
+    var meAtk = findControlled(lastState.ents);
+    if (decision.kind === 'attack') {
+      // 贴身刀（#027/#034）：红框闪 + 刀光线（decideClickMessage 已保证本地贴身判距内；
+      // 服务器裁决仍是权威——实体若在插值滞后窗口里走开，落空由世界呈现）
+      attackFx = { x: decision.fx.x, y: decision.fx.y, t: performance.now(), miss: false };
+      if (meAtk) {
+        attackLines.push({ x0: meAtk.x, y0: meAtk.y, x1: decision.fx.x, y1: decision.fx.y, born: performance.now(), miss: false });
+        if (attackLines.length > 8) attackLines.shift();
+      }
+      return;
+    }
+    // 远程射击（#036）：定装弹道弧线预览（本地模拟纯装饰，实际弹道以服务器为准）
+    // ——从 P 当前快照坐标到目标的一道渐隐虚线弧 + 终点小圆
+    if (meAtk) {
+      shootArcs.push({
+        pts: previewTrajectory(meAtk.x, meAtk.y, decision.fx.x, decision.fx.y),
+        born: performance.now(),
+      });
+      while (shootArcs.length > 8) shootArcs.shift();
     }
   });
   cv.addEventListener('contextmenu', function (ev) {
@@ -1086,6 +1189,7 @@
   reenterBtnEl.addEventListener('click', function () {
     loggedOut = null;
     logoutBannerEl.hidden = true;
+    dcBannerEl.hidden = true; // #036：重连路径重建横幅状态（连上隐藏/失败重现）
     if (wsSock) {
       var old = wsSock;
       wsSock = null;
@@ -1124,11 +1228,14 @@
       wsSock = ws; // 上行意图通道就绪（第一连接=操控端；后来连接上行被服务器丢弃）
       connState = 'ok';
       backoffMs = BACKOFF_INIT; // 连上了就重置退避
+      reconnectAttempts = 0;    // #036：重连成功计数清零
       resetBuffer();            // 重连后清空缓冲重新开始（断线期间旧帧与新世界不连续）
       moveTarget = null;        // 断线期间旧目标失效（重连后重新点击）
       clearPrediction();        // 预测状态一并清空（重连后世界可能重启，坐标不连续）
       attackLines = [];
       killFx = [];
+      shootArcs = [];           // 弧线预览一并清（#036：重连后从服务器快照重来）
+      dcBannerEl.hidden = true; // #036：断线横幅消失，操控恢复
       renderConn();
     };
     ws.onmessage = onMessage;
@@ -1140,9 +1247,10 @@
       console.info('[cw] WS 断开，' + Math.round(backoffMs / 1000) + 's 后重连');
       wsSock = null;
       moveTarget = null;
-      clearPrediction(); // 断线清预测（重连后从服务器快照重新开始）
+      clearPrediction(); // 断线清预测（重连后从服务器快照重新开始）——#036 冻结的根基
       attackLines = [];
       killFx = [];
+      shootArcs = [];
       connState = 'bad';
       // 已登出（#025）：不自动重连——重连=重新认领操控（顶掉接管者），
       // 这是"重新进入世界"按钮的显式动作；横幅保留，连接状态如实显示
@@ -1151,6 +1259,11 @@
         connEl.className = 'bad';
         return;
       }
+      // #036 断线横幅（预测冻结警示）：与世界失联=点击无效（本地预测已清，
+      // 画面停在最后一帧快照），顶栏醒目提示重连进度
+      reconnectAttempts++;
+      dcBannerTextEl.textContent = dcBannerText(reconnectAttempts);
+      dcBannerEl.hidden = false;
       renderConn();
       if (reconnectTimer !== null) return; // 防双调度（onerror 后紧跟 onclose）
       reconnectTimer = setTimeout(function () {

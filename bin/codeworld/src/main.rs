@@ -109,6 +109,10 @@ struct EntitySandboxMap {
     /// 本拍连接事件（#025 期五第一刀：WS 操控令牌翻转沿，main 循环每拍写入、
     /// tick ②5 消费清空；WS 禁用/无翻转= None）。处置状态机的触发源
     conn_event: Option<net::ConnEvent>,
+    /// 操控射击排队（#036：WsShoot 意图产的定装弹请求；route 后入队，阶段二
+    /// a1.5 与 sandbox pending_shoots 同一 process_shoots 出口统一发射。
+    /// 同拍至多 1 发由 route 单行动折叠保证——操控路径与 shoot import 限流同语义）
+    ctrl_shoots: Vec<codeworld_arena::sandbox::PendingShoot>,
 }
 
 impl EntitySandboxMap {
@@ -137,6 +141,7 @@ impl EntitySandboxMap {
             last_touching: std::collections::HashSet::new(),
             move_stall: None,
             conn_event: None,
+            ctrl_shoots: Vec::new(),
             projectiles: HashMap::new(),
             traces: Vec::new(),
         })
@@ -439,6 +444,8 @@ impl EntitySandboxMap {
         for handle in self.sandboxes.values_mut() {
             all.append(&mut handle.store.data_mut().pending_shoots);
         }
+        // 操控射击（#036）：并入同一发射出口（驾驶档定装参数已定，直接落地）
+        all.append(&mut self.ctrl_shoots);
         if !all.is_empty() {
             tracing::info!(count = all.len(), "[collect_pending_shoots] 收集射击请求");
         }
@@ -731,9 +738,13 @@ fn main() -> Result<()> {
     // 操控层 v0（#022）：raw mode 裸键输入 + 意图队列；旧 stdin read_line 线程退役
     //（read_line 等 Enter/EOF 的退出语义由 crossterm 事件循环接管：Quit 键/EOF 路等价）
     // #027：同一 IntentSink 克隆给 WS 线程——终端键盘与浏览器鼠标单入口双来源
+    // #036 双标志分离：running=世界进程（Q 二次确认才置）；terminal_alive=终端客户端
+    //（q/Enter/Ctrl+C 只关终端渲染与键盘，世界后台常驻——Minecraft dedicated server 语义）
     let running = Arc::new(AtomicBool::new(true));
+    let terminal_alive = Arc::new(AtomicBool::new(true));
     let (intent_sink, intent_queue) = input::intent_channel();
-    let input_thread = input::spawn_input_thread(intent_sink.clone(), running.clone());
+    let input_thread =
+        input::spawn_input_thread(intent_sink.clone(), running.clone(), terminal_alive.clone());
 
     // 延迟变更队列（架构文档 4.1 节阶段一产出、阶段二 a 统一应用）
     // 玩家代码执行期间产生的变更放入 pending，本 tick 阶段二统一应用后清空
@@ -753,7 +764,7 @@ fn main() -> Result<()> {
     // #027：第三刀起 WS 线程同时是上行意图入口（转发进共享 intent_sink）
     let ws_snapshots = net::init(&config, intent_sink);
 
-    tracing::info!("tick 循环开始（WASD/方向键操控，空格攻击，q/Enter/Ctrl+C 退出）");
+    tracing::info!("tick 循环开始（WASD/方向键操控，空格攻击，q=终端客户端退出，Q+Q=关闭世界）");
     // #025：操控令牌上拍值（翻转沿检测；WS 禁用时恒 false，处置永不触发）
     let mut conn_prev = false;
     while running.load(Ordering::SeqCst) {
@@ -769,6 +780,9 @@ fn main() -> Result<()> {
             conn_prev = now;
             ev
         });
+        // #036 世界常驻：终端客户端退出（q）后渲染静默——世界照常 tick/推快照/存档，
+        // 只是 ANSI 帧不再写 stdout（终端已还原用户 shell，外泄会污染显示）
+        renderer.set_output_enabled(terminal_alive.load(Ordering::SeqCst));
         // 操控层 v0：每拍开头 drain 意图队列（输入线程生产 -> tick 主线程消费）
         let intents = intent_queue.drain();
         tick_with_intents(
@@ -1121,12 +1135,39 @@ fn tick_with_intents(
                 }
                 tracing::info!("[input] 操控意图 Attack target={tpos:?} player={name}（操控刀优先）");
             }
+            input::ControlledAction::Shoot { tx, ty } => {
+                // 操控射击（#036 定装弹）：升力独立同款——悬空射击拍照常免重力；
+                // 走位目标未清（边走边射）。弹道参数服务器定装（驾驶档）：
+                // 方向=目标方向+60° 仰角补偿（30° 会被重力首拍压落地，见常量注）、
+                // 弹速 12、mass 1.0、payload 空、unbound
+                if let Some(e) = world.entities.get(id) {
+                    if e.pos().1 > e.radius() {
+                        aloft.insert(*id);
+                    }
+                    let (vx, vy) = ctrl_shoot_vector(e.pos(), (*tx, *ty));
+                    sandbox_map.ctrl_shoots.push(codeworld_arena::sandbox::PendingShoot {
+                        shooter: *id,
+                        vx,
+                        vy,
+                        mass: CTRL_SHOOT_MASS,
+                        binding: 0,
+                        payload: Vec::new(),
+                    });
+                }
+                tracing::info!("[input] 操控意图 Shoot target=({tx},{ty}) player={name}（定装弹：速度{CTRL_SHOOT_SPEED}/仰角60°/mass{CTRL_SHOOT_MASS}）");
+            }
         }
     }
     // 离开飞行（落地到达/地面意图/出刀后无悬停锚）：相位清零打结束沿——重力接管
     let still_flying = match &action {
         Some((_, input::ControlledAction::Move { aerial: true, .. })) => true,
         Some((id, input::ControlledAction::Attack(_))) => world
+            .entities
+            .get(id)
+            .map(|e| e.pos().1 > e.radius())
+            .unwrap_or(false),
+        // 空中射击不掉（#036 升力独立）：射击拍悬空实体照常免重力
+        Some((id, input::ControlledAction::Shoot { .. })) => world
             .entities
             .get(id)
             .map(|e| e.pos().1 > e.radius())
@@ -1174,9 +1215,16 @@ fn tick_with_intents(
 
     // 贴障停滞检测（期四第七刀，b8.log ±0.08 蹭动实锤）：点击走位 2 拍窗口
     // 净位移 < 0.01 = 全挡原地/滑出滑回蹭动 -> 视为到达清目标（防死循环蹭动）。
-    // 悬停维持拍位置恒定是主动悬停（实体或目标在空中），不参与地面停滞判定
+    // 悬停维持拍位置恒定是主动悬停（实体或目标在空中），不参与地面停滞判定。
+    // #036 修正：射击/出刀拍实体不动是"本拍没尝试走路"（行动被攻击/射击占用），
+    // 不是"被挡"——跳过停滞判定并冻结窗口（否则点地后立刻开火会误清走位目标，
+    // "边走边射/边走边砍"的并存承诺被停滞检测破坏）
+    let walk_attempted = !matches!(
+        &action,
+        Some((_, input::ControlledAction::Attack(_))) | Some((_, input::ControlledAction::Shoot { .. }))
+    );
     if let Some((tid, tpos)) = sandbox_map.ws_move_target {
-        if Some(tid) == control_target {
+        if walk_attempted && Some(tid) == control_target {
             if let Some(e) = world.entities.get(&tid) {
                 if e.is_alive() {
                     let (px, py) = e.pos();
@@ -1745,6 +1793,39 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
             "造物诞生：玩家造物进场（门二，产权链归属创造者 owner）"
         );
     }
+}
+
+/// 操控定装弹参数（#036 驾驶档）：初速模长（格/拍）。12 远低于世界极速 25——
+/// 弹道好看（H 玩家代码抛射初速 ~15 观感良好，操控档略低更优雅），发射钳制必过。
+/// 操控层是"驾驶"：参数定档不由玩家调，自定义弹道走玩家代码 env.shoot。
+const CTRL_SHOOT_SPEED: f64 = 12.0;
+/// 操控定装弹仰角补偿（弧度，60°）。任务书建议 30° 在本世界拍节奏下物理不成立：
+/// 重力 -9.8/拍，30° 仰角 vy=6 < 9.8，弹丸首拍即落地成哑弹——参考 H 实战弹
+/// 仰角 ~59°（vy=14.7 两拍回弧）定 60°，vy=10.4 两拍抛物线、射程 ~11 格
+///（标定锚：默认参数标准上抛射程 5~15 格，#034）
+const CTRL_SHOOT_ELEVATION: f64 = std::f64::consts::FRAC_PI_3;
+/// 操控定装弹质量（#034：mass 只参与物理弹道，永不参与攻击结算）
+const CTRL_SHOOT_MASS: f64 = 1.0;
+
+/// 操控定装弹初速矢量（纯函数；前端弹道弧线预览同式镜像——改一处必须同步另一处，
+/// 契约锚 net-protocol.md v1.9）：瞄准方向抬升仰角后归一化 × 定装档速。
+/// 抬升 = 瞄准单位矢量缩 cos(φ) 另加 sin(φ) 的 +y 分量（仰角恒向上抛，与目标
+/// 在左在右无关），结果归一化保模长恒等于定装档（不受瞄准高度影响）。
+fn ctrl_shoot_vector(from: (f64, f64), to: (f64, f64)) -> (f64, f64) {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let dist = (dx * dx + dy * dy).sqrt();
+    // 零距离目标防御：方向退化为正上（归一化分母保护）
+    let (ux, uy) = if dist > 1e-9 {
+        (dx / dist, dy / dist)
+    } else {
+        (0.0, 1.0)
+    };
+    let cos = CTRL_SHOOT_ELEVATION.cos();
+    let sin = CTRL_SHOOT_ELEVATION.sin();
+    let (dx2, dy2) = (ux * cos, uy * cos + sin);
+    let len = (dx2 * dx2 + dy2 * dy2).sqrt();
+    (CTRL_SHOOT_SPEED * dx2 / len, CTRL_SHOOT_SPEED * dy2 / len)
 }
 
 /// 发射处理（#034 弹道系统：env.shoot 排队请求 -> 弹丸实体落地成世界物体）
@@ -6722,6 +6803,191 @@ mod tests {
             world.entities.get(&shooter).unwrap().survival.points(),
             4,
             "击杀掠夺归发射者"
+        );
+    }
+
+    // === #036 期五第五刀：操控定装弹（WS 远程射击；驾驶档，玩家代码 shoot 才是自定义弹道）===
+
+    /// 世界内弹丸计数（断言辅助）
+    fn count_projectiles(world: &WorldState) -> usize {
+        world
+            .entities
+            .values()
+            .filter(|e| codeworld_core::collision::is_projectile(e))
+            .count()
+    }
+
+    #[test]
+    fn ctrl_shoot_vector_keeps_fixed_muzzle_speed() {
+        // 定装弹初速：模长恒 CTRL_SHOOT_SPEED（12 < 世界极速 25，发射钳制必过）
+        for (from, to) in [
+            ((30.0, 0.5), (45.0, 0.5)),  // 正东
+            ((30.0, 0.5), (15.0, 0.5)),  // 正西
+            ((30.0, 0.5), (30.0, 12.0)), // 正上
+            ((30.0, 0.5), (30.0, 0.2)),  // 微降（贴地目标）
+        ] {
+            let (vx, vy) = ctrl_shoot_vector(from, to);
+            let speed = (vx * vx + vy * vy).sqrt();
+            assert!(
+                (speed - CTRL_SHOOT_SPEED).abs() < 1e-9,
+                "初速模长恒定 {speed} != {}（{:?} -> {:?}）",
+                CTRL_SHOOT_SPEED,
+                from,
+                to
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_shoot_vector_lifts_shot_upward_and_toward_target() {
+        // 仰角补偿（60°）：垂直分量被抬升（抛物线手感），水平分量仍朝向目标；
+        // 且 vy > |重力|（10.4 > 9.8）——弹丸真的能飞起来（30° 方案 vy=6 首拍即落地）
+        let (vx, vy) = ctrl_shoot_vector((30.0, 0.5), (45.0, 0.5));
+        assert!(vx > 0.0, "正东目标 vx 应为正，实际 {vx}");
+        assert!(vy > 9.8, "仰角补偿后 vy 应压过重力（弹道离地），实际 {vy}");
+        let (vx_w, _) = ctrl_shoot_vector((30.0, 0.5), (15.0, 0.5));
+        assert!(vx_w < 0.0, "正西目标 vx 应为负（仰角补偿不丢水平方向）");
+    }
+
+    #[test]
+    fn ws_shoot_intent_spawns_projectile_with_fixed_loadout() {
+        // 端到端：WsShoot 意图 -> 操控目标发射弹丸（定装：弹速 12/mass 1.0/
+        // binding 0/payload 空），弹丸进世界+账本，发射位=拍末实况坐标
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let intents = vec![input::Intent::WsShoot { x: 45.0, y: 0.5 }];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(count_projectiles(&world), 1, "WsShoot 诞生恰好 1 发弹丸");
+        let p = world
+            .entities
+            .values()
+            .find(|e| codeworld_core::collision::is_projectile(e))
+            .unwrap();
+        // 初速=定装档由 ctrl_shoot_vector 纯函数锚定（E2E 里 muzzle 速度已被首拍
+        // 物理步消费：重力+阻力后弹速自然衰减）。这里锚首步落点：x = 30 + 6×0.95
+        //（弹速 12 × cos60° × 阻力衰减 0.95），y 升到半径线上方（弹道离地）
+        let (px, py) = p.pos();
+        assert!(
+            (px - 35.7).abs() < 1e-9,
+            "首步 x=35.7（弹速12×cos60°×阻力0.95），实际 {px}"
+        );
+        assert!(py > 0.6, "首步 y 应离地上升（60° 仰角压过重力），实际 {py}");
+        assert_eq!(p.mass(), CTRL_SHOOT_MASS, "定装质量");
+        assert_eq!(p.binding(), 0, "定装绑定=unbound");
+        let meta = map.projectiles.values().next().expect("弹丸账本在册");
+        assert_eq!(meta.shooter, pid, "发射者=操控目标");
+        assert!(meta.payload.is_empty(), "定装 payload 空（默认击杀模块）");
+    }
+
+    #[test]
+    fn ws_shoot_rate_limited_to_one_per_tick() {
+        // 同拍限流沿用（shoot import 1 发/拍在操控路径同样生效）：一批两次点击射
+        // 后到折叠成单行动 -> 恰 1 发
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, _pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let intents = vec![
+            input::Intent::WsShoot { x: 45.0, y: 0.5 },
+            input::Intent::WsShoot { x: 20.0, y: 0.5 },
+        ];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(count_projectiles(&world), 1, "同拍多次点击射=后到覆盖，只发 1 发");
+    }
+
+    #[test]
+    fn ws_shoot_and_move_coexist_across_ticks() {
+        // 边走边射闭环：射击拍发射且不清走位目标 -> 下拍无意图拍继续向目标走（不再射）
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        let intents = vec![
+            input::Intent::WsMove { x: 32.0, y: 0.5 },
+            input::Intent::WsShoot { x: 45.0, y: 0.5 },
+        ];
+        tick_with_intents(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+            &intents,
+        );
+        assert_eq!(count_projectiles(&world), 1, "拍1射击");
+        assert!(map.ws_move_target.is_some(), "走位目标保留（射击不清除）");
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos().0,
+            30.0,
+            "射击拍不移动（本拍行动=射击）"
+        );
+        let first_proj = world
+            .entities
+            .values()
+            .find(|e| codeworld_core::collision::is_projectile(e))
+            .map(|e| e.id);
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert_eq!(
+            world.entities.get(&pid).unwrap().pos().0,
+            31.0,
+            "拍2走位恢复（边走边射：移动中开火后继续走）——走位恢复即证明拍2未再射（射拍不动）"
+        );
+        // 拍2无新弹丸：原弹两拍抛物线后落地消亡属正常弹道寿命，这里只证没有"另一发"
+        let new_proj = world.entities.values().any(|e| {
+            codeworld_core::collision::is_projectile(e) && Some(e.id) != first_proj
+        });
+        assert!(!new_proj, "拍2无新弹丸（无射击意图）");
+    }
+
+    #[test]
+    fn terminal_client_quit_does_not_trigger_dispose_wait() {
+        // #036 语义锚（验收 b）：终端 q 退出只关终端客户端（渲染静默），不动 WS 令牌——
+        // 处置等待触发源=令牌翻转沿（#032），浏览器在线=操控在=无处置等待；世界照常 tick
+        let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
+            control_stage(AUTO_MOVER_WAT);
+        renderer.set_output_enabled(false); // 终端客户端已退出（q 路径效果）
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut map,
+        );
+        assert_eq!(world.tick(), 1, "世界照常推进（世界常驻）");
+        assert!(world.entities.get(&pid).unwrap().is_alive(), "角色照活");
+        assert!(
+            map.players.dispose.get("p1").is_none(),
+            "终端退出不触发处置等待（令牌未动）"
+        );
+        assert!(
+            map.ctrl_exclusive_active,
+            "浏览器连接在=操控在（操控独占不受终端退出影响）"
         );
     }
 

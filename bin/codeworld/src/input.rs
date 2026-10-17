@@ -16,7 +16,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 操控意图（#022：输入 = 意图流；#027 期四第三刀：终端键盘与 WS 鼠标双来源共享单入口）
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,6 +31,9 @@ pub enum Intent {
     WsMove { x: f64, y: f64 },
     /// 点击出刀（#027 WS 鼠标：点击敌人坐标 = 单次攻击，点一下砍一刀，不自动连击）
     WsAttack { x: f64, y: f64 },
+    /// 远程射击（#036 期五第五刀：WS 鼠标点远处敌人——操控定装弹，弹道参数
+    /// 服务器侧常量定档；只定目标方向，不清走位目标——边走边射）
+    WsShoot { x: f64, y: f64 },
     /// 停止（#027 右键/浏览器 S 键：清除点击走位目标，站住不动）
     Stop,
     /// 登出处置（#025 期五第一刀：WS logout 上行经同一意图单入口入队，tick 侧
@@ -40,7 +43,8 @@ pub enum Intent {
 
 /// 按键 -> 意图映射全表（纯函数；crossterm KeyEvent 可在测试中直接构造）
 ///
-/// - 方向键 + WASD 双支持（Vi 传统）；空格=攻击；q/Enter/Ctrl+C=退出
+/// - 方向键 + WASD 双支持（Vi 传统）；空格=攻击；q/Enter/Ctrl+C=终端客户端退出
+///   （#036 世界常驻：退出的是终端客户端，不是世界）
 /// - 只认 Press/Repeat：Windows 松键产生 Release（丢弃）；按住键产生 Repeat
 ///   （保留，"按住 A 持续西行"靠它）；未知按键返回 None（忽略不产生意图）
 pub fn key_to_intent(key: KeyEvent) -> Option<Intent> {
@@ -110,6 +114,9 @@ pub enum ControlledAction {
     /// 操控攻击：目标坐标（最近可见敌人 / 点击坐标，与 scan 同源口径）；
     /// None = 视野内无目标（本拍挥空不出刀，但操控仍接管本拍）
     Attack(Option<(f64, f64)>),
+    /// 操控射击（#036）：目标世界坐标（发射方向由此计算；弹道参数=驾驶档定装，
+    /// main.rs 常量——玩家代码 env.shoot 才是自定义弹道）
+    Shoot { tx: f64, ty: f64 },
 }
 
 /// 操控飞行相位（期四第六刀简化：爬升/平飞合一——矢量方向自然覆盖，保留悬停态）。
@@ -182,6 +189,11 @@ pub fn route_intents(
                 *move_target = Some((target, (*x, *y)));
             }
             Intent::WsAttack { x, y } => action = Some(ControlledAction::Attack(Some((*x, *y)))),
+            Intent::WsShoot { x, y } => {
+                // 远程射击：本拍行动交给射击（后到优先覆盖已有行动）；
+                // 不清走位目标——边走边射（移动中开火，下拍继续向目标走）
+                action = Some(ControlledAction::Shoot { tx: *x, ty: *y });
+            }
             Intent::Stop => {
                 if aerial_now {
                     // 空中停止 = 悬停不坠（stop 语义 = 停止移动不是坠落）：目标改写
@@ -302,45 +314,143 @@ impl MoveStallTrack {
     }
 }
 
-/// 独立输入线程：crossterm 事件轮询 -> 意图入队（生产者）
+/// 世界关闭确认窗时长（#036 期五第五刀）：首按 Q 开窗，3 秒内再按才真关（防误触）
+const SHUTDOWN_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+
+/// 世界关闭二段确认窗（#036）：首按 Q 开窗计时，窗内再按 Q = 确认关世界；
+/// 超时未按 = 自动取消。输入线程持有，Instant 注入可测。
+#[derive(Debug, Default)]
+pub struct ShutdownConfirmWindow {
+    armed_at: Option<Instant>,
+}
+
+impl ShutdownConfirmWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 首按 Q：开窗（窗起点 = 按下时刻）
+    pub fn arm(&mut self, now: Instant) {
+        self.armed_at = Some(now);
+    }
+
+    /// 窗是否开着（开着时 Q = 确认关世界；小写 q 不受影响仍是客户端退出）
+    pub fn is_armed(&self) -> bool {
+        self.armed_at.is_some()
+    }
+
+    /// 超时判定（窗开着且已过 3 秒）：true = 输入线程应取消收窗
+    pub fn expired(&self, now: Instant) -> bool {
+        match self.armed_at {
+            Some(t) => now.duration_since(t) >= SHUTDOWN_CONFIRM_WINDOW,
+            None => false,
+        }
+    }
+
+    /// 收窗（确认/超时取消后归零；再按 Q 重新走"首按提示"）
+    pub fn disarm(&mut self) {
+        self.armed_at = None;
+    }
+}
+
+/// 按键决策（#036：q 与 Q 语义分离；纯函数，输入线程照此执行）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KeyDecision {
+    /// 产生操控意图（入队，走原 key_to_intent 通路）
+    Intent(Intent),
+    /// 终端客户端退出（q/Enter/Ctrl+C）：关终端渲染与键盘监听，世界后台常驻
+    ClientQuit,
+    /// 世界关闭首按 Q：亮确认提示（3 秒确认窗）
+    ShutdownPrompt,
+    /// 世界关闭确认（窗内再按 Q）：真正关世界（存档 + 退出全体）
+    ShutdownConfirm,
+}
+
+/// 按键 -> 输入线程决策（纯函数）。confirm_armed = 关闭确认窗开着
+/// （决定 Q 是"亮提示"还是"确认关"）；其余按键经 key_to_intent 翻译。
+pub fn classify_key(key: KeyEvent, confirm_armed: bool) -> Option<KeyDecision> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    // Q 大写（SHIFT 修饰与否都算——crossterm 按字符上报，Windows 终端大小写可靠）
+    if matches!(key.code, KeyCode::Char('Q')) {
+        return Some(if confirm_armed {
+            KeyDecision::ShutdownConfirm
+        } else {
+            KeyDecision::ShutdownPrompt
+        });
+    }
+    match key_to_intent(key) {
+        Some(Intent::Quit) => Some(KeyDecision::ClientQuit),
+        Some(intent) => Some(KeyDecision::Intent(intent)),
+        None => None,
+    }
+}
+
+/// 独立输入线程：crossterm 事件轮询 -> 意图入队 / 客户端退出 / 世界关闭确认（生产者）
 ///
-/// - event::poll(50ms) 非阻塞探测，线程不占主循环、可被 running 标志正常叫停
-/// - 按键事件经 key_to_intent 转意图入队；Quit（q/Enter/Ctrl+C）直接置退出标志
-///   并收工（退出是主循环语义，不进路由）
-/// - poll/read 出错（EOF/终端消失）同样置退出标志（旧 stdin read_line 线程的
-///   EOF 退出路由此替代）
+/// - event::poll(50ms) 非阻塞探测，线程不占主循环、可被 running/terminal_alive 正常叫停
+/// - #036 键位语义：q/Enter/Ctrl+C = 终端客户端退出（恢复终端 + terminal_alive=false，
+///   running 不动——世界主循环继续）；Q = 世界关闭二段确认（3 秒窗内再按才置退出标志）
+/// - poll/read 出错（EOF/终端消失）同样置退出标志（终端没了等同客户端退出+进程收尾）
 pub fn spawn_input_thread(
     sink: IntentSink,
     running: Arc<AtomicBool>,
+    terminal_alive: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || loop {
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-        // 50ms 轮询：输入线程不占主循环，退出响应 ≤50ms
-        match event::poll(Duration::from_millis(50)) {
-            Ok(true) => match event::read() {
-                Ok(Event::Key(k)) => match key_to_intent(k) {
-                    Some(Intent::Quit) => {
-                        tracing::info!("[input] 收到退出键（q/Enter/Ctrl+C），置退出标志");
+    std::thread::spawn(move || {
+        let mut confirm = ShutdownConfirmWindow::new();
+        loop {
+            if !running.load(Ordering::SeqCst) || !terminal_alive.load(Ordering::SeqCst) {
+                break;
+            }
+            // Q 确认窗超时：自动取消（3 秒内没等到第二次 Q，世界照常）
+            if confirm.is_armed() && confirm.expired(Instant::now()) {
+                confirm.disarm();
+                tracing::info!("[input] 世界关闭确认超时，已取消");
+                eprint!("[shutdown] 已取消关闭世界（Q 超时）\r\n");
+            }
+            // 50ms 轮询：输入线程不占主循环，退出响应 ≤50ms
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(k)) => match classify_key(k, confirm.is_armed()) {
+                        Some(KeyDecision::Intent(intent)) => sink.send(intent),
+                        Some(KeyDecision::ClientQuit) => {
+                            // #036：终端客户端退出——恢复终端（退备用屏+关 raw mode，
+                            // 提示随后打在用户 shell 里），世界主循环继续（running 不动）
+                            tracing::info!("[exit] 终端客户端退出（世界常驻）");
+                            restore_terminal();
+                            terminal_alive.store(false, Ordering::SeqCst);
+                            eprintln!("[exit] 终端客户端退出——世界后台运行中（浏览器可继续操控）");
+                            eprintln!("[exit] 关闭世界请在退出前按 Q 二次确认；本进程现在可安全常驻后台");
+                            break;
+                        }
+                        Some(KeyDecision::ShutdownPrompt) => {
+                            confirm.arm(Instant::now());
+                            tracing::info!("[input] 世界关闭首按 Q，等待 3 秒内确认");
+                            eprint!("[shutdown] 确认关闭世界？再按一次 Q 确认（3 秒内有效）\r\n");
+                        }
+                        Some(KeyDecision::ShutdownConfirm) => {
+                            confirm.disarm();
+                            tracing::info!("[input] 世界关闭确认（Q 二次按下），置退出标志");
+                            running.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                        None => {}
+                    },
+                    Ok(_) => {} // 鼠标/窗口缩放等事件忽略（MVP 只认按键）
+                    Err(e) => {
+                        tracing::info!(error = %e, "[input] 输入流结束（EOF），置退出标志");
                         running.store(false, Ordering::SeqCst);
                         break;
                     }
-                    Some(intent) => sink.send(intent),
-                    None => {}
                 },
-                Ok(_) => {} // 鼠标/窗口缩放等事件忽略（MVP 只认按键）
+                Ok(false) => {} // 50ms 无按键，回 loop 查标志
                 Err(e) => {
-                    tracing::info!(error = %e, "[input] 输入流结束（EOF），置退出标志");
+                    tracing::info!(error = %e, "[input] 事件轮询失败，置退出标志");
                     running.store(false, Ordering::SeqCst);
                     break;
                 }
-            },
-            Ok(false) => {} // 50ms 无按键，回 loop 查 running 标志
-            Err(e) => {
-                tracing::info!(error = %e, "[input] 事件轮询失败，置退出标志");
-                running.store(false, Ordering::SeqCst);
-                break;
             }
         }
     })
@@ -969,6 +1079,73 @@ mod tests {
         assert_step_close(action, (-1.0, 0.0, false), "西向目标负向步");
     }
 
+    // === #036 期五第五刀：WS 远程射击意图（操控定装弹，弹道参数服务器定档）===
+
+    #[test]
+    fn ws_shoot_routes_to_controlled_shoot() {
+        // WsShoot 意图 -> Shoot 行动（目标坐标透传；弹道参数 main 侧定装，路由不管）
+        let target = eid(1);
+        let intents = vec![Intent::WsShoot { x: 15.0, y: 0.5 }];
+        let mut mt: Option<(EntityId, (f64, f64))> = None;
+        let action = route_intents(&intents, Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        assert_eq!(
+            action,
+            Some((target, ControlledAction::Shoot { tx: 15.0, ty: 0.5 })),
+            "WsShoot 意图翻译为对操控目标的射击行动"
+        );
+    }
+
+    #[test]
+    fn ws_shoot_keeps_move_target_marching() {
+        // 边走边射：shoot 不清除走位目标（与 attack 同语义——单发与走位并存）
+        let target = eid(1);
+        let intents = vec![Intent::WsShoot { x: 45.0, y: 0.5 }];
+        let mut mt = Some((target, (35.0, 0.5)));
+        let action = route_intents(&intents, Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        assert_eq!(
+            action,
+            Some((target, ControlledAction::Shoot { tx: 45.0, ty: 0.5 })),
+            "本拍射击"
+        );
+        assert_eq!(mt, Some((target, (35.0, 0.5))), "走位目标保留（下拍继续走）");
+    }
+
+    #[test]
+    fn ws_shoot_then_ws_move_last_wins() {
+        // 同拍互斥后到优先对 shoot 同样成立：先射击后点地 -> 走路生效
+        let target = eid(1);
+        let intents = vec![
+            Intent::WsShoot { x: 45.0, y: 0.5 },
+            Intent::WsMove { x: 35.0, y: 0.5 },
+        ];
+        let mut mt: Option<(EntityId, (f64, f64))> = None;
+        let action = route_intents(&intents, Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        assert_step_close(action, (1.0, 0.0, false), "后到的 WsMove 生效");
+        assert_eq!(mt, Some((target, (35.0, 0.5))));
+    }
+
+    #[test]
+    fn ws_move_then_ws_shoot_last_wins_keeps_target() {
+        // 先点地后射击 -> 本拍射击生效，且本拍点下的走位目标保留（射击不清除，下拍继续走）
+        let target = eid(1);
+        let intents = vec![
+            Intent::WsMove { x: 35.0, y: 0.5 },
+            Intent::WsShoot { x: 45.0, y: 0.5 },
+        ];
+        let mut mt = Some((target, (40.0, 0.5)));
+        let action = route_intents(&intents, Some(target), None, Some((30.0, 0.5)), 0.5, &mut mt);
+        assert_eq!(
+            action,
+            Some((target, ControlledAction::Shoot { tx: 45.0, ty: 0.5 })),
+            "后到的 WsShoot 生效（本拍射击）"
+        );
+        assert_eq!(
+            mt,
+            Some((target, (35.0, 0.5))),
+            "WsMove 点下的目标入册且未被射击清除"
+        );
+    }
+
     // === 期四第七刀：贴障停滞检测窗口（2 拍净位移）===
 
     #[test]
@@ -1003,16 +1180,119 @@ mod tests {
 
     // === 输入线程 / 终端模式（任务 A：raw mode + alternate screen + 全路径恢复）===
 
+    // === #036 期五第五刀：q=终端客户端退出 / Q=世界关闭（二段确认）===
+
+    fn uppercase_q() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE)
+    }
+
+    fn uppercase_q_shift() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT)
+    }
+
     #[test]
-    fn input_thread_terminates_on_running_flag() {
-        // 线程随 running 标志退出（正常退出路）：置 false 后 join 应返回。
-        // poll 间隔 50ms，线程若不理会标志此测试会卡死。
+    fn classify_q_enter_ctrl_c_as_client_quit() {
+        // q/Enter/Ctrl+C = 终端客户端退出（#036 世界常驻）：不再关世界，
+        // 只关终端渲染与键盘监听；世界后台常驻（浏览器可继续）
+        assert_eq!(
+            classify_key(key(KeyCode::Char('q')), false),
+            Some(KeyDecision::ClientQuit)
+        );
+        assert_eq!(
+            classify_key(key(KeyCode::Enter), false),
+            Some(KeyDecision::ClientQuit)
+        );
+        assert_eq!(
+            classify_key(ctrl_c(), false),
+            Some(KeyDecision::ClientQuit),
+            "Ctrl+C 同语义：客户端退出不是关世界"
+        );
+    }
+
+    #[test]
+    fn classify_uppercase_q_prompts_confirm_when_not_armed() {
+        // 首按 Q = 亮确认提示（不直接关世界——防误触）
+        assert_eq!(
+            classify_key(uppercase_q(), false),
+            Some(KeyDecision::ShutdownPrompt)
+        );
+        assert_eq!(
+            classify_key(uppercase_q_shift(), false),
+            Some(KeyDecision::ShutdownPrompt),
+            "SHIFT+Q（部分终端大写带 SHIFT 修饰）同语义"
+        );
+    }
+
+    #[test]
+    fn classify_uppercase_q_confirms_when_armed() {
+        // 确认窗已开（3 秒内）：再按 Q = 真正关世界
+        assert_eq!(
+            classify_key(uppercase_q(), true),
+            Some(KeyDecision::ShutdownConfirm)
+        );
+    }
+
+    #[test]
+    fn classify_lowercase_q_still_client_quit_when_armed() {
+        // q 与 Q 语义严格分离：确认窗开着时小写 q 仍是客户端退出，不是关世界
+        assert_eq!(
+            classify_key(key(KeyCode::Char('q')), true),
+            Some(KeyDecision::ClientQuit)
+        );
+    }
+
+    #[test]
+    fn classify_release_uppercase_q_ignored() {
+        // Windows 松键 Release 事件丢弃（与既有按键一致）
+        assert_eq!(classify_key(release(KeyCode::Char('Q')), true), None);
+    }
+
+    #[test]
+    fn shutdown_confirm_window_times_out_after_three_seconds() {
+        // 3 秒窗口：窗外判定超时（土豆没再按 Q = 取消，世界照常）
+        let mut w = ShutdownConfirmWindow::new();
+        assert!(!w.is_armed(), "新窗未开");
+        let t0 = std::time::Instant::now();
+        w.arm(t0);
+        assert!(w.is_armed());
+        assert!(
+            !w.expired(t0 + Duration::from_millis(2999)),
+            "3 秒内不算超时"
+        );
+        assert!(
+            w.expired(t0 + Duration::from_millis(3001)),
+            "3 秒过窗 = 超时待取消"
+        );
+    }
+
+    #[test]
+    fn shutdown_confirm_window_disarm_reopens_fresh() {
+        // 确认/取消后收窗：再按 Q 重新走"首按提示"（不是直接关）
+        let mut w = ShutdownConfirmWindow::new();
+        let t0 = std::time::Instant::now();
+        w.arm(t0);
+        w.disarm();
+        assert!(!w.is_armed(), "收窗后未开窗态");
+    }
+
+    #[test]
+    fn input_thread_terminates_on_both_flags() {
+        // 世界关闭标志（running）与客户端退出标志（terminal_alive）任一置位
+        // 都能让输入线程退出（线程不理会标志会卡死此测试）
         let (sink, _queue) = intent_channel();
         let running = Arc::new(AtomicBool::new(true));
-        let handle = spawn_input_thread(sink, running.clone());
+        let alive = Arc::new(AtomicBool::new(true));
+        let handle = spawn_input_thread(sink, running.clone(), alive.clone());
         running.store(false, Ordering::SeqCst);
-        handle.join().expect("输入线程应正常退出");
+        handle.join().expect("输入线程应随 running 标志退出");
+        let (sink2, _queue2) = intent_channel();
+        let running2 = Arc::new(AtomicBool::new(true));
+        let alive2 = Arc::new(AtomicBool::new(true));
+        let handle2 = spawn_input_thread(sink2, running2.clone(), alive2.clone());
+        alive2.store(false, Ordering::SeqCst);
+        handle2.join().expect("输入线程应随 terminal_alive 标志退出（客户端退出路）");
     }
+
 
     #[test]
     fn restore_terminal_writes_alt_screen_leave_and_reset() {

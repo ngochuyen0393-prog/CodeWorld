@@ -29,13 +29,18 @@ pub(crate) const SNAPSHOT_CHANNEL_CAP: usize = 16;
 
 // ---- 上行意图协议（docs/net-protocol.md v1.2 客户端 -> 服务器，#027）----
 
-/// 客户端上行消息（四型）：点击走位 / 点击出刀 / 停止 / 登出处置（v1.7，#025）。
+/// 客户端上行消息（五型）：点击走位 / 点击出刀 / 远程射击（v1.9，#036）/
+/// 停止 / 登出处置（v1.7，#025）。
 /// 坐标一律世界坐标（快照 viewport 域内），非法值解析层拒绝。
+/// （WS shutdown 关世界接口预留见 net-protocol.md v1.9——MVP 只做终端 Q，本层不收）
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum ClientMessage {
     Move { x: f64, y: f64 },
     Attack { x: f64, y: f64 },
+    /// 远程射击（#036 期五第五刀）：点击远处敌人——前端只发目标坐标，
+    /// 弹道参数服务器侧定装（驾驶档）
+    Shoot { x: f64, y: f64 },
     Stop,
     /// 登出处置三选一（#025）：take/stay_auto/stay_ai；仅操控连接生效，
     /// 处置由 tick 侧状态机落地（本层只转发意图+释放令牌）
@@ -52,6 +57,7 @@ pub(crate) fn parse_client_message(text: &str) -> Result<ClientMessage, String> 
     let finite = |v: f64| v.is_finite();
     let coords_ok = match &msg {
         ClientMessage::Move { x, y } | ClientMessage::Attack { x, y } => finite(*x) && finite(*y),
+        ClientMessage::Shoot { x, y } => finite(*x) && finite(*y),
         ClientMessage::Stop | ClientMessage::Logout { .. } => true,
     };
     if !coords_ok {
@@ -352,6 +358,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                         }
                         Ok(ClientMessage::Attack { x, y }) => {
                             state.intents.send(crate::input::Intent::WsAttack { x, y });
+                        }
+                        Ok(ClientMessage::Shoot { x, y }) => {
+                            state.intents.send(crate::input::Intent::WsShoot { x, y });
                         }
                         Ok(ClientMessage::Stop) => {
                             state.intents.send(crate::input::Intent::Stop);
@@ -738,6 +747,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_shoot_message_lands_in_intent_queue() {
+        // #036 远程射击同通路：WS shoot 消息 -> 共享意图队列（与键盘/鼠标单入口）
+        let static_dir = temp_static_dir("up-shoot");
+        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
+        let mut client = connect_client(addr).await;
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"type":"shoot","x":15.0,"y":2.5}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::WsShoot { x: 15.0, y: 2.5 },
+            "shoot 消息转 WsShoot 意图入共享队列"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn invalid_uplink_messages_dropped_connection_alive() {
         // 非法上行（未知 type/坏 JSON）：丢弃不入队，连接不断（后续合法消息照常转发）
         let static_dir = temp_static_dir("up-bad");
@@ -1023,6 +1054,24 @@ mod tests {
         let msg =
             parse_client_message(r#"{"type":"attack","x":15.5,"y":-2.0}"#).expect("attack 应可解析");
         assert_eq!(msg, ClientMessage::Attack { x: 15.5, y: -2.0 });
+    }
+
+    #[test]
+    fn parse_shoot_message_with_world_coords() {
+        // #036 远程射击上行：前端只发目标坐标（弹道参数服务器算）
+        let msg =
+            parse_client_message(r#"{"type":"shoot","x":15.0,"y":2.5}"#).expect("shoot 应可解析");
+        assert_eq!(
+            msg,
+            ClientMessage::Shoot { x: 15.0, y: 2.5 },
+            "shoot 携带点击的世界坐标"
+        );
+    }
+
+    #[test]
+    fn parse_shoot_non_finite_coords_rejected() {
+        // 有限性校验与 move/attack 同口径（溢出/非有限拒绝）
+        assert!(parse_client_message(r#"{"type":"shoot","x":1e400,"y":0}"#).is_err());
     }
 
     #[test]
