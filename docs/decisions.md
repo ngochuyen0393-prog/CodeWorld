@@ -188,6 +188,15 @@
 - 修订四（绑定契约 MVP，design-binding.md 机制层①）：契约=出生声明写进造物数据、世界每拍托管执行（遗嘱模式：契约不需要链路，控制才需要）。shoot 第 6 参/spawn 第 9 参：0=unbound（现状：同生不共死+死者弹照飞+落地砸自己合法）/1=fade_on_death（主人死当拍消亡）/2=grace_owner（落地不砸发射者）。攻击豁免条款定案（双审 P1-B）：世界不豁免，豁免是声明——玩家 on_attack 手写识别是完全体路径，MVP 先给声明开关。掠夺正交性：绑定不触碰掠夺管线（design-binding 已查证）。
 - 落点：core physics.rs（WORLD_MAX_SPEED/DefaultPhysics.max_speed）+ entity.rs（binding/bound_to 字段+clamp_binding+三档常数）+ collision.rs（segment_first_contact_circle/expanded_aabb）+ physics default.rs（飞行钳制+CCD 弹道步+落地交点）+ arena sandbox.rs（shoot 第6参/spawn 第9参/import 钳制）+ attack.rs（PendingAttack.grace_owner）+ main.rs（双端装配/LaunchTrace 痕迹表/enforce_binding_deaths 托管清算/deliver 豁免分支/WAT 补参）+ players/pioneer.wat + config（CODEWORLD_MAX_SPEED）+ api.md 三节 + progress。
 
+## #039 2026-10-18 · 冲量与出力系统立法（D-010，菜单 1.2 过条拍板）
+- 三件套定案：①碰撞冲量——撞=停升级为撞=动量交换（restitution 弹性 0~1 + friction 摩擦 0~1，公式抄 Box2D 标准，**确定性写进验收**：EntityId 定序+同平台浮点）；②攻击冲量——击退 payload（被击中者吃一记冲量，方向=攻击来向；同拍击飞先于投递→按实况落空，时序契约显式入文档）；③自主出力——thrust(dx,dy) API（给自己一记冲量，耗 fuel；跳跃/踏水推进/轻功水上漂的地基）。
+- **#021 切割声明**：已退役推挤（持续重叠互相挤开→连体 bug）≠冲量（碰撞瞬间一次性动量交换，撞完就分）——立法文档显式切割防混淆。
+- API 边界铁律：**力出自己身**——只开 thrust 给 self，不开放推别人 API（推人走碰撞或击退 payload，与攻击形态归玩家同哲学）。
+- 击退×决斗交互：击退不中断决斗，会话跟身体走（沙箱长在实体上）；弹飞时游魂在场照打（接触是投递门槛非持续通道）。
+- 参数锚点（1.7 标定法）：弹性=撞一下弹开半格观感/摩擦=冰面滑三格草地即停/thrust 上限=单次跳跃≤3格/出力系数=满力一次≈5%fuel。
+- 拆刀：冲量小刀（thrust+跳跃，可先做）→碰撞响应刀（撞=弹）→击退 payload 随决斗制。力矩归形状物理包（#037）。
+- 落点：dev-plan D-010；API 侧 docs/api.md 待任务书时补 thrust 节。
+
 ## #038 2026-10-18 · 通道公理与三层分离（土豆拍板，宪法级）
 - 总纲：**世界只修路，不跑车**——世界只提供通道（沙箱通道/信息通道），不提供剧情（攻守认定/胜负执行/战果回传/驯服）。通道之上，皆归玩家（#011 的最终补完）。
 - 沙箱通道=接触时双方内存读写权互授（双向接触法）：世界不认定攻方守方，只有接触的双方——守方可同步反杀（反手夺舍来袭飞剑=风筝流的对称反制，钓鱼执法合法）；多连接并存（世界开的是网吧不是擂台）。
