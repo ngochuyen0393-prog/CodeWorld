@@ -18,9 +18,8 @@ pub const CREATION_CODE: &str = "creation";
 /// 物理由 physics step_projectiles 接管；本模块/net.rs 共用同一常量）
 pub const PROJECTILE_CODE: &str = "projectile";
 
-/// 接触判定容差（#034 attack_at 接触化；2026-10-20 更名"臂长"→"接触容差"：
-/// 0.5 不是身体部件，是两身体半径和之外放宽的判定冗余，见 game-menu.md 常数表）：
-/// 出手判距 = r攻 + r目 + 0.5。容差不是射程属性（射程不立法，全部物理涌现——
+/// 贴身刀判距冗余（#034 attack_at 接触化）：出手判距 = r攻 + r目 + 0.5。
+/// 这 0.5 是"胳膊长度"物理判距常量，不是射程属性（射程不立法，全部物理涌现——
 /// design-ballistics.md 否决清单：attack_at 加射程属性已被土豆否决）
 pub const MELEE_REACH: f64 = 0.5;
 
@@ -625,8 +624,8 @@ mod tests {
     }
 
     #[test]
-    fn melee_in_reach_is_tolerance_not_range() {
-        // 容差 0.5 不是射程：大身体判距=半径和+0.5，够得着更远但仍是贴身语义
+    fn melee_in_reach_reach_is_arm_not_range() {
+        // 冗余 0.5 是"胳膊"不是射程：大身体判距=半径和+0.5，够得着更远但仍是贴身语义
         assert!(melee_in_reach((0.0, 0.0), 0.5, (1.0, 0.0), 0.5));
         assert!(melee_in_reach((0.0, 0.0), 2.0, (2.9, 0.0), 0.5));
         assert!(!melee_in_reach((0.0, 0.0), 2.0, (3.0, 0.0), 0.5));
