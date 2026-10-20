@@ -75,6 +75,21 @@ pub(crate) struct WorldSnapshot {
     pub caption: String,
     pub viewport: ViewportInfo,
     pub entities: Vec<EntitySnapshot>,
+    /// 本拍攻击命中事件（v2.0，D-017 协议小刀）：结算成功的刀的三件套——
+    /// 攻方/目标ID/目标位置（结算时刻实况坐标）。空数组恒有（前端无需可选
+    /// 分支）；落空/拦截/作废不广播。前端动画包方向变体（attack_high/mid/low）
+    /// 的选槽依据
+    pub attacks: Vec<AttackEventInfo>,
+}
+
+/// 单条攻击命中事件（D-017 定案字段："攻方/目标ID/目标位置——本来在广播
+/// 命中，多带字段，账本不变"）
+#[derive(Debug, Serialize)]
+pub(crate) struct AttackEventInfo {
+    pub attacker: String,
+    pub target: String,
+    pub x: f64,
+    pub y: f64,
 }
 
 /// 视口域（世界坐标 -> 画布坐标换算基准：x0/y0 左下角 + 宽高）
@@ -127,12 +142,14 @@ fn entity_kind(code_hash: &str, entity_id: EntityId, players: &PlayerDirectory) 
 }
 
 /// 组装世界快照（每拍一帧全量投影；实体按 id 字典序稳定排列，前端逐帧 diff 依赖帧序稳定）
+/// attack_events（v2.0，D-017）：本拍结算成功的攻击命中事件，随快照广播
 pub(crate) fn build_snapshot(
     world: &WorldState,
     caption: &str,
     viewport: &Viewport,
     players: &PlayerDirectory,
     controlled: Option<EntityId>,
+    attack_events: &[crate::AttackEventRecord],
 ) -> WorldSnapshot {
     let (min_x, max_x) = viewport.world_x_range();
     let (min_y, max_y) = viewport.world_y_range();
@@ -163,6 +180,17 @@ pub(crate) fn build_snapshot(
         })
         .collect();
     entities.sort_by(|a, b| a.id.cmp(&b.id));
+    // 命中事件投影（D-017）：attacker/target 序列化为 UUID 字符串（与 entities.id
+    // 同格式，前端可 join 找实体）；坐标原样 f64（结算时刻实况坐标）
+    let attacks = attack_events
+        .iter()
+        .map(|ev| AttackEventInfo {
+            attacker: ev.attacker.0.to_string(),
+            target: ev.target.0.to_string(),
+            x: ev.target_pos.0,
+            y: ev.target_pos.1,
+        })
+        .collect();
     WorldSnapshot {
         tick: world.tick(),
         caption: caption.to_string(),
@@ -173,6 +201,7 @@ pub(crate) fn build_snapshot(
             h: max_y - min_y,
         },
         entities,
+        attacks,
     }
 }
 
@@ -409,11 +438,12 @@ pub(crate) fn push_snapshot(
     viewport: &Viewport,
     players: &PlayerDirectory,
     controlled: Option<EntityId>,
+    attack_events: &[crate::AttackEventRecord],
 ) {
     if tx.receiver_count() == 0 {
         return;
     }
-    let snapshot = build_snapshot(world, caption, viewport, players, controlled);
+    let snapshot = build_snapshot(world, caption, viewport, players, controlled, attack_events);
     match serde_json::to_string(&snapshot) {
         Ok(json) => {
             if tx.send(json).is_err() {
@@ -430,6 +460,7 @@ pub(crate) fn push_snapshot(
 mod tests {
     use super::*;
     use crate::input::intent_channel;
+    use crate::AttackEventRecord;
     use codeworld_core::entity::{Appearance, Entity, PlayerId};
 
     /// 造一个测试实体（快照测试助手）
@@ -466,8 +497,50 @@ mod tests {
         players: &PlayerDirectory,
         controlled: Option<EntityId>,
     ) -> serde_json::Value {
-        let snap = build_snapshot(world, "cap", &default_viewport(), players, controlled);
+        let snap = build_snapshot(world, "cap", &default_viewport(), players, controlled, &[]);
         serde_json::to_value(&snap).expect("快照应可序列化")
+    }
+
+    // === v2.0 攻击命中事件（D-017 协议小刀）===
+
+    #[test]
+    fn snapshot_carries_attack_events_with_target_position() {
+        // 规则（v2.0）：本拍结算成功的命中事件随快照广播——attacker/target
+        // 转 UUID 字符串（与 entities.id 同格式可 join），target 位置=结算时刻
+        // 实况坐标；无事件的拍 attacks 为空数组（字段恒有，前端零可选分支）
+        let mut world = WorldState::new();
+        let (a, _) = put_entity(&mut world, "attacker", "A", "red", (0.0, 0.0));
+        let (t, _) = put_entity(&mut world, "defender", "D", "cyan", (1.0, 2.0));
+        let dir = PlayerDirectory::disabled();
+        let events = vec![AttackEventRecord {
+            attacker: a,
+            target: t,
+            target_pos: (1.0, 2.0),
+        }];
+        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &events);
+        let json = serde_json::to_value(&snap).expect("快照应可序列化");
+        let atk = &json["attacks"];
+        assert_eq!(atk.as_array().map(Vec::len), Some(1), "恰一条命中事件");
+        assert_eq!(atk[0]["attacker"], a.0.to_string(), "攻方 id=UUID 字符串");
+        assert_eq!(atk[0]["target"], t.0.to_string(), "目标 id=UUID 字符串");
+        assert_eq!(atk[0]["x"], 1.0, "目标位置 x=结算时刻实况坐标");
+        assert_eq!(atk[0]["y"], 2.0, "目标位置 y=结算时刻实况坐标");
+    }
+
+    #[test]
+    fn snapshot_attacks_empty_array_when_no_hits() {
+        // 规则（v2.0）：无命中的拍 attacks=[] 恒有字段——前端不必判空键；
+        // 空快照默认可序列化（既有 build 助手已带 &[]，此测锚定字段恒在）
+        let mut world = WorldState::new();
+        put_entity(&mut world, "attacker", "A", "red", (0.0, 0.0));
+        let dir = PlayerDirectory::disabled();
+        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &[]);
+        let json = serde_json::to_value(&snap).expect("快照应可序列化");
+        assert_eq!(
+            json["attacks"].as_array().map(Vec::len),
+            Some(0),
+            "attacks 空数组恒有"
+        );
     }
 
     #[test]
@@ -605,9 +678,9 @@ mod tests {
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
         world.advance_tick();
-        push_snapshot(&tx, &world, "c1", &vp, &dir, None);
+        push_snapshot(&tx, &world, "c1", &vp, &dir, None, &[]);
         world.advance_tick();
-        push_snapshot(&tx, &world, "c2", &vp, &dir, None);
+        push_snapshot(&tx, &world, "c2", &vp, &dir, None, &[]);
         let f1: serde_json::Value =
             serde_json::from_str(&tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("第一帧应在 2s 内到达").unwrap()).unwrap();
         let f2: serde_json::Value =
@@ -625,7 +698,7 @@ mod tests {
         let world = WorldState::new();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        push_snapshot(&tx, &world, "c", &vp, &dir, None);
+        push_snapshot(&tx, &world, "c", &vp, &dir, None, &[]);
         assert_eq!(tx.receiver_count(), 0, "无观众场景保持零接收者");
     }
 
@@ -905,9 +978,9 @@ mod tests {
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
         world.advance_tick();
-        push_snapshot(&tx, &world, "f1", &vp, &dir, None);
+        push_snapshot(&tx, &world, "f1", &vp, &dir, None, &[]);
         world.advance_tick();
-        push_snapshot(&tx, &world, "f2", &vp, &dir, None);
+        push_snapshot(&tx, &world, "f2", &vp, &dir, None, &[]);
 
         let frame1: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         let frame2: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
@@ -926,7 +999,7 @@ mod tests {
         // 服务器仍可用：新客户端再连并收到新帧
         let mut client2 = connect_client(addr).await;
         world.advance_tick();
-        push_snapshot(&tx, &world, "f3", &vp, &dir, None);
+        push_snapshot(&tx, &world, "f3", &vp, &dir, None, &[]);
         let frame3: serde_json::Value = serde_json::from_str(&next_text(&mut client2).await).unwrap();
         assert_eq!(frame3["tick"], 3, "断开后新客户端照常收帧");
 
@@ -984,7 +1057,7 @@ mod tests {
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
         world.advance_tick();
-        push_snapshot(&tx, &world, "shared", &vp, &dir, None);
+        push_snapshot(&tx, &world, "shared", &vp, &dir, None, &[]);
 
         let f1: serde_json::Value = serde_json::from_str(&next_text(&mut c1).await).unwrap();
         let f2: serde_json::Value = serde_json::from_str(&next_text(&mut c2).await).unwrap();
@@ -1245,7 +1318,7 @@ mod tests {
         world.advance_tick();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        push_snapshot(&tx, &world, "after-logout", &vp, &dir, None);
+        push_snapshot(&tx, &world, "after-logout", &vp, &dir, None, &[]);
         let frame: serde_json::Value = serde_json::from_str(&next_text(&mut c1).await).unwrap();
         assert_eq!(frame["caption"], "after-logout", "登出连接下行快照照收（观战）");
 

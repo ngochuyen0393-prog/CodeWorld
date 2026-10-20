@@ -113,6 +113,10 @@ struct EntitySandboxMap {
     /// a1.5 与 sandbox pending_shoots 同一 process_shoots 出口统一发射。
     /// 同拍至多 1 发由 route 单行动折叠保证——操控路径与 shoot import 限流同语义）
     ctrl_shoots: Vec<codeworld_arena::sandbox::PendingShoot>,
+    /// 本拍命中事件缓冲（D-017 协议小刀）：settle_attacks 结算成功时写入，
+    /// push_snapshot 随快照广播后由 tick 下一拍清空（读走即清，无观众=丢弃）。
+    /// 只缓冲一拍（事件是新闻不是档案）
+    attack_events: Vec<AttackEventRecord>,
 }
 
 impl EntitySandboxMap {
@@ -142,6 +146,7 @@ impl EntitySandboxMap {
             move_stall: None,
             conn_event: None,
             ctrl_shoots: Vec::new(),
+            attack_events: Vec::new(),
             projectiles: HashMap::new(),
             traces: Vec::new(),
         })
@@ -798,6 +803,10 @@ fn main() -> Result<()> {
         // 期四第一刀：每拍快照推 WS（渲染步骤旁组装；禁用时 None 完全跳过——不组装不发；
         // 无浏览器连接时 push_snapshot 内部跳过组装，同样零开销）
         if let Some(handle) = &ws_snapshots {
+            // D-017 协议小刀：本拍攻击命中事件（攻方/目标ID/目标位置）take 出来
+            // 随快照一起广播——不管有没有观众都取走（无观众=丢弃，事件不跨拍滞留；
+            // tick 下一拍的 ①0 清空是双保险）
+            let attack_events = std::mem::take(&mut sandbox_map.attack_events);
             net::push_snapshot(
                 &handle.snapshots,
                 &world,
@@ -805,6 +814,7 @@ fn main() -> Result<()> {
                 renderer.viewport(),
                 &sandbox_map.players,
                 renderer.controlled(),
+                &attack_events,
             );
         }
         std::thread::sleep(config.tick_interval());
@@ -880,6 +890,10 @@ fn tick_with_intents(
     let should_snapshot = time_engine.advance_tick();
     world.advance_tick();
     let current_tick = world.tick();
+
+    // ①0 命中事件缓冲清空（D-017 协议小刀）：上一拍的攻击命中事件已随上一拍
+    // 快照广播（或无观众被丢弃），事件是新闻不是档案——本拍缓冲从头开始收集
+    sandbox_map.attack_events.clear();
 
     // ② 阶段一：玩家代码执行（MVP 单线程，逐个实体）
     //    调每个实体沙箱的 on_tick() + life()；life()=false 或调用失败则标记死亡。
@@ -2173,6 +2187,20 @@ struct PendingStrike {
     attack: PendingAttack,
 }
 
+/// 命中事件记录（D-017 协议小刀：随本拍快照广播的"打中了"三件套）。
+///
+/// 只记结算成功的刀（击杀或击晕都算命中——动画槽位选择只关心砍没砍中）；
+/// 落空/拦截/作废不进广播（落空提示前端已有本地预告；拦截是防守方隐私，
+/// 广播拦截=替攻方做侦察）。字段对齐 dev-plan D-017 定案原文："攻方/目标ID/
+/// 目标位置——本来在广播命中，多带字段，账本不变"。目标位置=**结算时刻
+/// 实况坐标**（非攻击点击坐标），是前端动画包方向变体（attack_high/mid/low）
+/// 的选槽依据。
+pub(crate) struct AttackEventRecord {
+    pub(crate) attacker: EntityId,
+    pub(crate) target: EntityId,
+    pub(crate) target_pos: (f64, f64),
+}
+
 /// 绑定契约托管清算（#034 修订四：世界每拍执行出生声明——遗嘱模式，
 /// 契约不需要链路）。排在攻击结算/生存衰减之后：本拍所有死亡来源
 /// （击杀/衰减/life()=false/登出）都已落地，同生契约当拍生效。
@@ -2477,6 +2505,19 @@ fn settle_attacks(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, st
         // 换血（P0：失败时旧沙箱已由 replace_code 还原）
         match sandbox_map.replace_code(&strike.target, &strike.attack.payload) {
             Ok(killed) => {
+                // 命中事件（D-017 协议小刀）：结算成功的刀记攻方/目标/目标位置，
+                // 随本拍快照广播（击杀或击晕都算命中——动画选槽只关心砍没砍中）。
+                // 位置取结算时刻实况坐标（本刀尚未移动过目标，圆心即被打中的地方）
+                let hit_pos = world
+                    .entities
+                    .get(&strike.target)
+                    .map(|e| e.pos())
+                    .unwrap_or(strike.attack.target_pos);
+                sandbox_map.attack_events.push(AttackEventRecord {
+                    attacker: strike.attack.attacker,
+                    target: strike.target,
+                    target_pos: hit_pos,
+                });
                 if killed {
                     // 击杀掠夺：从死者转移 1 生存点数给攻击者（自攻自跳过转移但仍击杀）
                     if strike.attack.attacker != strike.target {
@@ -5358,6 +5399,8 @@ mod tests {
         let attacks = vec![PendingAttack::strike(b, (0.0, 0.0), vec![9])];
         process_attacks(&mut world, &mut map, &attacks);
         assert!(world.entities.get(&a).unwrap().is_alive(), "防守失败 -> 刀作废，A 应存活");
+        // D-017：防守失败作废的刀不进命中事件广播
+        assert!(map.attack_events.is_empty(), "刀作废不应记命中事件");
         let handle = map.sandboxes.get(&a).unwrap();
         assert!(
             handle.store.data().api_calls.contains(&"sentinel".to_string()),
@@ -5398,9 +5441,70 @@ mod tests {
         id
     }
 
+    // === D-017 协议小刀：攻击命中事件（攻方/目标ID/目标位置广播）===
+
+    #[test]
+    fn attack_events_recorded_on_hit_stun_and_cleared_per_tick() {
+        // 击晕（命中未杀）也记事件——动画选槽只关心砍没砍中，不关心死没死；
+        // 位置取结算时刻实况坐标（目标站在哪就记哪，与攻击点击坐标无关）；
+        // 缓冲一拍生命周期：tick ①0 清空，下拍落空后缓冲为空
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let attacker =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.5), PLAYER_WAT);
+        let target =
+            make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.5), TARGET_WAT);
+        // 击晕 payload：life()=true（换血成功但目标不死）
+        let stun = wasm(&ver_module(111));
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.5), stun)];
+        process_attacks(&mut world, &mut map, &attacks);
+        assert!(world.entities.get(&target).unwrap().is_alive(), "击晕：目标存活");
+        assert_eq!(map.attack_events.len(), 1, "击晕也算命中，应记事件");
+        assert_eq!(map.attack_events[0].target_pos, (5.0, 0.5), "目标位置=实况坐标");
+        // 攻击点击坐标 ≠ 目标身体中心时，事件仍记实况坐标（D-017：位置是选槽依据）
+        map.attack_events.clear(); // 模拟 tick ①0（下一拍缓冲清空）
+        let attacks2 = vec![PendingAttack::strike(attacker, (5.2, 0.9), wasm(&kill_ver_module(222)))];
+        process_attacks(&mut world, &mut map, &attacks2);
+        assert_eq!(map.attack_events.len(), 1, "第二刀（击杀）也记事件");
+        assert_eq!(
+            map.attack_events[0].target_pos, (5.0, 0.5),
+            "事件位置=目标实况圆心，非点击坐标 (5.2,0.9)"
+        );
+    }
+
+    #[test]
+    fn attack_events_not_recorded_for_voided_or_dead_attacker() {
+        // 攻击者已死的刀整刀作废（收件阶段 voided）——不记事件；
+        // 结算阶段目标先死后续刀跳过——不记事件。广播里只有真砍中的刀
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let attacker =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.0), PLAYER_WAT);
+        let target =
+            make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), TARGET_WAT);
+        // 攻击者先死：刀入队后攻击者被标记死亡
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![])];
+        world.entities.get_mut(&attacker).unwrap().kill();
+        process_attacks(&mut world, &mut map, &attacks);
+        assert!(map.attack_events.is_empty(), "死者之刀作废，不记事件");
+        // 目标先死：结算前目标已死（deliver 仍找到目标但 settle 跳过）——构造：
+        // 目标已被上一刀击杀标记死亡，第二刀投递时 find_hit_target 过滤死者
+        // -> 落空路径，同样不记事件
+        world.entities.get_mut(&target).unwrap().kill();
+        let attacks2 = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![])];
+        // 攻击者复活回来出第二刀（kill 标记不可逆，用新攻击者）
+        let attacker2 =
+            make_entity_with_sandbox(&mut world, &mut map, 3, (4.5, 0.0), PLAYER_WAT);
+        let attacks3 = vec![PendingAttack::strike(attacker2, (5.0, 0.0), vec![])];
+        process_attacks(&mut world, &mut map, &attacks2);
+        process_attacks(&mut world, &mut map, &attacks3);
+        assert!(map.attack_events.is_empty(), "目标已死，刀落空不记事件");
+    }
+
     #[test]
     fn process_attacks_miss_when_no_entity_at_pos() {
         // 攻击落空（验收#5）：坐标无存活实体 -> 不崩溃、不击杀
+        // D-017：落空不进命中事件广播（落空提示是前端本地预告，不是世界事实）
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         let attacker =
@@ -5409,6 +5513,7 @@ mod tests {
         process_attacks(&mut world, &mut map, &attacks);
         assert_eq!(world.entities.len(), 1, "落空不应移除实体");
         assert!(world.entities.contains_key(&attacker));
+        assert!(map.attack_events.is_empty(), "落空不应记命中事件");
     }
 
     #[test]
@@ -5424,6 +5529,12 @@ mod tests {
         assert_eq!(world.entities.get(&attacker).unwrap().survival.points(), 3);
         let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![])];
         process_attacks(&mut world, &mut map, &attacks);
+        // D-017 协议小刀：结算成功（击杀）写一条命中事件——攻方/目标/结算时刻坐标
+        assert_eq!(map.attack_events.len(), 1, "击杀应记一条命中事件");
+        let ev = &map.attack_events[0];
+        assert_eq!(ev.attacker, attacker, "事件攻方=攻击者");
+        assert_eq!(ev.target, target, "事件目标=被击杀者");
+        assert_eq!(ev.target_pos, (5.0, 0.0), "目标位置=结算时刻实况坐标");
         // 目标被标记死亡（kill，retain 在 tick 死亡清理步才移除）
         assert!(!world.entities.get(&target).unwrap().is_alive(), "目标应被击杀");
         // 攻击者掠夺 +1（3 -> 4）
@@ -5452,6 +5563,8 @@ mod tests {
         let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![])];
         process_attacks(&mut world, &mut map, &attacks);
         assert!(world.entities.get(&target).unwrap().is_alive(), "拦截后目标应存活");
+        // D-017：被拦截的刀不进命中事件广播（拦截=防守成功，世界不替攻方宣布"打中了"）
+        assert!(map.attack_events.is_empty(), "拦截不应记命中事件");
         assert_eq!(
             world.entities.get(&attacker).unwrap().survival.points(),
             3,
