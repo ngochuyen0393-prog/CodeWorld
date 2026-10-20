@@ -596,7 +596,10 @@
 
   // 弹道模拟采样（镜像 main.rs solve_launch_vector 内 simulate_path：与
   // crates/physics step_projectiles 同序——先重力、后阻力、再极速钳、再位移），
-  // 返回逐拍末坐标（含起点），落地 y<半径截断
+  // 返回逐拍末坐标（含起点），落地 y<半径截断。
+  // 【#044 子步宪法锚·弹道积分/预览采样】N=1 整步积分，步数只由弹丸状态
+  // 决定（落地 y<半径 或寿命 30 拍截断）——纯状态驱动，零机器数据
+  // （墙钟/CPU/帧率），同输入必然同弧线（decisions #044 / D-015）
   function simTrajectory(sx, sy, vx, vy) {
     var pts = [{ x: sx, y: sy }];
     var x = sx, y = sy;
@@ -672,7 +675,9 @@
 
   // 弹道弧线预览采样（纯装饰，实际弹道以服务器物理为准）：解算初速起步逐拍
   // 模拟（simTrajectory 同服务器步序），每拍 8 细分插值——折线变平滑真弧线
-  //（5 拍弹道 ≈ 40 点）。无解返回 null（调用方不画弧线+灰字"够不着"）
+  //（5 拍弹道 ≈ 40 点）。无解返回 null（调用方不画弧线+灰字"够不着"）。
+  // 【#044 子步宪法锚·表现层】细分（8 档/拍）是渲染平滑手段，纯表现层
+  // 自由——永不反向影响仿真（#044 表现层铁律：世界按拍算，画面按帧画）。
   function previewTrajectory(sx, sy, tx, ty) {
     var v = solveLaunchVector(sx, sy, tx, ty);
     if (!v) return null;

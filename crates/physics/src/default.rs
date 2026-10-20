@@ -1326,4 +1326,141 @@ mod tests {
             other => panic!("应撞体事件（t 先于触地），实际 {other:?}"),
         }
     }
+
+    // ===== #044 子步宪法：确定性测试锚（D-015 法典化）=====
+    //
+    // 宪法要求（decisions #044）：N=世界状态的纯函数——同状态必然同 N 同结算；
+    // 红线=绝不用墙钟/CPU/帧率选 N。现状三处子步形态（CCD 扫掠/预览采样/弹道
+    // 积分）全部是"状态驱动"实现，以下锚测试把宪法条款钉进可执行断言。
+
+    #[test]
+    fn step_projectiles_same_state_same_result() {
+        // #044 纯函数锚：同一初始状态（实体集合+速度+拍号一致，HashMap 遍历序
+        // 不同）跑两遍弹道步——事件序列与末态坐标必须逐位一致。
+        // 这是"N=世界状态纯函数"的可执行形态：结算只依赖世界状态，不依赖
+        // 容器遍历序/机器/时间。将来 tier>1 自适应子步落地时本锚仍然必须绿
+        // （tier 只能读上拍状态，两遍跑看到同一状态必然同 tier）。
+        let engine = DefaultPhysicsEngine::new();
+        let mut world_a = WorldState::new();
+        let mut world_b = WorldState::new();
+        // 多弹丸多目标混合场景：一条平射弹道（vy=9.8 恰抵消重力，本拍水平
+        // 穿越）撞中途目标 + 一条上抛弹道落地，覆盖 HitBody/Landed 分支与
+        // EntityId 定序
+        for (id, pos, vel) in [
+            (1u128, (0.0, 20.0), (12.0, 9.8)),  // 平射→撞 (6,20) 目标
+            (2u128, (30.0, 1.0), (3.0, 6.0)),   // 上抛→落地
+        ] {
+            let a = make_projectile(id, pos, vel, 0);
+            let b = make_projectile(id, pos, vel, 0);
+            world_a.entities.insert(a.id, a);
+            world_b.entities.insert(b.id, b);
+        }
+        for (id, pos) in [(3u128, (6.0, 20.0)), (4u128, (50.0, 20.0))] {
+            let a = make_entity(id, pos.0, pos.1, 0);
+            let b = make_entity(id, pos.0, pos.1, 0);
+            world_a.entities.insert(a.id, a);
+            world_b.entities.insert(b.id, b);
+        }
+        // shooters 表两遍共用（实现只 .get 点查不遍历，无关序）
+        let mut shooters = HashMap::new();
+        shooters.insert(EntityId(Uuid::from_u128(1)), EntityId(Uuid::from_u128(9)));
+        let ev_a = engine.step_projectiles(&mut world_a, 1, &shooters);
+        let ev_b = engine.step_projectiles(&mut world_b, 1, &shooters);
+        // 事件序列逐位一致（ProjectileEvent 派生 PartialEq；含命中点坐标）
+        assert_eq!(ev_a, ev_b, "同状态必然同事件序列（#044 纯函数要求）");
+        assert!(!ev_a.is_empty(), "场景应产生事件（撞体/落地），空则锚退化");
+        // 末态逐位一致：每个实体坐标与存亡
+        let mut ids: Vec<EntityId> = world_a.entities.keys().copied().collect();
+        ids.sort_by_key(|i| i.0);
+        for id in ids {
+            let (a, b) = (
+                world_a.entities.get(&id).unwrap(),
+                world_b.entities.get(&id).unwrap(),
+            );
+            assert_eq!(a.is_alive(), b.is_alive(), "存亡必须一致");
+            assert_eq!(a.pos(), b.pos(), "坐标必须逐位一致（#044）");
+        }
+    }
+
+    #[test]
+    fn step_projectiles_result_independent_of_hashmap_iteration_order() {
+        // #044 机器数据红线锚（对照组）：同上测试的场景构造序反过来——
+        // 先插目标后插弹丸、ids 收集后统一排序——结算必须与正序构造完全一致。
+        // step_projectiles 内部对弹丸/目标均按 EntityId 升序定序（确定序），
+        // 实体表是 HashMap，插入序≠遍历序：本锚证明结算与遍历序无关，
+        // 即"N 的决定规则只读世界状态"在实现层成立。
+        let engine = DefaultPhysicsEngine::new();
+        let run = |insert_targets_first: bool| -> (Vec<ProjectileEvent>, Vec<(EntityId, (f64, f64), bool)>) {
+            let mut world = WorldState::new();
+            let targets: Vec<Entity> = [(3u128, 6.0, 20.0), (4u128, 50.0, 20.0)]
+                .into_iter()
+                .map(|(id, x, y)| make_entity(id, x, y, 0))
+                .collect();
+            let projs: Vec<Entity> = [
+                (1u128, (0.0, 20.0), (12.0, 9.8)),
+                (2u128, (30.0, 1.0), (3.0, 6.0)),
+            ]
+            .into_iter()
+            .map(|(id, pos, vel)| make_projectile(id, pos, vel, 0))
+            .collect();
+            if insert_targets_first {
+                for e in targets {
+                    world.entities.insert(e.id, e);
+                }
+                for e in projs {
+                    world.entities.insert(e.id, e);
+                }
+            } else {
+                for e in projs {
+                    world.entities.insert(e.id, e);
+                }
+                for e in targets {
+                    world.entities.insert(e.id, e);
+                }
+            }
+            let ev = engine.step_projectiles(&mut world, 1, &HashMap::new());
+            let mut fin: Vec<(EntityId, (f64, f64), bool)> = world
+                .entities
+                .iter()
+                .map(|(id, e)| (*id, e.pos(), e.is_alive()))
+                .collect();
+            fin.sort_by_key(|(id, _, _)| id.0);
+            (ev, fin)
+        };
+        let (ev1, fin1) = run(false);
+        let (ev2, fin2) = run(true);
+        assert_eq!(ev1, ev2, "事件序列与构造序无关（EntityId 定序）");
+        assert_eq!(fin1, fin2, "末态与构造序无关（#044：结算只读状态）");
+        assert!(!ev1.is_empty(), "场景应产生事件，空则锚退化");
+    }
+
+    #[test]
+    fn step_projectiles_swept_check_pure_geometry_no_wall_clock() {
+        // #044 红线锚：CCD 扫掠判据=纯几何——同一（位置，速度）对在极速内
+        // 取任意两档速度，命中判定只由几何决定且单调（路径穿过目标必命中，
+        // 与跑多少次/何时跑无关）。本锚用"高速漏检 Impossible"钉死：
+        // 极速内慢速 4 格/拍命中路径上的目标，高速 20 格/拍同样必命中
+        // （旧点检查在 20 格/拍会漏——隧穿；CCD 扫掠两档都中）。
+        // 若有人把判据改成读机器数据（帧率/负载），两档结果会出现非几何
+        // 相关的漂移，本锚（连同上面的同状态锚）会红。
+        let engine = straight_engine();
+        for speed in [4.0f64, 20.0f64] {
+            let mut world = WorldState::new();
+            let target = make_entity(2, 2.0, 20.0, 0);
+            let tid = target.id;
+            world.entities.insert(tid, target);
+            let p = make_projectile(1, (0.0, 20.0), (speed, 0.0), 0);
+            world.entities.insert(p.id, p);
+            let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+            assert_eq!(
+                events.len(),
+                1,
+                "速度 {speed} 格/拍：路径上的目标必命中（CCD 纯几何判据）"
+            );
+            assert!(
+                matches!(&events[0], ProjectileEvent::HitBody { target: t, .. } if *t == tid),
+                "速度 {speed} 应命中目标"
+            );
+        }
+    }
 }

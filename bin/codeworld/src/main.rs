@@ -1846,6 +1846,13 @@ const CTRL_SHOOT_MASS: f64 = 1.0;
 /// 操控弹炮塔解算器（期五第六刀重写：不再恒定 60° 仰角——那是高空目标
 /// 四发哑弹的根因，顶点 ~9.6 够不到 12 格高的 S）。给定发射点/目标点/基准
 /// 炮口速度，解出能命中目标的初速矢量。
+///【#044 子步宪法锚】本解算器是"弹道积分"子步的预测侧形态：内部
+/// simulate_path 逐拍重演世界物理（N=1 整步积分），搜索空间（速度梯×角度）
+/// 是固定常数表——判据只读发射点/目标点/世界物理参数（纯仿真输入），
+/// 不读任何机器数据，同一输入必然同一解（解算确定性锚测试
+/// solve_launch_vector_deterministic_same_input_same_solution）。宪法要求的
+/// "N=世界状态的纯函数"在此已然成立：解算结果是 (sx,sy,tx,ty) 与世界常数的
+/// 纯函数。docs/decisions.md #044 / dev-plan D-015。
 ///
 /// 选型说明（闭式解 vs 模拟搜索）：教科书闭式解
 /// tanθ = (v² ± √(v⁴ - g(g·d² + 2·Δy·v²))) / (g·d) 假设连续时间物理，本世界
@@ -1882,7 +1889,9 @@ pub fn solve_launch_vector(
     let phys = codeworld_core::physics::DefaultPhysics::default();
     let high_arc = d >= CTRL_SOLVE_CLOSE_RANGE && dy > 0.0;
     // 模拟弹道全程：真实物理步序（与 crates/physics step_projectiles 同序镜像），
-    // 返回逐拍末坐标（含起点），落地 y<半径截断
+    // 返回逐拍末坐标（含起点），落地 y<半径截断。
+    // 【#044 子步宪法锚·弹道积分】逐拍 N=1 整步积分，步数只由弹丸状态决定
+    // （落地 y<半径 或 寿命 30 拍截断）——纯状态驱动，无任何机器数据参与。
     let simulate_path = |mut vx: f64, mut vy: f64| -> Vec<(f64, f64)> {
         let r = codeworld_core::collision::PROJECTILE_RADIUS;
         let mut pts = vec![(sx, sy)];
@@ -6970,6 +6979,8 @@ mod tests {
     /// 弹道模拟采样（测试辅助）：定装弹从 出发逐拍推演，与弹道步
     /// step_projectiles 同序（重力→阻力→极速钳→位移），落地 y<半径截断。
     /// 返回逐拍末坐标（含起点）。
+    /// 【#044 子步宪法锚】N=1 整步积分，步数由状态决定（落地/寿命截断），
+    /// 纯状态驱动零机器数据——与 solve_launch_vector 内 simulate_path 同构。
     fn sim_trajectory(sx: f64, sy: f64, mut vx: f64, mut vy: f64) -> Vec<(f64, f64)> {
         let p = codeworld_core::physics::DefaultPhysics::default();
         let r = codeworld_core::collision::PROJECTILE_RADIUS;
@@ -7099,6 +7110,47 @@ mod tests {
             v_high <= CTRL_SHOOT_MAX_EFF_SPEED + 1e-9,
             "不得超过自适应火力上限 {CTRL_SHOOT_MAX_EFF_SPEED}"
         );
+    }
+
+    #[test]
+    fn solve_launch_vector_deterministic_same_input_same_solution() {
+        // #044 子步宪法·解算确定性锚（D-015）：解算器内部是"弹道积分"子步的
+        // 预测侧重演（逐拍 N=1），同一输入（发射点/目标点/世界常数）必须产出
+        // 逐位相同的解——判据只读仿真输入，零机器数据（墙钟/CPU/帧率）参与。
+        // 三组几何形态各调两遍：低弧地面目标/高弧高空目标/无解超远——含
+        // None 路径（无解也要确定性无解，两台机器一致拒绝）。
+        for (sx, sy, tx, ty) in [
+            (30.0, 0.5, 40.0, 0.5),   // 低弧：10 格平地
+            (30.0, 0.5, 25.0, 12.0),  // 高弧：12 格高空
+            (30.0, 0.5, 80.0, 0.5),   // 无解：超射程
+        ] {
+            let a = solve_launch_vector(sx, sy, tx, ty, CTRL_SHOOT_SPEED);
+            let b = solve_launch_vector(sx, sy, tx, ty, CTRL_SHOOT_SPEED);
+            assert_eq!(a, b, "同输入必须同解（#044 纯函数）：({sx},{sy})->({tx},{ty})");
+        }
+    }
+
+    #[test]
+    fn solver_path_pure_state_driven_tick_count() {
+        // #044 子步宪法·积分步数状态驱动锚：sim_trajectory 的步数只由弹丸
+        // 状态决定——同一初条件跑两遍逐位一致；且状态不同步数不同（高初速
+        // 弹飞的拍数 > 低初速弹，截断条件=落地 y<半径 或寿命 30 拍，全是
+        // 弹丸自身状态非机器数据）。将来解算器若引入自适应采样（tier>1），
+        // 本锚必须随宪法一起更新（tier 读上拍状态+滞回带+换档记日志）。
+        let slow = sim_trajectory(30.0, 0.5, 6.0, 6.0);
+        let fast = sim_trajectory(30.0, 0.5, 14.0, 14.0);
+        // 同一初条件重跑逐位一致（确定性）
+        let slow2 = sim_trajectory(30.0, 0.5, 6.0, 6.0);
+        assert_eq!(slow, slow2, "同初条件必须逐位一致（#044）");
+        // 快弹飞更远、在空中更多拍（状态驱动步数的最小证据）
+        assert!(
+            fast.len() > slow.len(),
+            "高初速弹应比低初速弹多飞拍数（{} vs {}）",
+            fast.len(),
+            slow.len()
+        );
+        // 截断上限=寿命常数（纯状态：任何弹道不超过 30 拍+起点）
+        assert!(fast.len() <= 31, "弹道拍数不得超寿命上限 30");
     }
 
     #[test]

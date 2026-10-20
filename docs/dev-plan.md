@@ -124,7 +124,8 @@
 
 ### D-015 子步宪法实施 [已立法·渐进生效]（2026-10-20 #044）
 - N=世界状态纯函数（tier 量化阈值+滞回带+换档记日志）；EVE 式时间膨胀护栏；Factorio 确定性配额；红线=禁机器数据选 N。现有三处子步（CCD/预览/弹道积分）已是状态驱动形态=法典化既有实践。
-- 将来扩展点：关节链/软体 tier 规则（形状物理包刀内）；时间膨胀护栏（多人大世界前）；确定性配额（实体数放开时）。
+- **法典化落地（2026-10-20，本条任务完成）**：三处现状对照+注释锚+确定性测试锚已进代码——① CCD（crates/physics step_projectiles）：扫掠检查=速度 tier 已然形态，纯几何判据（只读速度/位置/身体），锚测试 step_projectiles_same_state_same_result（同状态两跑逐位一致）/ result_independent_of_hashmap_iteration_order（构造序无关）/ swept_check_pure_geometry_no_wall_clock（极速内两档速度纯几何命中）；② 弹道积分（bin solve_launch_vector 内 simulate_path + 测试辅助 sim_trajectory）：N=1 整步积分，步数由状态截断（落地/寿命），锚测试 solve_launch_vector_deterministic_same_input_same_solution（同输入同解含 None 路径）/ solver_path_pure_state_driven_tick_count（步数状态驱动）；③ 预览采样（前端 index.html simTrajectory/previewTrajectory）：镜像注释锚，细分 8 档/拍=表现层自由永不反影响仿真（#044 表现层铁律）。结论：三处现状零改动即合规——法典化=钉注释+钉测试，非改代码。
+- 将来扩展点：关节链/软体 tier 规则（形状物理包刀内）；时间膨胀护栏（多人大世界前）；确定性配额（实体数放开时）。新子步落地时必须过上述锚测试形态（同状态两跑逐位一致是验收底线）。
 - 调研原文：deleg_8de85371（Roblox/Factorio/EVE/Quantum/学术论文全部出处）。
 
  [已定案·分批实施]（2026-10-19 #043，身份链/遗嘱钩子/凭证三铁律）
