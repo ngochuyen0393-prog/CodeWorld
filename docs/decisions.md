@@ -188,6 +188,12 @@
 - 修订四（绑定契约 MVP，design-binding.md 机制层①）：契约=出生声明写进造物数据、世界每拍托管执行（遗嘱模式：契约不需要链路，控制才需要）。shoot 第 6 参/spawn 第 9 参：0=unbound（现状：同生不共死+死者弹照飞+落地砸自己合法）/1=fade_on_death（主人死当拍消亡）/2=grace_owner（落地不砸发射者）。攻击豁免条款定案（双审 P1-B）：世界不豁免，豁免是声明——玩家 on_attack 手写识别是完全体路径，MVP 先给声明开关。掠夺正交性：绑定不触碰掠夺管线（design-binding 已查证）。
 - 落点：core physics.rs（WORLD_MAX_SPEED/DefaultPhysics.max_speed）+ entity.rs（binding/bound_to 字段+clamp_binding+三档常数）+ collision.rs（segment_first_contact_circle/expanded_aabb）+ physics default.rs（飞行钳制+CCD 弹道步+落地交点）+ arena sandbox.rs（shoot 第6参/spawn 第9参/import 钳制）+ attack.rs（PendingAttack.grace_owner）+ main.rs（双端装配/LaunchTrace 痕迹表/enforce_binding_deaths 托管清算/deliver 豁免分支/WAT 补参）+ players/pioneer.wat + config（CODEWORLD_MAX_SPEED）+ api.md 三节 + progress。
 
+## #046 2026-10-20 · 攻防燃料记账铁律：账户跟人不跟房子（土豆定死）
+- **定律（唯一账本法律，全场景适用）**：**谁的代码在跑，烧谁的步数——代码在哪跑（战场/沙箱）无关，账户跟代码作者走**。别名：住店自付电费，搬家不换账户。
+- 四场景对账：①attack_at 出手=攻方烧（调用即指令）②on_attack 防御应答=守方烧（围殴=磨算力，刻意生态压力）③决斗制游魂驻留守方沙箱攻杀=**攻方烧自己出厂携带的燃料赌注**（战场≠代码驻留地≠账户：内存映射只是伸长的手，攻方代码全程是攻方的）④守方反制=守方烧。
+- 历史纠偏：此前表述"战场在守方沙箱所以烧守方"为错误混同——战场（地盘）与账户（付钱）是两个概念；本条一锤定音，此后无版本分歧。
+- 衍生：燃料赌注（D-005 题 3）因此获得明确定义=游魂出厂自带的油箱（攻方决斗期间的全部军费）；出厂下限防垃圾骚扰免费化、上限防无限赖皮、守方限额应战为守方自声明的防御参数（非世界偏袒）。
+
 ## #045 2026-10-20 · 标准弹丸退役：世界不配发身体（土豆裁决）
 - **裁决**：shoot 制式弹丸（0.15 圆点+世界弹道管线）从世界 API 退役——世界配发制式弹=世界造车，违反 #038 修路不跑车/#011 零预设/#041 三位一体（弹丸有身体无沙箱是身份例外）。shoot 转位**新手文档教学模板**（"第一课：拼一个投掷器"——spawn+发射+接触代码攻的组装教学，D-006 模板台阶的代码玩家版），不是世界原语。
 - **新身份铁律**：**世界投递代码（attack_at=纯投递判定不造实体，合规）；世界不配发身体（shoot=世界亲手造实体，违宪）**——通道与内容的最终分界。
