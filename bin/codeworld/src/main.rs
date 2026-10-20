@@ -137,10 +137,24 @@ impl EntitySandboxMap {
         Self::new_with_max_speed(codeworld_core::physics::WORLD_MAX_SPEED)
     }
 
-    /// 创建映射表（指定世界极速，#034 修订一：发射钳制与飞行钳制同源装配）
+    /// 创建映射表（指定世界极速，#034 修订一：发射钳制与飞行钳制同源装配）。
+    /// 阻力取 core DefaultPhysics 默认值（D-007 收尾 P1-3：未显式装配 drag 的
+    /// 旧调用点保持默认口径零回归）
+    #[cfg(test)] // D-007 收尾 P1-3 后生产装配走 new_with_reach_physics（drag 走
+    // bin Config 装配值）；本构造器仅测试基线用（无此标注 dead_code 误报）
     fn new_with_max_speed(max_speed: f64) -> Result<Self> {
+        Self::new_with_reach_physics(
+            max_speed,
+            codeworld_core::physics::DefaultPhysics::default_values().drag_coefficient,
+        )
+    }
+
+    /// 创建映射表（指定世界极速 + 够不着判定阻力，D-007 收尾 P1-3）：shoot 够
+    /// 不着弹道模拟的 drag 与真实弹丸同一装配源——main() 从 bin Config 传
+    /// config.drag_coefficient，CODEWORLD_DRAG 覆盖后判定不与真实弹道分叉
+    fn new_with_reach_physics(max_speed: f64, drag: f64) -> Result<Self> {
         Ok(Self {
-            manager: SandboxManager::new_with_max_speed(max_speed)?,
+            manager: SandboxManager::new_with_reach_physics(max_speed, drag)?,
             sandboxes: HashMap::new(),
             visible_ids: Vec::new(),
             visible_positions: Vec::new(),
@@ -769,7 +783,9 @@ fn main() -> Result<()> {
     // 实体-沙箱映射表（架构 4.1 阶段一：玩家代码执行）
     // 注意：从快照恢复的实体只有元数据、无沙箱（WASM 实例不持久化），
     //       这些实体 run_player_code 会跳过；重新挂沙箱属 Phase 2 范畴。
-    let mut sandbox_map = EntitySandboxMap::new_with_max_speed(config.max_speed)?;
+    // D-007 收尾 P1-3：够不着判定 drag 用装配值（与物理步同一 config.drag_coefficient，
+    // CODEWORLD_DRAG 覆盖后判定与真实弹道同源不分叉）
+    let mut sandbox_map = EntitySandboxMap::new_with_reach_physics(config.max_speed, config.drag_coefficient)?;
     // probe 预算装配（三层感知 Phase A：config 可调的 on_probe 独立小 fuel）
     sandbox_map.probe_fuel = config.probe_fuel;
     // D-007 三兄弟预算装配（接触回调/遗嘱钩子，模式同 probe_fuel）
@@ -2907,6 +2923,16 @@ fn run_death_wills(
                 "[will] 遗嘱排队的攻击丢弃（死人不出刀）"
             );
         }
+    }
+    // P2-1 收尾：消费循环结束后清场——两类合法登记（登出 take / 残影到期消散）
+    // 都在 d 步【之前】kill 且实体仍在世界，同拍必进 dead_ids 被上面的 remove
+    // 消费掉；活到此处的全是死条目（典型：战斗死亡实体已 remove 后登出 take，
+    // remove_online 返回旧 id 的登记永不进 dead_ids，跨拍残留无界增长）。
+    // 语义："遗嘱窗口已过，未消费的登记全是死条目"。
+    if !sandbox_map.session_takes.is_empty() {
+        let stale = sandbox_map.session_takes.len();
+        sandbox_map.session_takes.clear();
+        tracing::debug!(stale, "[will] session_takes 死条目清场（遗嘱窗口已过）");
     }
     (will_shoots, will_spawns)
 }
@@ -10097,5 +10123,63 @@ mod tests {
             "会话级离场不触发遗嘱（无遗物）"
         );
         assert!(map.session_takes.is_empty(), "session_takes 应被遗嘱窗口消费清空");
+    }
+
+    #[test]
+    fn run_death_wills_clears_stale_session_take_entries() {
+        // P2-1 收尾：战斗死亡（实体已 remove）后玩家登出 take——remove_online 返回
+        // 旧 id，session_takes 登记永不进 dead_ids 的死条目，永久残留（无界增长）。
+        // 语义定案："遗嘱窗口已过，未消费的登记全是死条目"——run_death_wills
+        // 消费循环结束后 clear() 清场。本测试锚定残留路径：登记不在 dead_ids 里
+        //（空表=无死者），条目照样被清。
+        let mut map = test_sandbox_map();
+        let stale = EntityId(Uuid::from_u128(77));
+        map.session_takes.insert(stale); // 战斗死亡后的 take 残留（实体早已不在世界）
+        let (will_shoots, will_spawns) = run_death_wills(&mut map, &[]);
+        assert!(will_shoots.is_empty(), "无死者应无遗嘱产物（shoot）");
+        assert!(will_spawns.is_empty(), "无死者应无遗嘱产物（spawn）");
+        assert!(map.session_takes.is_empty(), "跨拍死条目应在遗嘱窗口后清场");
+    }
+
+    #[test]
+    fn entity_sandbox_map_new_with_reach_physics_forwards_drag() {
+        // P1-3 收尾装配锚：EntitySandboxMap::new_with_reach_physics 把装配阻力
+        // 透传给 SandboxManager 够不着判定——同参数 lob，drag=0.05 够得着的
+        // 快照在 drag=0.3 下改判够不着（数值预验证：min 距离 0.0 vs 1.8752，
+        // 容差 0.65 两侧）。main() 装配点传 config.drag_coefficient，
+        // CODEWORLD_DRAG 覆盖后判定与真实弹道不分叉
+        let shooter_wat = r#"(module
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    (f64.const 4.0) (f64.const 9.8) (f64.const 0.5) (i32.const 0) (i32.const 0) (i32.const 0)
+    call $shoot global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let verdict = |drag: f64, eid: u128| -> i32 {
+            let mut map = EntitySandboxMap::new_with_reach_physics(25.0, drag).unwrap();
+            let sid = EntityId(Uuid::from_u128(eid));
+            map.create(sid, &wasm(shooter_wat), 100_000).unwrap();
+            {
+                let handle = map.sandboxes.get_mut(&sid).unwrap();
+                handle.store.data_mut().pos = (0.0, 0.5);
+                handle.store.data_mut().nearest_enemy = Some((3.5, 0.5));
+            }
+            map.manager
+                .call_on_tick(map.sandboxes.get_mut(&sid).unwrap())
+                .unwrap();
+            call_i32_export(&mut map, &sid, "get_ret")
+        };
+        assert_eq!(
+            verdict(0.05, 78),
+            1,
+            "drag=0.05（默认档）3.5 格快照应够得着（正序号，现状不变）"
+        );
+        assert_eq!(
+            verdict(0.3, 79),
+            -1,
+            "drag=0.3 同参数应改判够不着（警告码 -N）——装配阻力必须透传"
+        );
     }
 }

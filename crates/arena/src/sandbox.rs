@@ -294,10 +294,18 @@ fn seg_point_distance(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> f64 {
 
 /// 够不着判定弹道模拟（D-007 ①）：从 from 以初速 (vx,vy)/mass 模拟弹丸全程，
 /// 返回弹道各段到目标点的最小距离。物理步序与 crates/physics step_projectiles
-/// 完全同序（重力→阻力→极速钳→位移，落地 y<半径 或寿命尽截断）；物理常数
-/// 取 core DefaultPhysics 默认值（与 bin solve_launch_vector 预测侧同源），
+/// 完全同序（重力→阻力→极速钳→位移，落地 CCD 或寿命尽截断）；
+/// 阻力用装配值 drag（D-007 收尾 P1-3：与真实弹丸同一 drag 源，含 apply_drag
+/// 同款符号翻转钳零——drag/mass ≥ 1 时钳 0，方向永不翻转），重力取 core
+/// DefaultPhysics 默认值（与 bin solve_launch_vector 预测侧同源），
 /// 极速钳用管理器装配的世界极速（与飞行钳制同源）。
+/// 落地截断镜像 step_projectiles 的地形 CCD 判据（terrain.segment_first_contact，
+/// y < height(x)+r弹 口径；D-007 收尾 P1-1：hills/mountain 下坡面挡弹如实判定）；
+/// terrain 指针判空回退平地旧口径 y < r弹（平地=全零高度数组，两判据等价，
+/// 无 host 挂载的测试环境零回归）。
 /// 判据在调用方：最小距离 ≤ SHOOT_REACH_TOLERANCE = 够得着。
+#[allow(clippy::too_many_arguments)] // D-007 收尾扩到 8 参（drag/terrain 环境同步）：
+// 弹道模拟的物理输入族，8 参为镜像 step_projectiles 的固有形状，不拆结构体
 fn shoot_reach_min_distance(
     from: (f64, f64),
     vx: f64,
@@ -305,6 +313,8 @@ fn shoot_reach_min_distance(
     mass: f64,
     target: (f64, f64),
     max_speed: f64,
+    drag: f64,
+    terrain: *const codeworld_core::terrain::Terrain,
 ) -> f64 {
     let phys = codeworld_core::physics::DefaultPhysics::default_values();
     let r = codeworld_core::collision::PROJECTILE_RADIUS;
@@ -315,9 +325,18 @@ fn shoot_reach_min_distance(
     for _ in 0..SHOOT_REACH_SIM_TICKS {
         // 重力→阻力→极速钳→位移（与 step_projectiles 逐拍同序）
         vy += phys.gravity;
-        let f = 1.0 - phys.drag_coefficient / mass;
-        vx *= f;
-        vy *= f;
+        // 阻力定律镜像 apply_drag：衰减越过零点（drag/mass ≥ 1）钳到 0
+        let f = 1.0 - drag / mass;
+        let decay = |comp: f64| -> f64 {
+            let next = comp * f;
+            if comp != 0.0 && next.signum() != comp.signum() {
+                0.0
+            } else {
+                next
+            }
+        };
+        vx = decay(vx);
+        vy = decay(vy);
         let sp = (vx * vx + vy * vy).sqrt();
         if sp > max_speed {
             let k = max_speed / sp;
@@ -326,10 +345,26 @@ fn shoot_reach_min_distance(
         }
         x += vx;
         y += vy;
-        min = min.min(seg_point_distance(prev, (x, y), target));
-        prev = (x, y);
-        if y < r {
-            break; // 落地截断（与 step_projectiles 落地判据同口径）
+        // 落地截断：镜像 step_projectiles 的 terrain.segment_first_contact CCD；
+        // 触地时最小距离只计入 prev→触地点段（真实弹丸在触地点消亡做哑弹
+        // 点命中，之后的路径不存在）。判空回退平地 y<r弹（整段计入=旧口径）。
+        let contact_t = if terrain.is_null() {
+            (y < r).then_some(1.0)
+        } else {
+            // SAFETY：窗口契约（见 SandboxData.terrain 文档）——窗口期内指针指向
+            // 存活的 world.terrain，import 闭包只在此窗口内被玩家代码调用
+            unsafe { (*terrain).segment_first_contact(prev, (x, y), r) }
+        };
+        match contact_t {
+            Some(t) => {
+                let end = (prev.0 + (x - prev.0) * t, prev.1 + (y - prev.1) * t);
+                min = min.min(seg_point_distance(prev, end, target));
+                break; // 触地消亡：弹道到此为止（与 step_projectiles Landed 同语义）
+            }
+            None => {
+                min = min.min(seg_point_distance(prev, (x, y), target));
+                prev = (x, y);
+            }
         }
     }
     min
@@ -360,16 +395,28 @@ impl SandboxManager {
     }
 
     /// 创建管理器（指定世界极速，#034 修订一）：发射钳制与飞行钳制同源。
-    /// 极速值经 move 闭包进 shoot import，管理器本体不再存副本
+    /// 阻力取 core DefaultPhysics 默认值（D-007 收尾 P1-3：未显式装配 drag 的
+    /// 旧调用点保持默认口径零回归）
     pub fn new_with_max_speed(max_speed: f64) -> Result<Self> {
+        Self::new_with_reach_physics(
+            max_speed,
+            codeworld_core::physics::DefaultPhysics::default_values().drag_coefficient,
+        )
+    }
+
+    /// 创建管理器（指定世界极速 + 够不着判定阻力，D-007 收尾 P1-3）：
+    /// shoot 够不着弹道模拟的 drag 与真实弹丸同一装配源（bin CODEWORLD_DRAG
+    /// 覆盖后判定不与真实弹道分叉）；极速值经 move 闭包进 shoot import，
+    /// 管理器本体不再存副本
+    pub fn new_with_reach_physics(max_speed: f64, drag: f64) -> Result<Self> {
         let mut config = Config::new();
         config.consume_fuel(true);
         // 内存限制：每个 WASM 实例最大 64MB（CLAUDE.md 技术约束）
         // static_memory_maximum_size 设静态内存上限；完整动态内存硬上限用 ResourceLimiter（Phase 2）
         config.static_memory_maximum_size(64 * 1024 * 1024);
         let engine = Engine::new(&config)?;
-        let linker = Self::make_linker(&engine, max_speed)?;
-        tracing::debug!(max_speed, "SandboxManager 创建");
+        let linker = Self::make_linker(&engine, max_speed, drag)?;
+        tracing::debug!(max_speed, drag, "SandboxManager 创建");
         Ok(Self { engine, linker })
     }
 
@@ -383,7 +430,7 @@ impl SandboxManager {
     ///   - len 超过 MAX_PAYLOAD_LEN（1MB）直接拒绝：不入队、不拷贝内存
     ///     （防大块拷贝 + 超大模块编译阻塞 tick，编译不受 fuel 约束）。
     ///   - 返回 1=已排队，0=拒绝（超限）。
-    fn make_linker(engine: &Engine, max_speed: f64) -> Result<Linker<SandboxData>> {
+    fn make_linker(engine: &Engine, max_speed: f64, drag: f64) -> Result<Linker<SandboxData>> {
         let mut linker = Linker::new(engine);
         // env.log(v)：玩家代码日志（v 为玩家自定义 marker，含义见各生物 WAT 注释）。
         // 记 api_calls 元数据 + marker 值序列（log_markers，host 字幕解析用）
@@ -1131,8 +1178,16 @@ impl SandboxManager {
                 // 玩家战术权利），仅返回值带负号提示 + INFO 日志。
                 let unreachable_target = caller.data().nearest_enemy.map(|(tx, ty)| {
                     let from = caller.data().pos;
-                    shoot_reach_min_distance(from, vx, vy, mass, (tx, ty), max_speed)
-                        > SHOOT_REACH_TOLERANCE
+                    shoot_reach_min_distance(
+                        from,
+                        vx,
+                        vy,
+                        mass,
+                        (tx, ty),
+                        max_speed,
+                        drag,
+                        caller.data().terrain,
+                    ) > SHOOT_REACH_TOLERANCE
                 });
                 caller.data_mut().shots_fired += 1;
                 let serial = caller.data().shots_fired;
@@ -3676,6 +3731,104 @@ mod tests {
         handle.store.data_mut().pending_shoots.clear(); // 主程序收集后清空（drain 语义）
         mgr.call_on_tick(&mut handle).unwrap();
         assert_eq!(call_i32_export(&mut handle, "get_ret"), -2, "次拍警告码随序号 -2");
+    }
+
+    #[test]
+    fn shoot_reach_terrain_blocks_lob_that_flat_ground_reaches() {
+        // P1-1 收尾（D-007 ①）：够不着判定的落地截断吃地形（镜像 step_projectiles
+        // 的 terrain.segment_first_contact CCD）——山地陡翼坡面挡弹，平地判据下
+        // "够得着"的同参数快照改判"够不着"（警告码 -N）。
+        // 场景几何从地形样本自取（山地总爬升 16 格/坡度钳 1.5，1 格爬升 >0.8 的
+        // 陡翼必存在）：发射者在陡翼起点当地地面 +0.5 悬空高度，敌人快照同高 3 格
+        // 外——平地弹道穿身而过（对照臂=判空指针回退），挂地形后 CCD 在坡面提前
+        // 截断，触地点离目标 > 容差。
+        let terrain = codeworld_core::terrain::Terrain::new(
+            codeworld_core::terrain::TerrainPreset::Mountain,
+            42,
+        );
+        let samples = terrain.samples();
+        let si = (0..samples.len() - 4)
+            .find(|&i| samples[i + 4] - samples[i] > 0.8)
+            .expect("山地预设必有陡翼（测试前提）");
+        let sx = codeworld_core::terrain::TERRAIN_X_MIN + si as f64 * codeworld_core::terrain::TERRAIN_SPACING;
+        let sy = samples[si] + 0.5; // 发射高度 = 当地地面 + 0.5
+        let target = (sx + 3.0, sy); // 敌人快照：同高 3 格外，坡在中间
+        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "0");
+
+        // 对照臂：terrain 指针 null（SandboxData 默认）→ 平地判据，lob 穿身而过=够得着
+        let mgr_flat = SandboxManager::new().unwrap();
+        let mut h_flat = mgr_flat
+            .create_sandbox(&wasm(&wat_text), 100_000, id(930))
+            .unwrap();
+        h_flat.store.data_mut().pos = (sx, sy);
+        h_flat.store.data_mut().nearest_enemy = Some(target);
+        mgr_flat.call_on_tick(&mut h_flat).unwrap();
+        assert_eq!(
+            call_i32_export(&mut h_flat, "get_ret"),
+            1,
+            "判空回退平地判据：同参数应够得着（正序号，不 panic）"
+        );
+
+        // 挂载山地地形（窗口契约：Terrain 活在测试栈上，指针在 call 窗口内有效，
+        // call 后置空对称收尾）→ CCD 坡面截断 → 改判够不着
+        let mgr_hill = SandboxManager::new().unwrap();
+        let mut h_hill = mgr_hill
+            .create_sandbox(&wasm(&wat_text), 100_000, id(931))
+            .unwrap();
+        h_hill.store.data_mut().pos = (sx, sy);
+        h_hill.store.data_mut().nearest_enemy = Some(target);
+        h_hill.store.data_mut().terrain = &terrain;
+        mgr_hill.call_on_tick(&mut h_hill).unwrap();
+        h_hill.store.data_mut().terrain = std::ptr::null();
+        assert_eq!(
+            call_i32_export(&mut h_hill, "get_ret"),
+            -1,
+            "山地坡面挡弹：同参数应改判够不着（警告码 -N）"
+        );
+    }
+
+    #[test]
+    fn shoot_reach_drag_assembly_changes_reach_verdict() {
+        // P1-3 收尾（D-007 ①）：够不着判定的 drag 用装配值（与真实弹丸同一阻力
+        // 定律参数）——同参数 lob，drag=0.05 够得着的快照在 drag=0.3 下改判够不着
+        // （阻力大弹丸飞不远，判定必须跟着装配走）。
+        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "0");
+        let verdict = |mgr: &SandboxManager, eid: u128| -> i32 {
+            let mut handle = mgr.create_sandbox(&wasm(&wat_text), 100_000, id(eid)).unwrap();
+            handle.store.data_mut().pos = (0.0, 0.5);
+            handle.store.data_mut().nearest_enemy = Some((3.5, 0.5));
+            mgr.call_on_tick(&mut handle).unwrap();
+            call_i32_export(&mut handle, "get_ret")
+        };
+        let mgr_lo = SandboxManager::new_with_reach_physics(25.0, 0.05).unwrap();
+        assert_eq!(
+            verdict(&mgr_lo, 932),
+            1,
+            "drag=0.05（默认档）3.5 格快照应够得着（现有行为不变）"
+        );
+        let mgr_hi = SandboxManager::new_with_reach_physics(25.0, 0.3).unwrap();
+        assert_eq!(
+            verdict(&mgr_hi, 933),
+            -1,
+            "drag=0.3 同参数应改判够不着（警告码 -N）"
+        );
+    }
+
+    #[test]
+    fn shoot_reach_drag_ge_mass_clamps_to_zero_without_panic() {
+        // drag/mass ≥ 1 的极端装配：镜像 apply_drag 符号翻转钳零（方向永不翻转），
+        // 弹丸原地不动，判定有限返回不 panic（护栏不炸沙箱）
+        let mgr = SandboxManager::new_with_reach_physics(25.0, 10.0).unwrap();
+        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 1.0", "0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(934))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.5);
+        handle.store.data_mut().nearest_enemy = Some((3.5, 0.5));
+        mgr.call_on_tick(&mut handle).unwrap();
+        let ret = call_i32_export(&mut handle, "get_ret");
+        assert_eq!(ret, -1, "弹丸被钳原地（3.5 格够不着）应返回警告码");
+        assert_eq!(handle.store.data().pending_shoots.len(), 1, "照常入队（哑弹自由）");
     }
 
     // === 绑定契约（#034 修订四：shoot 第 6 参 / spawn 第 9 参）===

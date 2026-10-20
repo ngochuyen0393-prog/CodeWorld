@@ -56,7 +56,9 @@ pub struct Constraints {
     /// 被接触方 on_contact 预算（防被接触方死循环；与 probe 同档——
     /// 地雷/哨戒圈是轻量应答）
     pub contact_target_instruction_limit: u64,
-    /// 死亡谢幕 on_death 预算（遗嘱有字数上限=预算即上限；与 on_attack 同档）
+    /// 死亡谢幕 on_death 预算（遗嘱有字数上限=预算即上限；数值与
+    /// attack_target_instruction_limit 同档位 200_000——注意 on_attack 本身
+    /// 无独立预算包裹，跑在攻击目标剩余 tick fuel 上，此处仅数值对齐）
     pub death_instruction_limit: u64,
 
     // === call ===
@@ -180,7 +182,8 @@ mod tests {
     fn default_contact_and_death_instruction_limits_match_d007() {
         // D-007 三兄弟预算默认值（架构 3.3 同族技术保护，非游戏消耗）：
         // contact=10_000 与 probe 同档（地雷/哨戒圈是轻量应答）；
-        // death=200_000 与 on_attack 同档（遗嘱有字数上限=预算即上限）。
+        // death=200_000 数值与 attack_target_instruction_limit 同档位
+        //（遗嘱有字数上限=预算即上限；on_attack 无独立预算，仅数值对齐）。
         let c = Constraints::default();
         assert_eq!(
             c.contact_target_instruction_limit, 10_000,
@@ -188,7 +191,7 @@ mod tests {
         );
         assert_eq!(
             c.death_instruction_limit, 200_000,
-            "遗嘱钩子预算默认应为 200_000（与 on_attack 同档）"
+            "遗嘱钩子预算默认应为 200_000（数值与 attack_target_instruction_limit 同档位）"
         );
     }
 
