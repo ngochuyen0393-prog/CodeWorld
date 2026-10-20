@@ -37,6 +37,12 @@ pub const MAX_SHOOT_SPEED: f64 = codeworld_core::physics::WORLD_MAX_SPEED;
 /// 防无界扫描线性内存。
 pub const MAX_META_LEN: usize = 64;
 
+/// spawn 出生数据包最大字节数（64KB，D-017 挂靠立法：世界不解释内容）
+///
+/// blob_len 超限 → 整次 spawn 拒绝（在读内存之前拦下防大拷贝）；
+/// **不裁剪**——裁剪数据包 = 偷改玩家数据。
+pub const MAX_SPAWN_BLOB_LEN: usize = 64 * 1024;
+
 /// 本 tick 排队的 spawn 请求（env.spawn 推入，阶段二收集统一处理）
 ///
 /// import 层只做零 world 校验（限流/有限性/钻地/±10 格/外观格式），
@@ -65,6 +71,16 @@ pub struct PendingSpawn {
     /// 0=static 钉死（默认=现状，格对齐 AABB）/ 1=dynamic 全活（受完整物理，
     /// 身体=声明 radius 的圆）；kinematic 剧本档缓立）
     pub motion: i32,
+    /// 出生初速 x 分量（spawn 第 11 参，D-018 一体式发射提前落地；import 层已校验：
+    /// 有限 + 模长 ≤ 世界极速，恰等放行。velocity 字段所有实体都有——static 造物
+    /// 钉死不吃速度物理，初速仅对 dynamic 造物有物理意义，照存不裁）
+    pub vx: f64,
+    /// 出生初速 y 分量（spawn 第 12 参，校验同上）
+    pub vy: f64,
+    /// 出生数据包（spawn 第 13/14 参，D-017 挂靠立法：世界不解释内容——母体传讯/
+    /// 代际遗传/子弹带任务参数，通道归世界内容归玩家。blob_len≤0 = 空包合法；
+    /// > MAX_SPAWN_BLOB_LEN 整次拒绝不裁剪。随造物沙箱存活，经 env.birth_blob 读回）
+    pub blob: Vec<u8>,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
 }
@@ -163,6 +179,10 @@ pub struct SandboxData {
     /// 本 tick 的悬停声明（env.hover 置位，host 阶段一收件并入免重力集合后清空；
     /// 每拍重申语义——玩家代码要持续对抗世界规则，上一拍声明不延续）
     pub hover_declared: bool,
+    /// 出生数据包（spawn 第 13/14 参的读取侧：造物诞生时 host 写入，造物代码经
+    /// env.birth_blob 随时读回——世界不解释内容，通道归世界内容归玩家。随沙箱
+    /// 存活不持久化，跨重启不保留；玩家进场与弹丸无包，读回恒 0）
+    pub birth_blob: Vec<u8>,
     /// 地形快照指针（D-016：move_by/spawn 的钻地判据从 y<0 改 y<ground(x)）。
     /// 与 probe_bridge 同款窗口契约：仅主循环阶段一执行玩家代码的窗口内非空
     ///（host 挂载 -> call -> 置空同一循环体作用域），窗口外恒 null——
@@ -243,6 +263,76 @@ fn terrain_depth_violation(
         unsafe { (*terrain).height(x) }
     };
     (y < ground).then_some(ground)
+}
+
+/// 够不着判定寿命上限（D-007 ①）：弹道模拟全程拍数。
+/// 【镜像约束】与 codeworld_physics::default::PROJECTILE_MAX_AGE_TICKS（30，
+/// 弹丸超时哑弹上限）同值——改一处必改另一处，bin 侧镜像锚测试
+/// `shoot_reach_sim_ticks_mirror_physics` 咬合两边（arena 不依赖 physics
+/// crate，此处独立声明）。
+pub const SHOOT_REACH_SIM_TICKS: u64 = 30;
+
+/// 够不着判定容差（D-007 ①）：弹道全程与目标最小距离 ≤ 0.65 视为够得着。
+/// 0.65 = CCD 撞体窗口（r弹 0.15 + 默认身体半径 0.5），与 bin 侧
+/// CTRL_SOLVE_TOLERANCE（预测侧解算器）同口径——判据一致才能保证
+/// "代码层说够不着"与"驾驶层说够不着"及"服务器真结算"三方同判。
+const SHOOT_REACH_TOLERANCE: f64 = 0.65;
+
+/// 点到线段最小距离（D-007 ①辅助）：弹道拍间是直线段，仅拍末采样会漏
+/// 最近点，必须按段扫（与 bin solve_launch_vector 的 seg_min_dist 同式，
+/// 与服务器 CCD 撞体窗口同判据）。
+fn seg_point_distance(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> f64 {
+    let (abx, aby) = (b.0 - a.0, b.1 - a.1);
+    let len2 = abx * abx + aby * aby;
+    let t = if len2 < 1e-12 {
+        0.0
+    } else {
+        (((p.0 - a.0) * abx + (p.1 - a.1) * aby) / len2).clamp(0.0, 1.0)
+    };
+    ((p.0 - a.0 - abx * t).powi(2) + (p.1 - a.1 - aby * t).powi(2)).sqrt()
+}
+
+/// 够不着判定弹道模拟（D-007 ①）：从 from 以初速 (vx,vy)/mass 模拟弹丸全程，
+/// 返回弹道各段到目标点的最小距离。物理步序与 crates/physics step_projectiles
+/// 完全同序（重力→阻力→极速钳→位移，落地 y<半径 或寿命尽截断）；物理常数
+/// 取 core DefaultPhysics 默认值（与 bin solve_launch_vector 预测侧同源），
+/// 极速钳用管理器装配的世界极速（与飞行钳制同源）。
+/// 判据在调用方：最小距离 ≤ SHOOT_REACH_TOLERANCE = 够得着。
+fn shoot_reach_min_distance(
+    from: (f64, f64),
+    vx: f64,
+    vy: f64,
+    mass: f64,
+    target: (f64, f64),
+    max_speed: f64,
+) -> f64 {
+    let phys = codeworld_core::physics::DefaultPhysics::default_values();
+    let r = codeworld_core::collision::PROJECTILE_RADIUS;
+    let (mut x, mut y) = from;
+    let (mut vx, mut vy) = (vx, vy);
+    let mut min = f64::MAX;
+    let mut prev = from;
+    for _ in 0..SHOOT_REACH_SIM_TICKS {
+        // 重力→阻力→极速钳→位移（与 step_projectiles 逐拍同序）
+        vy += phys.gravity;
+        let f = 1.0 - phys.drag_coefficient / mass;
+        vx *= f;
+        vy *= f;
+        let sp = (vx * vx + vy * vy).sqrt();
+        if sp > max_speed {
+            let k = max_speed / sp;
+            vx *= k;
+            vy *= k;
+        }
+        x += vx;
+        y += vy;
+        min = min.min(seg_point_distance(prev, (x, y), target));
+        prev = (x, y);
+        if y < r {
+            break; // 落地截断（与 step_projectiles 落地判据同口径）
+        }
+    }
+    min
 }
 
 /// 沙箱句柄（持有 Store + Instance）
@@ -698,7 +788,8 @@ impl SandboxManager {
                 }
             },
         )?;
-        // env.spawn(code_ptr, code_len, x, y, glyph_ptr, color_ptr, radius, mass, binding, motion) -> i32：造物
+        // env.spawn(code_ptr, code_len, x, y, glyph_ptr, color_ptr, radius, mass, binding,
+        //           motion, vx, vy, blob_ptr, blob_len) -> i32：造物
         //（门二开放，world-foundation 门二 + decisions.md #012 能力统一：造物再造造物合法）。
         // 玩家代码提交一段 WAT 文本 + 出生坐标 + 外观，请求造一个新实体。
         // import 层只做零 world 校验（同 move_by 模式：快照坐标 host 填充，玩家伪造不了）：
@@ -713,23 +804,32 @@ impl SandboxManager {
         //     （#034 物理人格属性，除零护栏）
         //   - binding 第 9 参钳制非法值回 unbound（#034 修订四）
         //   - motion 第 10 参钳制非法值回 static（D-003）：0=钉死默认/1=全活 dynamic
+        //   - 出生初速第 11/12 参：vx/vy 有限 + 模长 ≤ 世界极速（经装配 max_speed，
+        //     与 shoot 同源同口径，恰等放行；D-018 一体式发射提前落地）
+        //   - 出生数据包第 13/14 参：blob_len ≤0 = 空包合法（无包语义）；
+        //     > MAX_SPAWN_BLOB_LEN 整次拒绝（读内存前拦下防大拷贝，不裁剪——
+        //     裁剪数据包=偷改玩家数据）；D-017 挂靠立法：世界不解释内容
         // 产权链 owner 继承、世界实体上限、WAT 编译都在阶段二判（返回 1=已排队，
         // 阶段二拒绝以日志为准，api.md 载明）。
         linker.func_wrap(
             "env",
             "spawn",
-            |mut caller: Caller<SandboxData>,
-             code_ptr: i32,
-             code_len: i32,
-             x: f64,
-             y: f64,
-             glyph_ptr: i32,
-             color_ptr: i32,
-             radius: f64,
-             mass: f64,
-             binding: i32,
-             motion: i32|
-             -> i32 {
+            move |mut caller: Caller<SandboxData>,
+                  code_ptr: i32,
+                  code_len: i32,
+                  x: f64,
+                  y: f64,
+                  glyph_ptr: i32,
+                  color_ptr: i32,
+                  radius: f64,
+                  mass: f64,
+                  binding: i32,
+                  motion: i32,
+                  vx: f64,
+                  vy: f64,
+                  blob_ptr: i32,
+                  blob_len: i32|
+                  -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
                 // 限流：每实体每 tick 最多 1 个造物请求
@@ -817,6 +917,45 @@ impl SandboxManager {
                     tracing::warn!(entity_id = %creator.0, "[spawn] 颜色为空，拒绝");
                     return 0;
                 }
+                // 出生初速校验（spawn 第 11/12 参，D-018 一体式发射提前落地）：
+                // 有限性 + 模长 ≤ 世界极速（经装配 max_speed，与 shoot 同源同口径；
+                // 严格 > 拒绝——恰等于极速放行）
+                if !vx.is_finite() || !vy.is_finite() {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        vx,
+                        vy,
+                        "[spawn] 出生初速非有限，拒绝"
+                    );
+                    return 0;
+                }
+                let speed2 = vx * vx + vy * vy;
+                if speed2 > max_speed * max_speed {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        speed = speed2.sqrt(),
+                        max = max_speed,
+                        "[spawn] 出生初速超世界极速，拒绝（与 shoot 同口径：恰等放行）"
+                    );
+                    return 0;
+                }
+                // 出生数据包长度预检（spawn 第 13/14 参，D-017 挂靠立法）：blob_len >0
+                // 且超限 → 整次拒绝（读内存之前拦下防大拷贝；不裁剪——裁剪数据包=
+                // 偷改玩家数据）。blob_len ≤0 = 空包合法（无包语义）
+                if blob_len > 0 && blob_len as usize > MAX_SPAWN_BLOB_LEN {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        actual_len = blob_len,
+                        max = MAX_SPAWN_BLOB_LEN,
+                        "[spawn] 出生数据包超限，整次拒绝（不裁剪）"
+                    );
+                    return 0;
+                }
+                let blob = if blob_len <= 0 {
+                    Vec::new()
+                } else {
+                    read_payload_from_caller(&mut caller, blob_ptr, blob_len)
+                };
                 // fuel 配额继承创造者（造物与创造者同算力档）
                 let fuel_limit = caller.data().fuel_limit;
                 // #030 第 7 参 radius 校验钳制（0.05..=25.0，非有限回退 0.5，超界 warn）
@@ -836,6 +975,9 @@ impl SandboxManager {
                     mass,
                     binding,
                     motion,
+                    vx,
+                    vy,
+                    blob_len = blob.len(),
                     code_len = code.len(),
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
@@ -852,9 +994,69 @@ impl SandboxManager {
                         mass,
                         binding,
                         motion,
+                        vx,
+                        vy,
+                        blob,
                         fuel_limit,
                     });
                 1
+            },
+        )?;
+        // env.birth_blob(ptr: i32, cap: i32) -> i32：读回自己的出生数据包（第 13 个玩家
+        // import，spawn 第 13/14 参的读取侧，D-017 挂靠立法：世界不解释内容——母体传讯/
+        // 代际遗传/子弹带任务参数，通道归世界内容归玩家）。数据包由 host 在造物诞生时
+        // 写进 SandboxData.birth_blob，本 import 原样搬运回 caller memory：
+        //   - 返回 0 = 无数据包（玩家进场/弹丸恒此路径），不写 memory
+        //   - 返回正数 N = 已把 N 字节写入 memory[ptr..ptr+N)（原子：能整体写入才写）
+        //   - 返回负数 -N = 数据包长 N 但 cap 不足或指针非法，未写任何字节（日志区分
+        //     两种原因；玩家按 64KB 上限备缓冲一次必成）
+        // 生命周期：随沙箱存活（每拍可读），沙箱不持久化故跨重启不保留（api.md 载明）。
+        linker.func_wrap(
+            "env",
+            "birth_blob",
+            |mut caller: Caller<SandboxData>, ptr: i32, cap: i32| -> i32 {
+                caller.data_mut().api_calls.push("birth_blob".to_string());
+                let entity = caller.data().entity_id;
+                let blob = caller.data().birth_blob.clone();
+                if blob.is_empty() {
+                    tracing::debug!(
+                        entity_id = %entity.0,
+                        "[birth_blob] 无出生数据包，返回 0"
+                    );
+                    return 0;
+                }
+                let n = blob.len();
+                // 容量预检：cap 为负或小于 N 都算容量不足（cap 是 i32，负值转 usize
+                // 会回绕成巨数，必须先判符号）
+                let cap_ok = cap >= 0 && (cap as usize) >= n;
+                if !cap_ok {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        need = n,
+                        cap,
+                        "[birth_blob] 缓冲区容量不足，未写任何字节（按 64KB 上限备缓冲一次必成）"
+                    );
+                    return -(n as i32);
+                }
+                // 原子写：write_bytes_to_caller 整段校验后才落笔，指针非法时返回 0
+                // 不留半截数据
+                let written = write_bytes_to_caller(&mut caller, ptr, &blob, n);
+                if written == n {
+                    tracing::debug!(
+                        entity_id = %entity.0,
+                        len = n,
+                        "[birth_blob] 出生数据包已读回 caller memory"
+                    );
+                    n as i32
+                } else {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        ptr,
+                        need = n,
+                        "[birth_blob] 写入指针非法，未写任何字节"
+                    );
+                    -(n as i32)
+                }
             },
         )?;
         // env.shoot(vx, vy, mass, payload_ptr, payload_len) -> i32：射击（#034 第 12 个
@@ -923,6 +1125,15 @@ impl SandboxManager {
                 let mass = codeworld_core::collision::clamp_mass(mass);
                 // #034 修订四第 6 参 binding 校验钳制（非法值钳 unbound，warn）
                 let binding = codeworld_core::entity::clamp_binding(binding);
+                // D-007 够不着判定（不审查但告知，与 mass 超界警告同哲学）：判定输入=
+                // 发射者坐标快照 + nearest_enemy 快照（import 层拿不到 world，与 scan
+                // 同源）；无快照（视野内无敌人）不判定。够不着时照常发射（哑弹自由=
+                // 玩家战术权利），仅返回值带负号提示 + INFO 日志。
+                let unreachable_target = caller.data().nearest_enemy.map(|(tx, ty)| {
+                    let from = caller.data().pos;
+                    shoot_reach_min_distance(from, vx, vy, mass, (tx, ty), max_speed)
+                        > SHOOT_REACH_TOLERANCE
+                });
                 caller.data_mut().shots_fired += 1;
                 let serial = caller.data().shots_fired;
                 caller.data_mut().pending_shoots.push(PendingShoot {
@@ -933,6 +1144,18 @@ impl SandboxManager {
                     binding,
                     payload,
                 });
+                if unreachable_target.unwrap_or(false) {
+                    tracing::info!(
+                        entity_id = %shooter.0,
+                        vx,
+                        vy,
+                        mass,
+                        serial,
+                        target = ?caller.data().nearest_enemy,
+                        "[shoot-unreachable] 发射参数按标准解够不着目标，照常发射（返回 -序号 提示，哑弹自由=玩家战术权利）"
+                    );
+                    return -serial;
+                }
                 tracing::info!(
                     entity_id = %shooter.0,
                     vx,
@@ -1105,6 +1328,75 @@ impl SandboxManager {
     /// 检查实例是否导出某函数
     pub fn has_export(&self, handle: &mut SandboxHandle, name: &str) -> Result<bool> {
         Ok(handle.instance.get_func(&mut handle.store, name).is_some())
+    }
+
+    /// 调用 on_contact(other_x, other_y)（D-007 ②接触回调；host 侧独立预算包裹）
+    ///
+    /// 返回 `Ok(Some(fuel_used))` = 已调用（used 记在预算尺度）；
+    /// `Ok(None)` = 未导出（no-op，与 on_attack 未导出同款防御）。
+    /// 预算包裹（probe 同款三步）：存剩余量 -> set 预算 -> 调 -> 恢复；
+    /// fuel_consumed 元数据按原尺度重算（包裹期间预算尺度算过假象，防污染）。
+    pub fn call_on_contact(
+        &self,
+        handle: &mut SandboxHandle,
+        other_x: f64,
+        other_y: f64,
+        budget: u64,
+    ) -> Result<Option<u64>> {
+        if !self.has_export(handle, "on_contact")? {
+            tracing::debug!("[contact] on_contact 未导出，跳过");
+            return Ok(None);
+        }
+        let limit = handle.store.data().fuel_limit;
+        let prev_fuel = handle.store.get_fuel()?;
+        if let Err(e) = handle.store.set_fuel(budget) {
+            anyhow::bail!("[contact] 预算设置失败: {e}");
+        }
+        let func = handle
+            .instance
+            .get_typed_func::<(f64, f64), ()>(&mut handle.store, "on_contact")?;
+        let call_result = func.call(&mut handle.store, (other_x, other_y));
+        // 无论调用成败都恢复原 fuel（Err 上抛前不能弄丢目标剩余配额）
+        let fuel_left = handle.store.get_fuel().unwrap_or(budget);
+        let used = budget.saturating_sub(fuel_left);
+        if let Err(e) = handle.store.set_fuel(prev_fuel) {
+            tracing::warn!(error = %e, "[contact] fuel 恢复失败");
+        }
+        handle.store.data_mut().fuel_consumed = limit.saturating_sub(prev_fuel);
+        call_result?;
+        tracing::info!(other_x, other_y, fuel_used = used, "call on_contact");
+        Ok(Some(used))
+    }
+
+    /// 调用 on_death()（D-007 ③遗嘱钩子；host 侧独立预算包裹，世界托管执行）
+    ///
+    /// 返回 `Ok(Some(fuel_used))` = 已调用；`Ok(None)` = 未导出（无遗嘱，现状行为）。
+    /// 预算即遗嘱字数上限：燃料耗尽遗嘱写不完（世界不补偿不重试；wasm 内烧穿
+    /// fuel 在 Windows 上是进程 abort，.cc-bugs #5 环境级问题，生产化前需升级
+    /// wasmtime——本包裹只保证正常路径的预算记账与恢复）。
+    pub fn call_on_death(&self, handle: &mut SandboxHandle, budget: u64) -> Result<Option<u64>> {
+        if !self.has_export(handle, "on_death")? {
+            tracing::debug!("[will] on_death 未导出，无遗嘱");
+            return Ok(None);
+        }
+        let limit = handle.store.data().fuel_limit;
+        let prev_fuel = handle.store.get_fuel()?;
+        if let Err(e) = handle.store.set_fuel(budget) {
+            anyhow::bail!("[will] 预算设置失败: {e}");
+        }
+        let func = handle
+            .instance
+            .get_typed_func::<(), ()>(&mut handle.store, "on_death")?;
+        let call_result = func.call(&mut handle.store, ());
+        let fuel_left = handle.store.get_fuel().unwrap_or(budget);
+        let used = budget.saturating_sub(fuel_left);
+        if let Err(e) = handle.store.set_fuel(prev_fuel) {
+            tracing::warn!(error = %e, "[will] fuel 恢复失败");
+        }
+        handle.store.data_mut().fuel_consumed = limit.saturating_sub(prev_fuel);
+        call_result?;
+        tracing::info!(fuel_used = used, "call on_death");
+        Ok(Some(used))
     }
 
     /// 引擎引用
@@ -1328,6 +1620,112 @@ mod tests {
         let mgr = SandboxManager::new().unwrap();
         let mut handle = mgr.create_sandbox(&wasm(ATTACK_INTERCEPT_WAT), 1000, id(1)).unwrap();
         assert!(mgr.call_on_attack(&mut handle, &[1]).unwrap()); // 拦截
+    }
+
+    // === D-007 三兄弟：call_on_contact / call_on_death（host 侧独立预算包裹）===
+
+    /// 接触记录模块：on_contact 把对方坐标存进两个 f64 global + 调用计数
+    ///（get_gx/get_gy/get_calls 观测导出，坐标值断言用）
+    const CONTACT_RECORDER_WAT: &str = r#"(module
+  (global $gx (mut f64) (f64.const -999))
+  (global $gy (mut f64) (f64.const -999))
+  (global $calls (mut i32) (i32.const 0))
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "on_contact") (param $ox f64) (param $oy f64)
+    local.get $ox global.set $gx
+    local.get $oy global.set $gy
+    global.get $calls i32.const 1 i32.add global.set $calls)
+  (func (export "get_gx") (result f64) global.get $gx)
+  (func (export "get_gy") (result f64) global.get $gy)
+  (func (export "get_calls") (result i32) global.get $calls))"#;
+
+    /// 遗嘱记录模块：on_death 把标记置 1（get_will 观测导出，触发断言用）
+    const WILL_RECORDER_WAT: &str = r#"(module
+  (global $will (mut i32) (i32.const 0))
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "on_death") global.get $will i32.const 1 i32.add global.set $will)
+  (func (export "get_will") (result i32) global.get $will))"#;
+
+    #[test]
+    fn call_on_contact_passes_opposite_coords() {
+        // D-007 ②：on_contact(other_x, other_y) 收到对方坐标（f64,f64 多参元组直传），
+        // WAT global 记录后观测导出断言值正确；返回 Some(used)=已调用
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(CONTACT_RECORDER_WAT), 100_000, id(30))
+            .unwrap();
+        let used = mgr
+            .call_on_contact(&mut handle, 3.5, -2.25, 10_000)
+            .unwrap()
+            .expect("导出了 on_contact 应返回 Some(used)");
+        assert!(used > 0 && used <= 10_000, "消耗应记在预算尺度内（used={used}）");
+        assert_eq!(call_f64_export(&mut handle, "get_gx"), 3.5, "对方 x 应透传");
+        assert_eq!(call_f64_export(&mut handle, "get_gy"), -2.25, "对方 y 应透传");
+        assert_eq!(call_i32_export(&mut handle, "get_calls"), 1, "调用一次计数 1");
+    }
+
+    #[test]
+    fn call_on_contact_without_export_is_noop() {
+        // 负面路径：不导出 on_contact -> Ok(None) 不 Err（与 on_attack 未导出同款防御）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(LIFE_TRUE_WAT), 1000, id(31)).unwrap();
+        assert!(
+            mgr.call_on_contact(&mut handle, 1.0, 2.0, 10_000)
+                .unwrap()
+                .is_none(),
+            "未导出应返回 None（no-op）"
+        );
+    }
+
+    #[test]
+    fn call_on_contact_restores_fuel_and_recomputes_consumed() {
+        // 燃料不污染（probe 同款）：包裹前 fuel=55_555 -> 调用后恢复 55_555；
+        // fuel_consumed 元数据按原尺度重算（包裹期间预算尺度算过假象）。
+        // 注：不构造 wasm 内烧穿预算的场景——wasmtime 25 + Windows 下 fuel 耗尽
+        // trap = 进程 abort（.cc-bugs #5 红线），预算中断由 host 侧 set_fuel
+        // 包裹逻辑保证，测试只验证记账与恢复。
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(CONTACT_RECORDER_WAT), 100_000, id(32))
+            .unwrap();
+        handle.store.set_fuel(55_555).unwrap();
+        mgr.call_on_contact(&mut handle, 7.0, 8.0, 10_000).unwrap();
+        assert_eq!(
+            handle.store.get_fuel().unwrap(),
+            55_555,
+            "调用后 fuel 应恢复原值（接触通知不扣手续费）"
+        );
+        assert_eq!(
+            handle.store.data().fuel_consumed,
+            100_000 - 55_555,
+            "fuel_consumed 应按原尺度重算，不被包裹污染"
+        );
+    }
+
+    #[test]
+    fn call_on_death_invokes_export_and_returns_fuel_used() {
+        // D-007 ③：on_death 无参被调（WAT global 标记置位），返回 Some(used)
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(WILL_RECORDER_WAT), 100_000, id(33))
+            .unwrap();
+        let used = mgr
+            .call_on_death(&mut handle, 200_000)
+            .unwrap()
+            .expect("导出了 on_death 应返回 Some(used)");
+        assert!(used > 0 && used <= 200_000, "消耗应记在预算尺度内（used={used}）");
+        assert_eq!(call_i32_export(&mut handle, "get_will"), 1, "遗嘱钩子应被调用");
+    }
+
+    #[test]
+    fn call_on_death_without_export_is_noop() {
+        // 负面路径：不导出 on_death -> Ok(None)（现状行为，零回归：无遗嘱=无事发生）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(LIFE_TRUE_WAT), 1000, id(34)).unwrap();
+        assert!(
+            mgr.call_on_death(&mut handle, 200_000).unwrap().is_none(),
+            "未导出应返回 None（无遗嘱）"
+        );
     }
 
     #[test]
@@ -2398,7 +2796,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
@@ -2413,12 +2811,20 @@ mod tests {
     f64.const 1.0
     i32.const 0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.0
     i32.const 0
     i32.const 0
     call $spawn global.set $r2)
@@ -2432,7 +2838,7 @@ mod tests {
 
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
@@ -2445,6 +2851,10 @@ mod tests {
     f64.const 1.0
     i32.const 0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -2454,7 +2864,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -2466,6 +2876,10 @@ mod tests {
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.0
     i32.const 0
     i32.const 0
     call $spawn global.set $ret)
@@ -2517,7 +2931,7 @@ mod tests {
         // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
         let wat_text = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -2528,6 +2942,10 @@ mod tests {
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1000.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.0
     i32.const 0
     i32.const 0
     call $spawn drop)
@@ -2730,6 +3148,285 @@ mod tests {
         assert_eq!(spawns[0].vy, -4.0, "vy 应透传");
     }
 
+    // === 出生数据包（spawn 第 13/14 参 blob_ptr/blob_len，D-017 挂靠立法）===
+
+    /// 带出生数据包的造物方 WAT：blob 数据段放 8500（外观段 8256 之后），
+    /// blob_ptr/blob_len 以 WAT 表达式传入（超限用例传 i32.const 65537 即可——
+    /// 拒绝发生在读内存前，无需真备 64KB 数据）
+    fn spawner_blob_wat(
+        code: &str,
+        x: &str,
+        y: &str,
+        blob_data: &[u8],
+        blob_ptr: &str,
+        blob_len: &str,
+    ) -> String {
+        let escaped = wat_escape(code);
+        let blob_escaped: String = blob_data.iter().map(|b| format!("\\{b:02x}")).collect();
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8500) "{blob_escaped}")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    {x} {y}
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.0
+    {blob_ptr} {blob_len}
+    call $spawn global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = code.len(),
+            x = x,
+            y = y,
+            blob_ptr = blob_ptr,
+            blob_len = blob_len,
+        )
+    }
+
+    #[test]
+    fn spawn_import_reads_birth_blob_from_memory() {
+        // blob_len 5（1..=64KB）→ 从 caller memory 原样读字节入队（世界不解释内容）
+        let mgr = SandboxManager::new().unwrap();
+        let blob = [0xDEu8, 0xAD, 0xBE, 0xEF, 0x42];
+        let mut handle = mgr
+            .create_sandbox(
+                &wasm(&spawner_blob_wat(
+                    SPAWNED_CODE,
+                    "f64.const 2.0",
+                    "f64.const 3.0",
+                    &blob,
+                    "i32.const 8500",
+                    "i32.const 5",
+                )),
+                100_000,
+                id(831),
+            )
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "合法 blob 应放行");
+        assert_eq!(
+            handle.store.data().pending_spawns[0].blob,
+            blob.to_vec(),
+            "blob 应从 memory 原样读入"
+        );
+    }
+
+    #[test]
+    fn spawn_import_empty_blob_len_zero_is_legal() {
+        // blob_len=0 → 空数据包合法（无包语义），spawn 照常入队
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(
+                &wasm(&spawner_blob_wat(
+                    SPAWNED_CODE,
+                    "f64.const 2.0",
+                    "f64.const 3.0",
+                    &[],
+                    "i32.const 0",
+                    "i32.const 0",
+                )),
+                100_000,
+                id(832),
+            )
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "空包应合法放行");
+        assert!(
+            handle.store.data().pending_spawns[0].blob.is_empty(),
+            "空包 blob 应为空"
+        );
+    }
+
+    #[test]
+    fn spawn_import_negative_blob_len_is_empty_packet() {
+        // blob_len=-1 → 合法（负长度同空包语义，不读内存）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(
+                &wasm(&spawner_blob_wat(
+                    SPAWNED_CODE,
+                    "f64.const 2.0",
+                    "f64.const 3.0",
+                    &[],
+                    "i32.const 0",
+                    "i32.const -1",
+                )),
+                100_000,
+                id(833),
+            )
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "负长度应合法放行");
+        assert!(
+            handle.store.data().pending_spawns[0].blob.is_empty(),
+            "负长度 blob 应为空"
+        );
+    }
+
+    #[test]
+    fn spawn_import_rejects_oversized_blob() {
+        // blob_len=65537 > 64KB 上限 → 整次拒绝（读内存前拦下，不裁剪——
+        // 裁剪数据包=偷改玩家数据）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(
+                &wasm(&spawner_blob_wat(
+                    SPAWNED_CODE,
+                    "f64.const 2.0",
+                    "f64.const 3.0",
+                    &[],
+                    "i32.const 0",
+                    "i32.const 65537",
+                )),
+                100_000,
+                id(834),
+            )
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超限 blob 应整次拒绝");
+        assert!(
+            handle.store.data().pending_spawns.is_empty(),
+            "超限 blob 不应入队"
+        );
+    }
+
+    #[test]
+    fn spawn_import_allows_blob_exactly_64k() {
+        // 边界：blob_len=65536 恰等上限放行（blob 内容=零页初始内存，只锚长度）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(
+                &wasm(&spawner_blob_wat(
+                    SPAWNED_CODE,
+                    "f64.const 2.0",
+                    "f64.const 3.0",
+                    &[],
+                    "i32.const 0",
+                    "i32.const 65536",
+                )),
+                100_000,
+                id(835),
+            )
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "恰等 64KB 应放行");
+        assert_eq!(
+            handle.store.data().pending_spawns[0].blob.len(),
+            65536,
+            "恰等上限的 blob 应完整读入"
+        );
+    }
+
+    // === env.birth_blob import（第 13 个玩家 import：造物读回自己的出生数据包）===
+
+    /// birth_blob 读取方 WAT：data 段 [2048] 放哨兵 \77（"未写任何字节"断言锚点），
+    /// on_tick 调 birth_blob(ptr, cap) 返回值存全局
+    fn birth_blob_reader_wat(ptr: &str, cap: &str) -> String {
+        format!(
+            r#"(module
+  (import "env" "birth_blob" (func $birth_blob (param i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 2048) "\77")
+  (func (export "on_tick")
+    {ptr} {cap}
+    call $birth_blob global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#
+        )
+    }
+
+    /// 读沙箱线性内存 [start..start+len)（birth_blob 写入侧断言用）
+    fn read_memory(handle: &mut SandboxHandle, start: usize, len: usize) -> Vec<u8> {
+        let memory = handle
+            .instance
+            .get_memory(&mut handle.store, "memory")
+            .expect("测试模块应导出 memory");
+        memory.data(&handle.store)[start..start + len].to_vec()
+    }
+
+    #[test]
+    fn birth_blob_import_returns_zero_when_no_packet() {
+        // 无出生数据包（默认空）→ 返回 0，不写 memory（哨兵字节原样）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&birth_blob_reader_wat("i32.const 3000", "i32.const 64")), 100_000, id(841))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "无包应返回 0");
+        assert_eq!(read_memory(&mut handle, 2048, 1), vec![0x77], "无包不应写 memory");
+    }
+
+    #[test]
+    fn birth_blob_import_writes_and_returns_len() {
+        // 有包 + cap 足够 → 原样写入 [ptr..ptr+N)，返回 N（原子整体写入）
+        let mgr = SandboxManager::new().unwrap();
+        let blob = vec![0x11u8, 0x22, 0x33, 0x44, 0x55];
+        let mut handle = mgr
+            .create_sandbox(&wasm(&birth_blob_reader_wat("i32.const 3000", "i32.const 64")), 100_000, id(842))
+            .unwrap();
+        handle.store.data_mut().birth_blob = blob.clone();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 5, "写入成功应返回 N=5");
+        assert_eq!(read_memory(&mut handle, 3000, 5), blob, "blob 应原样写入 memory");
+        assert_eq!(read_memory(&mut handle, 3005, 1), vec![0], "写入不应越过 N 边界");
+        assert_eq!(read_memory(&mut handle, 2048, 1), vec![0x77], "哨兵不应受扰");
+    }
+
+    #[test]
+    fn birth_blob_import_returns_negative_when_cap_short() {
+        // cap 不足（2 < 5）→ 返回 -N=-5，未写任何字节（玩家按 64KB 备缓冲一次必成）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&birth_blob_reader_wat("i32.const 3000", "i32.const 2")), 100_000, id(843))
+            .unwrap();
+        handle.store.data_mut().birth_blob = vec![0xAAu8; 5];
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), -5, "cap 不足应返回 -N");
+        assert_eq!(read_memory(&mut handle, 3000, 1), vec![0], "cap 不足不应写 memory");
+    }
+
+    #[test]
+    fn birth_blob_import_returns_negative_when_cap_zero() {
+        // cap=0 → 容量不足路径（返回 -N，不写）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&birth_blob_reader_wat("i32.const 3000", "i32.const 0")), 100_000, id(844))
+            .unwrap();
+        handle.store.data_mut().birth_blob = vec![0xAAu8; 5];
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), -5, "cap=0 应返回 -N");
+    }
+
+    #[test]
+    fn birth_blob_import_returns_negative_when_ptr_illegal() {
+        // 指针越界（70000 > 64KB 页）→ 返回 -N，未写任何字节
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&birth_blob_reader_wat("i32.const 70000", "i32.const 64")), 100_000, id(845))
+            .unwrap();
+        handle.store.data_mut().birth_blob = vec![0xAAu8; 5];
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), -5, "指针非法应返回 -N");
+    }
+
     // === env.shoot import（#034 第 12 个玩家 import：发射弹丸）===
 
     /// 射手 WAT 生成器：on_tick 调 shoot(vx, vy, mass, 0, payload_len)（payload 从
@@ -2906,6 +3603,79 @@ mod tests {
         mgr.call_on_tick(&mut handle).unwrap();
         assert_eq!(call_i32_export(&mut handle, "get_ret"), 1);
         assert_eq!(handle.store.data().pending_shoots[0].mass, 0.05, "低下限应钳到 0.05");
+    }
+
+    // === 够不着警告码（D-007 ①：不审查但告知——照常发射，返回负序号提示）===
+
+    #[test]
+    fn shoot_unreachable_target_returns_negative_serial_but_still_queues() {
+        // 发射参数按标准解够不着最近敌人快照（(30,0.5) 远超 (4,9.8) 抛射射程）：
+        // 世界照常发射（哑弹自由=玩家战术权利）——pending_shoots 仍入队 1 发参数原样，
+        // 返回值改 -序号（负数=带警告的弹丸序号，玩家代码 sign 即知）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "4");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(920))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.5);
+        handle.store.data_mut().nearest_enemy = Some((30.0, 0.5));
+        mgr.call_on_tick(&mut handle).unwrap();
+        let ret = call_i32_export(&mut handle, "get_ret");
+        assert_eq!(ret, -1, "够不着目标应返回 -序号（警告码）");
+        let shoots = &handle.store.data().pending_shoots;
+        assert_eq!(shoots.len(), 1, "够不着也照常入队（哑弹自由）");
+        assert_eq!(shoots[0].vx, 4.0, "入队参数原样（vx）");
+        assert_eq!(shoots[0].vy, 9.8, "入队参数原样（vy）");
+        assert_eq!(shoots[0].mass, 0.5, "入队参数原样（mass）");
+    }
+
+    #[test]
+    fn shoot_reachable_target_returns_positive_serial() {
+        // 快照目标够得着（(3.5,0.5) 在抛射弧线正下，首段水平线扫过）-> 正序号（现状不变）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "4");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(921))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.5);
+        handle.store.data_mut().nearest_enemy = Some((3.5, 0.5));
+        mgr.call_on_tick(&mut handle).unwrap();
+        let ret = call_i32_export(&mut handle, "get_ret");
+        assert_eq!(ret, 1, "够得着目标返回正序号（无警告）");
+        assert_eq!(handle.store.data().pending_shoots.len(), 1);
+    }
+
+    #[test]
+    fn shoot_without_enemy_snapshot_skips_reach_check() {
+        // 无 nearest_enemy 快照（视野内无敌人）-> 不判定，照常返回正序号
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "4");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(922))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.5);
+        // nearest_enemy 保持 None（Default）
+        mgr.call_on_tick(&mut handle).unwrap();
+        let ret = call_i32_export(&mut handle, "get_ret");
+        assert_eq!(ret, 1, "无快照不判定，照常返回正序号");
+        assert_eq!(handle.store.data().pending_shoots.len(), 1);
+    }
+
+    #[test]
+    fn shoot_unreachable_negative_carries_current_serial() {
+        // -N 与 N 指同一发弹：跨拍序号递增时负号随当前序号走（tick1 -1、drain 后 tick2 -2）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(923))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.5);
+        handle.store.data_mut().nearest_enemy = Some((30.0, 0.5));
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), -1, "首发警告码 -1");
+        handle.store.data_mut().pending_shoots.clear(); // 主程序收集后清空（drain 语义）
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), -2, "次拍警告码随序号 -2");
     }
 
     // === 绑定契约（#034 修订四：shoot 第 6 参 / spawn 第 9 参）===

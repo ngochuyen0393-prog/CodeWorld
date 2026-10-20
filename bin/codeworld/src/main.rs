@@ -96,6 +96,17 @@ struct EntitySandboxMap {
     /// 上拍相触实体对集合（#030 接触边沿触发状态：本拍新进入接触才触发
     /// ContactPair，持续贴着不重复，分开再碰再触发；每拍整体重建）
     last_touching: std::collections::HashSet<(EntityId, EntityId)>,
+    /// on_contact 独立小 fuel 预算（D-007 ②，架构 3.3 同族
+    /// contact_target_instruction_limit；main() 从 config.contact_fuel 设置，默认 10_000）
+    contact_fuel: u64,
+    /// on_death 遗嘱预算（D-007 ③，架构 3.3 同族 death_instruction_limit；
+    /// main() 从 config.death_fuel 设置，默认 200_000——遗嘱有字数上限=预算即上限）
+    death_fuel: u64,
+    /// 本拍会话级离场登记（登出 take #025 + 残影到期消散 #013）：两类 kill 都在
+    /// d 步遗嘱窗口【之前】发生且都会清掉自己的目录记录（remove_online/ghosts.remove），
+    /// d 步 is_ghost 判不到"刚消散的残影"——故在 kill 处直接挂号，遗嘱窗口据此
+    /// 跳过 on_death（会话级离场非死亡谢幕）并消费清空
+    session_takes: std::collections::HashSet<EntityId>,
     /// 在飞弹丸账本（#034 弹道系统：弹丸 -> 发射者+payload）。
     /// Entity 本体只存物理（质量/速度/半径），发射者豁免与结算 payload 归账本；
     /// 弹丸消亡（命中/落地/超时）时一并清理。不持久化（跨重启按哑弹清场）
@@ -121,6 +132,7 @@ struct EntitySandboxMap {
 
 impl EntitySandboxMap {
     /// 创建映射表（初始化 SandboxManager，世界极速用缺省常数——测试基线用）
+    #[cfg(test)] // 仅测试装配用（生产路径走 new_with_max_speed）；无此标注 dead_code 误报
     fn new() -> Result<Self> {
         Self::new_with_max_speed(codeworld_core::physics::WORLD_MAX_SPEED)
     }
@@ -143,6 +155,9 @@ impl EntitySandboxMap {
             ctrl_exclusive_active: false,
             flight_phase: None,
             last_touching: std::collections::HashSet::new(),
+            contact_fuel: 10_000,
+            death_fuel: 200_000,
+            session_takes: std::collections::HashSet::new(),
             move_stall: None,
             conn_event: None,
             ctrl_shoots: Vec::new(),
@@ -663,10 +678,13 @@ impl EntitySandboxMap {
         }
         // 2. 残影到期消散：标记死亡，本拍死亡清理步移除实体+销毁沙箱
         //    （不算击杀：无掠夺对象，只是消散——在线锚合同下线语义）
+        //    D-007 ③：消散登记会话级离场（expire_due_ghosts 已删残影记录，
+        //    d 步 is_ghost 判不到，遗嘱窗口凭本集合跳过 on_death）
         for entity_id in self.players.expire_due_ghosts(current_tick) {
             if let Some(entity) = world.entities.get_mut(&entity_id) {
                 tracing::info!(entity_id = %entity_id.0, "[players] 残影消散（非击杀，无掠夺）");
                 entity.kill();
+                self.session_takes.insert(entity_id);
             }
         }
         // 3. 记录打扫：残影期被击杀等已不在世界的实体，清残影/参战记录（防无界增长）；
@@ -754,6 +772,9 @@ fn main() -> Result<()> {
     let mut sandbox_map = EntitySandboxMap::new_with_max_speed(config.max_speed)?;
     // probe 预算装配（三层感知 Phase A：config 可调的 on_probe 独立小 fuel）
     sandbox_map.probe_fuel = config.probe_fuel;
+    // D-007 三兄弟预算装配（接触回调/遗嘱钩子，模式同 probe_fuel）
+    sandbox_map.contact_fuel = config.contact_fuel;
+    sandbox_map.death_fuel = config.death_fuel;
     // 世界实体上限装配（门二 spawn 配套，decisions.md #020）
     sandbox_map.max_entities = config.max_entities;
 
@@ -1386,6 +1407,9 @@ fn tick_with_intents(
     if contact_count > 0 {
         tracing::info!(tick = current_tick, contact_count, "接触事件处理（边沿触发）");
     }
+    //      接触回调通知（D-007 ②）：新进入接触的对，双方造物代码各收对方坐标
+    //      （on_contact 独立预算包裹；世界零过滤，过滤归玩家代码）
+    notify_contacts(world, sandbox_map, &contacts);
 
     //   d0. 玩家目录在线锚（门一进场/下线/残影消散；disabled 时 no-op 零开销）。
     //       攻击结算（a2）之后：本拍参战记录已入册，#013 战斗残影时长计算才完整。
@@ -1399,6 +1423,21 @@ fn tick_with_intents(
         .filter(|(_, e)| !e.is_alive())
         .map(|(id, _)| *id)
         .collect();
+    //      d-will 遗嘱窗口（D-007 ③，#043 死亡谢幕）：必须在 remove 之前（沙箱还在
+    //      才能执行遗嘱）、retain 之前（遗嘱产物发射/出生要读死者坐标与产权）。
+    //      遗嘱排队的 spawn/shoot 当拍喂回既有管线（先后顺序与 a1/a1.5 同：先造物
+    //      后弹道），attack 丢弃（死人不出刀）。残影消散/登出 take 不触发（函数内过滤）。
+    let (will_shoots, will_spawns) = run_death_wills(sandbox_map, &dead_ids);
+    if !will_spawns.is_empty() {
+        // 遗嘱执行人资格：创造者本拍刚死的 spawn 放行（产权链照常继承）
+        let creators: Vec<EntityId> = will_spawns.iter().map(|r| r.creator).collect();
+        process_spawn_requests(world, sandbox_map, will_spawns, current_tick, &creators);
+    }
+    if !will_shoots.is_empty() {
+        // 死者最后一发照常出膛（发射位置读死者实况坐标——retain 前仍在 world）
+        let shooters: Vec<EntityId> = will_shoots.iter().map(|s| s.shooter).collect();
+        process_shoot_requests(world, sandbox_map, will_shoots, current_tick, &shooters);
+    }
     for id in &dead_ids {
         sandbox_map.remove(id);
         // #025：处置中的实体死亡（等待期/站桩期被杀）——处置状态一并清
@@ -1536,6 +1575,8 @@ fn dispose_take(
         if let Some(e) = world.entities.get_mut(&id) {
             e.kill();
         }
+        // D-007 ③：take 的死亡不触发遗嘱（会话级离场非死亡）——遗嘱窗口据此跳过
+        sandbox_map.session_takes.insert(id);
     }
     sandbox_map.players.mark_absent(name);
     sandbox_map.players.dispose.clear(name);
@@ -1762,9 +1803,29 @@ fn process_destroys(
 /// 存续独立于创造者在线状态）。
 fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, current_tick: u64) {
     let requests = sandbox_map.collect_pending_spawns();
+    process_spawn_requests(world, sandbox_map, requests, current_tick, &[]);
+}
+
+/// 造物请求落地（process_spawns 主体；will_creators = 遗嘱放行名单，D-007 ③）
+///
+/// 创造者已死分支的例外：#043 遗嘱钩子在死亡清理窗口排队、当拍消费的 spawn
+/// 放行（创造者本拍刚死——遗嘱执行人资格，产权链照常继承，死者实体仍在 world
+/// 可读 owner）。常规路径传空名单，行为与拆分前完全一致。
+fn process_spawn_requests(
+    world: &mut WorldState,
+    sandbox_map: &mut EntitySandboxMap,
+    requests: Vec<PendingSpawn>,
+    current_tick: u64,
+    will_creators: &[EntityId],
+) {
     for req in requests {
-        // 创造者必须存活（死者不造物）
-        let Some(creator) = world.entities.get(&req.creator).filter(|e| e.is_alive()) else {
+        // 创造者必须存活（死者不造物；遗嘱例外：死亡谢幕窗口排队的 spawn 放行）
+        let will_pass = will_creators.contains(&req.creator);
+        let Some(creator) = world
+            .entities
+            .get(&req.creator)
+            .filter(|e| e.is_alive() || will_pass)
+        else {
             tracing::warn!(
                 creator = %req.creator.0,
                 "[process_spawns] 创造者已死，造物请求作废"
@@ -1844,6 +1905,12 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
         // D-003 spawn 第 10 参 motion：运动身份写进造物数据（import 层已钳制，
         // 此处直存）——dynamic 造物即刻受完整物理（身体=声明 radius 的圆）
         entity.set_motion(req.motion);
+        // 出生初速（spawn 第 11/12 参，D-018 一体式发射提前落地）：import 层已校验
+        // （有限+模长 ≤ 世界极速），此处写进造物 velocity 字段。位置积分（造物被
+        // 初速带着飞）不做——那是 D-018「通用有速度实体物理」的活；velocity 字段
+        // 所有实体都有，static 造物钉死不吃速度物理（初速仅对 dynamic 造物有
+        // 物理意义，api.md 载明）
+        entity.set_velocity((req.vx, req.vy));
         // 沙箱创建成功才插入世界（失败则实体不落世界，不留无沙箱活体）
         if let Err(e) = sandbox_map.create(entity_id, &wasm_bytes, req.fuel_limit) {
             tracing::warn!(
@@ -1853,6 +1920,13 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
             );
             continue;
         }
+        // 出生数据包交付（spawn 第 13/14 参读取侧）：写进造物沙箱 SandboxData，
+        // 造物代码经 env.birth_blob 随时读回（世界不解释内容，通道归世界内容归
+        // 玩家）；随沙箱存活不持久化，跨重启不保留（api.md 载明）
+        let blob_len = req.blob.len();
+        if let Some(handle) = sandbox_map.sandboxes.get_mut(&entity_id) {
+            handle.store.data_mut().birth_blob = req.blob;
+        }
         world.entities.insert(entity_id, entity);
         tracing::info!(
             entity_id = %entity_id.0,
@@ -1861,6 +1935,9 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
             pos = ?req.pos,
             glyph = %req.glyph,
             motion = req.motion,
+            vx = req.vx,
+            vy = req.vy,
+            blob_len,
             "造物诞生：玩家造物进场（门二，产权链归属创造者 owner；D-003 motion={}）",
             if req.motion == codeworld_core::entity::MOTION_DYNAMIC { "dynamic 全活" } else { "static 钉死" }
         );
@@ -2056,8 +2133,29 @@ pub fn solve_launch_vector(
 /// 返回无（弹丸下一段在 tick 的弹道步积分；命中/落地事件归弹道步产出）。
 fn process_shoots(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, current_tick: u64) {
     let requests = sandbox_map.collect_pending_shoots();
+    process_shoot_requests(world, sandbox_map, requests, current_tick, &[]);
+}
+
+/// 射击请求落地（process_shoots 主体；will_shooters = 遗嘱放行名单，D-007 ③）
+///
+/// 发射者已死分支的例外：遗嘱钩子当拍排队的 shoot 放行（死者最后一发照常出膛
+/// ——烟花/遗物弹，发射位置读死者实况坐标）。常规路径传空名单，行为与拆分前
+/// 完全一致。
+fn process_shoot_requests(
+    world: &mut WorldState,
+    sandbox_map: &mut EntitySandboxMap,
+    requests: Vec<codeworld_arena::sandbox::PendingShoot>,
+    current_tick: u64,
+    will_shooters: &[EntityId],
+) {
     for req in requests {
-        let Some(shooter) = world.entities.get(&req.shooter).filter(|e| e.is_alive()) else {
+        // 发射者必须存活（死者不出手，防御性复查；遗嘱例外：死亡谢幕窗口放行）
+        let will_pass = will_shooters.contains(&req.shooter);
+        let Some(shooter) = world
+            .entities
+            .get(&req.shooter)
+            .filter(|e| e.is_alive() || will_pass)
+        else {
             tracing::warn!(
                 shooter = %req.shooter.0,
                 "[process_shoots] 发射者已死，射击请求作废"
@@ -2691,6 +2789,126 @@ fn handle_collisions(pairs: &[ContactPair], entities: &HashMap<EntityId, Entity>
         count += 1;
     }
     count
+}
+
+/// 接触回调通知（D-007 ②：on_contact——与 on_attack/on_probe 同族第三兄弟）
+///
+/// 对每个新进入接触的 ContactPair 通知双方：a 收 (b.x, b.y)、b 收 (a.x, a.y)。
+/// 坐标取接触拍实况（c 步 world 实况坐标）。防刷屏双闸：边沿触发（contacts
+/// 已是本拍新进入对）+ 过滤归代码（世界零过滤，双方都收通知，白名单/可疑判断
+/// 玩家自己写）。燃料：host 侧独立小预算包裹（call_on_contact 内部，probe 同款）。
+/// 跳过语义（锚定不 Err）：含死亡方整对跳过（与 handle_collisions 同口径）；
+/// 残影侧不唤醒（残影不执行玩家代码既有不变量）；无沙箱侧跳过（框架实体）。
+fn notify_contacts(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, contacts: &[ContactPair]) {
+    let budget = sandbox_map.contact_fuel;
+    for pair in contacts {
+        // 含死亡方整对跳过（死亡实体本拍会被 d 步移除，接触通道针对存活交互）
+        let a_alive = world.entities.get(&pair.a).map(|e| e.is_alive()).unwrap_or(false);
+        let b_alive = world.entities.get(&pair.b).map(|e| e.is_alive()).unwrap_or(false);
+        if !a_alive || !b_alive {
+            tracing::debug!(a = %pair.a.0, b = %pair.b.0, "[contact] 跳过含死亡实体的接触通知");
+            continue;
+        }
+        // 双方实况坐标（接触拍实况，非建对时快照）
+        let (Some(a_pos), Some(b_pos)) = (
+            world.entities.get(&pair.a).map(|e| e.pos()),
+            world.entities.get(&pair.b).map(|e| e.pos()),
+        ) else {
+            continue;
+        };
+        // 双方通知：自己收对方的坐标
+        for (self_id, other_pos) in [(pair.a, b_pos), (pair.b, a_pos)] {
+            // 残影休眠不唤醒（残影不执行玩家代码，沙箱保留但世界不驱动它）
+            if sandbox_map.players.is_ghost(&self_id) {
+                tracing::debug!(entity_id = %self_id.0, "[contact] 残影侧跳过（不唤醒）");
+                continue;
+            }
+            let Some(handle) = sandbox_map.sandboxes.get_mut(&self_id) else {
+                tracing::debug!(entity_id = %self_id.0, "[contact] 无沙箱侧跳过");
+                continue;
+            };
+            match sandbox_map
+                .manager
+                .call_on_contact(handle, other_pos.0, other_pos.1, budget)
+            {
+                Ok(Some(_used)) => {} // 已通知（预算内消耗由 call_on_contact 记账）
+                Ok(None) => {}        // 未导出 on_contact：no-op（不设防同款防御）
+                Err(e) => tracing::warn!(
+                    entity_id = %self_id.0,
+                    error = %e,
+                    "[contact] on_contact 执行失败（不影响对方侧通知）"
+                ),
+            }
+        }
+    }
+}
+
+/// 遗嘱窗口（D-007 ③：on_death 遗嘱钩子，#043 死亡谢幕——世界托管执行）
+///
+/// 对本拍每个死亡实体（沙箱还在）调用 on_death（host 侧独立预算包裹，预算即
+/// 遗嘱字数上限：烧尽即写不完，世界不补偿不重试），并抢救其遗嘱产物：
+/// - pending_shoots / pending_spawns 收集返回，由调用方当拍喂回既有管线
+///   （遗嘱模式=#035 推广：生前签好条款世界照办，本人无需在场——创造者已死
+///   分支对遗嘱队列开例外放行）
+/// - pending_attacks 丢弃（死人不出刀，与"死者攻击作废"既有语义对齐）
+///
+/// 时机契约：必须在 sandbox_map.remove 之前（沙箱还在才能执行遗嘱）、必须在
+/// retain 之前（死者实体还在 world，遗嘱产物的发射坐标/产权继承要读它）。
+/// 触发排除：残影消散（会话离场合同，消散≠死亡谢幕）、登出 take（会话级离场
+/// 非死亡）；decay/被杀/life()=false/处置期死亡全触发。无沙箱（弹丸/框架实体）
+/// 自然跳过。
+fn run_death_wills(
+    sandbox_map: &mut EntitySandboxMap,
+    dead_ids: &[EntityId],
+) -> (Vec<codeworld_arena::sandbox::PendingShoot>, Vec<PendingSpawn>) {
+    let mut will_shoots = Vec::new();
+    let mut will_spawns = Vec::new();
+    for id in dead_ids {
+        // 会话级离场（登出 take / 残影到期消散）：非死亡谢幕，不触发遗嘱
+        //（挂号消费掉，防跨拍残留）
+        if sandbox_map.session_takes.remove(id) {
+            tracing::debug!(entity_id = %id.0, "[will] 会话级离场（take/消散），不触发遗嘱");
+            continue;
+        }
+        // 残影消散：非死亡谢幕（下线合同），不触发遗嘱
+        if sandbox_map.players.is_ghost(id) {
+            tracing::debug!(entity_id = %id.0, "[will] 残影消散，不触发遗嘱");
+            continue;
+        }
+        let Some(handle) = sandbox_map.sandboxes.get_mut(id) else {
+            // 无沙箱（弹丸/框架实体）：无遗嘱可言（debug 级，弹丸消亡是常态不刷屏）
+            tracing::debug!(entity_id = %id.0, "[will] 无沙箱，无遗嘱");
+            continue;
+        };
+        let budget = sandbox_map.death_fuel;
+        tracing::info!(entity_id = %id.0, budget, "[will] 死亡谢幕：执行遗嘱（世界托管，限步数）");
+        match sandbox_map.manager.call_on_death(handle, budget) {
+            Ok(Some(used)) => {
+                tracing::info!(entity_id = %id.0, fuel_used = used, "[will] 遗嘱执行完毕");
+            }
+            Ok(None) => {
+                tracing::debug!(entity_id = %id.0, "[will] 无 on_death 导出，无遗嘱（零回归）");
+            }
+            Err(e) => {
+                // 遗嘱执行失败不影响死亡清理（世界照办的部分已排队，失败的作废）
+                tracing::warn!(entity_id = %id.0, error = %e, "[will] 遗嘱执行失败（不影响死亡清理）");
+            }
+        }
+        // 遗嘱产物抢救（沙箱销毁前）：shoot/spawn 当拍放行，attack 丢弃
+        let data = handle.store.data_mut();
+        will_shoots.append(&mut data.pending_shoots);
+        will_spawns.append(&mut data.pending_spawns);
+        let discarded = data.pending_attacks.len();
+        data.pending_attacks.clear();
+        if discarded > 0 {
+            tracing::info!(
+                entity_id = %id.0,
+                count = discarded,
+                "[will] 遗嘱排队的攻击丢弃（死人不出刀）"
+            );
+        }
+    }
+    (will_shoots, will_spawns)
 }
 
 /// 解析 log marker 流中的盾量上报（战况字幕数据源，纯函数）
@@ -8863,12 +9081,13 @@ mod tests {
         birth_motion_spawner_wat(code, x, y, "i32.const 0")
     }
 
-    /// 指定 motion 的造物方 WAT（D-003 spawn 第 10 参）
+    /// 指定 motion 的造物方 WAT（D-003 spawn 第 10 参；本任务 14 参：
+    /// 初速 vx/vy 第 11/12 参 + blob_ptr/blob_len 第 13/14 参默认零速无包）
     fn birth_motion_spawner_wat(code: &str, x: &str, y: &str, motion: &str) -> String {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -8881,6 +9100,10 @@ mod tests {
     f64.const 1.0
     i32.const 0
     {motion}
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -9038,37 +9261,196 @@ mod tests {
         );
     }
 
+    // === 出生参数批：出生初速 + 出生数据包（spawn 第 11-14 参全链路）===
+
+    #[test]
+    fn process_spawns_writes_birth_velocity_into_creation() {
+        // 出生初速写进造物数据（velocity 字段所有实体都有）：static 造物钉死不吃
+        // 速度物理，初速照存不裁（物理意义仅对 dynamic 造物生效——D-018 通用
+        // 有速度实体物理的活，本刀只管"出生时把速度写进数据"）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(21));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(21, 70, (10.0, 0.0)));
+        let mut map = test_sandbox_map();
+        // 创造者沙箱（直构请求绕过 import 排队路径，直测阶段二落库）
+        map.create(creator, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        map.sandboxes
+            .get_mut(&creator)
+            .unwrap()
+            .store
+            .data_mut()
+            .pending_spawns
+            .push(codeworld_arena::sandbox::PendingSpawn {
+                creator,
+                pos: (12.0, 0.0),
+                code: "(module (func (export \"life\") (result i32) i32.const 1))".to_string(),
+                glyph: "T".to_string(),
+                color: "cyan".to_string(),
+                radius: 0.5,
+                mass: 1.0,
+                binding: 0,
+                motion: 0,
+                vx: 3.0,
+                vy: -4.0,
+                blob: Vec::new(),
+                fuel_limit: 1_000_000,
+            });
+        process_spawns(&mut world, &mut map, 7);
+        let creation = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .expect("造物应诞生");
+        assert_eq!(
+            creation.velocity(),
+            (3.0, -4.0),
+            "出生初速应写进造物 velocity 字段"
+        );
+    }
+
+    #[test]
+    fn process_spawns_delivers_birth_blob_end_to_end() {
+        // 端到端：创造者 spawn 带 blob + 初速排队 -> 阶段二造物诞生 ->
+        // 造物下一拍 on_tick 经 env.birth_blob 原样读回字节（数据流两端可串：
+        // spawn 排队 blob_len 日志 ↔ 造物诞生 ↔ birth_blob 读回日志）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(22));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(22, 71, (10.0, 0.0)));
+        // 造物代码：on_tick 调 birth_blob(1024, 4096)，返回值可观测
+        let creation_code = r#"(module
+  (import "env" "birth_blob" (func $birth_blob (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (global $blob_ret (mut i32) (i32.const -1))
+  (func (export "on_tick")
+    (global.set $blob_ret (call $birth_blob (i32.const 1024) (i32.const 4096))))
+  (func (export "get_blob_ret") (result i32) (global.get $blob_ret))
+  (func (export "life") (result i32) (i32.const 1)))"#;
+        let blob: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42];
+        let blob_escaped: String = blob.iter().map(|b| format!("\\{b:02x}")).collect();
+        let escaped = wat_escape(creation_code);
+        let spawner = format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8500) "{blob_escaped}")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const 12.0 f64.const 0.0
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1.0
+    i32.const 0
+    i32.const 0
+    f64.const 3.0 f64.const -4.0
+    i32.const 8500 i32.const 5
+    call $spawn drop)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = creation_code.len(),
+            blob_escaped = blob_escaped,
+        );
+        let mut map = test_sandbox_map();
+        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+        // 阶段一：创造者排队 spawn（带 blob + 初速）
+        map.run_player_code(&world, &unbounded_bb());
+        // 阶段二：造物诞生（初速/blob 应落进造物）
+        process_spawns(&mut world, &mut map, 7);
+        let creation = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .expect("造物应诞生");
+        assert_eq!(creation.velocity(), (3.0, -4.0), "初速应随造物落库");
+        let creation_id = creation.id;
+        // 造物下一拍自己跑 on_tick：birth_blob 读回 blob
+        map.run_player_code(&world, &unbounded_bb());
+        assert_eq!(
+            call_i32_export(&mut map, &creation_id, "get_blob_ret"),
+            5,
+            "birth_blob 应返回 N=5（blob 已写入造物 memory）"
+        );
+        // 端到端字节一致：造物 memory [1024..1029) == 创造者 data 段携带的 blob
+        let handle = map.sandboxes.get_mut(&creation_id).unwrap();
+        let memory = handle
+            .instance
+            .get_memory(&mut handle.store, "memory")
+            .expect("造物应导出 memory");
+        assert_eq!(
+            &memory.data(&handle.store)[1024..1029],
+            &blob[..],
+            "造物经 birth_blob 读回的字节应与出生数据包逐字节一致"
+        );
+        assert!(
+            handle.store.data().api_calls.contains(&"birth_blob".to_string()),
+            "birth_blob 调用应记入造物 api_calls 元数据"
+        );
+    }
+
+    #[test]
+    fn process_spawns_allows_adjacent_edge_touching_birth() {
+        // 相邻不重叠边界锚（#030 严格 < 判据）：出生格 (12,0) 的 AABB 是
+        // [12,13]×[0,1]（格对齐），占据者圆 r=0.5 圆心挪半格到 (13.5,0.5)
+        // ——距格边恰 0.5 = 相切（严格 < 不满足）→ 不算重叠 → 正常诞生。
+        // 与"出生格被占=拒绝"（上方 occupied 用例）构成边界两侧的双锚
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(23));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(23, 72, (10.0, 0.0)));
+        let occupant = make_entity_of_owner(24, 73, (13.5, 0.5));
+        world.entities.insert(occupant.id, occupant);
+        let mut map = test_sandbox_map();
+        let spawner = birth_spawner_wat(CREATION_LOG_WAT, "12.0", "0.0");
+        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+        map.run_player_code(&world, &unbounded_bb());
+        process_spawns(&mut world, &mut map, 7);
+        assert!(
+            world.entities.values().any(|e| e.code_hash == "creation"),
+            "贴边相邻（相切不重叠）应正常诞生"
+        );
+        assert_eq!(world.entities.len(), 3, "1 创造者 + 1 占据者 + 1 造物");
+    }
+
     // === D-003 motion 出生声明（spawn 第 10 参全链路）===
 
     #[test]
     fn process_spawns_dynamic_motion_birth_precheck_uses_circle() {
-        // D-003 出生预检按声明档分流：motion=1 造物身体=r=0.5 的圆——
-        // 距占据者圆心 0.75（>AABB 覆盖域 0.5 但 < 圆判距 1.0-冗余）：
-        // static 档此距离可过（现状语义），dynamic 档被圆判据挡下。
-        // 反向锚：距 1.6 时两档都放行（dynamic 圆判距 1.0 之外）。
-        for (dx, dyn_ok, label) in [(0.75, false, "0.75 圆内"), (1.6, true, "1.6 圆外")] {
-            // dynamic 档
+        // D-003 出生预检按声明档分流：dynamic 造物身体=r=0.5 的圆（圆-圆判据），
+        // static 造物身体=出生格 AABB（圆-AABB 判据）。occupant 固定 (0,0.5)，
+        // 造物出生 (d,0)：圆-圆重叠 ⟺ d²+0.25<1 ⟺ d<0.866；
+        // 圆-AABB 重叠 ⟺ 圆心(0,0.5)到出生格[floor(d),floor(d)+1]钳距<0.5 ⟺ floor(d)=0 ⟺ d<1。
+        // d=0.9 是分流核心证据：dynamic 放行（1.06>1.0）而 static 被挡（圆心贴盒边钳距 0）
+        // ——dynamic 若误用 AABB 判据即被挡下，测试即红。
+        for (dx, dyn_ok, label) in [
+            (0.75, false, "0.75 圆判距内两档都挡"),
+            (0.9, true, "0.9 圆外格内=分流证据"),
+        ] {
             let mut world = WorldState::new();
             let creator = EntityId(Uuid::from_u128(4));
             world
                 .entities
-                .insert(creator, make_entity_of_owner(4, 60, (0.0, 0.0)));
-            let occupant = make_entity_of_owner(5, 61, (dx, 0.5)); // 圆 r=0.5，圆心(dx,0.5)
+                .insert(creator, make_entity_of_owner(4, 60, (10.0, 0.0)));
+            let occupant = make_entity_of_owner(5, 61, (0.0, 0.5)); // 圆 r=0.5，圆心(0,0.5)
             world.entities.insert(occupant.id, occupant);
             let mut map = test_sandbox_map();
-            let spawner =
-                birth_motion_spawner_wat(CREATION_LOG_WAT, &format!("{dx}"), "0.0", "i32.const 1");
+            let spawner = birth_motion_spawner_wat(
+                CREATION_LOG_WAT,
+                &format!("{dx}"),
+                "0.0",
+                "i32.const 1",
+            );
             map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
             map.run_player_code(&world, &unbounded_bb());
             process_spawns(&mut world, &mut map, 7);
-            let born = world
-                .entities
-                .values()
-                .any(|e| e.code_hash == "creation");
-            assert_eq!(
-                born, dyn_ok,
-                "dynamic 档距 {label} 出生结果应为 {dyn_ok}"
-            );
+            let born = world.entities.values().any(|e| e.code_hash == "creation");
+            assert_eq!(born, dyn_ok, "dynamic 档 d={label} 出生结果应为 {dyn_ok}");
             if born {
                 let c = world
                     .entities
@@ -9078,23 +9460,24 @@ mod tests {
                 assert_eq!(c.motion(), codeworld_core::entity::MOTION_DYNAMIC, "motion=1 应落库");
             }
         }
-        // static 档零回归：距 0.75（AABB 覆盖 0.5 之外）照常诞生
-        let mut world = WorldState::new();
-        let creator = EntityId(Uuid::from_u128(6));
-        world
-            .entities
-            .insert(creator, make_entity_of_owner(6, 60, (0.0, 0.0)));
-        let occupant = make_entity_of_owner(7, 61, (0.75, 0.5));
-        world.entities.insert(occupant.id, occupant);
-        let mut map = test_sandbox_map();
-        let spawner = birth_spawner_wat(CREATION_LOG_WAT, "0.75", "0.0");
-        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
-        map.run_player_code(&world, &unbounded_bb());
-        process_spawns(&mut world, &mut map, 7);
-        assert!(
-            world.entities.values().any(|e| e.code_hash == "creation"),
-            "static 档距 0.75 不受圆判据影响（现状语义）"
-        );
+        // static 档分流对锚：d=1.2 被 AABB 挡下（dynamic 同点放行——两档判据确已分流）；
+        // d=1.6 两档都放行（远处零回归）
+        for (dx, born_expect, label) in [(0.9, false, "0.9 AABB覆盖内挡下"), (1.6, true, "1.6 两档判距外放行")] {
+            let mut world = WorldState::new();
+            let creator = EntityId(Uuid::from_u128(6));
+            world
+                .entities
+                .insert(creator, make_entity_of_owner(6, 60, (10.0, 0.0)));
+            let occupant = make_entity_of_owner(7, 61, (0.0, 0.5));
+            world.entities.insert(occupant.id, occupant);
+            let mut map = test_sandbox_map();
+            let spawner = birth_spawner_wat(CREATION_LOG_WAT, &format!("{dx}"), "0.0");
+            map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+            map.run_player_code(&world, &unbounded_bb());
+            process_spawns(&mut world, &mut map, 7);
+            let born = world.entities.values().any(|e| e.code_hash == "creation");
+            assert_eq!(born, born_expect, "static 档 d={label} 出生结果应为 {born_expect}");
+        }
     }
 
     #[test]
@@ -9161,6 +9544,9 @@ mod tests {
                 mass: 1.0,
                 binding: 0,
                 motion: 0,
+                vx: 0.0,
+                vy: 0.0,
+                blob: Vec::new(),
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -9260,7 +9646,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -9278,6 +9664,10 @@ mod tests {
         (i32.const 8256)
         (f64.const 0.5)
         (f64.const 1.0)
+        (i32.const 0)
+        (i32.const 0)
+        (f64.const 0.0)
+        (f64.const 0.0)
         (i32.const 0)
         (i32.const 0)
         (call $spawn)
@@ -9351,5 +9741,361 @@ mod tests {
         // 第 3 拍：once 节流生效——不再刷造物（世界稳定在 3 个实体）
         tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
         assert_eq!(world.entities.len(), 3, "once 节流下不应再诞生新造物");
+    }
+
+    // === D-007 三兄弟：on_contact 接触回调 + on_death 遗嘱钩子 + 够不着镜像锚 ===
+
+    /// 接触记录模块（main 侧同款）：on_contact 记对方坐标 + 调用计数
+    const CONTACT_RECORDER_WAT: &str = r#"(module
+  (global $gx (mut f64) (f64.const -999))
+  (global $gy (mut f64) (f64.const -999))
+  (global $calls (mut i32) (i32.const 0))
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "on_contact") (param $ox f64) (param $oy f64)
+    local.get $ox global.set $gx
+    local.get $oy global.set $gy
+    global.get $calls i32.const 1 i32.add global.set $calls)
+  (func (export "get_gx") (result f64) global.get $gx)
+  (func (export "get_gy") (result f64) global.get $gy)
+  (func (export "get_calls") (result i32) global.get $calls))"#;
+
+    /// 遗嘱造物模块：life=0（首拍即死）+ on_death 排队造遗物（观测点：
+    /// 死后世界出现 creation 实体=遗嘱被世界托管执行——遗物是死后仍可观测的证据）
+    fn dying_will_spawn_wat(relic_x: &str, relic_y: &str) -> String {
+        let relic_code = r#"(module (func (export "life") (result i32) i32.const 1))"#;
+        let escaped = wat_escape(relic_code);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "R\00")
+  (data (i32.const 8256) "gold\00")
+  (func (export "life") (result i32) i32.const 0)
+  (func (export "on_death")
+    i32.const 0 i32.const {len}
+    f64.const {rx} f64.const {ry}
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
+    call $spawn drop))"#,
+            escaped = escaped,
+            len = relic_code.len(),
+            rx = relic_x,
+            ry = relic_y,
+        )
+    }
+
+    /// 活体遗嘱模块：life=1（正常活着）+ on_death 排队造遗物——残影消散测试用
+    ///（玩家文件必须 life=1，否则活不过一拍根本进不了残影路径）
+    fn living_will_spawn_wat(relic_x: &str, relic_y: &str) -> String {
+        let body = dying_will_spawn_wat(relic_x, relic_y);
+        // 复用死体生成器，仅把 life 从 0 改回 1（遗物段完全一致，观测同构）
+        body.replace(
+            r#"(func (export "life") (result i32) i32.const 0)"#,
+            r#"(func (export "life") (result i32) i32.const 1)"#,
+        )
+    }
+
+    /// 遗嘱射击模块：life=0 + on_death 排队 shoot（烟花：遗嘱排队的弹当拍发射）
+    const DYING_WILL_SHOOT_WAT: &str = r#"(module
+  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "life") (result i32) i32.const 0)
+  (func (export "on_death")
+    f64.const 3.0 f64.const 9.8 f64.const 1.0 i32.const 0 i32.const 0 i32.const 0
+    call $shoot drop))"#;
+
+    /// 遗嘱攻击模块：life=0 + on_death 排队 attack_at（死人不出刀：队列应丢弃）
+    const DYING_WILL_ATTACK_WAT: &str = r#"(module
+  (import "env" "attack_at" (func $attack (param f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "life") (result i32) i32.const 0)
+  (func (export "on_death")
+    f64.const 3.0 f64.const 0.5 i32.const 0 i32.const 0
+    call $attack drop))"#;
+
+    /// 拦截计数防守模块（遗嘱攻击丢弃的观测点：on_attack 被问过才计数）
+    const DEFEND_COUNTER_WAT: &str = r#"(module
+  (global $calls (mut i32) (i32.const 0))
+  (func (export "life") (result i32) i32.const 1)
+  (func (export "on_attack") (param i32) (result i32)
+    global.get $calls i32.const 1 i32.add global.set $calls
+    i32.const 0)
+  (func (export "get_calls") (result i32) global.get $calls))"#;
+
+    #[test]
+    fn shoot_reach_sim_ticks_mirror_physics() {
+        // D-007 ①镜像约束锚：arena 侧够不着判定的弹道模拟寿命必须与 physics
+        // 弹丸寿命上限（30 拍超时哑弹）同值——判定模拟的就是真实弹丸的一生
+        assert_eq!(
+            codeworld_arena::sandbox::SHOOT_REACH_SIM_TICKS,
+            codeworld_physics::default::PROJECTILE_MAX_AGE_TICKS,
+            "arena 弹道模拟寿命与 physics 弹丸寿命镜像（改一处必改另一处）"
+        );
+    }
+
+    #[test]
+    fn notify_contacts_both_sides_receive_opposite_coords() {
+        // D-007 ②直接单测：新进入接触的对，双方都收通知且坐标=对方实况位置
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 60, (0.5, 0.5), CONTACT_RECORDER_WAT);
+        let b = make_entity_with_sandbox(&mut world, &mut map, 61, (1.5, 0.5), CONTACT_RECORDER_WAT);
+        let contacts = vec![ContactPair { a, b, pos: (0.5, 0.5), source: "touch" }];
+        notify_contacts(&mut world, &mut map, &contacts);
+        assert_eq!(call_i32_export(&mut map, &a, "get_calls"), 1, "a 应收到通知");
+        assert_eq!(call_f64_export(&mut map, &a, "get_gx"), 1.5, "a 收到 b 的 x");
+        assert_eq!(call_f64_export(&mut map, &a, "get_gy"), 0.5, "a 收到 b 的 y");
+        assert_eq!(call_i32_export(&mut map, &b, "get_calls"), 1, "b 应收到通知");
+        assert_eq!(call_f64_export(&mut map, &b, "get_gx"), 0.5, "b 收到 a 的 x");
+        assert_eq!(call_f64_export(&mut map, &b, "get_gy"), 0.5, "b 收到 a 的 y");
+    }
+
+    #[test]
+    fn notify_contacts_skips_pair_with_dead_side() {
+        // 边界锚定：接触对一方死亡 -> 整对跳过（与 handle_collisions 死亡过滤同语义），
+        // 活方不收通知、不 Err
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 62, (0.5, 0.5), CONTACT_RECORDER_WAT);
+        let mut dead = make_entity(63, (1.5, 0.5));
+        dead.kill();
+        let b = dead.id;
+        world.entities.insert(b, dead);
+        let contacts = vec![ContactPair { a, b, pos: (0.5, 0.5), source: "touch" }];
+        notify_contacts(&mut world, &mut map, &contacts);
+        assert_eq!(call_i32_export(&mut map, &a, "get_calls"), 0, "含死亡方的对整对跳过");
+    }
+
+    #[test]
+    fn notify_contacts_notifies_only_sandboxed_side() {
+        // 边界锚定：一方无沙箱（框架实体）-> 该侧跳过，有沙箱的活方照常收通知，不 Err
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 64, (0.5, 0.5), CONTACT_RECORDER_WAT);
+        let bare = make_entity(65, (1.5, 0.5));
+        let b = bare.id;
+        world.entities.insert(b, bare);
+        let contacts = vec![ContactPair { a, b, pos: (0.5, 0.5), source: "touch" }];
+        notify_contacts(&mut world, &mut map, &contacts);
+        assert_eq!(call_i32_export(&mut map, &a, "get_calls"), 1, "有沙箱侧照常收通知");
+        assert!(!map.sandboxes.contains_key(&b), "无沙箱侧无沙箱可调（前置自证）");
+    }
+
+    #[test]
+    fn contact_notification_is_edge_triggered_full_cycle() {
+        // 边沿触发全周期（tick 级）：碰（双方各 1 次）-> 持续贴（不重复）->
+        // 分开再碰（再触发）
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 66, (0.5, 0.5), CONTACT_RECORDER_WAT);
+        let b = make_entity_with_sandbox(&mut world, &mut map, 67, (1.5, 0.5), CONTACT_RECORDER_WAT);
+        // 拍 1：新进入接触 -> 双方各收 1 次
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert_eq!(call_i32_export(&mut map, &a, "get_calls"), 1, "拍 1 a 首触");
+        assert_eq!(call_i32_export(&mut map, &b, "get_calls"), 1, "拍 1 b 首触");
+        // 拍 2：持续贴着 -> 不再触发（防刷屏）
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert_eq!(call_i32_export(&mut map, &a, "get_calls"), 1, "持续贴不再触发");
+        // 拍 3：a 搬走（SetPos 排队，阶段二 a 步应用）-> 分开
+        pending.push(PendingChange::SetPos { entity: a, new_pos: (5.5, 0.5) });
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert_eq!(call_i32_export(&mut map, &a, "get_calls"), 1);
+        // 拍 4：a 搬回 -> 分开后再碰再触发
+        pending.push(PendingChange::SetPos { entity: a, new_pos: (0.5, 0.5) });
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert_eq!(call_i32_export(&mut map, &a, "get_calls"), 2, "分开再碰再触发");
+        assert_eq!(call_i32_export(&mut map, &b, "get_calls"), 2, "b 侧同拍再触发");
+    }
+
+    #[test]
+    fn contact_ghost_side_is_not_notified() {
+        // 残影休眠不通知：残影是身体会被碰到（对成立），但其沙箱不被唤醒
+        //（残影不执行玩家代码既有不变量）；活方照常收到残影坐标
+        let dir = temp_players_dir("contact-ghost");
+        std::fs::write(dir.join("willer.wat"), CONTACT_RECORDER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let ghost_id = find_player_id(&world, "willer");
+        std::fs::remove_file(dir.join("willer.wat")).unwrap();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(map.players.is_ghost(&ghost_id), "前置：残影已登记");
+        // 活方贴着残影（残影首进场 x=30 落地 y=0.5）
+        let neighbor = make_entity_with_sandbox(&mut world, &mut map, 68, (31.0, 0.5), CONTACT_RECORDER_WAT);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert_eq!(call_i32_export(&mut map, &neighbor, "get_calls"), 1, "活方收到接触通知");
+        assert_eq!(call_f64_export(&mut map, &neighbor, "get_gx"), 30.0, "对方坐标=残影实况位置");
+        assert_eq!(call_f64_export(&mut map, &neighbor, "get_gy"), 0.5);
+        assert_eq!(call_i32_export(&mut map, &ghost_id, "get_calls"), 0, "残影侧不被唤醒");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn killed_entity_runs_will_and_relic_spawns() {
+        // D-007 ③验收：实体死亡（life=0）-> on_death 被世界托管调用 ->
+        // 遗嘱排队的 spawn 放行（创造者已死例外，产权链照常）-> 死后世界出现遗物
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        let dying_id = EntityId(Uuid::from_u128(70));
+        let dying = make_entity(70, (2.0, 0.5));
+        map.create(dying_id, &wasm(&dying_will_spawn_wat("5.5", "0.5")), 1_000_000).unwrap();
+        world.entities.insert(dying_id, dying);
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(!world.entities.contains_key(&dying_id), "死者应被死亡清理移除");
+        assert!(!map.sandboxes.contains_key(&dying_id), "死者沙箱应销毁");
+        let relic = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .expect("遗嘱造物应存在（创造者已死放行，遗产归属生效）");
+        assert_eq!(relic.pos(), (5.5, 0.5), "遗物出生在遗嘱指定位置");
+    }
+
+    #[test]
+    fn will_shoot_fires_same_tick() {
+        // 验收：遗嘱排队的 shoot 当拍发射（烟花）——弹丸实体+账本当拍出现
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        let dying_id = EntityId(Uuid::from_u128(71));
+        let dying = make_entity(71, (2.0, 0.5));
+        map.create(dying_id, &wasm(DYING_WILL_SHOOT_WAT), 1_000_000).unwrap();
+        world.entities.insert(dying_id, dying);
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(!world.entities.contains_key(&dying_id), "死者应被移除");
+        let fireworks = world
+            .entities
+            .values()
+            .filter(|e| e.code_hash == codeworld_core::collision::PROJECTILE_CODE)
+            .count();
+        assert_eq!(fireworks, 1, "遗嘱烟花应当拍发射（弹丸实体已落地）");
+        assert_eq!(map.projectiles.len(), 1, "在飞弹丸账本应有 1 条");
+    }
+
+    #[test]
+    fn will_attack_discarded_dead_men_strike_no_blows() {
+        // 验收：遗嘱排队的 attack 丢弃（死人不出刀）——目标无恙且 on_attack 未被问
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        let dying_id = EntityId(Uuid::from_u128(72));
+        let dying = make_entity(72, (2.0, 0.5));
+        map.create(dying_id, &wasm(DYING_WILL_ATTACK_WAT), 1_000_000).unwrap();
+        world.entities.insert(dying_id, dying);
+        let target = make_entity_with_sandbox(&mut world, &mut map, 73, (3.0, 0.5), DEFEND_COUNTER_WAT);
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(!world.entities.contains_key(&dying_id), "死者应被移除");
+        assert!(world.entities.get(&target).unwrap().is_alive(), "目标应无恙");
+        assert_eq!(call_i32_export(&mut map, &target, "get_calls"), 0, "死人不出刀：目标收件未发生");
+    }
+
+    #[test]
+    fn dead_without_on_death_export_no_regression() {
+        // 零回归锚：无 on_death 导出的死亡路径与现状完全一致（实体移除、无遗物、不 Err）
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        let dying_id = EntityId(Uuid::from_u128(74));
+        let dying = make_entity(74, (2.0, 0.5));
+        // 无 on_death 的普通死亡模块（零回归对照：只有 life 导出）
+        map.create(dying_id, &wasm("(module (func (export \"life\") (result i32) i32.const 0))"), 1_000_000).unwrap();
+        world.entities.insert(dying_id, dying);
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(!world.entities.contains_key(&dying_id), "死者照常移除");
+        assert!(
+            !world.entities.values().any(|e| e.code_hash == "creation"),
+            "无遗嘱不应有遗物"
+        );
+    }
+
+    #[test]
+    fn ghost_disperse_does_not_trigger_will() {
+        // 验收：残影消散不触发遗嘱（消散≠死亡谢幕）——遗嘱若被触发会留下遗物，
+        // 消散后世界不应有任何 creation
+        let dir = temp_players_dir("will-ghost");
+        std::fs::write(dir.join("willer.wat"), living_will_spawn_wat("40.0", "0.5")).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let pid = find_player_id(&world, "willer");
+        std::fs::remove_file(dir.join("willer.wat")).unwrap();
+        // 下线进残影（拍 2）+ 残影期 5 拍（拍 3..6 仍在）
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 5);
+        assert!(world.entities.contains_key(&pid), "残影第 5 拍末仍应在世界");
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(!world.entities.contains_key(&pid), "残影应消散");
+        assert!(
+            !world.entities.values().any(|e| e.code_hash == "creation"),
+            "残影消散不触发遗嘱（无遗物）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_take_does_not_trigger_will() {
+        // 登出 take 路径不触发遗嘱（会话级离场非死亡）：dispose_take kill 的实体
+        // 落进 session_takes 集合，遗嘱窗口据此跳过（集合消费后清空）
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        let taken_id = EntityId(Uuid::from_u128(75));
+        let taken = make_entity(75, (2.0, 0.5));
+        map.create(taken_id, &wasm(&dying_will_spawn_wat("9.5", "0.5")), 1_000_000).unwrap();
+        world.entities.insert(taken_id, taken);
+        world.entities.get_mut(&taken_id).unwrap().kill(); // dispose_take 同款 kill
+        map.session_takes.insert(taken_id); // dispose_take 同款登记
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(!world.entities.contains_key(&taken_id), "被带走的角色照常移除");
+        assert!(
+            !world.entities.values().any(|e| e.code_hash == "creation"),
+            "会话级离场不触发遗嘱（无遗物）"
+        );
+        assert!(map.session_takes.is_empty(), "session_takes 应被遗嘱窗口消费清空");
     }
 }
