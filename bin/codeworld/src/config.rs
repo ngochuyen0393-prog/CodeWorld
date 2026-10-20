@@ -73,6 +73,16 @@ pub struct Config {
     /// 地形生成种子（D-016 可复现凭据：同预设+种子必产同一高度图），默认 0。
     /// CODEWORLD_SEED 覆盖；解析失败回退 0（容错语义同其他数值项）。
     pub terrain_seed: u64,
+    /// 被接触方 on_contact 的独立小 fuel 预算（D-007 三兄弟，架构 3.3 同族
+    /// contact_target_instruction_limit），默认 10_000（与 probe 同档——地雷/
+    /// 哨戒圈是轻量应答）。host 侧 set_fuel 包裹同 probe 模式。
+    /// CODEWORLD_CONTACT_FUEL 覆盖。
+    pub contact_fuel: u64,
+    /// 死亡谢幕 on_death 的独立 fuel 预算（D-007 遗嘱钩子，架构 3.3 同族
+    /// death_instruction_limit），默认 200_000（与 on_attack 同档——遗嘱有
+    /// 字数上限=预算即上限，烧尽即遗嘱写不完，世界不补偿不重试）。
+    /// CODEWORLD_DEATH_FUEL 覆盖。
+    pub death_fuel: u64,
 }
 
 impl Default for Config {
@@ -98,6 +108,8 @@ impl Default for Config {
             max_speed: codeworld_core::physics::WORLD_MAX_SPEED,
             terrain_preset: "flat".to_string(),
             terrain_seed: 0,
+            contact_fuel: 10_000,
+            death_fuel: 200_000,
         }
     }
 }
@@ -193,6 +205,13 @@ impl Config {
         }
         if let Some(s) = env_u64("CODEWORLD_SEED") {
             cfg.terrain_seed = s;
+        }
+        // D-007 三兄弟预算（模式照抄 CODEWORLD_PROBE_FUEL：解析失败保留默认值）
+        if let Some(f) = env_u64("CODEWORLD_CONTACT_FUEL") {
+            cfg.contact_fuel = f;
+        }
+        if let Some(f) = env_u64("CODEWORLD_DEATH_FUEL") {
+            cfg.death_fuel = f;
         }
         cfg
     }
@@ -555,6 +574,58 @@ mod tests {
     }
 
     // === 世界极速（#034 修订一：视觉可读性常数，CODEWORLD_MAX_SPEED）===
+
+    // === 接触/遗嘱预算（D-007 三兄弟，模式照抄 probe_fuel）===
+
+    #[test]
+    fn default_contact_and_death_fuel_match_core_constraints() {
+        // 创建：接触回调预算默认 10_000（core Constraints.contact_target_instruction_limit
+        // 同值，与 probe 同档）；遗嘱预算默认 200_000（death_instruction_limit 同值，
+        // 与 on_attack 同档——遗嘱有字数上限=预算即上限）
+        let c = Config::default();
+        assert_eq!(c.contact_fuel, 10_000, "接触回调预算默认应为 10_000");
+        assert_eq!(c.death_fuel, 200_000, "遗嘱预算默认应为 200_000");
+    }
+
+    #[test]
+    fn load_contact_fuel_env_overrides_default() {
+        // 修改：CODEWORLD_CONTACT_FUEL 覆盖默认（技术保护可调）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_CONTACT_FUEL", "500");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_CONTACT_FUEL");
+        assert_eq!(c.contact_fuel, 500, "环境变量应覆盖接触回调预算");
+    }
+
+    #[test]
+    fn load_contact_fuel_invalid_falls_back_to_default() {
+        // 边界：CODEWORLD_CONTACT_FUEL 非法（非整数）-> 回退默认 10_000（容错语义）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_CONTACT_FUEL", "soon");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_CONTACT_FUEL");
+        assert_eq!(c.contact_fuel, 10_000, "非法值应回退默认接触回调预算");
+    }
+
+    #[test]
+    fn load_death_fuel_env_overrides_default() {
+        // 修改：CODEWORLD_DEATH_FUEL 覆盖默认（遗嘱字数上限世界可调）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_DEATH_FUEL", "777");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_DEATH_FUEL");
+        assert_eq!(c.death_fuel, 777, "环境变量应覆盖遗嘱预算");
+    }
+
+    #[test]
+    fn load_death_fuel_invalid_falls_back_to_default() {
+        // 边界：CODEWORLD_DEATH_FUEL 非法（非整数）-> 回退默认 200_000（容错语义）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_DEATH_FUEL", "not-a-number");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_DEATH_FUEL");
+        assert_eq!(c.death_fuel, 200_000, "非法值应回退默认遗嘱预算");
+    }
 
     #[test]
     fn default_max_speed_is_twenty_five() {

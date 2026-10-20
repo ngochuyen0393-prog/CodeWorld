@@ -51,6 +51,14 @@ pub struct Constraints {
     /// attack超时（200ms）
     pub attack_timeout_ms: u64,
 
+    // === contact / death（D-007 三兄弟，同族技术保护，不是游戏消耗） ===
+    // 与 probe/attack 同哲学：不扣手续费，host 侧独立小预算包裹
+    /// 被接触方 on_contact 预算（防被接触方死循环；与 probe 同档——
+    /// 地雷/哨戒圈是轻量应答）
+    pub contact_target_instruction_limit: u64,
+    /// 死亡谢幕 on_death 预算（遗嘱有字数上限=预算即上限；与 on_attack 同档）
+    pub death_instruction_limit: u64,
+
     // === call ===
     /// call超时（100ms）
     pub call_timeout_ms: u64,
@@ -107,6 +115,10 @@ impl Constraints {
             attack_target_instruction_limit: 200_000,
             attack_timeout_ms: 200,
 
+            // contact / death（D-007，不扣手续费，host 侧独立预算包裹）
+            contact_target_instruction_limit: 10_000,
+            death_instruction_limit: 200_000,
+
             // call
             call_timeout_ms: 100,
             call_response_max_size: 64 * 1024,
@@ -149,6 +161,8 @@ mod tests {
         assert_eq!(c.attack_payload_max_size, 64 * 1024);
         assert_eq!(c.attack_target_instruction_limit, 200_000);
         assert_eq!(c.attack_timeout_ms, 200);
+        assert_eq!(c.contact_target_instruction_limit, 10_000);
+        assert_eq!(c.death_instruction_limit, 200_000);
         assert_eq!(c.call_timeout_ms, 100);
         assert_eq!(c.call_response_max_size, 64 * 1024);
         assert_eq!(c.call_per_tick, 10);
@@ -160,6 +174,22 @@ mod tests {
         assert_eq!(c.physics_override_instruction_limit, 200_000);
         assert_eq!(c.physics_override_timeout_ms, 50);
         assert_eq!(c.physics_global_override_total, 5);
+    }
+
+    #[test]
+    fn default_contact_and_death_instruction_limits_match_d007() {
+        // D-007 三兄弟预算默认值（架构 3.3 同族技术保护，非游戏消耗）：
+        // contact=10_000 与 probe 同档（地雷/哨戒圈是轻量应答）；
+        // death=200_000 与 on_attack 同档（遗嘱有字数上限=预算即上限）。
+        let c = Constraints::default();
+        assert_eq!(
+            c.contact_target_instruction_limit, 10_000,
+            "接触回调预算默认应为 10_000（与 probe 同档）"
+        );
+        assert_eq!(
+            c.death_instruction_limit, 200_000,
+            "遗嘱钩子预算默认应为 200_000（与 on_attack 同档）"
+        );
     }
 
     #[test]
