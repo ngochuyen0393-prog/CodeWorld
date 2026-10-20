@@ -3,6 +3,18 @@
 > 纪律：只增不改。改主意 = 写新条目标「取代 #N」，旧条目不删不编辑。
 > 每条 ≤5 行，记「为什么」，不记「怎么实现」（实现看代码）。
 
+## #049 2026-10-21 · D-007 三兄弟落地：shoot 够不着警告码 + on_contact 接触回调 + on_death 遗嘱钩子（不审查但告知/世界零过滤/世界托管谢幕）
+- 定案：①shoot 返回值加警告码——发射参数按标准解够不着最近敌人快照时**照常发射**（哑弹自由=玩家战术权利），返回 `-序号`（-N 与 N 指同一发弹）+INFO；无快照不判定；判定=与弹丸物理同序的弹道全程模拟、判据=CCD 撞体窗口 0.65（与驾驶层灰字"够不着"对称——哲学同 mass 超界警告：不审查，但告知）。②on_contact(other_x, other_y)：接触事件通知造物自己的代码（on_attack/on_probe 同族第三兄弟），**边沿触发+过滤归代码**双闸；host 侧独立预算包裹（10_000 与 probe 同档）；世界零过滤，双方都收（地雷/警报/哨戒圈玩法原语）。③on_death()：死亡谢幕遗嘱钩子——生前配置（限步数=预算即上限，200_000 与 on_attack 同档），死亡触发世界托管执行；遗嘱排队的 spawn/shoot **当拍放行**（遗嘱执行人资格，产权链照常），attack 丢弃（死人不出刀）；残影消散/登出 take 不触发（会话离场非死亡谢幕）。
+- 原因：D-007 dev-plan 定案三件套（2026-10-18/19 立法）+ #043 骨架出厂槽位最小落地——感知三接口（scan/probe/visible）齐了，缺"世界主动告诉造物"的最后一厘米；死亡只有销毁没有体面。
+- 边界：on_contact 弹丸不参与（哑弹无代码）；遗嘱燃料烧尽不补偿不重试（遗嘱有字数上限=诚实的代价）；wasm 内 fuel 烧穿在 Windows 是进程 abort（.cc-bugs #5 环境级），预算包裹只保证正常路径记账——生产化前需升级 wasmtime。
+- 落点：core config.rs（contact/death_instruction_limit 两预算）+ arena sandbox.rs（shoot 负序号判定+call_on_contact/call_on_death 预算包裹方法）+ bin config.rs（CODEWORLD_CONTACT_FUEL/CODEWORLD_DEATH_FUEL）+ main.rs（notify_contacts c 步接线/run_death_wills d 步遗嘱窗口+会话级离场登记[dispose_take+残影消散]/process_spawn·shoot_requests 遗嘱放行参数）+ api.md（导出表两行+两小节+shoot 负序号段）。
+
+## #048 2026-10-20 · D-003 motion 出生声明：spawn 第 10 参（0=static 默认/1=dynamic 全活）
+- 定案：造物运动身份出生时声明（与 radius/mass/binding 同款声明族）——0=static（默认=现状：钉死，格对齐 AABB，不吃速度物理）；1=dynamic（全活：身体=声明 radius 的圆，出生拍起受完整物理——重力落点解析/速度矢量阻力衰减/世界极速钳制/移动裁决/接触通道，与生物同管线）；kinematic 剧本档缓立（全活+意图移动已可表达电梯，等"物理算不准必须精确到顶"玩法再议）。非法值钳 0。进场生物写死全活不开放声明（本体天生 dynamic）。
+- 原因：手册完备性=立法信号（土豆 2026-10-17：照 api.md 创作的玩家是消费者，手册上没有的身份=玩家不知道能做什么）；造物的运动身份此前由出生通道隐式决定，无声明能力。
+- 边界：dynamic 落"受完整物理"=主动物理待遇（重力/阻力/极速/裁决/接触）；"被撞飞"依赖碰撞响应（D-010 冲量三件套），不在本档——速度矢量已就位，v≡0 时零效果，冲量落地即真实生效。
+- 落点：entity.rs（motion 字段+clamp_motion+两档常数，serde default 旧快照回退 static）+ collision.rs（is_dynamic_creation 判据/body_of 分流：dynamic=圆）+ physics default.rs（step：dynamic 走 circle_landing_y+apply_drag+极速钳制；static 分支零回归）+ arena sandbox.rs（spawn 第 10 参+PendingSpawn.motion）+ main.rs（出生预检按档分流：dynamic=圆/radius，static=AABB；set_motion 落库；诞生日志带 motion）+ net.rs（kind=creation_dynamic）+ index.html（圆渲染/圆点击/悬浮"全活造物"）+ pioneer.wat/api.md/net-protocol.md v2.1（全调用点同步）。
+
 ## #001 2026-10-13 · 攻击语义铁律四条（定了什么算攻击、什么算点数变动）
 - 定案：攻击只伤代码（换血/覆写）与算力（防守烧 fuel），不碰生存点数；生存点数唯一变动路径=时间衰减+击杀掠夺；血条只存在于渲染层；掠夺只属于击杀（无吸血式）。
 - 原因：堵住"攻击直接扣点数/吸血"这类设计歧路，保住"点数=生存压力、代码=能力"的分层。

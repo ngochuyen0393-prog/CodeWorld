@@ -18,6 +18,19 @@ pub const CREATION_CODE: &str = "creation";
 /// 物理由 physics step_projectiles 接管；本模块/net.rs 共用同一常量）
 pub const PROJECTILE_CODE: &str = "projectile";
 
+/// 造物是否声明为全活 dynamic（D-003 motion 第 10 参：motion=1 的 creation
+/// 身体=声明 radius 的圆，与生物同物理管线；static 造物仍格对齐 AABB）。
+/// 判据与 is_projectile 同款集中在常量旁；kinematic 缓立不在此判。
+pub fn is_dynamic_creation(e: &Entity) -> bool {
+    e.code_hash == CREATION_CODE && e.motion() == crate::entity::MOTION_DYNAMIC
+}
+
+/// 按声明值判 dynamic 造物（出生预检伴生：spawn 阶段二实体未建，只有 motion 值；
+/// 调用方语境已定 code_hash=creation，此处只比档位）
+pub fn is_dynamic_creation_candidate(motion: i32) -> bool {
+    motion == crate::entity::MOTION_DYNAMIC
+}
+
 /// 贴身刀判距冗余（#034 attack_at 接触化）：出手判距 = r攻 + r目 + 0.5。
 /// 这 0.5 是"胳膊长度"物理判距常量，不是射程属性（射程不立法，全部物理涌现——
 /// design-ballistics.md 否决清单：attack_at 加射程属性已被土豆否决）
@@ -58,9 +71,10 @@ pub fn creation_aabb(pos: (f64, f64)) -> ((f64, f64), (f64, f64)) {
     ((cx, cy), (cx + 1.0, cy + 1.0))
 }
 
-/// 实体 -> 身体（creation=格对齐 AABB，其余=圆）
+/// 实体 -> 身体（creation：static=格对齐 AABB / dynamic（D-003）=声明 radius 的圆；
+/// 其余=圆）
 pub fn body_of(e: &Entity) -> Body {
-    if e.code_hash == CREATION_CODE {
+    if e.code_hash == CREATION_CODE && !is_dynamic_creation(e) {
         let (min, max) = creation_aabb(e.pos());
         Body::Aabb { min, max }
     } else {
@@ -497,6 +511,54 @@ mod tests {
                 radius: 0.7
             }
         );
+    }
+
+    // === body dispatch（D-003：dynamic creation=声明 radius 的圆）===
+
+    #[test]
+    fn dynamic_creation_body_is_declared_radius_circle() {
+        // D-003 motion=1：全活造物身体=声明 radius 的圆（连续坐标不取整，
+        // 与生物同款），不再是格对齐 AABB
+        let mut e = make_entity(4, "creation", (10.3, 2.7));
+        e.set_radius(0.8);
+        e.set_motion(crate::entity::MOTION_DYNAMIC);
+        assert!(is_dynamic_creation(&e), "motion=1 的 creation 应判 dynamic");
+        assert_eq!(
+            body_of(&e),
+            Body::Circle {
+                center: (10.3, 2.7),
+                radius: 0.8
+            }
+        );
+    }
+
+    #[test]
+    fn static_creation_body_stays_aabb() {
+        // 默认档（motion=0）造物身体不变：格对齐 AABB（现状零回归锚）
+        let e = make_entity(5, "creation", (10.3, 2.7));
+        assert!(!is_dynamic_creation(&e));
+        assert_eq!(
+            body_of(&e),
+            Body::Aabb {
+                min: (10.0, 2.0),
+                max: (11.0, 3.0)
+            }
+        );
+    }
+
+    #[test]
+    fn dynamic_creation_circle_overlaps_circle_not_aabb_semantics() {
+        // 行为锚：同坐标下 dynamic 造物（r=0.5）与生物圆按圆-圆判——
+        // 距 1.0 恰好相切不重叠（判据严格 <，两 r=0.5 的圆相切距离=r和=1.0），
+        // 距 0.99 重叠；若误走 AABB 语义（1×1 盒）距 1.0 早已重叠，断言即红。
+        let mut dc = make_entity(6, "creation", (0.0, 0.5));
+        dc.set_motion(crate::entity::MOTION_DYNAMIC);
+        let mut mob = make_entity(7, "attacker", (1.0, 0.5));
+        dc.set_radius(0.5);
+        mob.set_radius(0.5);
+        assert!(!body_overlap(&body_of(&dc), &body_of(&mob)), "距 1.0=两圆恰相切，不重叠");
+        mob.set_pos((0.99, 0.5));
+        assert!(body_overlap(&body_of(&dc), &body_of(&mob)), "距 0.99<1.0 两圆重叠");
     }
 
     #[test]

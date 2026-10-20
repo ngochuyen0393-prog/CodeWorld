@@ -121,6 +121,17 @@ pub struct Entity {
     #[serde(default)]
     bound_to: Option<EntityId>,
 
+    // 运动身份（D-003 motion 出生声明：spawn 第 10 参，声明族第 4 个与 radius/mass/binding
+    // 同款，dev-plan 2026-10-17 拍板）。仅造物受声明影响：
+    // - 0=static（默认=现状）：钉死——身体=占地格 AABB，无速度矢量物理；
+    // - 1=dynamic：全活——受完整物理（重力落点解析/速度矢量阻力/极速钳制），
+    //   身体=声明 radius 的圆，与生物同管线；"被撞飞"依赖碰撞响应（D-010）不在本档。
+    // kinematic（剧本档）缓立：全活+意图移动已可表达电梯。
+    // 进场生物不受此字段影响（本体天生 dynamic，写死全活不开放声明）。
+    /// serde default：旧快照无此字段时回退 static（现状语义，存储向后兼容）
+    #[serde(default = "default_motion")]
+    motion: i32,
+
     // 外观与动作状态
     /// 渲染数据
     pub appearance: Appearance,
@@ -151,6 +162,30 @@ fn default_mass() -> f64 {
 /// 绑定契约默认值（#034 修订四：新实体与旧快照回退共用 unbound）
 fn default_binding() -> i32 {
     BINDING_UNBOUND
+}
+
+/// 运动身份默认值（D-003：新实体与旧快照回退共用 static——现状语义）
+fn default_motion() -> i32 {
+    MOTION_STATIC
+}
+
+/// 运动身份档位（D-003 motion 出生声明，dev-plan 拍板 2026-10-17；kinematic 剧本档缓立）
+/// - static（默认=现状）：造物钉死——格对齐 AABB 身体，无速度矢量物理
+/// - dynamic：造物全活——受完整物理（重力/阻力/极速），身体=声明 radius 的圆
+/// 仅造物受声明影响；进场生物/弹丸不受此字段影响（生物天生 dynamic，弹丸速度积分制）
+pub const MOTION_STATIC: i32 = 0;
+pub const MOTION_DYNAMIC: i32 = 1;
+
+/// 运动身份校验钳制（spawn 第 10 参口径，与 clamp_binding 同款）：非法值钳 static
+/// 并 warn——坏声明不进世界，回退最保守的现状语义
+pub fn clamp_motion(v: i32) -> i32 {
+    match v {
+        MOTION_STATIC | MOTION_DYNAMIC => v,
+        other => {
+            tracing::warn!(value = other, clamped = MOTION_STATIC, "[motion] 非法运动身份值，钳 static");
+            MOTION_STATIC
+        }
+    }
 }
 
 /// 绑定契约档位（#034 修订四，design-binding.md 机制层 MVP 三档）
@@ -200,6 +235,7 @@ impl Entity {
             mass: default_mass(),
             binding: default_binding(),
             bound_to: None,
+            motion: default_motion(),
             appearance,
             action_state: ActionState::Idle,
             instruction_guard: InstructionGuard::new(per_tick_instruction_limit),
@@ -281,6 +317,16 @@ impl Entity {
     /// 设置绑定对象
     pub fn set_bound_to(&mut self, owner: Option<EntityId>) {
         self.bound_to = owner;
+    }
+
+    /// 运动身份档位（D-003）
+    pub fn motion(&self) -> i32 {
+        self.motion
+    }
+
+    /// 设置运动身份（import 层已 clamp_motion，此处直存）
+    pub fn set_motion(&mut self, motion: i32) {
+        self.motion = motion;
     }
 
     /// 设置坐标（物理规则校验与变换管线由 space/physics 模块负责，此处只存）
@@ -618,5 +664,51 @@ mod tests {
         assert_eq!(clamp_binding(9), BINDING_UNBOUND);
         assert_eq!(clamp_binding(-1), BINDING_UNBOUND);
         assert_eq!(clamp_binding(i32::MAX), BINDING_UNBOUND);
+    }
+
+    // === motion（D-003 运动身份出生声明）===
+
+    #[test]
+    fn entity_motion_defaults_to_static() {
+        // 创建：新实体默认 static（现状语义：造物钉死；生物不受此字段影响）
+        let e = sample_entity();
+        assert_eq!(e.motion(), MOTION_STATIC);
+    }
+
+    #[test]
+    fn entity_motion_survives_serialize_roundtrip() {
+        // 读写：运动身份序列化往返保留（快照存档不断档）
+        let mut e = sample_entity();
+        e.set_motion(MOTION_DYNAMIC);
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.motion(), MOTION_DYNAMIC);
+    }
+
+    #[test]
+    fn entity_motion_serde_backcompat_old_snapshot() {
+        // 边界：旧快照（无 motion 字段）反序列化回退 static（存储向后兼容，
+        // radius/mass/binding 同款先例——旧存量造物全部保持钉死现状）
+        let mut obj: serde_json::Value = serde_json::to_value(sample_entity()).unwrap();
+        obj.as_object_mut().unwrap().remove("motion");
+        let json = serde_json::to_string(&obj).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.motion(), MOTION_STATIC, "旧快照应回退 static");
+    }
+
+    #[test]
+    fn clamp_motion_passes_valid_values() {
+        // 校验：两档合法值原样通过（kinematic 剧本档缓立，不在合法域）
+        assert_eq!(clamp_motion(0), MOTION_STATIC);
+        assert_eq!(clamp_motion(1), MOTION_DYNAMIC);
+    }
+
+    #[test]
+    fn clamp_motion_rejects_invalid_to_static() {
+        // 校验：非法值钳 static（坏声明不进世界，回退现状语义；2=将来 kinematic
+        // 预留位，当前声明即钳回）
+        assert_eq!(clamp_motion(2), MOTION_STATIC);
+        assert_eq!(clamp_motion(-1), MOTION_STATIC);
+        assert_eq!(clamp_motion(i32::MAX), MOTION_STATIC);
     }
 }

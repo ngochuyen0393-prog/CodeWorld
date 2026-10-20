@@ -44,13 +44,13 @@
 | `glyph` | string | 恒有 | ASCII 字形（与终端渲染同源） |
 | `color` | string | 恒有 | 颜色名（red/cyan/yellow/purple/green/magenta/blue/white） |
 | `x`, `y` | f64 | 恒有 | 世界坐标（f64 原值，未取整；画布换算见 §4）。活动实体 y ≥ radius（圆心即位置，脚贴地）；creation 落地 y=0（占地格贴地） |
-| `radius` | f64 | 恒有（v1.5 起，#030） | 活动实体身体圆半径（默认 0.5；合法域 0.05..=25.0）——前端按它画身体圆轮廓。**creation 不用它**（身体=占地格 AABB：`floor(x)..floor(x)+1 × floor(y)..floor(y)+1`，前端按 kind=creation 画方格底衬） |
-| `kind` | string | 恒有 | `"npc"` / `"player"` / `"creation"`（见 §3.1） |
+| `radius` | f64 | 恒有（v1.5 起，#030） | 活动实体身体圆半径（默认 0.5；合法域 0.05..=25.0）——前端按它画身体圆轮廓。**creation（static）不用它**（身体=占地格 AABB：`floor(x)..floor(x)+1 × floor(y)..floor(y)+1`，前端按 kind=creation 画方格底衬）；**creation_dynamic（v2.1，D-003）身体=此半径的圆**，渲染/点击同活动实体 |
+| `kind` | string | 恒有 | `"npc"` / `"player"` / `"creation"` / `"creation_dynamic"`（v2.1 起，见 §3.1） / `"projectile"` |
 | `name` | string | 恒有（v1.1 起，原仅 player） | 代码身份 `code_hash` 原文：npc=`attacker`/`defender`/`hunter`/`spy`；player=玩家名（players/ 文件名）；creation=`"creation"`（身份看 `owner`） |
 | `controlled` | bool | 仅 player | `true` = me 声明的操控目标（#024，每拍解析）；player 字段恒在（前端 `e.controlled` 直接可用） |
 | `disposition` | string | 处置中的 player（v1.7 起，#025） | 会话级下线处置状态签：`"dispose_wait"`（处置等待中，操控连接意外断开倒计时）/ `"auto"`（停留+自主接管，on_tick 恢复）/ `"ai-await"`（停留+等外部 AI 接入，站桩）。**字段缺席 = online 在线态**（操控独占照常） |
 | `wait_left` | u64 | 仅 `disposition="dispose_wait"` | 处置等待剩余拍数（每拍 -1，到 0 即被服务器默认带走）——前端画"处置等待中 NN 拍"抢救倒计时 |
-| `owner` | string | 仅 creation | 创造者 PlayerId 的 UUID 字符串（产权链 #015） |
+| `owner` | string | 仅 creation/creation_dynamic | 创造者 PlayerId 的 UUID 字符串（产权链 #015） |
 
 npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSON 干净）；v1.1 起 `name` 全实体恒有（第二刀悬浮提示需要 npc 的代码身份）。
 
@@ -66,6 +66,13 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 
 语义边界：**落空（点不在身体内/距离不足）/拦截/作废（攻击者已死/防守失败）不进广播**——拦截是防守方隐私，世界不替攻方宣布"打中了"；落空提示前端已有本地预告（v1.8 灰线）。事件随本拍快照一次性广播（事件是新闻不是档案，不跨拍滞留）；无观众=丢弃（零开销路径与快照同款）。
 
+### v2.1 变更记录（2026-10-20，D-003 motion 出生声明）
+
+- `kind` 新增 `"creation_dynamic"`：`code_hash="creation"` 且 motion=1 的全活造物（spawn 第 10 参声明，dev-plan D-003）——身体=声明 `radius` 的圆（不再是格对齐 AABB），出生拍起受完整物理（重力落点/阻力/极速钳制），渲染与点击判定同活动实体。
+- `creation`（static）语义零变更：AABB 身体、方格底衬、AABB 点击包含判定，全现状。
+- `owner` 字段出现条件从「仅 creation」扩为「creation/creation_dynamic」（产权链与运动身份正交，两档都带）。
+- `radius` 字段对 creation_dynamic 开始有物理含义（=身体圆半径），对 creation（static）仍仅快照携带。
+
 ### v1.1 变更记录（2026-10-15，期四第二刀）
 
 - `name` 字段出现条件从「仅 player」扩为「恒有」，值为 `code_hash` 原文。原因：Canvas 页悬浮提示要显示 name/kind，npc（A/D/H/S 主角四人组）在 v1 下无名可显；`code_hash` 即代码身份（本世界"代码即现实"的第一身份），恒有后前端无需可选分支。
@@ -76,7 +83,8 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 | code_hash | kind |
 |-----------|------|
 | `attacker` / `defender` / `hunter` / `spy` | `npc`（开局四生物） |
-| `creation` | `creation`（门二造物，带 owner） |
+| `creation`（motion=0，static 钉死） | `creation`（门二造物，带 owner） |
+| `creation`（motion=1，D-003 全活） | `creation_dynamic`（v2.1：圆身体受完整物理，带 owner；渲染/点击同活动实体） |
 | `projectile` | `projectile`（v1.8，#034 弹丸：小圆点+尾迹，颜色=发射者 glyph 色，无可选字段） |
 | players/ 目录在线玩家名 | `player` |
 | 残影躯壳（#013，已下线未消散） | `player`（code_hash 仍是玩家名；`controlled` 恒 false） |
