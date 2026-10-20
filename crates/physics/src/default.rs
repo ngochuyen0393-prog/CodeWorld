@@ -43,6 +43,25 @@ pub enum ProjectileEvent {
     Expired { projectile: EntityId },
 }
 
+/// static 造物的地面高度（D-016）：格对齐 AABB 占地格 [cx, cx+1]，
+/// 地面取该区间内高度数组峰值（两端+中点三点采样取 max——AABB 不能悬空：
+/// 山坡半格悬空的塔不合法；采样粒度 0.25 格远细于占地格 1 格，
+/// 三点采样对线性插值面已是精确覆盖）
+fn terrain_ground_for_creation(world: &WorldState, x: f64) -> f64 {
+    let (min, max) = creation_aabb((x, 0.0));
+    terrain_ground_over(world, min.0, max.0)
+}
+
+/// 区间 [xa, xb] 内地形峰值（测试/造物落底共用；三点采样对 0.25 格
+/// 线性插值面 + 1 格区间是精确覆盖）
+fn terrain_ground_over(world: &WorldState, xa: f64, xb: f64) -> f64 {
+    world
+        .terrain
+        .height(xa)
+        .max(world.terrain.height((xa + xb) / 2.0))
+        .max(world.terrain.height(xb))
+}
+
 /// 阻力定律（#034 立法第 3 条：阻力减速 = 阻力 ÷ 质量，除法是定律质量为分母）
 ///
 /// v = v - drag * v / mass：线性阻力模型，方向不变模衰减。
@@ -146,6 +165,16 @@ impl DefaultPhysicsEngine {
 
     /// 弹丸步进（#034 弹道系统：离体之物的世界物理）
     ///
+    /// 【#044 子步宪法锚】N=世界状态的纯函数——本函数的"子步"形态是 CCD 扫掠：
+    /// 每弹丸每拍恒定一整步积分（重力→阻力→极速钳→位移，N=1），随速度状态
+    /// 自适应的是"检查精度"而非"步数"（线段扫掠精确到首次接触参数 t，极速
+    /// 常数内任何速度如实结算，无需为高速体降步长）。这是宪法速度 tier 的
+    /// 已然形态：精度由弹丸速度状态决定（状态驱动），同一状态必然同一结算
+    /// ——两台机器看同一个世界必然同样结果（回放仲裁根基）。将来自适应真
+    /// 子步（tier>1）时必须沿用本宪法：tier 由量化阈值算+滞回带防抖+换档
+    /// 只在拍边界并记日志入回放流；红线=绝不用墙钟/CPU/帧率选 N（机器数据
+    /// =结果分叉=回放仲裁全毁）。docs/decisions.md #044 / dev-plan D-015。
+    ///
     /// 每拍对每个弹丸（EntityId 升序确定序）执行：
     /// 1. 寿命检查：age（current_tick - created_tick）≥ PROJECTILE_MAX_AGE_TICKS
     ///    -> Expired 事件 + 消亡（哑弹，不再积分）
@@ -221,6 +250,11 @@ impl DefaultPhysicsEngine {
             //    "起点->终点线段扫过身体"（点到线段距离 < r弹+r身；造物 AABB 用
             //    线段-扩展 AABB 相交）——高速弹一拍跳过目标的隧穿修复，
             //    极速常数之内的任何速度都如实结算。
+            //    【#044 子步宪法锚·CCD 现状】这里的"扫掠检查"就是速度 tier 的
+            //    已然形态：高速体自动获得与低速体同级的命中精度（精确到 t），
+            //    且判据是纯几何——只读弹丸速度/位置/目标身体，不读任何机器
+            //    数据（墙钟/CPU/帧率），同状态必然同结算（#044 纯函数要求，
+            //    同拍同状态锚测试 step_projectiles_same_state_same_result）。
             //    多目标取线段参数 t 最小者（最先碰到），与触地 t 一起统一按真实
             //    先后定序（先撞体后落地不再靠检查顺序，消灭随机性）。
             //    跳过发射者（出生拍起豁免）/其他弹丸（互撞 MVP 不做）的口径不变。
@@ -262,16 +296,11 @@ impl DefaultPhysicsEngine {
                     }
                 }
             }
-            // 触地参数 t（地面=半径线）：路径自上而下穿过半径线的交点
-            let ground_t: Option<f64> = if after.1 < radius {
-                if before.1 >= radius {
-                    Some((before.1 - radius) / (before.1 - after.1))
-                } else {
-                    Some(0.0) // 起步已在半径线下（异常态兜底）：立即触地
-                }
-            } else {
-                None
-            };
+            // 触地判定（D-016 地形版）：弹道路径与地形面（高度数组线性插值）
+            // 的首次接触——逐段解析查表 O(路径跨格数)，替代旧"半径线 y=r"
+            // 平面交点（平地是该查表的退化特例：全零高度数组）。起步已在
+            // 地下（异常态兜底）由查表返回 t=0 立即触地。
+            let ground_t: Option<f64> = world.terrain.segment_first_contact(before, after, radius);
             let body_first = match (best_t, ground_t) {
                 (Some(bt), Some(gt)) => bt <= gt,
                 (Some(_), None) => true,
@@ -291,16 +320,18 @@ impl DefaultPhysicsEngine {
                 });
                 continue;
             }
-            // 6. 落地：路径先触地则结算于触地点——落点=线段与地面线的交点
-            //（x 取交点插值、y=半径线），不再是拍末积分位置（高速弹穿地后拉回的
-            // 旧口径同时退役）；P2 顺手修：尸体坐标同步钳到落点，地下异态不留在世界
+            // 6. 落地：路径先触地则结算于触地点——落点=路径与地形面的交点
+            //（x 取交点插值、y=ground(x)+radius 弹心贴面），不再是拍末积分位置
+            //（高速弹穿地后拉回的旧口径同时退役）；P2 顺手修沿用：尸体坐标同步
+            // 钳到落点，地下异态不留在世界
             if let Some(gt) = ground_t {
-                let land = (before.0 + (after.0 - before.0) * gt, radius);
+                let land_x = before.0 + (after.0 - before.0) * gt;
+                let land = (land_x, world.terrain.height(land_x) + radius);
                 if let Some(p) = world.entities.get_mut(&pid) {
                     p.set_pos(land);
                     p.kill();
                 }
-                tracing::debug!(projectile = %pid.0, pos = ?land, "[projectile] 触地（CCD 地面交点）");
+                tracing::debug!(projectile = %pid.0, pos = ?land, "[projectile] 触地（CCD 地形交点，D-016）");
                 events.push(ProjectileEvent::Landed {
                     projectile: pid,
                     point: land,
@@ -314,8 +345,7 @@ impl DefaultPhysicsEngine {
     }
 
     /// 圆实体落点解析：从 from_y 以重力步长下落，返回落点 y。
-    ///
-    /// 地面 = max(ground_y, 自身半径)（脚贴地，圆心即位置）；
+    /// max(terrain, r) 保底脚贴地不陷入；y=0 半径线是平地地形的特例）；
     /// 落点面上有身体（水平方向与我有重叠部分的下方实体/造物）→ 落到恰好接触的高度
     /// （圆-圆用 sqrt(s²-dxh²) 解析贴面；圆-AABB 落到盒顶+贴面）——堆叠合法，
     /// 底下的走了上面的自然下落。落点只在 from_y 及以下取（不向上传送）。
@@ -328,7 +358,9 @@ impl DefaultPhysicsEngine {
         from_y: f64,
     ) -> f64 {
         let fall_to = from_y + self.params.gravity; // gravity 为负值
-        let mut landing = self.params.ground_y.max(me_r);
+        // D-016 地形：地面=高度数组插值（max(ground, r) 保脚贴地——坑深时
+        // 不陷入半径线以下，与旧平地口径 ground_y.max(r) 同构）
+        let mut landing = world.terrain.height(me_x).max(me_r);
         for (id, e) in &world.entities {
             if *id == me_id || !e.is_alive() {
                 continue;
@@ -384,7 +416,7 @@ impl DefaultPhysicsEngine {
         ids.sort_by_key(|id| id.0);
         for id in ids {
             // 先读实体数据（落下借再用），落点计算借 world 不可变引用
-            let (alive, aloft_skip, is_creation, is_proj, before, me_r) = {
+            let (alive, aloft_skip, is_creation, is_dyn_creation, is_proj, before, me_r, me_mass, me_vel) = {
                 let Some(entity) = world.entities.get(&id) else {
                     continue;
                 };
@@ -392,9 +424,12 @@ impl DefaultPhysicsEngine {
                     entity.is_alive(),
                     aloft.contains(&id),
                     entity.code_hash == codeworld_core::collision::CREATION_CODE,
+                    codeworld_core::collision::is_dynamic_creation(entity),
                     codeworld_core::collision::is_projectile(entity),
                     entity.pos(),
                     entity.radius(),
+                    entity.mass(),
+                    entity.velocity(),
                 )
             };
             if !alive {
@@ -409,11 +444,14 @@ impl DefaultPhysicsEngine {
                 tracing::debug!(entity_id = %id.0, "[step] 悬停中，本拍免重力");
                 continue;
             }
-            let new_pos = if is_creation {
-                // 造物：直落地面，落点与身体重叠则原位悬停（下拍重试）
+            let new_pos = if is_creation && !is_dyn_creation {
+                // static 造物：直落地面（D-016：地面=terrain.height(x)，格对齐 AABB
+                // 以其覆盖列的最高地面为准——占地格不悬空），落点与身体重叠则
+                // 原位悬停（下拍重试）
+                let ground_here = terrain_ground_for_creation(world, before.0);
                 let target = (
                     before.0,
-                    (before.1 + self.params.gravity).max(self.params.ground_y),
+                    (before.1 + self.params.gravity).max(ground_here),
                 );
                 let (tmin, tmax) = creation_aabb(target);
                 let blocked = world.entities.iter().any(|(oid, e)| {
@@ -432,9 +470,34 @@ impl DefaultPhysicsEngine {
                     target
                 }
             } else {
+                // 生物 + dynamic 造物（D-003 全活）：同一条圆物理管线
                 let ly = self.circle_landing_y(world, id, before.0, me_r, before.1);
                 (before.0, ly)
             };
+            // D-003 dynamic 造物速度矢量定律（v≡0 时零效果，与生物同款待遇）：
+            // 阻力衰减 + 世界极速钳制（#045 口径"阻力/极速从弹丸专属通用化为一切
+            // 有速度实体"）。重力走上方落点制（位置物理），不往 vy 累积——避免速度
+            // 字段与实际运动脱节；速度积分进位置（被撞飞/抛射）待 D-010/D-018。
+            if is_dyn_creation {
+                let mut vel = apply_drag(me_vel, me_mass, self.params.drag_coefficient);
+                let speed2 = vel.0 * vel.0 + vel.1 * vel.1;
+                let max_speed = self.params.max_speed;
+                if speed2 > max_speed * max_speed {
+                    let scale = max_speed / speed2.sqrt();
+                    tracing::debug!(
+                        entity_id = %id.0,
+                        from_speed = speed2.sqrt(),
+                        to_speed = max_speed,
+                        "[step] dynamic 造物世界极速钳制"
+                    );
+                    vel = (vel.0 * scale, vel.1 * scale);
+                }
+                if vel != me_vel {
+                    if let Some(entity) = world.entities.get_mut(&id) {
+                        entity.set_velocity(vel);
+                    }
+                }
+            }
             if new_pos != before {
                 if let Some(entity) = world.entities.get_mut(&id) {
                     entity.set_pos(new_pos);
@@ -718,6 +781,101 @@ mod tests {
         world.entities.insert(id_t, t);
         engine.step(&mut world, &HashSet::new());
         assert_eq!(world.entities.get(&id_t).unwrap().pos(), (10.0, 5.0), "落点重叠悬停原位");
+    }
+
+    // === D-003 motion 出生声明（dynamic 造物=圆物理管线）===
+
+    /// dynamic 造物构造器：code_hash=creation + motion=1
+    fn make_dyn_creation(id_u: u128, x: f64, y: f64) -> Entity {
+        let mut e = make_creation(id_u, x, y);
+        e.set_motion(codeworld_core::entity::MOTION_DYNAMIC);
+        e
+    }
+
+    #[test]
+    fn step_dynamic_creation_falls_to_radius_line() {
+        // D-003 全活造物：空中出生走圆物理管线（circle_landing_y 一拍到底），
+        // 落到地面=半径线 y=radius（脚贴地）——与生物同款，不是 static 的 y=0 落地
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let t = make_dyn_creation(1, 10.0, 5.0);
+        assert!(codeworld_core::collision::is_dynamic_creation(&t));
+        let id = t.id;
+        world.entities.insert(id, t);
+        engine.step(&mut world, &HashSet::new());
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (10.0, 0.5),
+            "dynamic 造物一拍落到半径线（生物同款管线）"
+        );
+    }
+
+    #[test]
+    fn step_dynamic_creation_stacks_on_static_tower_top() {
+        // dynamic 造物可落在 static 塔顶（圆-AABB 落点面），物理涌现"造物当桥"
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let tower = make_creation(1, 10.0, 0.0); // AABB [10,11]×[0,1]
+        let ball = make_dyn_creation(2, 10.5, 5.0); // r=0.5，正上方
+        let id_t = tower.id;
+        let id_b = ball.id;
+        world.entities.insert(id_t, tower);
+        world.entities.insert(id_b, ball);
+        engine.step(&mut world, &HashSet::new());
+        assert_eq!(
+            world.entities.get(&id_b).unwrap().pos(),
+            (10.5, 1.5),
+            "dynamic 造物落在塔顶（盒顶 1.0 + 半径 0.5）"
+        );
+    }
+
+    #[test]
+    fn step_dynamic_creation_velocity_drag_and_speed_limit() {
+        // D-003 速度矢量定律：v≠0 时按 drag/mass 衰减（v=10, mass=1, drag=0.05
+        // → 9.5）；速度不超过世界极速（60 → 25 归一化）。速度积分进位置待 D-010
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut a = make_dyn_creation(1, 0.0, 100.0); // 高空，落点解析不干扰速度断言
+        a.set_velocity((10.0, 0.0));
+        let mut b = make_dyn_creation(2, 50.0, 100.0);
+        b.set_velocity((60.0, 0.0));
+        let id_a = a.id;
+        let id_b = b.id;
+        world.entities.insert(id_a, a);
+        world.entities.insert(id_b, b);
+        engine.step(&mut world, &HashSet::new());
+        assert_eq!(
+            world.entities.get(&id_a).unwrap().velocity(),
+            (9.5, 0.0),
+            "阻力定律 v=10 衰 5% → 9.5（mass=1）"
+        );
+        let (vx, _) = world.entities.get(&id_b).unwrap().velocity();
+        assert!(
+            (vx - 25.0).abs() < 1e-9,
+            "超极速 60 应归一化压回 25，实际 {vx}"
+        );
+    }
+
+    #[test]
+    fn step_static_creation_velocity_untouched_zero_regression() {
+        // 零回归锚：static 造物无速度矢量物理（速度字段原样不动），落地仍 y=0
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut t = make_creation(1, 10.0, 5.0);
+        t.set_velocity((99.0, 0.0)); // 即使被硬塞速度，static 造物也不吃物理
+        let id = t.id;
+        world.entities.insert(id, t);
+        engine.step(&mut world, &HashSet::new());
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (10.0, 0.0),
+            "static 造物仍直落地面 y=0（现状不变）"
+        );
+        assert_eq!(
+            world.entities.get(&id).unwrap().velocity(),
+            (99.0, 0.0),
+            "static 造物速度字段不被 step 触碰"
+        );
     }
 
     #[test]
@@ -1439,7 +1597,7 @@ mod tests {
         // #044 红线锚：CCD 扫掠判据=纯几何——同一（位置，速度）对在极速内
         // 取任意两档速度，命中判定只由几何决定且单调（路径穿过目标必命中，
         // 与跑多少次/何时跑无关）。本锚用"高速漏检 Impossible"钉死：
-        // 极速内慢速 4 格/拍命中路径上的目标，高速 20 格/拍同样必命中
+        // 极速内慢速 4 格/拍命中路径中点目标，高速 20 格/拍同样必命中
         // （旧点检查在 20 格/拍会漏——隧穿；CCD 扫掠两档都中）。
         // 若有人把判据改成读机器数据（帧率/负载），两档结果会出现非几何
         // 相关的漂移，本锚（连同上面的同状态锚）会红。
@@ -1462,5 +1620,179 @@ mod tests {
                 "速度 {speed} 应命中目标"
             );
         }
+    }
+
+    // === D-016 地形起伏：物理四件套③（落地钳制/CCD 落点查表）===
+
+    #[test]
+    fn d016_step_entity_lands_on_hill() {
+        // D-016：生物落在山地上——落点=地形面（ground(x)+贴面），不再钳 y=0 半径线
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        world.set_terrain(codeworld_core::terrain::Terrain::new(
+            codeworld_core::terrain::TerrainPreset::Mountain,
+            8,
+        ));
+        // 找最高点，从其上空 10 格垂直下落
+        let t = &world.terrain;
+        let (peak_i, &peak_h) = t
+            .samples()
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let peak_x = codeworld_core::terrain::TERRAIN_X_MIN
+            + peak_i as f64 * codeworld_core::terrain::TERRAIN_SPACING;
+        let e = make_entity(1, peak_x, peak_h + 10.0, 0);
+        let id = e.id;
+        world.entities.insert(id, e);
+        // 多拍下落到稳定（落点解析：落点=max(ground(x), r)——山顶尖上圆心=peak_h+r）
+        for _ in 0..5 {
+            engine.step(&mut world, &HashSet::new());
+        }
+        let final_y = world.entities.get(&id).unwrap().pos().1;
+        let expect = peak_h.max(0.5);
+        assert!(
+            (final_y - expect).abs() < 1e-9,
+            "峰顶落点应为 ground+半径（{expect}），实际 {final_y}"
+        );
+    }
+
+    #[test]
+    fn d016_step_entity_rests_in_valley() {
+        // D-016：坑负全合法——谷底生物落点=谷底地面（y=0 退位为基准线）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        world.set_terrain(codeworld_core::terrain::Terrain::new(
+            codeworld_core::terrain::TerrainPreset::Mountain,
+            8,
+        ));
+        let t = &world.terrain;
+        let (valley_i, &valley_h) = t
+            .samples()
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let valley_x = codeworld_core::terrain::TERRAIN_X_MIN
+            + valley_i as f64 * codeworld_core::terrain::TERRAIN_SPACING;
+        assert!(valley_h < 0.0, "山地应有负高度坑（海平面语义），实际 {valley_h}");
+        let e = make_entity(1, valley_x, valley_h + 5.0, 0);
+        let id = e.id;
+        world.entities.insert(id, e);
+        for _ in 0..5 {
+            engine.step(&mut world, &HashSet::new());
+        }
+        let final_y = world.entities.get(&id).unwrap().pos().1;
+        let expect = valley_h.max(0.5);
+        assert!(
+            (final_y - expect).abs() < 1e-9,
+            "谷底落点应为 ground（{expect}），实际 {final_y}"
+        );
+    }
+
+    #[test]
+    fn d016_flat_terrain_physics_zero_regression() {
+        // D-016 零回归锚：平地地形（全零数组）下物理行为与旧常数地面逐位一致
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new(); // 默认 terrain=flat
+        let e = make_entity(1, 5.0, 10.0, 0);
+        let id = e.id;
+        world.entities.insert(id, e);
+        engine.step(&mut world, &HashSet::new());
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (5.0, 0.5),
+            "平地落点=半径线（旧口径零回归）"
+        );
+    }
+
+    #[test]
+    fn d016_projectile_lands_on_mountain_slope() {
+        // D-016：弹道 CCD 落点查表——撞山坡的弹丸落点贴地形面（y=ground+r）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        world.set_terrain(codeworld_core::terrain::Terrain::new(
+            codeworld_core::terrain::TerrainPreset::Mountain,
+            8,
+        ));
+        let t = &world.terrain;
+        let (peak_i, &peak_h) = t
+            .samples()
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let peak_x = codeworld_core::terrain::TERRAIN_X_MIN
+            + peak_i as f64 * codeworld_core::terrain::TERRAIN_SPACING;
+        // 从峰左侧高处向右下斜射（必撞上山坡）
+        let start = (peak_x - 4.0, peak_h + 6.0);
+        let p = make_projectile(1, start, (10.0, -12.0), 0);
+        let pid = p.id;
+        let r = p.radius(); // PROJECTILE_RADIUS 常量
+        world.entities.insert(pid, p);
+        let mut landed = None;
+        for tick in 1..=30 {
+            let events = engine.step_projectiles(&mut world, tick, &HashMap::new());
+            if let Some(ProjectileEvent::Landed { point, .. }) = events.first() {
+                landed = Some(*point);
+                break;
+            }
+        }
+        let (lx, ly) = landed.expect("30 拍内必撞坡落地");
+        let ground = world.terrain.height(lx);
+        assert!(
+            (ly - ground - r).abs() < 1e-6,
+            "落点弹心应贴地形面（ground+{r}），实际 ({lx},{ly}) ground={ground}"
+        );
+        assert!(lx < peak_x + 1.0, "应在山坡上落地（未过峰），实际 lx={lx}");
+    }
+
+    #[test]
+    fn d016_creation_lands_on_terrain_no_float() {
+        // D-016：static 造物落在起伏地形上不悬空——落地稳定后，AABB 底边
+        // 不高于占地格内地形峰值（塔脚总有着落点），且多拍稳定不抖动
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        world.set_terrain(codeworld_core::terrain::Terrain::new(
+            codeworld_core::terrain::TerrainPreset::Hills,
+            11,
+        ));
+        // 在有起伏处放造物（找一个左右高差 >0.3 的 x：占地格跨坡）
+        let t = &world.terrain;
+        let mut spot = None;
+        for i in 1..t.sample_count() - 5 {
+            let x = codeworld_core::terrain::TERRAIN_X_MIN
+                + i as f64 * codeworld_core::terrain::TERRAIN_SPACING;
+            let g0 = t.height(x);
+            let g1 = t.height(x + 1.0);
+            if (g1 - g0).abs() > 0.3 {
+                spot = Some(x);
+                break;
+            }
+        }
+        let x = spot.expect("丘陵 0.25 采样必有跨坡格");
+        let c = make_creation(1, x, 8.0);
+        let cid = c.id;
+        world.entities.insert(cid, c);
+        let mut last = None;
+        for _ in 0..8 {
+            engine.step(&mut world, &HashSet::new());
+            last = Some(world.entities.get(&cid).unwrap().pos().1);
+        }
+        let final_y = last.unwrap();
+        // 落地稳定（连续两拍同位）
+        engine.step(&mut world, &HashSet::new());
+        let stable_y = world.entities.get(&cid).unwrap().pos().1;
+        assert_eq!(final_y, stable_y, "造物落地应稳定不抖动");
+        // 不悬空：AABB 底边 floor(y) 不高于占地格地形峰值
+        let (min, max) = creation_aabb((x, final_y));
+        let ground_peak = terrain_ground_over(&world, min.0, max.0);
+        assert!(
+            min.1 <= ground_peak + 1e-9,
+            "AABB 底边 {min_1} 应不高于地形峰值 {ground_peak}（塔脚有着落）",
+            min_1 = min.1
+        );
+        assert!(final_y <= 0.0 + 1e-9 || min.1 >= ground_peak - 1.0 - 1e-9);
     }
 }

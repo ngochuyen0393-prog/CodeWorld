@@ -248,6 +248,7 @@
   var cam = null;               // 相机中心（世界坐标，lerp 平滑）
   var camEdges = null;          // 相机贴边标记 {l,r,b,t}（viewport 边界线可视化用）
   var view = null;              // 当前可视世界窗口（全景=viewport；跟随=相机窗口）
+  var terrainData = null;       // 地形折线 {x0,dx,heights}（D-016；null=平地/旧协议，回落 y=0 横线）
   var loggedOut = null;         // 已登出的处置（'take'|'stay_auto'|'stay_ai'，#025）；null=未登出
                                 // 登出后连接降级观战继续直播；此时断线不自动重连（重连=抢回操控）
   var logoutPanelBusy = false;  // 弹窗决策/淡出进行中：禁一切面板交互（防双发 logout）
@@ -282,6 +283,9 @@
     lastRawTick = snap.tick;
     lastRawEnts = ents;
     vp = snap.viewport;
+    // 地形折线（D-016）：有则换新（世界创建后地形不变，重发幂等）；缺席
+    //（平地世界不发/旧协议前端）清空回落 y=0 横线
+    terrainData = snap.terrain || null;
     // 击杀标记（第四刀 B2）：相邻两帧对比，消失的实体在最后坐标留渐隐 ✕
     if (prevFrame) {
       var kills = collectKills(prevFrame.ents, ents);
@@ -320,6 +324,7 @@
     avgInterval = null;
     lastRecvT = null;
     projPrev = null; // 弹丸尾迹锚点随缓冲清空（重连后无历史方向，尾迹从零起步）
+    terrainData = null; // 地形折线随缓冲清空（下一帧快照按 terrain 字段有无重建）
     itvEl.textContent = '-';
   }
 
@@ -554,7 +559,8 @@
   var CLICK_TOLERANCE = 1.5;
 
   // 点击处的实体选中判定（#031 + 第七刀容差）：活动实体=距圆心 < CLICK_TOLERANCE；
-  // creation=格对齐方块闭区间包含（原判据不动）；操控目标自己排除（点自己不出刀）；
+  // creation=格对齐方块闭区间包含（原判据不动）；creation_dynamic（D-003）=圆实体
+  // 同活动实体待遇（容差判定）；操控目标自己排除（点自己不出刀）；
   // 弹丸排除（#034：弹丸是飞行物不是攻击目标，服务器 find_hit_target 同判据）
   function nearestEntityAtWorld(state, wx, wy) {
     if (!state) return null;
@@ -897,8 +903,19 @@
     }
     ctx.stroke();
 
-    // 地面线：y=0 一条稍亮横线（域内才画）
-    if (view.y0 <= 0 && 0 <= view.y0 + view.h) {
+    // 地面线（D-016）：有地形折线数据时画高度折线（纯线起步定案，无填充/纹理）；
+    // 无数据（平地/旧协议前端兼容）保留旧 y=0 横线行为
+    if (terrainData && Array.isArray(terrainData.heights) && terrainData.heights.length > 1) {
+      var hs = terrainData.heights;
+      ctx.strokeStyle = COLOR_GROUND;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (var ti = 0; ti < hs.length; ti++) {
+        var tp = worldToScreen(terrainData.x0 + ti * terrainData.dx, hs[ti]);
+        if (ti === 0) ctx.moveTo(tp.x, tp.y); else ctx.lineTo(tp.x, tp.y);
+      }
+      ctx.stroke();
+    } else if (view.y0 <= 0 && 0 <= view.y0 + view.h) {
       var gy = Math.round(worldToScreen(0, 0).y) + 0.5;
       ctx.strokeStyle = COLOR_GROUND;
       ctx.beginPath();
@@ -974,6 +991,7 @@
         ctx.fillStyle = 'rgba(255,255,255,0.10)'; // 造物方形底衬
         ctx.fillRect(p.x - half, p.y - half, half * 2, half * 2);
       } else if (e.radius > 0) {
+        // 活动实体 + creation_dynamic（D-003 全活造物）：按 radius 画身体圆
         ctx.strokeStyle = 'rgba(255,255,255,0.16)'; // 身体圆轮廓（半径可视化，网格线保留地址感）
         ctx.lineWidth = 1;
         ctx.beginPath();
@@ -1186,6 +1204,7 @@
     var text = e.name + ' · ' + e.kind;
     if (e.controlled) text += ' · 操控中';
     if (e.kind === 'creation' && e.owner) text += ' · owner ' + e.owner.slice(0, 8);
+    if (e.kind === 'creation_dynamic' && e.owner) text += ' · 全活造物 · owner ' + e.owner.slice(0, 8);
     tipEl.textContent = text;
     tipEl.hidden = false;
     // 锚点=实体正上方水平居中（身体圆顶再留 4px，越界 clamp——期五第六刀；

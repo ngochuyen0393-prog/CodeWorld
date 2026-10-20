@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::entity::{Entity, EntityId, PlayerId};
 use crate::physics::{DefaultPhysics, PhysicsOverride};
+use crate::terrain::Terrain;
 
 /// 区域唯一标识
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -297,6 +298,11 @@ pub struct WorldState {
     pub physics_overrides: Vec<PhysicsOverride>,
     /// 默认物理参数
     pub default_physics: DefaultPhysics,
+    /// 高度图地面（D-016 地形起伏：ground(x) 查表的唯一权威数据源；
+    /// serde default 平地——旧快照无此字段回退全零高度，行为零回归）。
+    /// y=0 退位为坐标基准线（海平面语义），丘正坑负全合法
+    #[serde(default)]
+    pub terrain: Terrain,
     /// 历史快照
     pub snapshots: SnapshotStore,
 }
@@ -312,6 +318,7 @@ impl WorldState {
             transforms: Vec::new(),
             physics_overrides: Vec::new(),
             default_physics: DefaultPhysics::default(),
+            terrain: Terrain::flat(),
             snapshots: SnapshotStore::new(),
         };
         tracing::info!("世界状态创建 (tick=0)");
@@ -321,6 +328,18 @@ impl WorldState {
     /// 当前全局 tick
     pub fn tick(&self) -> u64 {
         self.tick
+    }
+
+    /// 装配地形（D-016：主程序启动时按 config 预设+种子生成一次；新世界专用，
+    /// 快照恢复的世界地形随快照走——高度数组是持久世界状态的一部分）
+    pub fn set_terrain(&mut self, terrain: Terrain) {
+        tracing::info!(
+            preset = terrain.preset.as_str(),
+            seed = terrain.seed,
+            samples = terrain.sample_count(),
+            "[world] 地形装配（D-016 高度图地面）"
+        );
+        self.terrain = terrain;
     }
 
     /// 推进一个 tick（time-engine 每 tick 调用）
@@ -668,5 +687,59 @@ mod tests {
         assert_eq!(back.tick(), 1);
         assert_eq!(back.default_physics.gravity, -9.8);
         assert_eq!(back.entities.len(), 0);
+    }
+
+    // === 地形（D-016 高度图地面）===
+
+    #[test]
+    fn world_state_new_has_flat_terrain() {
+        // 创建：新世界默认平地（y=0 即地面，与旧地面语义零回归）
+        let w = WorldState::new();
+        assert_eq!(w.terrain.preset, crate::terrain::TerrainPreset::Flat);
+        assert_eq!(w.terrain.height(0.0), 0.0);
+        assert_eq!(w.terrain.height(23.7), 0.0);
+    }
+
+    #[test]
+    fn world_state_set_terrain_and_serialize_roundtrip() {
+        // 读写：装配山地地形 → 快照往返地形不变形（重启世界地形稳定）
+        let mut w = WorldState::new();
+        w.set_terrain(crate::terrain::Terrain::new(
+            crate::terrain::TerrainPreset::Mountain,
+            42,
+        ));
+        let json = serde_json::to_string(&w).unwrap();
+        let back: WorldState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.terrain.preset, crate::terrain::TerrainPreset::Mountain);
+        assert_eq!(back.terrain.seed, 42);
+        let drift = back
+            .terrain
+            .samples()
+            .iter()
+            .zip(w.terrain.samples())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(drift < 1e-9, "快照往返高度漂移 {drift} 应 < 1e-9（serde_json 1ULP 容差）");
+    }
+
+    #[test]
+    fn world_state_old_snapshot_without_terrain_falls_back_flat() {
+        // 边界：旧世界快照（无 terrain 字段）→ serde default 平地（零回归锚：
+        // serde_json 忽略多余字段、缺失字段走 Default::default——Terrain::flat）
+        let mut w = WorldState::new();
+        w.set_terrain(crate::terrain::Terrain::new(
+            crate::terrain::TerrainPreset::Hills,
+            7,
+        ));
+        w.advance_tick();
+        let json = serde_json::to_string(&w).unwrap();
+        // 手工剥掉 terrain 字段（模拟旧版本快照）
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("terrain");
+        let stripped = serde_json::to_string(&v).unwrap();
+        let back: WorldState = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(back.terrain.preset, crate::terrain::TerrainPreset::Flat);
+        assert_eq!(back.terrain.height(0.0), 0.0, "旧快照回退平地");
     }
 }

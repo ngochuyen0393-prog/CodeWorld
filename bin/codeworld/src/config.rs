@@ -65,6 +65,14 @@ pub struct Config {
     /// 积分后归一化压回（重力累积封顶）。标定锚：横穿全图 100 格最短约 4 拍。
     /// CODEWORLD_MAX_SPEED 覆盖；非正数/非有限值回退默认。
     pub max_speed: f64,
+    /// 地形预设（D-016 高度图地面），默认 "flat"（平地）。
+    /// 取值 flat/hills/mountain，收英文中文别名（丘陵/山地）；此处存原文，
+    /// 非法回退平地的口径在主程序装配时由 TerrainPreset::parse 执行（warn 提示）。
+    /// CODEWORLD_TERRAIN 覆盖。仅新世界生效——快照恢复的世界地形随快照走。
+    pub terrain_preset: String,
+    /// 地形生成种子（D-016 可复现凭据：同预设+种子必产同一高度图），默认 0。
+    /// CODEWORLD_SEED 覆盖；解析失败回退 0（容错语义同其他数值项）。
+    pub terrain_seed: u64,
 }
 
 impl Default for Config {
@@ -88,6 +96,8 @@ impl Default for Config {
             dispose_wait_ticks: 30,
             drag_coefficient: 0.05,
             max_speed: codeworld_core::physics::WORLD_MAX_SPEED,
+            terrain_preset: "flat".to_string(),
+            terrain_seed: 0,
         }
     }
 }
@@ -175,6 +185,14 @@ impl Config {
         }
         if let Ok(val) = std::env::var("CODEWORLD_PLAYERS_DIR") {
             cfg.players_dir = val;
+        }
+        // D-016 地形装配参数：preset 存原文（parse 回退口径在装配层，坏值不进世界
+        // 但也不无声消失——装配时 warn）；seed 解析失败回退 0，容错同其他数值项
+        if let Ok(val) = std::env::var("CODEWORLD_TERRAIN") {
+            cfg.terrain_preset = val;
+        }
+        if let Some(s) = env_u64("CODEWORLD_SEED") {
+            cfg.terrain_seed = s;
         }
         cfg
     }
@@ -569,5 +587,56 @@ mod tests {
             std::env::remove_var("CODEWORLD_MAX_SPEED");
             assert_eq!(c.max_speed, 25.0, "非法值 {bad} 应回退默认世界极速");
         }
+    }
+
+    // === D-016 地形预设与种子（CODEWORLD_TERRAIN / CODEWORLD_SEED）===
+
+    #[test]
+    fn default_terrain_preset_is_flat_and_seed_zero() {
+        // 创建：地形默认平地 + 种子 0（D-016；快照恢复/旧部署零回归）
+        let c = Config::default();
+        assert_eq!(c.terrain_preset, "flat", "地形预设默认应为 flat");
+        assert_eq!(c.terrain_seed, 0, "地形种子默认应为 0");
+    }
+
+    #[test]
+    fn load_terrain_env_overrides_default() {
+        // 修改：CODEWORLD_TERRAIN / CODEWORLD_SEED 覆盖默认
+        //（preset 存原文，非法回退口径在装配层 TerrainPreset::parse；seed 数值容错）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_TERRAIN", "hills");
+        std::env::set_var("CODEWORLD_SEED", "12345");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_TERRAIN");
+        std::env::remove_var("CODEWORLD_SEED");
+        assert_eq!(c.terrain_preset, "hills", "环境变量应覆盖地形预设");
+        assert_eq!(c.terrain_seed, 12345, "环境变量应覆盖地形种子");
+    }
+
+    #[test]
+    fn load_terrain_seed_invalid_falls_back_to_zero() {
+        // 边界：CODEWORLD_SEED 非法（非整数）-> 回退默认 0（容错语义同其他数值项）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_SEED", "not-a-number");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_SEED");
+        assert_eq!(c.terrain_seed, 0, "非法种子应回退默认 0");
+    }
+
+    #[test]
+    fn load_terrain_preset_stores_raw_string_and_parse_falls_back_flat() {
+        // 边界：CODEWORLD_TERRAIN 非法值 -> config 按字符串类语义存原文
+        //（"有值即覆盖"），非法回退平地的口径在装配层 TerrainPreset::parse 执行
+        //（terrain.rs preset_parse_aliases 已锚定）；此处锚定 config/装配两端分工
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_TERRAIN", "moon");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_TERRAIN");
+        assert_eq!(c.terrain_preset, "moon", "config 应存原文（回退在装配层）");
+        assert_eq!(
+            codeworld_core::terrain::TerrainPreset::parse(&c.terrain_preset),
+            codeworld_core::terrain::TerrainPreset::Flat,
+            "非法值装配层 parse 应回退平地"
+        );
     }
 }

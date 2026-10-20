@@ -61,6 +61,10 @@ pub struct PendingSpawn {
     /// 绑定契约（#034 修订四 spawn 第 9 参；import 层已钳制非法值为 unbound：
     /// 0=独立存在 1=fade_on_death 主人死塔消亡）
     pub binding: i32,
+    /// 运动身份（D-003 spawn 第 10 参；import 层已钳制非法值为 static：
+    /// 0=static 钉死（默认=现状，格对齐 AABB）/ 1=dynamic 全活（受完整物理，
+    /// 身体=声明 radius 的圆）；kinematic 剧本档缓立）
+    pub motion: i32,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
 }
@@ -159,6 +163,12 @@ pub struct SandboxData {
     /// 本 tick 的悬停声明（env.hover 置位，host 阶段一收件并入免重力集合后清空；
     /// 每拍重申语义——玩家代码要持续对抗世界规则，上一拍声明不延续）
     pub hover_declared: bool,
+    /// 地形快照指针（D-016：move_by/spawn 的钻地判据从 y<0 改 y<ground(x)）。
+    /// 与 probe_bridge 同款窗口契约：仅主循环阶段一执行玩家代码的窗口内非空
+    ///（host 挂载 -> call -> 置空同一循环体作用域），窗口外恒 null——
+    /// import 层判空时回退平地判据 y<0（无地形的测试环境零回归）。
+    /// # SAFETY：挂载方保证指针在窗口期内指向存活的 world.terrain。
+    pub terrain: *const codeworld_core::terrain::Terrain,
     /// probe 通路桥指针（三层感知 Phase A，见 ProbeBridge 的 SAFETY 契约）。
     /// 仅在主循环阶段一执行玩家代码的窗口内非空（挂载 -> call -> 置空同一循环体
     /// 作用域），窗口外恒为 null——import 层判空作废探测。
@@ -214,6 +224,25 @@ pub struct ProbeBridge {
     /// 本拍可见的发射痕迹（#034 修订三；probe 命中痕迹坐标返回发射者身份，
     /// 与沙箱表无交集——痕迹不建沙箱）
     pub traces: Vec<TraceProbe>,
+}
+
+/// 地形钻地判据（D-016）："y < ground(x)" 的沙箱侧实现。
+/// terrain 指针判空：无 host 挂载（测试环境/窗口外）回退平地判据 y<0.0——
+/// 与旧世界零回归（平地地形 ground(x)≡0 两判据等价）。
+/// 返回 Some(ground_y)=钻地（携带地面高度供日志），None=合法。
+fn terrain_depth_violation(
+    terrain: *const codeworld_core::terrain::Terrain,
+    x: f64,
+    y: f64,
+) -> Option<f64> {
+    let ground = if terrain.is_null() {
+        0.0
+    } else {
+        // SAFETY：窗口契约（见 SandboxData.terrain 文档）——窗口期内指针指向
+        // 存活的 world.terrain，import 闭包只在此窗口内被玩家代码调用
+        unsafe { (*terrain).height(x) }
+    };
+    (y < ground).then_some(ground)
 }
 
 /// 沙箱句柄（持有 Store + Instance）
@@ -335,7 +364,8 @@ impl SandboxManager {
         // 合法 -> 排队 PendingChange::SetPos 进 pending_moves（阶段二统一应用，与攻击排队
         // 同模式，不即时改坐标）；拒绝 -> 返回 0 不入队。拒绝条件：
         //   - dx/dy 非有限（NaN/无穷，WASM 浮点除零可产生）：防污染世界状态
-        //   - 目标点非有限（有限+有限可上溢为无穷）或 y < 0（钻地，默认物理地面 y=0）
+        //   - 目标点非有限（有限+有限可上溢为无穷）或 y < ground(x)（钻地；D-016 起
+        //     地面=高度数组，平地退化 y<0）
         // 注：同 tick 多次 move_by 各自从同一快照算绝对目标，阶段二按序应用后
         // 仅最后一次生效（非增量累加）；正常用法每 tick 只 move 一次。
         linker.func_wrap(
@@ -367,11 +397,15 @@ impl SandboxManager {
                     );
                     return 0;
                 }
-                if target.1 < 0.0 {
+                if let Some(ground) =
+                    terrain_depth_violation(caller.data().terrain, target.0, target.1)
+                {
                     tracing::warn!(
                         entity_id = %entity.0,
+                        target_x = target.0,
                         target_y = target.1,
-                        "[move_by] 目标钻地（y<0），拒绝入队"
+                        ground,
+                        "[move_by] 目标钻地（y<ground(x)，D-016），拒绝入队"
                     );
                     return 0;
                 }
@@ -664,19 +698,21 @@ impl SandboxManager {
                 }
             },
         )?;
-        // env.spawn(code_ptr, code_len, x, y, glyph_ptr, color_ptr, radius, mass) -> i32：造物
+        // env.spawn(code_ptr, code_len, x, y, glyph_ptr, color_ptr, radius, mass, binding, motion) -> i32：造物
         //（门二开放，world-foundation 门二 + decisions.md #012 能力统一：造物再造造物合法）。
         // 玩家代码提交一段 WAT 文本 + 出生坐标 + 外观，请求造一个新实体。
         // import 层只做零 world 校验（同 move_by 模式：快照坐标 host 填充，玩家伪造不了）：
         //   - 限流：每实体每 tick 最多 1 个请求，多余拒绝
         //   - 代码：len>0 且 <= MAX_PAYLOAD_LEN（编译不受 fuel 约束，防超大模块阻塞 tick），
         //     从 memory [ptr..ptr+len) 读 UTF-8 文本
-        //   - 出生点：x/y 有限、y>=0（不钻地）、创造者快照 ±10 格内（SPAWN_RANGE，
-        //     防远程投射刷屏；规则由宪法允许后续玩法化）
+        //   - 出生点：x/y 有限、y>=ground(x)（不钻地，D-016 地形判据）、创造者快照
+        //     ±10 格内（SPAWN_RANGE，防远程投射刷屏；规则由宪法允许后续玩法化）
         //   - 外观：glyph/color 从 memory 读 NUL 结尾字符串（≤ MAX_META_LEN），
         //     glyph 恰 1 字符、color 非空
         //   - radius 第 7 参钳制 0.05..=25.0（#030）；mass 第 8 参钳制 0.05..=100.0
         //     （#034 物理人格属性，除零护栏）
+        //   - binding 第 9 参钳制非法值回 unbound（#034 修订四）
+        //   - motion 第 10 参钳制非法值回 static（D-003）：0=钉死默认/1=全活 dynamic
         // 产权链 owner 继承、世界实体上限、WAT 编译都在阶段二判（返回 1=已排队，
         // 阶段二拒绝以日志为准，api.md 载明）。
         linker.func_wrap(
@@ -691,7 +727,8 @@ impl SandboxManager {
              color_ptr: i32,
              radius: f64,
              mass: f64,
-             binding: i32|
+             binding: i32,
+             motion: i32|
              -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
@@ -726,8 +763,16 @@ impl SandboxManager {
                     tracing::warn!(entity_id = %creator.0, x, y, "[spawn] 出生点非有限，拒绝");
                     return 0;
                 }
-                if y < 0.0 {
-                    tracing::warn!(entity_id = %creator.0, y, "[spawn] 出生点钻地（y<0），拒绝");
+                if let Some(ground) =
+                    terrain_depth_violation(caller.data().terrain, x, y)
+                {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        x,
+                        y,
+                        ground,
+                        "[spawn] 出生点钻地（y<ground(x)，D-016），拒绝"
+                    );
                     return 0;
                 }
                 let (px, py) = caller.data().pos;
@@ -780,6 +825,8 @@ impl SandboxManager {
                 let mass = codeworld_core::collision::clamp_mass(mass);
                 // #034 修订四第 9 参 binding 校验钳制（非法值钳 unbound，warn）
                 let binding = codeworld_core::entity::clamp_binding(binding);
+                // D-003 第 10 参 motion 校验钳制（非法值钳 static，warn）
+                let motion = codeworld_core::entity::clamp_motion(motion);
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
@@ -788,6 +835,7 @@ impl SandboxManager {
                     radius,
                     mass,
                     binding,
+                    motion,
                     code_len = code.len(),
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
@@ -803,6 +851,7 @@ impl SandboxManager {
                         radius,
                         mass,
                         binding,
+                        motion,
                         fuel_limit,
                     });
                 1
@@ -2288,12 +2337,32 @@ mod tests {
         spawner_binding_wat(code, x, y, "i32.const 0")
     }
 
-    /// 带契约的造物方 WAT（#034 修订四：spawn 第 9 参 binding）
+    /// 带契约的造物方 WAT（#034 修订四：spawn 第 9 参 binding；
+    /// D-003：第 10 参 motion，默认补 i32.const 0 兼容旧调用点）
     fn spawner_binding_wat(code: &str, x: &str, y: &str, binding: &str) -> String {
+        spawner_full_wat(code, x, y, binding, "i32.const 0")
+    }
+
+    /// 全参造物方 WAT（D-003：binding 第 9 参 + motion 第 10 参）
+    fn spawner_full_wat(code: &str, x: &str, y: &str, binding: &str, motion: &str) -> String {
+        spawner_velocity_wat(code, x, y, binding, motion, "f64.const 0.0", "f64.const 0.0")
+    }
+
+    /// 带出生初速的造物方 WAT（spawn 第 11/12 参 vx/vy；14 参生成器最全档：
+    /// blob 恒无包 i32.const 0/0——blob 用例走 spawner_blob_wat）
+    fn spawner_velocity_wat(
+        code: &str,
+        x: &str,
+        y: &str,
+        binding: &str,
+        motion: &str,
+        vx: &str,
+        vy: &str,
+    ) -> String {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -2306,6 +2375,10 @@ mod tests {
     f64.const 0.5
     f64.const 1.0
     {binding}
+    {motion}
+    {vx} {vy}
+    i32.const 0
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -2314,6 +2387,9 @@ mod tests {
             x = x,
             y = y,
             binding = binding,
+            motion = motion,
+            vx = vx,
+            vy = vy,
         )
     }
 
@@ -2322,7 +2398,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
@@ -2336,12 +2412,14 @@ mod tests {
     f64.const 0.5
     f64.const 1.0
     i32.const 0
+    i32.const 0
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1.0
+    i32.const 0
     i32.const 0
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
@@ -2354,7 +2432,7 @@ mod tests {
 
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
@@ -2366,6 +2444,7 @@ mod tests {
     f64.const 0.5
     f64.const 1.0
     i32.const 0
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -2375,7 +2454,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -2387,6 +2466,7 @@ mod tests {
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1.0
+    i32.const 0
     i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
@@ -2437,7 +2517,7 @@ mod tests {
         // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
         let wat_text = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -2448,6 +2528,7 @@ mod tests {
     i32.const 8192 i32.const 8256
     f64.const 0.5
     f64.const 1000.0
+    i32.const 0
     i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -2462,6 +2543,191 @@ mod tests {
         let spawns = &handle.store.data().pending_spawns;
         assert_eq!(spawns.len(), 1);
         assert_eq!(spawns[0].mass, 100.0, "超上限 mass 应钳到 100.0");
+    }
+
+    // === D-003 motion 出生声明（spawn 第 10 参）===
+
+    #[test]
+    fn spawn_import_passes_motion_through_and_clamps_invalid() {
+        // D-003 第 10 参 motion：1=dynamic 透传；非法值（7/2）钳 static——
+        // 坏声明不进世界，回退现状语义（与 binding 同款口径）
+        let mgr = SandboxManager::new().unwrap();
+        let creator = id(811);
+        let wat_text = spawner_full_wat(
+            SPAWNED_CODE,
+            "f64.const 2.0",
+            "f64.const 3.0",
+            "i32.const 0",
+            "i32.const 1",
+        );
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, creator)
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(
+            handle.store.data().pending_spawns[0].motion,
+            codeworld_core::entity::MOTION_DYNAMIC,
+            "合法值 1 应透传 dynamic"
+        );
+        // 非法值 7（含 kinematic 预留位 2）钳 static
+        for bad in ["i32.const 7", "i32.const 2"] {
+            handle.store.data_mut().pending_spawns.clear();
+            let bad_text = spawner_full_wat(
+                SPAWNED_CODE,
+                "f64.const 2.0",
+                "f64.const 3.0",
+                "i32.const 0",
+                bad,
+            );
+            let mut h = mgr
+                .create_sandbox(&wasm(&bad_text), 100_000, id(812))
+                .unwrap();
+            h.store.data_mut().pos = (10.0, 10.0);
+            mgr.call_on_tick(&mut h).unwrap();
+            assert_eq!(
+                h.store.data().pending_spawns[0].motion,
+                codeworld_core::entity::MOTION_STATIC,
+                "非法 motion（{bad}）应钳 static"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_import_motion_defaults_to_static_when_zero() {
+        // 边界：motion=0（显式钉死）与省略语义等价——PendingSpawn.motion=static
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(
+                &wasm(&spawner_wat(SPAWNED_CODE, "f64.const 2.0", "f64.const 3.0")),
+                100_000,
+                id(813),
+            )
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(
+            handle.store.data().pending_spawns[0].motion,
+            codeworld_core::entity::MOTION_STATIC,
+            "默认档（0）应排队 static"
+        );
+    }
+
+    // === 出生初速（spawn 第 11/12 参，D-018 一体式发射提前落地）===
+
+    #[test]
+    fn spawn_import_rejects_birth_velocity_over_max() {
+        // 出生初速模长 28.28 > 世界极速 25 → 拒绝返回 0，不入队（与 shoot 同口径）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(
+                &wasm(&spawner_velocity_wat(
+                    SPAWNED_CODE,
+                    "f64.const 2.0",
+                    "f64.const 3.0",
+                    "i32.const 0",
+                    "i32.const 1",
+                    "f64.const 20.0",
+                    "f64.const 20.0",
+                )),
+                100_000,
+                id(821),
+            )
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let ret = call_i32_export(&mut handle, "get_ret");
+        assert_eq!(ret, 0, "超极速初速应拒绝返回 0");
+        assert!(
+            handle.store.data().pending_spawns.is_empty(),
+            "超极速初速不应入队"
+        );
+    }
+
+    #[test]
+    fn spawn_import_allows_birth_velocity_exactly_max() {
+        // 边界：初速恰等于世界极速 25 放行（严格 > 判据，与 shoot 完全同口径）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(
+                &wasm(&spawner_velocity_wat(
+                    SPAWNED_CODE,
+                    "f64.const 2.0",
+                    "f64.const 3.0",
+                    "i32.const 0",
+                    "i32.const 1",
+                    "f64.const 25.0",
+                    "f64.const 0.0",
+                )),
+                100_000,
+                id(822),
+            )
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let ret = call_i32_export(&mut handle, "get_ret");
+        assert_eq!(ret, 1, "恰等于极速应放行（严格 > 判据）");
+        assert_eq!(
+            handle.store.data().pending_spawns.len(),
+            1,
+            "恰极速初速应入队"
+        );
+    }
+
+    #[test]
+    fn spawn_import_rejects_nonfinite_birth_velocity() {
+        // NaN 初速拒绝：speed2 含 NaN 时 > 比较恒 false，必须显式有限性校验拦下
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(
+                &wasm(&spawner_velocity_wat(
+                    SPAWNED_CODE,
+                    "f64.const 2.0",
+                    "f64.const 3.0",
+                    "i32.const 0",
+                    "i32.const 1",
+                    "f64.const nan",
+                    "f64.const 0.0",
+                )),
+                100_000,
+                id(823),
+            )
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let ret = call_i32_export(&mut handle, "get_ret");
+        assert_eq!(ret, 0, "NaN 初速应拒绝返回 0");
+        assert!(
+            handle.store.data().pending_spawns.is_empty(),
+            "NaN 初速不应入队"
+        );
+    }
+
+    #[test]
+    fn spawn_import_passes_birth_velocity_through() {
+        // 合法初速 (3, -4)（模长 5 < 25）→ PendingSpawn 原样透传
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(
+                &wasm(&spawner_velocity_wat(
+                    SPAWNED_CODE,
+                    "f64.const 2.0",
+                    "f64.const 3.0",
+                    "i32.const 0",
+                    "i32.const 1",
+                    "f64.const 3.0",
+                    "f64.const -4.0",
+                )),
+                100_000,
+                id(824),
+            )
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns.len(), 1, "合法初速应入队");
+        assert_eq!(spawns[0].vx, 3.0, "vx 应透传");
+        assert_eq!(spawns[0].vy, -4.0, "vy 应透传");
     }
 
     // === env.shoot import（#034 第 12 个玩家 import：发射弹丸）===

@@ -255,6 +255,9 @@ impl EntitySandboxMap {
             })
             .collect();
         let probe_fuel = self.probe_fuel;
+        // D-016 地形指针（与 probe 桥同款 cast：world 是本函数不可变借用，
+        // terrain 指针仅阶段一 on_tick 窗口内挂载进 SandboxData，窗口期 world 存活）
+        let terrain_ptr: *const codeworld_core::terrain::Terrain = &world.terrain;
         for entity_id in entity_ids {
             // 防御：只处理存活实体（架构 4.1"把所有存活实体放进任务队列"）。
             // 正常流程死亡实体已在上一 tick 阶段二 d 步移除，此为兜底，避免对残留死者跑玩家代码。
@@ -297,6 +300,10 @@ impl EntitySandboxMap {
                 traces: bridge_traces.clone(),
             };
             handle.store.data_mut().probe_bridge = &mut bridge;
+            // D-016 地形快照挂载：on_tick 窗口内 env.move_by/spawn 的钻地判据
+            // 用真实地形（y<ground(x)）；窗口结束置空（与 probe_bridge 同款契约，
+            // 生命期=本次循环体，world 不可变借用贯穿窗口）
+            handle.store.data_mut().terrain = terrain_ptr;
             // 重置本 tick 指令配额（架构 4.1：每 tick 重置指令配额）。
             // MVP 指令计量靠 wasmtime fuel（consume_fuel），fuel 跨 tick 累计消耗会耗尽，
             // 导致 call_life 返回 Err 误杀实体；架构要求"超额不死亡、下次 tick 继续"，
@@ -333,6 +340,8 @@ impl EntitySandboxMap {
             }
             // 窗口关闭：置空桥指针（SAFETY 契约，防后续 life 调用期悬垂）
             handle.store.data_mut().probe_bridge = std::ptr::null_mut();
+            // D-016 地形快照窗口同关（life 调用期判空回退平地判据，契约同上）
+            handle.store.data_mut().terrain = std::ptr::null();
             // 调 life()：false 或调用失败均标记死亡
             match self.manager.call_life(handle) {
                 Ok(true) => {} // 仍存活
@@ -674,14 +683,15 @@ fn main() -> Result<()> {
 
     // 打开存储，尝试恢复快照；无快照则新建世界
     let mut storage = StorageEngine::open(&config.db_path)?;
-    let mut world = match storage.load_latest_world()? {
+    // D-016：快照恢复判定（恢复的世界地形随快照走，不按 config 重生成高度图）
+    let (mut world, restored_from_snapshot) = match storage.load_latest_world()? {
         Some(w) => {
             tracing::info!(tick = w.tick(), entities = w.entities.len(), "从快照恢复世界");
-            w
+            (w, true)
         }
         None => {
             tracing::info!("无快照，创建新世界");
-            WorldState::new()
+            (WorldState::new(), false)
         }
     };
     // #034：弹丸不跨重启——发射账本（发射者/payload）不持久化，恢复快照里的在飞
@@ -708,6 +718,27 @@ fn main() -> Result<()> {
         max_speed: config.max_speed,
         ..codeworld_core::physics::DefaultPhysics::default_values()
     });
+
+    // D-016 地形装配：新世界按 config 预设+种子生成高度图（快照恢复的世界
+    // 地形随快照走——高度数组是持久世界状态，不重生成）；平地也调 set_terrain
+    //（幂等，Flat 即默认值），日志只在非平地打
+    if !restored_from_snapshot {
+        let preset = codeworld_core::terrain::TerrainPreset::parse(&config.terrain_preset);
+        // 非法值护栏：parse 已回退平地，坏配置仍值得一句 warn（坏值不进世界，也不无声消失）
+        if preset == codeworld_core::terrain::TerrainPreset::Flat
+            && !matches!(
+                config.terrain_preset.trim().to_ascii_lowercase().as_str(),
+                "" | "flat" | "平地"
+            )
+        {
+            tracing::warn!(raw = %config.terrain_preset, "[terrain] CODEWORLD_TERRAIN 非法值，回退平地");
+        }
+        if preset != codeworld_core::terrain::TerrainPreset::Flat {
+            tracing::info!(preset = preset.as_str(), seed = config.terrain_seed,
+                "[terrain] D-016 地形装配（CODEWORLD_TERRAIN/CODEWORLD_SEED）");
+        }
+        world.set_terrain(codeworld_core::terrain::Terrain::new(preset, config.terrain_seed));
+    }
     let viewport = Viewport::new(
         config.viewport_center,
         config.viewport_half_width,
@@ -1761,13 +1792,21 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
             continue;
         };
         let entity_id = EntityId::new();
-        // #030 出生预检（Factorio 放置检查，半径版）：造物身体（格对齐 AABB）与
-        // 任何存活身体重叠 → 该次 spawn 失败。放在编译之后、建沙箱之前（防沙箱
-        // 泄漏）；不诞生、不占世界名额，下拍可重试。
+        // #030 出生预检（Factorio 放置检查，半径版）：造物身体与任何存活身体重叠
+        // → 该次 spawn 失败。放在编译之后、建沙箱之前（防沙箱泄漏）；不诞生、
+        // 不占世界名额，下拍可重试。D-003：dynamic 造物身体=声明 radius 的圆，
+        // static 造物身体=出生格对齐 1×1 AABB（现状不变）。
         {
             use codeworld_core::collision::{body_of, body_overlap, creation_aabb, Body};
-            let (bmin, bmax) = creation_aabb(req.pos);
-            let body = Body::Aabb { min: bmin, max: bmax };
+            let body = if codeworld_core::collision::is_dynamic_creation_candidate(req.motion) {
+                Body::Circle {
+                    center: req.pos,
+                    radius: req.radius,
+                }
+            } else {
+                let (bmin, bmax) = creation_aabb(req.pos);
+                Body::Aabb { min: bmin, max: bmax }
+            };
             let blocker = world
                 .entities
                 .iter()
@@ -1802,6 +1841,9 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
         // 托管执行）；绑定对象=创造者（fade_on_death 的"主人"）
         entity.set_binding(req.binding);
         entity.set_bound_to(Some(req.creator));
+        // D-003 spawn 第 10 参 motion：运动身份写进造物数据（import 层已钳制，
+        // 此处直存）——dynamic 造物即刻受完整物理（身体=声明 radius 的圆）
+        entity.set_motion(req.motion);
         // 沙箱创建成功才插入世界（失败则实体不落世界，不留无沙箱活体）
         if let Err(e) = sandbox_map.create(entity_id, &wasm_bytes, req.fuel_limit) {
             tracing::warn!(
@@ -1818,7 +1860,9 @@ fn process_spawns(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, cu
             owner = %owner.0,
             pos = ?req.pos,
             glyph = %req.glyph,
-            "造物诞生：玩家造物进场（门二，产权链归属创造者 owner）"
+            motion = req.motion,
+            "造物诞生：玩家造物进场（门二，产权链归属创造者 owner；D-003 motion={}）",
+            if req.motion == codeworld_core::entity::MOTION_DYNAMIC { "dynamic 全活" } else { "static 钉死" }
         );
     }
 }
@@ -1860,7 +1904,8 @@ const CTRL_SHOOT_MASS: f64 = 1.0;
 /// 操控弹炮塔解算器（期五第六刀重写：不再恒定 60° 仰角——那是高空目标
 /// 四发哑弹的根因，顶点 ~9.6 够不到 12 格高的 S）。给定发射点/目标点/基准
 /// 炮口速度，解出能命中目标的初速矢量。
-///【#044 子步宪法锚】本解算器是"弹道积分"子步的预测侧形态：内部
+///
+/// 【#044 子步宪法锚】本解算器是"弹道积分"子步的预测侧形态：内部
 /// simulate_path 逐拍重演世界物理（N=1 整步积分），搜索空间（速度梯×角度）
 /// 是固定常数表——判据只读发射点/目标点/世界物理参数（纯仿真输入），
 /// 不读任何机器数据，同一输入必然同一解（解算确定性锚测试
@@ -3762,6 +3807,81 @@ mod tests {
             storage.snapshot_count().unwrap(),
             1,
             "tick 100 应存一次快照"
+        );
+    }
+
+    // === D-016 地形四件套收尾：装配链组合锚 ===
+
+    #[test]
+    fn d016_parse_set_terrain_step_entity_never_clips_underground() {
+        // D-016 组合链（config 装配口径）：TerrainPreset::parse -> set_terrain ->
+        // 一步 physics.step——mountain 世界实体落点不穿地（y >= ground(x) - 1e-9）。
+        // 峰/谷/平段多点采样覆盖，谷底（负高度）也不陷入地形面
+        let preset = codeworld_core::terrain::TerrainPreset::parse("mountain");
+        assert_eq!(preset, codeworld_core::terrain::TerrainPreset::Mountain);
+        let mut world = WorldState::new();
+        world.set_terrain(codeworld_core::terrain::Terrain::new(preset, 42));
+        let engine = DefaultPhysicsEngine::new();
+        let mut ids = Vec::new();
+        for x in [-40.0f64, -10.0, 0.0, 10.0, 33.7] {
+            let ground = world.terrain.height(x);
+            let e = make_entity(x as u128, (x, ground + 0.5));
+            ids.push(e.id);
+            world.entities.insert(e.id, e);
+        }
+        engine.step(&mut world, &std::collections::HashSet::new());
+        for id in ids {
+            let e = world.entities.get(&id).unwrap();
+            let (x, y) = e.pos();
+            let ground = world.terrain.height(x);
+            assert!(
+                y >= ground - 1e-9,
+                "实体落点 ({x},{y}) 不得穿地（ground={ground}）"
+            );
+        }
+    }
+
+    #[test]
+    fn d016_mountain_world_one_tick_entity_not_underground() {
+        // D-016 集成：mountain 世界一拍完整 tick（阶段一跳过无沙箱实体 ->
+        // 阶段二物理步）——峰顶上空实体落点不穿地，贴合峰顶地面
+        let mut world = WorldState::new();
+        world.set_terrain(codeworld_core::terrain::Terrain::new(
+            codeworld_core::terrain::TerrainPreset::Mountain,
+            42,
+        ));
+        let (peak_i, &peak_h) = world
+            .terrain
+            .samples()
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let peak_x = codeworld_core::terrain::TERRAIN_X_MIN
+            + peak_i as f64 * codeworld_core::terrain::TERRAIN_SPACING;
+        let e = make_entity(7, (peak_x, peak_h + 0.5));
+        let id = e.id;
+        world.entities.insert(id, e);
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut sandbox_map = test_sandbox_map();
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut sandbox_map,
+        );
+        let (x, y) = world.entities.get(&id).unwrap().pos();
+        assert!(
+            y >= world.terrain.height(x) - 1e-9,
+            "tick 后落点 ({x},{y}) 不穿地（ground={}）",
+            world.terrain.height(x)
         );
     }
 
@@ -8738,11 +8858,17 @@ mod tests {
 
     /// 造物方 WAT 生成器（main 侧）：data 段放造物源码 + 字形/颜色，
     /// on_tick 调 spawn(0, len, x, y, 256, 300)。code_len 由 Rust 计算（手数必错）。
+    /// D-003：第 10 参 motion（默认 0=static）
     fn birth_spawner_wat(code: &str, x: &str, y: &str) -> String {
+        birth_motion_spawner_wat(code, x, y, "i32.const 0")
+    }
+
+    /// 指定 motion 的造物方 WAT（D-003 spawn 第 10 参）
+    fn birth_motion_spawner_wat(code: &str, x: &str, y: &str, motion: &str) -> String {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -8754,12 +8880,14 @@ mod tests {
     f64.const 0.5
     f64.const 1.0
     i32.const 0
+    {motion}
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
             len = code.len(),
             x = x,
             y = y,
+            motion = motion,
         )
     }
 
@@ -8910,6 +9038,102 @@ mod tests {
         );
     }
 
+    // === D-003 motion 出生声明（spawn 第 10 参全链路）===
+
+    #[test]
+    fn process_spawns_dynamic_motion_birth_precheck_uses_circle() {
+        // D-003 出生预检按声明档分流：motion=1 造物身体=r=0.5 的圆——
+        // 距占据者圆心 0.75（>AABB 覆盖域 0.5 但 < 圆判距 1.0-冗余）：
+        // static 档此距离可过（现状语义），dynamic 档被圆判据挡下。
+        // 反向锚：距 1.6 时两档都放行（dynamic 圆判距 1.0 之外）。
+        for (dx, dyn_ok, label) in [(0.75, false, "0.75 圆内"), (1.6, true, "1.6 圆外")] {
+            // dynamic 档
+            let mut world = WorldState::new();
+            let creator = EntityId(Uuid::from_u128(4));
+            world
+                .entities
+                .insert(creator, make_entity_of_owner(4, 60, (0.0, 0.0)));
+            let occupant = make_entity_of_owner(5, 61, (dx, 0.5)); // 圆 r=0.5，圆心(dx,0.5)
+            world.entities.insert(occupant.id, occupant);
+            let mut map = test_sandbox_map();
+            let spawner =
+                birth_motion_spawner_wat(CREATION_LOG_WAT, &format!("{dx}"), "0.0", "i32.const 1");
+            map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+            map.run_player_code(&world, &unbounded_bb());
+            process_spawns(&mut world, &mut map, 7);
+            let born = world
+                .entities
+                .values()
+                .any(|e| e.code_hash == "creation");
+            assert_eq!(
+                born, dyn_ok,
+                "dynamic 档距 {label} 出生结果应为 {dyn_ok}"
+            );
+            if born {
+                let c = world
+                    .entities
+                    .values()
+                    .find(|e| e.code_hash == "creation")
+                    .unwrap();
+                assert_eq!(c.motion(), codeworld_core::entity::MOTION_DYNAMIC, "motion=1 应落库");
+            }
+        }
+        // static 档零回归：距 0.75（AABB 覆盖 0.5 之外）照常诞生
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(6));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(6, 60, (0.0, 0.0)));
+        let occupant = make_entity_of_owner(7, 61, (0.75, 0.5));
+        world.entities.insert(occupant.id, occupant);
+        let mut map = test_sandbox_map();
+        let spawner = birth_spawner_wat(CREATION_LOG_WAT, "0.75", "0.0");
+        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+        map.run_player_code(&world, &unbounded_bb());
+        process_spawns(&mut world, &mut map, 7);
+        assert!(
+            world.entities.values().any(|e| e.code_hash == "creation"),
+            "static 档距 0.75 不受圆判据影响（现状语义）"
+        );
+    }
+
+    #[test]
+    fn process_spawns_dynamic_creation_falls_in_tick_physics() {
+        // 全链路：motion=1 空中出生（y=5）-> 插入世界 -> 同拍 physics.step 圆管线
+        // 一拍落到半径线 0.5（生物同款）；static 档同场景落地 y=0（AABB 贴地）。
+        // 锚定 tick 内顺序：process_spawns(a1) 先于 physics.step(c)——出生拍即受物理
+        for (motion_wat, want_y, label) in
+            [("i32.const 1", 0.5, "dynamic 落半径线"), ("i32.const 0", 0.0, "static 落地面")]
+        {
+            let mut world = WorldState::new();
+            let creator = EntityId(Uuid::from_u128(8));
+            world
+                .entities
+                .insert(creator, make_entity_of_owner(8, 62, (0.0, 0.0)));
+            let mut map = test_sandbox_map();
+            let spawner =
+                birth_motion_spawner_wat(CREATION_LOG_WAT, "3.0", "5.0", motion_wat);
+            map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+            map.run_player_code(&world, &unbounded_bb());
+            process_spawns(&mut world, &mut map, 7);
+            assert!(
+                world.entities.values().any(|e| e.code_hash == "creation"),
+                "motion={motion_wat} 造物应诞生"
+            );
+            let physics = DefaultPhysicsEngine::new();
+            physics.step(&mut world, &std::collections::HashSet::new());
+            let c = world
+                .entities
+                .values()
+                .find(|e| e.code_hash == "creation")
+                .unwrap();
+            assert_eq!(
+                c.pos().1, want_y,
+                "{label}（D-003 出生拍即受物理）"
+            );
+        }
+    }
+
     #[test]
     fn process_spawns_drops_uncompilable_code_without_crash() {
         // WAT 编译失败 -> 该次 spawn 作废 + warn，不崩世界（参照玩家进场容错）
@@ -8936,6 +9160,7 @@ mod tests {
                 radius: 0.5,
                 mass: 1.0,
                 binding: 0,
+                motion: 0,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -9035,7 +9260,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -9053,6 +9278,7 @@ mod tests {
         (i32.const 8256)
         (f64.const 0.5)
         (f64.const 1.0)
+        (i32.const 0)
         (i32.const 0)
         (call $spawn)
         (drop))))

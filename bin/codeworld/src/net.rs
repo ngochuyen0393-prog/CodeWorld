@@ -80,6 +80,21 @@ pub(crate) struct WorldSnapshot {
     /// 分支）；落空/拦截/作废不广播。前端动画包方向变体（attack_high/mid/low）
     /// 的选槽依据
     pub attacks: Vec<AttackEventInfo>,
+    /// 地形折线投影（D-016）：非平地才有（平地缺席——前端回落 y=0 横线；
+    /// 旧前端忽略未知字段，向后兼容）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terrain: Option<TerrainInfo>,
+}
+
+/// 地形投影（D-016：前端折线渲染数据源；非平地才发全量，平地发 None 省带宽）
+#[derive(Debug, Serialize)]
+pub(crate) struct TerrainInfo {
+    /// 采样 x 起点（-50.0，codeworld_core TERRAIN_X_MIN）
+    pub x0: f64,
+    /// 采样间距（0.25，codeworld_core TERRAIN_SPACING）
+    pub dx: f64,
+    /// 高度数组（与 world.terrain.samples() 同源）
+    pub heights: Vec<f64>,
 }
 
 /// 单条攻击命中事件（D-017 定案字段："攻方/目标ID/目标位置——本来在广播
@@ -127,13 +142,20 @@ pub(crate) struct EntitySnapshot {
     pub wait_left: Option<u64>,
 }
 
-/// kind 判定（纯映射，任务书定案）：开局四生物=npc；creation=造物；
+/// kind 判定（纯映射，任务书定案）：开局四生物=npc；creation=造物（static 钉死）；
+/// creation_dynamic=D-003 全活造物（motion=1，圆身体受完整物理）；
 /// 弹丸=projectile（#034 弹道系统：前端画小圆点+尾迹）；players 目录在线名
 /// （或残影躯壳）=player；其余未知 code_hash 兜底 npc。
-fn entity_kind(code_hash: &str, entity_id: EntityId, players: &PlayerDirectory) -> &'static str {
+fn entity_kind(code_hash: &str, entity_id: EntityId, players: &PlayerDirectory, motion: i32) -> &'static str {
     match code_hash {
         crate::ATTACKER_CODE | crate::DEFENDER_CODE | crate::HUNTER_CODE | crate::SPY_CODE => "npc",
-        "creation" => "creation",
+        "creation" => {
+            if motion == codeworld_core::entity::MOTION_DYNAMIC {
+                "creation_dynamic"
+            } else {
+                "creation"
+            }
+        }
         codeworld_core::collision::PROJECTILE_CODE => "projectile",
         name if players.is_online(name) => "player",
         _ if players.is_ghost(&entity_id) => "player",
@@ -158,7 +180,7 @@ pub(crate) fn build_snapshot(
         .entities
         .values()
         .map(|e| {
-            let kind = entity_kind(&e.code_hash, e.id, players);
+            let kind = entity_kind(&e.code_hash, e.id, players, e.motion());
             let (x, y) = e.pos();
             // 处置状态签（v1.7，#025）：账本命中的实体带 disposition/wait_left
             //（账本只收玩家名，npc/creation 天然缺席）；字段缺席=online 在线态
@@ -173,7 +195,8 @@ pub(crate) fn build_snapshot(
                 kind,
                 name: e.code_hash.clone(),
                 controlled: (kind == "player").then(|| Some(e.id) == controlled),
-                owner: (kind == "creation").then(|| e.owner.0.to_string()),
+                owner: (kind == "creation" || kind == "creation_dynamic")
+                    .then(|| e.owner.0.to_string()),
                 disposition: disposed.map(|s| s.wire_name()),
                 wait_left: disposed.and_then(|s| s.wait_left(now)),
             }
@@ -191,6 +214,15 @@ pub(crate) fn build_snapshot(
             y: ev.target_pos.1,
         })
         .collect();
+    // 地形折线投影（D-016）：平地不发货（省 401 点×f64 的帧体积，前端回落旧
+    // y=0 横线）；非平地全量 401 采样（≈6.4KB JSON/帧，与实体数据同量级可接受）
+    let terrain = (world.terrain.preset != codeworld_core::terrain::TerrainPreset::Flat).then(|| {
+        TerrainInfo {
+            x0: codeworld_core::terrain::TERRAIN_X_MIN,
+            dx: codeworld_core::terrain::TERRAIN_SPACING,
+            heights: world.terrain.samples().to_vec(),
+        }
+    });
     WorldSnapshot {
         tick: world.tick(),
         caption: caption.to_string(),
@@ -202,6 +234,7 @@ pub(crate) fn build_snapshot(
         },
         entities,
         attacks,
+        terrain,
     }
 }
 
@@ -608,6 +641,25 @@ mod tests {
             "owner = 创造者 PlayerId UUID 字符串"
         );
         assert!(e.get("controlled").is_none(), "creation 不带 controlled");
+    }
+
+    #[test]
+    fn dynamic_creation_maps_to_creation_dynamic_kind() {
+        // D-003：motion=1 的造物 kind=creation_dynamic（前端按圆渲染+圆点击判定），
+        // owner 产权签照带（产权链与运动身份正交）
+        let mut world = WorldState::new();
+        let (cid, owner) = put_entity(&mut world, "creation", "B", "cyan", (40.0, 0.0));
+        world
+            .entities
+            .get_mut(&cid)
+            .unwrap()
+            .set_motion(codeworld_core::entity::MOTION_DYNAMIC);
+        let dir = PlayerDirectory::disabled();
+        let json = build(&world, &dir, None);
+        let e = &json["entities"][0];
+        assert_eq!(e["kind"], "creation_dynamic", "motion=1 造物应映射 creation_dynamic");
+        assert_eq!(e["radius"], 0.5, "radius 字段照常携带（圆身体半径）");
+        assert_eq!(e["owner"], owner.0.to_string(), "dynamic 造物照带 owner 产权签");
     }
 
     #[test]
@@ -1252,6 +1304,47 @@ mod tests {
         let json = build(&world, &dir, None);
         let p = &json["entities"][0];
         assert_eq!(p["disposition"], "ai-await");
+    }
+
+    // === D-016 地形折线投影 ===
+
+    #[test]
+    fn snapshot_flat_world_has_no_terrain_field() {
+        // 契约（D-016）：平地世界快照不带 terrain 字段（省 401 点/帧带宽；
+        // 前端回落 y=0 横线，旧前端兼容）
+        let world = WorldState::new(); // 默认平地
+        let dir = PlayerDirectory::disabled();
+        let json = build(&world, &dir, None);
+        assert!(json.get("terrain").is_none(), "平地快照不应携带 terrain 字段");
+    }
+
+    #[test]
+    fn snapshot_mountain_world_carries_terrain_polyline() {
+        // 契约（D-016）：非平地快照带 terrain 折线（x0/dx/heights 与 world.terrain
+        // 同源，首尾采样精确一致；401 点全量 ≈6.4KB/帧，与实体数据同量级可接受）
+        let mut world = WorldState::new();
+        world.set_terrain(codeworld_core::terrain::Terrain::new(
+            codeworld_core::terrain::TerrainPreset::Mountain,
+            42,
+        ));
+        let dir = PlayerDirectory::disabled();
+        let json = build(&world, &dir, None);
+        let t = json.get("terrain").expect("山地快照应携带 terrain 折线");
+        assert_eq!(t["x0"], -50.0, "采样 x 起点=域左端");
+        assert_eq!(t["dx"], 0.25, "采样间距=0.25 格");
+        let hs = t["heights"].as_array().expect("heights 应为数组");
+        assert_eq!(hs.len(), world.terrain.sample_count(), "全量采样与 world 同源");
+        let last = hs.len() - 1;
+        assert_eq!(
+            hs[0].as_f64().unwrap(),
+            world.terrain.samples()[0],
+            "首采样与 world.terrain 同源"
+        );
+        assert_eq!(
+            hs[last].as_f64().unwrap(),
+            world.terrain.samples()[last],
+            "末采样与 world.terrain 同源"
+        );
     }
 
     #[test]

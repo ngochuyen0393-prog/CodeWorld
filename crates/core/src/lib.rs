@@ -18,4 +18,5 @@ pub mod pending;
 pub mod physics;
 pub mod render;
 pub mod survival;
+pub mod terrain;
 pub mod world;
