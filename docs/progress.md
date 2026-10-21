@@ -73,6 +73,7 @@
 - 常数：FIELD_FORMING_TICKS=3（CODEWORLD_FIELD_FORMING）+ field_fuel 10_000（CODEWORLD_FIELD_FUEL），入 game-menu 1.7 总账
 - 测试：workspace 1000 全绿（基线 952+48）；示例 examples/field-demo.wat（守卫测试同源）；文档 api.md（17 参+on_field+field_pulse+力场节）/ net-protocol v2.3（fields 数组）/ decisions #052 / dev-plan D-012 ✅
 - 边界注记：极速场未做；优先级未做；边界冷却防抖不做（on_field 是询问非事件）；#051 已被 D-017 两刀占用，本刀顺延 #052
+- **收尾刀（2026-10-22 82e0846，跨模型双审后）**：独立双审（质量审 glm-5.3 全量复跑+需求审 8/8 兑现）无 P0，修 2 P1——①apply_field_pulses 应用前按 source EntityId 升序排死（HashMap 收集序不再影响结算，#044 确定性红线）②场信箱超容截断显式 warn；快赢 P2 三条（needless_borrow/fields 快照 id 定序/fields_total 日志诚实命名）+api.md 补整数粒度与截断注意；收尾后 workspace 1063 全绿（含并行刀），clippy 本刀零新增
 
 
 ---
