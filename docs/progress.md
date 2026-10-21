@@ -2,10 +2,10 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-21 D-007 三兄弟 收工更新）
-- 在做：D-007 三兄弟已落地（shoot 够不着负序号警告码 + on_contact 接触回调 + on_death 遗嘱钩子，decisions #049，897 测试全绿）
+## 现在（2026-10-21 D-003 motion 出生声明 收工更新）
+- 在做：D-003 已落地（spawn 第 10 参 motion：0=static 钉死默认/1=dynamic 全活——圆身体+完整物理管线，与 radius/mass/binding 同款声明族；decisions #048，kinematic 缓立；897 测试全绿。与 D-016/D-017/D-018 并行批合流，spawn 现为 14 参签名）
 - 卡在：无
-- 下一步：① D-007 人工验收（土豆：watch 日志看 [shoot-unreachable]/[contact]/[will] 三族日志行，或直接跑 start.bat 观察地雷/遗嘱玩法雏形）② 期五第六刀人工验收（土豆浏览器五场景：地面点高空的 S→真弧线高抛命中；点超远目标→灰字"够不着"不发弹；哑弹落地→灰圈尘点无红✕，步骤见 cc-report.md）③ 期五第五刀人工验收（断线常驻四场景，见上轮 cc-report.md）④ design-binding.md 排期：②活弹+③外接算力桥同期（大件）→④弹弹相撞（中刀）⑤ wasmtime out-of-fuel trap 生产化阻断（.cc-bugs #5，D-007 遗嘱预算同样受制）⑥ 已知 MVP 缺口同前（probe 残影答 on_probe/门二销毁通路/弹丸互撞拦截射弹）⑦ 期五候补：物理场调制接口、发射痕迹进快照
+- 下一步：① D-003 人工验收（土豆：api.md spawn 节 motion 行+ decisions #048 + 浏览器看 creation_dynamic 圆渲染；或跑测试 process_spawns_dynamic_* / step_dynamic_creation_* 族）② D-007 人工验收（watch 日志看 [shoot-unreachable]/[contact]/[will] 三族日志行，或直接跑 start.bat 观察地雷/遗嘱玩法雏形）③ 期五第六刀人工验收（土豆浏览器五场景：地面点高空的 S→真弧线高抛命中；点超远目标→灰字"够不着"不发弹；哑弹落地→灰圈尘点无红✕，步骤见 cc-report.md）④ 期五第五刀人工验收（断线常驻四场景，见上轮 cc-report.md）⑤ design-binding.md 排期：②活弹+③外接算力桥同期（大件）→④弹弹相撞（中刀）⑥ wasmtime out-of-fuel trap 生产化阻断（.cc-bugs #5，D-007 遗嘱预算同样受制）⑦ 已知 MVP 缺口同前（probe 残影答 on_probe/门二销毁通路/弹丸互撞拦截射弹）⑧ 期五候补：物理场调制接口、发射痕迹进快照
 
 ## 已完成
 - spawn 出生参数批·小刀（2026-10-21，D-017 挂靠+D-018 ②项提前落地，decisions 不新增）：① spawn 第 11/12 参出生初速 vx/vy（import 层校验：有限性+模长 ≤ 世界极速 25，与 shoot 同源同口径严格 > 拒绝/恰等放行/NaN 拒绝；PendingSpawn.vx/vy → process_spawns set_velocity 落库——velocity 字段所有实体都有，static 钉死照存无物理意义，"造物被初速带着飞"的位置积分留 D-018 通用有速度实体物理）② spawn 第 13/14 参出生数据包 blob（新常数 MAX_SPAWN_BLOB_LEN=64KB；blob_len≤0=空包合法/0<len≤64K 原样读入/超限**整次拒绝不裁剪**且在读内存前拦下；PendingSpawn.blob → 造物沙箱 SandboxData.birth_blob，随沙箱存活跨重启不保留）③ 第 13 个玩家 import `env.birth_blob(ptr,cap)->i32` 三态返回（0=无包【玩家进场与弹丸恒此路径】/正 N=原子写入返回 N/负 -N=容量不足或指针非法未写一字节，日志区分两种原因，write_bytes_to_caller 同款防半截）④ 出生重叠拒绝验锚+补测（static AABB 占据格拒绝/出生格=创造者格拒绝已有锚，新增贴边相切放行边界锚：占据者圆挪半格距出生格 AABB 恰 0.5=相切严格 < 不重叠→诞生）⑤ 14 参破坏性变更全调用点同一批同步（pioneer.wat/.txt 补零速无包 4 实参 CRLF 保持、arena spawner 系 5 处生成器+新增 spawner_velocity_wat/spawner_blob_wat/birth_blob_reader_wat、main birth/once_spawner 生成器+直构用例、api.md spawn 签名/参数表 4 行/作废条款/示例+birth_blob 节+import 计数 12→13、game-menu 1.7 常数总账补初速≤25+数据包≤64KB 超限拒绝不裁剪、dev-plan D-018 ②项改注已提前落地）；TDD 红绿全程 17 新测试（arena 14：初速超限拒绝/恰等极速放行/NaN 拒绝/合法透传+blob 读取/空 len0 合法/负 len 合法/超限拒绝/恰等 64K+birth_blob 无包返0/写入返N/cap 短返-N/cap0 返-N/指针非法返-N；main 3：初速落库/端到端 blob 造物读回字节一致/贴边相邻放行；负面路径 6），workspace 897 全绿（arena 104/core 188/codeworld 377），clippy 因兄弟在途 lint 暂卡（core entity.rs doc 缩进+main.rs unused var，非本刀 hunks，已记录报告）（2026-10-21）

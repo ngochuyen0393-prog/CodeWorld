@@ -172,6 +172,7 @@ fn default_motion() -> i32 {
 /// 运动身份档位（D-003 motion 出生声明，dev-plan 拍板 2026-10-17；kinematic 剧本档缓立）
 /// - static（默认=现状）：造物钉死——格对齐 AABB 身体，无速度矢量物理
 /// - dynamic：造物全活——受完整物理（重力/阻力/极速），身体=声明 radius 的圆
+///
 /// 仅造物受声明影响；进场生物/弹丸不受此字段影响（生物天生 dynamic，弹丸速度积分制）
 pub const MOTION_STATIC: i32 = 0;
 pub const MOTION_DYNAMIC: i32 = 1;
