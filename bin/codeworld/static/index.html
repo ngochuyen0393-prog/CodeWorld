@@ -36,6 +36,12 @@
   手写零依赖声明：无框架、无 CDN、无构建工具、无 script src，
   单文件原生 JS + Canvas 2D（项目零前端工具链宪法）。
 
+  D-017 收图通道（TASK-d017-image）：WS 连接首帧=avatar_assets 一次性资产
+  全量消息（asset_id/url/原图尺寸/128x128 掩码，net-protocol v2.2）。本卡只做
+  资产层：左上角调试面板把每张掩码画成 64x64 白色半透明图（实心格可见），
+  旁标 asset_id 前 8 位——土豆肉眼验收"图进来了、掩码对得上原图"；原图 URL
+  打到 console 可直开。掩码挂实体渲染=后续刀（本卡不碰实体渲染路径）。
+
   登出弹窗（期五第二刀）：弹窗是一次决策的场所——点任一选项/取消/Esc = 决策
   完成 = 弹窗立刻 0.25s 淡出关门（busy 守卫防双发 logout），决策结果交给非阻塞
   的顶部横幅。另修 [hidden] 根因：容器显式 display:flex 会压过浏览器 UA 对
@@ -172,6 +178,7 @@
   <span id="conn" class="wait">连接中……</span>
   <span>tick <b id="tick">-</b></span>
   <span>实体 <b id="cnt">-</b></span>
+  <span>assets: <b id="assets">-</b>（D-017）</span>
   <span>帧间隔 <b id="itv">-</b>ms</span>
   <span>左键移动 · 右键停止 · 点击敌人攻击(近)/射击(远) · F 切镜头 · L 登出</span>
   <button id="camBtn" type="button">镜头：跟随</button>
@@ -203,6 +210,7 @@
   var connEl = document.getElementById('conn');
   var tickEl = document.getElementById('tick');
   var cntEl = document.getElementById('cnt');
+  var assetsEl = document.getElementById('assets');
   var itvEl = document.getElementById('itv');
   var mouseEl = document.getElementById('mouse');
   var tipEl = document.getElementById('tip');
@@ -252,12 +260,19 @@
   var loggedOut = null;         // 已登出的处置（'take'|'stay_auto'|'stay_ai'，#025）；null=未登出
                                 // 登出后连接降级观战继续直播；此时断线不自动重连（重连=抢回操控）
   var logoutPanelBusy = false;  // 弹窗决策/淡出进行中：禁一切面板交互（防双发 logout）
+  var avatarAssets = [];        // D-017 资产调试面板 [{id,url,w,h,canvas}]——canvas=128x128
+                                // 离屏掩码图（实心白半透明），avatar_assets 消息到达即重建
 
   // ---- 快照接收：入缓冲 + 帧间隔滚动平均 ----
   function onMessage(ev) {
     var snap;
     try { snap = JSON.parse(ev.data); } catch (e) {
       console.warn('[cw] 收到非 JSON 帧，丢弃');
+      return;
+    }
+    // D-017：avatar_assets 资产消息（连接首帧，非快照）——分流处理不进快照缓冲
+    if (snap && snap.type === 'avatar_assets') {
+      handleAvatarAssets(snap);
       return;
     }
     if (!snap || !Array.isArray(snap.entities) || !snap.viewport) {
@@ -317,6 +332,64 @@
     tickEl.textContent = String(snap.tick);
     cntEl.textContent = String(snap.entities.length);
     itvEl.textContent = avgInterval === null ? '-' : String(Math.round(avgInterval));
+  }
+
+  // ---- D-017 资产调试面板：avatar_assets 消息 -> 离屏掩码图 + 状态行 + URL 日志 ----
+  function handleAvatarAssets(msg) {
+    var list = Array.isArray(msg.assets) ? msg.assets : [];
+    var built = [];
+    for (var i = 0; i < list.length; i++) {
+      var a = list[i];
+      // 字段护栏：id/url/掩码长度齐整才收（协议不符条目跳过不崩面板）
+      if (!a || typeof a.asset_id !== 'string' || typeof a.url !== 'string' ||
+          !Array.isArray(a.mask) || a.mask.length !== 128 * 128) {
+        console.warn('[cw] avatar_assets 条目字段缺失，跳过');
+        continue;
+      }
+      // 掩码画进 128x128 离屏画布（实心格=白色半透明，空心透明），
+      // 绘制时 drawImage 缩到 64x64（一次成像，逐帧只做缩放拷贝）
+      var off = document.createElement('canvas');
+      off.width = 128;
+      off.height = 128;
+      var octx = off.getContext('2d');
+      var img = octx.createImageData(128, 128);
+      for (var p = 0; p < a.mask.length; p++) {
+        if (a.mask[p] === 1) {
+          img.data[p * 4] = 255;
+          img.data[p * 4 + 1] = 255;
+          img.data[p * 4 + 2] = 255;
+          img.data[p * 4 + 3] = 128;
+        }
+      }
+      octx.putImageData(img, 0, 0);
+      built.push({ id: a.asset_id, url: a.url, w: a.w, h: a.h, canvas: off });
+      console.info('[cw] 头像资产 ' + a.asset_id + ' 原图 URL: ' + location.origin + a.url);
+    }
+    avatarAssets = built; // 整表换新（重连重发幂等）
+    assetsEl.textContent = String(built.length);
+  }
+
+  // 调试面板渲染（画布左上角）：每张掩码 64x64 + asset_id 前 8 位——
+  // 肉眼验收"掩码对得上原图"；掩码挂实体渲染=后续刀，本卡不碰
+  function drawAvatarPanel() {
+    if (avatarAssets.length === 0) return;
+    var x0 = 8, y0 = 8, size = 64, slot = size + 18;
+    ctx.save();
+    ctx.imageSmoothingEnabled = false; // 像素风缩放（128 -> 64 保锐利）
+    ctx.font = '11px Consolas, monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    for (var i = 0; i < avatarAssets.length; i++) {
+      var a = avatarAssets[i];
+      var y = y0 + i * slot;
+      ctx.drawImage(a.canvas, x0, y, size, size);
+      ctx.strokeStyle = '#30363d';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x0 - 0.5, y - 0.5, size + 1, size + 1);
+      ctx.fillStyle = '#8b949e';
+      ctx.fillText(a.id.slice(0, 8), x0, y + size + 2);
+    }
+    ctx.restore();
   }
 
   function resetBuffer() {
@@ -881,6 +954,7 @@
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText('等待世界快照……（启动 start.bat 后自动连接）', viewW / 2, viewH / 2);
+      drawAvatarPanel(); // D-017 调试面板（不依赖快照，资产到了就画）
       return;
     }
     var cell = Math.min(viewW / view.w, viewH / view.h);
@@ -1173,6 +1247,7 @@
       ctx.stroke();
       ctx.globalAlpha = 1;
     }
+    drawAvatarPanel(); // D-017 资产调试面板（最后画=置顶，实体可能压过左上角）
   }
 
   function updateCaption(state) {

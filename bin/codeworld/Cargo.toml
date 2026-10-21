@@ -29,14 +29,18 @@ serde_json = { workspace = true }
 # 异步运行时（WS 服务器独立线程 + broadcast 快照通道桥接，期四第一刀）
 tokio = { workspace = true }
 # Web 服务（WS + 静态验收页一把抓：路由/ServeDir/WS升级同框架，第二刀 HTML 同入口伺服）
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.7", features = ["ws", "multipart"] }
 tower-http = { version = "0.5", features = ["fs"] }
 # WS 连接 split/流操作（axum 依赖树内已有，零新增编译）
 futures-util = "0.3"
+# 资产 ID 生成（D-017 头像资产 av_ + UUID 前 16 hex）
+uuid = { workspace = true }
 
 [dev-dependencies]
 # 测试构造固定 EntityId
 uuid = { workspace = true }
+# 测试自产 PNG fixtures（D-017 上传通道集成测试）
+png = { workspace = true }
 # WS 集成测试客户端（0.21 与 axum 0.7 内部 ws 栈同版本，不重复编译）
 tokio-tungstenite = "0.21"
 # 测试客户端 split/next 流操作

@@ -12,6 +12,7 @@
 pub mod collision;
 pub mod config;
 pub mod entity;
+pub mod mask;
 pub mod guard;
 pub mod occupancy;
 pub mod pending;

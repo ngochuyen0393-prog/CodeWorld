@@ -20,7 +20,7 @@ mod players;
 use anyhow::{Context, Result};
 use codeworld_arena::attack::{PendingAttack, DEFAULT_KILL_WASM};
 use codeworld_arena::sandbox::{
-    PendingDestroy, PendingSpawn, ProbeBridge, SandboxHandle, SandboxManager,
+    PendingDestroy, PendingSpawn, PendingThrust, ProbeBridge, SandboxHandle, SandboxManager,
 };
 use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 use codeworld_core::pending::PendingChange;
@@ -434,6 +434,39 @@ impl EntitySandboxMap {
             tracing::debug!(count = ids.len(), "[hover] 收集悬停声明");
         }
         ids
+    }
+
+    /// 收集本 tick 各沙箱排队的 thrust 冲量请求并统一扣除 fuel 代价（D-010a）
+    ///
+    /// drain 各沙箱 pending_thrusts 后清空（不跨拍残留）；同沙箱累计的
+    /// thrust_fuel_cost 从当拍剩余 fuel 一次扣除（饱和减 + 保底 1——绝不由记账
+    /// 把油箱打到 0，0 fuel 是 out-of-fuel trap 引信，Windows 上 wasm 内 fuel 烧穿
+    /// = 进程 abort，.cc-bugs #5 红线；天然烧干是既有环境级暴露非本刀制造）。
+    /// 在 tick 阶段二 apply_pending_changes 之后调用：冲量入速度字段，随后本拍
+    /// physics.step 的速度积分路径带位移（起跳→弧线→落地）。
+    fn collect_thrust_requests(&mut self) -> Vec<PendingThrust> {
+        let mut all = Vec::new();
+        for handle in self.sandboxes.values_mut() {
+            all.append(&mut handle.store.data_mut().pending_thrusts);
+            let cost = handle.store.data_mut().thrust_fuel_cost;
+            if cost > 0 {
+                let remaining = handle.store.get_fuel().unwrap_or(0);
+                let new_fuel = remaining.saturating_sub(cost).max(1);
+                if let Err(e) = handle.store.set_fuel(new_fuel) {
+                    tracing::warn!(error = %e, cost, "[thrust] fuel 扣除失败（本拍代价作废）");
+                } else {
+                    tracing::debug!(cost, from = remaining, to = new_fuel, "[thrust] fuel 扣除");
+                }
+                handle.store.data_mut().thrust_fuel_cost = 0;
+            }
+        }
+        if !all.is_empty() {
+            tracing::info!(
+                count = all.len(),
+                "[collect_thrust_requests] 收集冲量请求"
+            );
+        }
+        all
     }
 
     /// 收集本 tick 所有沙箱的 log marker 值序列（战况字幕数据源）
@@ -1308,6 +1341,15 @@ fn tick_with_intents(
     // 接触语义统一为"身体相触"，由阶段二 c 步全量扫描+边沿触发裁决
     apply_pending_changes(world, pending, control_target);
 
+    //   a0. thrust 冲量应用（D-010a 冲量小刀）：插在 apply_pending_changes 之后、
+    //       physics.step 之前——冲量入速度字段（v += impulse，世界极速钳制），随后
+    //       本拍 physics.step 的速度积分路径带位移（起跳→弧线→落地）。同拍被攻击
+    //       杀死的实体在此跳过（已死不出力）；fuel 代价已在 collect 里统一扣除
+    let thrust_requests = sandbox_map.collect_thrust_requests();
+    if !thrust_requests.is_empty() {
+        apply_thrust_requests(world, thrust_requests, physics.params().max_speed);
+    }
+
     // 贴障停滞检测（期四第七刀，b8.log ±0.08 蹭动实锤）：点击走位 2 拍窗口
     // 净位移 < 0.01 = 全挡原地/滑出滑回蹭动 -> 视为到达清目标（防死循环蹭动）。
     // 悬停维持拍位置恒定是主动悬停（实体或目标在空中），不参与地面停滞判定。
@@ -1597,6 +1639,60 @@ fn dispose_take(
     sandbox_map.players.mark_absent(name);
     sandbox_map.players.dispose.clear(name);
     tracing::info!("[dispose] 处置完成：take player={name}（{reason}；角色已移除，文件锚保留）");
+}
+
+/// 应用 thrust 冲量（D-010a 冲量小刀）：v_new = v_old + impulse，世界极速钳制后写回
+///
+/// 【#021 切割声明】一次性冲量非持续推挤——已退役的"推挤"（持续重叠互相挤开→
+/// 连体 bug）是每拍重复施加的位置推力；thrust 是一次性动量注入（撞完就分），
+/// 本函数只在阶段二执行一次，不与任何重叠检测耦合。
+/// 钳制口径：累加后速度模长 > max_speed（世界极速 25）归一化压回（方向不变），
+/// 与弹丸/dynamic 造物同款极速口径——冲量买不到超极速位移。
+/// static 钉死造物拒绝（速度不写）：钉死就是钉死，import 侧已扣的 fuel 不退
+/// （诚实的代价——同 D-009 "岸上空烧 fuel 踩水"哲学，api.md 载明）。
+fn apply_thrust_requests(
+    world: &mut WorldState,
+    thrusts: Vec<PendingThrust>,
+    max_speed: f64,
+) {
+    for t in thrusts {
+        let Some(entity) = world.entities.get_mut(&t.entity) else {
+            tracing::debug!(entity = %t.entity.0, "[thrust] 实体不存在，冲量作废");
+            continue;
+        };
+        if !entity.is_alive() {
+            tracing::debug!(entity = %t.entity.0, "[thrust] 实体已死，冲量作废");
+            continue;
+        }
+        if entity.code_hash == codeworld_core::collision::CREATION_CODE
+            && entity.motion() == codeworld_core::entity::MOTION_STATIC
+        {
+            tracing::warn!(
+                entity = %t.entity.0,
+                impulse = ?t.impulse,
+                "[thrust] static 钉死造物出力无效（钉死就是钉死，fuel 照扣）"
+            );
+            continue;
+        }
+        let old = entity.velocity();
+        let summed = (old.0 + t.impulse.0, old.1 + t.impulse.1);
+        // 世界极速钳制：归一化压回（方向不变）
+        let speed2 = summed.0 * summed.0 + summed.1 * summed.1;
+        let new_v = if speed2 > max_speed * max_speed {
+            let scale = max_speed / speed2.sqrt();
+            (summed.0 * scale, summed.1 * scale)
+        } else {
+            summed
+        };
+        entity.set_velocity(new_v);
+        tracing::info!(
+            entity = %t.entity.0,
+            from = ?old,
+            impulse = ?t.impulse,
+            to = ?new_v,
+            "[thrust] 冲量应用（速度累加+极速钳制）"
+        );
+    }
 }
 
 /// 应用延迟变更队列（架构文档 4.1 节阶段二 a 步 + #030 半径物理移动裁决）
@@ -6722,6 +6818,200 @@ mod tests {
             map.collect_hover_declarations().is_empty(),
             "收集后应清空（声明不跨拍残留）"
         );
+    }
+
+    // === thrust 冲量全链路（D-010a：import 排队 -> 阶段二应用 -> 物理弹道）===
+
+    /// 一次性跳 WAT：on_tick 首拍 thrust(0, 7.7)，之后不再跳（弹道锚测试用）
+    const JUMPER_ONE_SHOT_WAT: &str = r#"(module
+  (import "env" "thrust" (func $thrust (param f64 f64) (result i32)))
+  (global $done (mut i32) (i32.const 0))
+  (func (export "on_tick")
+    (if (i32.eqz (global.get $done))
+      (then
+        (global.set $done (i32.const 1))
+        (drop (call $thrust (f64.const 0.0) (f64.const 7.7))))))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 记账用 thrust WAT：on_tick 调 thrust(0, 7.7)（fuel 扣除测试用）
+    const THRUSTER_WAT_HOST: &str = r#"(module
+  (import "env" "thrust" (func $thrust (param f64 f64) (result i32)))
+  (func (export "on_tick")
+    (drop (call $thrust (f64.const 0.0) (f64.const 7.7))))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn apply_thrust_accumulates_velocity_clamps_and_skips_dead_or_static() {
+        // 应用规则：v_new = v_old + impulse；超世界极速归一化压回；死实体跳过；
+        // static 钉死造物拒绝（速度不写，fuel 照扣=诚实的代价）
+        let mut world = WorldState::new();
+        let a = make_entity(1, (0.0, 0.5));
+        let id_a = a.id;
+        world.entities.insert(id_a, a);
+        let mut b = make_entity(2, (0.0, 0.5));
+        b.set_velocity((20.0, 0.0));
+        let id_b = b.id;
+        world.entities.insert(id_b, b);
+        let mut dead = make_entity(3, (0.0, 0.5));
+        dead.kill();
+        let id_dead = dead.id;
+        world.entities.insert(id_dead, dead);
+        // static 钉死造物（code_hash=creation + motion=static）
+        let tower = Entity::new(
+            EntityId(Uuid::from_u128(4)),
+            PlayerId(Uuid::from_u128(99)),
+            "creation".to_string(),
+            (0.0, 0.0),
+            Appearance::new("T".to_string(), "cyan".to_string(), 1.0),
+            0,
+            1_000_000,
+        );
+        let id_tower = tower.id;
+        world.entities.insert(id_tower, tower);
+        apply_thrust_requests(
+            &mut world,
+            vec![
+                PendingThrust { entity: id_a, impulse: (0.0, 7.7) },
+                PendingThrust { entity: id_b, impulse: (20.0, 0.0) },
+                PendingThrust { entity: id_dead, impulse: (0.0, 7.7) },
+                PendingThrust { entity: id_tower, impulse: (0.0, 7.7) },
+                PendingThrust { entity: EntityId(Uuid::from_u128(999)), impulse: (1.0, 1.0) },
+            ],
+            25.0,
+        );
+        assert_eq!(
+            world.entities.get(&id_a).unwrap().velocity(),
+            (0.0, 7.7),
+            "零速实体冲量后速度应为冲量本身"
+        );
+        assert_eq!(
+            world.entities.get(&id_b).unwrap().velocity(),
+            (25.0, 0.0),
+            "累加超极速 (40,0) 应归一化压回 25（方向不变）"
+        );
+        assert_eq!(
+            world.entities.get(&id_dead).unwrap().velocity(),
+            (0.0, 0.0),
+            "死实体不出力"
+        );
+        assert_eq!(
+            world.entities.get(&id_tower).unwrap().velocity(),
+            (0.0, 0.0),
+            "static 钉死造物出力无效（速度不写）"
+        );
+    }
+
+    #[test]
+    fn collect_thrust_requests_deducts_fuel_and_drains() {
+        // 收集即清空 + fuel 统一扣除：收集后 pending 清空、fuel_cost 归零、
+        // 沙箱剩余 fuel = 原剩余 - 代价（满力 50_000 = 1_000_000 × 5%）
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world.entities.insert(id, make_entity(1, (0.0, 0.5)));
+        let mut map = test_sandbox_map();
+        map.create(id, &wasm(THRUSTER_WAT_HOST), 1_000_000).unwrap();
+        map.run_player_code(&world, &unbounded_bb());
+        let thrusts = map.collect_thrust_requests();
+        assert_eq!(thrusts.len(), 1, "应收集 1 条冲量请求");
+        assert_eq!(thrusts[0].entity, id, "冲量应绑定沙箱实体");
+        let handle = map.sandboxes.get(&id).unwrap();
+        let after_fuel = handle.store.get_fuel().unwrap();
+        assert!(
+            after_fuel <= 950_000,
+            "满力出力应扣除 5% fuel（50_000），剩余 {after_fuel}"
+        );
+        assert_eq!(
+            handle.store.data().thrust_fuel_cost, 0,
+            "扣除后记账应归零（不跨拍残留）"
+        );
+        assert!(
+            map.collect_thrust_requests().is_empty(),
+            "收集后应清空（不跨调用残留）"
+        );
+    }
+
+    #[test]
+    fn thrust_jump_full_chain_ballistic_anchor() {
+        // 跳跃弹道锚（D-010a Gate）：jumper WAT 首拍 thrust(0,7.7) 全链路——
+        // 拍 1 升空 ≈3 格（±0.5 容差，逐拍位移 ≤ 极速 25 非瞬移），拍 2 落地
+        // 贴半径线、速度全清零（vy 清零规则）。
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world.entities.insert(id, make_entity(1, (0.0, 0.5)));
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut sandbox_map = test_sandbox_map();
+        sandbox_map
+            .create(id, &wasm(JUMPER_ONE_SHOT_WAT), 1_000_000)
+            .unwrap();
+        // 拍 1：起跳（阶段二冲量入速度 → physics 速度积分带位移）
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut sandbox_map,
+        );
+        {
+            let e = world.entities.get(&id).unwrap();
+            let height = e.pos().1 - 0.5;
+            assert!(
+                (2.5..=3.5).contains(&height),
+                "跳跃最高点应 ≈3 格（±0.5 容差），实测 {height}"
+            );
+            let rise = (e.pos().1 - 0.5).abs();
+            assert!(rise <= 25.0, "起跳拍位移 ≤ 世界极速（非瞬移），实测 {rise}");
+            assert!(e.velocity().1 < 0.0, "升空后重力已入速度（vy 转负回落）");
+        }
+        // 拍 2：落地清零
+        tick(
+            &mut world,
+            &mut time,
+            &physics,
+            &mut renderer,
+            &mut storage,
+            &mut pending,
+            &mut sandbox_map,
+        );
+        let e = world.entities.get(&id).unwrap();
+        assert!(
+            (e.pos().1 - 0.5).abs() < 1e-9,
+            "拍 2 应落地贴半径线，实测 {:?}",
+            e.pos()
+        );
+        assert_eq!(
+            e.velocity(),
+            (0.0, 0.0),
+            "落地速度全清零（vy 清零规则：落地时清）"
+        );
+    }
+
+    #[test]
+    fn demo_jumper_wat_compiles_and_thrusts() {
+        // players/jumper.wat 演示生物：语法可编译（wat::parse_str），on_tick 跑通
+        // 并排队冲量（与生产加载路径同款 wat::parse_bytes，见 main.rs:594）
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../../players/jumper.wat");
+        let wat_text = std::fs::read_to_string(src).expect("应能读到 players/jumper.wat");
+        let wasm_bytes = wat::parse_bytes(wat_text.as_bytes()).expect("jumper.wat 应编译通过");
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm_bytes.into_owned(), 100_000, EntityId(Uuid::from_u128(1)))
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        // tick 1：jumper 的第 1 拍不跳（tick%4==0 才跳，global 从 0 起自增后 =1）
+        // 造 tick%4==0 的场景：再跑 4 拍，第 4 拍应排队 1 条冲量
+        let mut total = 0;
+        for _ in 0..4 {
+            mgr.call_on_tick(&mut handle).unwrap();
+            total += handle.store.data().pending_thrusts.len();
+            handle.store.data_mut().pending_thrusts.clear();
+        }
+        assert_eq!(total, 1, "4 拍内应恰好跳 1 次（每 4 拍一跳）");
     }
 
     // === move_by 全链路（import 排队 -> tick 阶段二应用）===

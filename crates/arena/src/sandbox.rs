@@ -43,6 +43,29 @@ pub const MAX_META_LEN: usize = 64;
 /// **不裁剪**——裁剪数据包 = 偷改玩家数据。
 pub const MAX_SPAWN_BLOB_LEN: usize = 64 * 1024;
 
+/// thrust 单次出力上限（D-010a 冲量小刀，1.7 标定法跳跃锚点）：向量模长上限
+/// 7.7 格/拍。推导：跳跃 ≤3 格高 → 连续弹道峰值 h = v0²/(2g) → v0 = √(2·9.8·3)
+/// ≈ 7.67，取 7.7。超限归一化压回（方向不变）——满力 = 跳 3 格高。
+pub const THRUST_MAX_PER_CALL: f64 = 7.7;
+
+/// thrust 出力燃料系数（D-010a 参数锚点）：满力一次 ≈5% fuel。
+/// 代价 = (有效冲量模长 / THRUST_MAX_PER_CALL) × (fuel_limit × 5%)。
+pub const THRUST_FUEL_RATIO: f64 = 0.05;
+
+/// 本 tick 排队的 thrust 冲量请求（env.thrust 推入，阶段二收集统一应用）
+///
+/// 【#021 切割声明】已退役的"推挤"（持续重叠互相挤开→连体 bug）≠ 冲量（一次性
+/// 动量交换，撞完就分）：thrust 是一次性冲量非持续推挤。
+/// 【力出自己身铁律】只开 thrust 给 self，不开放"推别人"API（推人走碰撞或击退
+/// payload，与"攻击形态归玩家"同哲学）。
+#[derive(Debug, Clone)]
+pub struct PendingThrust {
+    /// 出力者（冲量只施加给自己）
+    pub entity: EntityId,
+    /// 冲量矢量（import 层已过上限归一化钳制，模长 ≤ THRUST_MAX_PER_CALL）
+    pub impulse: (f64, f64),
+}
+
 /// 本 tick 排队的 spawn 请求（env.spawn 推入，阶段二收集统一处理）
 ///
 /// import 层只做零 world 校验（限流/有限性/钻地/±10 格/外观格式），
@@ -179,6 +202,14 @@ pub struct SandboxData {
     /// 本 tick 的悬停声明（env.hover 置位，host 阶段一收件并入免重力集合后清空；
     /// 每拍重申语义——玩家代码要持续对抗世界规则，上一拍声明不延续）
     pub hover_declared: bool,
+    /// 本 tick 排队的 thrust 冲量请求（env.thrust 推入，host 阶段二收集统一应用
+    /// 后 drain 清空；#021 切割声明见 PendingThrust）
+    pub pending_thrusts: Vec<PendingThrust>,
+    /// 本 tick thrust 累计 fuel 代价（env.thrust import 层累加；host 收集侧统一从
+    /// 该沙箱当拍剩余 fuel 扣除——import 闭包内不真扣 store fuel（不打乱配额
+    /// 重置语义），也不烧光 fuel 触发 out-of-fuel trap（Windows 进程 abort，
+    /// .cc-bugs #5 红线，host 侧 set_fuel 构造等价效果）
+    pub thrust_fuel_cost: u64,
     /// 出生数据包（spawn 第 13/14 参的读取侧：造物诞生时 host 写入，造物代码经
     /// env.birth_blob 随时读回——世界不解释内容，通道归世界内容归玩家。随沙箱
     /// 存活不持久化，跨重启不保留；玩家进场与弹丸无包，读回恒 0）
@@ -576,6 +607,80 @@ impl SandboxManager {
                 "[hover] 悬停声明（本拍免重力，每拍需重申）"
             );
         })?;
+        // env.thrust(dx, dy) -> i32：本拍给自己一记冲量（D-010a 冲量小刀，第 14 个
+        // 玩家 import）。冲量只入自己的速度字段（力出自己身铁律：不开放"推别人"
+        // API，推人走碰撞或击退 payload），阶段二统一累加应用，本拍物理步的速度
+        // 积分路径带位移——跳跃/踏水推进/轻功水上漂的地基（D-010 自主出力）。
+        // 【#021 切割声明】已退役的"推挤"（持续重叠互相挤开→连体 bug）≠ 冲量
+        //（一次性动量交换，撞完就分）：thrust 是一次性冲量非持续推挤。
+        // 上限钳制：向量模长 > THRUST_MAX_PER_CALL 归一化压回（方向不变）——
+        // 满力 = 跳 ≤3 格高（1.7 标定法跳跃锚点，推导见常量注释）。
+        // fuel 代价：cost = (有效模长/7.7) × (fuel_limit × 5%)，满力一次 ≈5% fuel。
+        // import 侧只粗校验+记账（thrust_fuel_cost 累计），真正扣除在 host 收集侧
+        // 统一做（闭包内不扣 store fuel——不打乱配额重置语义；也不烧光 fuel 触发
+        // out-of-fuel trap——Windows 上是进程 abort，.cc-bugs #5 红线）。
+        // 返回 1 = 已排队；0 = 拒绝（NaN/Inf 输入 / 剩余 fuel 不足本次出力）。
+        linker.func_wrap(
+            "env",
+            "thrust",
+            |mut caller: Caller<SandboxData>, dx: f64, dy: f64| -> i32 {
+                let entity = caller.data().entity_id;
+                caller.data_mut().api_calls.push("thrust".to_string());
+                // NaN/Inf 输入按 0 拒绝：冲量进速度字段会污染世界状态（同 move_by 口径）
+                if !dx.is_finite() || !dy.is_finite() {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        dx,
+                        dy,
+                        "[thrust] 冲量非有限，拒绝入队"
+                    );
+                    return 0;
+                }
+                // 上限钳制：模长超 THRUST_MAX_PER_CALL 归一化压回（方向不变）——
+                // 超限请求按满力计价（钳制后模长），白嫖不了方向折扣
+                let mag = (dx * dx + dy * dy).sqrt();
+                let (ix, iy) = if mag > THRUST_MAX_PER_CALL {
+                    let scale = THRUST_MAX_PER_CALL / mag;
+                    (dx * scale, dy * scale)
+                } else {
+                    (dx, dy)
+                };
+                // fuel 代价：满力 = fuel_limit × 5%（D-010a 出力燃料系数锚点）
+                let fuel_limit = caller.data().fuel_limit;
+                let eff_mag = (ix * ix + iy * iy).sqrt();
+                let cost =
+                    ((eff_mag / THRUST_MAX_PER_CALL) * (fuel_limit as f64 * THRUST_FUEL_RATIO))
+                        as u64;
+                // import 侧粗校验：活体剩余 fuel（wasmtime Caller::get_fuel 实时读，
+                // 反映 on_tick 至今的烧量）须覆盖"已记账 thrust 代价 + 本次代价"
+                // ——真正的扣除在 host 收集侧统一 set_fuel 做。live_fuel 只会减少
+                //（wasm 单调烧），故逐次校验即累计有保障
+                let live_fuel = caller.get_fuel().unwrap_or(0);
+                if cost > 0 && live_fuel < caller.data().thrust_fuel_cost + cost {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        cost,
+                        live_fuel,
+                        "[thrust] 剩余 fuel 不足本次出力，拒绝"
+                    );
+                    return 0;
+                }
+                let data = caller.data_mut();
+                data.pending_thrusts.push(PendingThrust {
+                    entity,
+                    impulse: (ix, iy),
+                });
+                data.thrust_fuel_cost += cost;
+                tracing::info!(
+                    entity_id = %entity.0,
+                    dx = ix,
+                    dy = iy,
+                    fuel_cost = cost,
+                    "[thrust] 冲量已排队（阶段二应用）"
+                );
+                1
+            },
+        )?;
         linker.func_wrap(
             "env",
             "attack_at",
@@ -4071,6 +4176,123 @@ mod tests {
         assert!(
             handle.store.data().api_calls.contains(&"hover".to_string()),
             "hover 调用应记入 api_calls 元数据"
+        );
+    }
+
+    // === env.thrust import（D-010a 冲量小刀：本拍给自己一记冲量，耗 fuel）===
+
+    /// 满力跳 WAT：on_tick 调 thrust(0, 7.7)（跳 ≤3 格高锚点值）
+    const THRUSTER_WAT: &str = r#"(module
+  (import "env" "thrust" (func $thrust (param f64 f64) (result i32)))
+  (global $ret (mut i32) (i32.const 0))
+  (func (export "on_tick")
+    f64.const 0.0 f64.const 7.7 call $thrust global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn thrust_import_queues_pending_thrust() {
+        // thrust(0, 7.7)：排队 1 条冲量请求（满力=跳 ≤3 格高锚点值），
+        // api_calls 记录元数据
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(THRUSTER_WAT), 100_000, id(911)).unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "合法 thrust 应返回 1");
+        let thrusts = &handle.store.data().pending_thrusts;
+        assert_eq!(thrusts.len(), 1, "应排队 1 个冲量请求");
+        assert_eq!(thrusts[0].entity, id(911), "冲量应绑定沙箱实体");
+        assert!(
+            (thrusts[0].impulse.0 - 0.0).abs() < 1e-9 && (thrusts[0].impulse.1 - 7.7).abs() < 1e-9,
+            "满力冲量应原样入队 (0, 7.7)，实际 {:?}",
+            thrusts[0].impulse
+        );
+        assert!(
+            handle.store.data().api_calls.contains(&"thrust".to_string()),
+            "thrust 调用应记入 api_calls 元数据"
+        );
+        // fuel 记账：满力一次 = fuel_limit × 5% = 5_000
+        assert_eq!(
+            handle.store.data().thrust_fuel_cost, 5_000,
+            "满力出力应记账 fuel_limit×5%"
+        );
+    }
+
+    #[test]
+    fn thrust_import_rejects_non_finite() {
+        // NaN/Inf 输入按 0 拒绝：冲量进速度字段会污染世界状态
+        let wat = r#"(module
+  (import "env" "thrust" (func $thrust (param f64 f64) (result i32)))
+  (global $ret (mut i32) (i32.const 0))
+  (func (export "on_tick")
+    f64.const nan f64.const 1.0 call $thrust global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(wat), 100_000, id(912)).unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(
+            call_i32_export(&mut handle, "get_ret"),
+            0,
+            "NaN 冲量应被拒绝返回 0"
+        );
+        assert!(
+            handle.store.data().pending_thrusts.is_empty(),
+            "拒绝的冲量不入队"
+        );
+    }
+
+    #[test]
+    fn thrust_import_clamps_over_limit_keeping_direction() {
+        // 超上限归一化钳制：thrust(0, 77)（模长 77 > 7.7）压回 (0, 7.7) 方向不变；
+        // 次满力（模长 5 < 7.7）原样入队不钳
+        let wat = r#"(module
+  (import "env" "thrust" (func $thrust (param f64 f64) (result i32)))
+  (global $ret (mut i32) (i32.const 0))
+  (func (export "on_tick")
+    f64.const 0.0 f64.const 77.0 call $thrust drop
+    f64.const 3.0 f64.const 4.0 call $thrust global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(wat), 100_000, id(913)).unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "第二次 thrust 合法应返回 1");
+        let thrusts = &handle.store.data().pending_thrusts;
+        assert_eq!(thrusts.len(), 2, "两次调用都应入队");
+        assert!(
+            (thrusts[0].impulse.1 - 7.7).abs() < 1e-9,
+            "超限冲量应归一化压回 7.7（方向不变），实际 {:?}",
+            thrusts[0].impulse
+        );
+        assert!(
+            (thrusts[1].impulse.0 - 3.0).abs() < 1e-9 && (thrusts[1].impulse.1 - 4.0).abs() < 1e-9,
+            "次满力冲量应原样入队，实际 {:?}",
+            thrusts[1].impulse
+        );
+    }
+
+    #[test]
+    fn thrust_import_rejects_when_fuel_insufficient() {
+        // fuel 粗校验：活体剩余 fuel 低于本次出力代价则拒绝返回 0。
+        // 构造：fuel_limit=1_000_000（满力代价 50_000），set_fuel(500) 模拟
+        // on_tick 烧得只剩零头——500 远小于 50_000，拒绝；且不在 wasm 内烧穿
+        // fuel（.cc-bugs #5 红线：不用 out-of-fuel trap 构造测试）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(THRUSTER_WAT), 1_000_000, id(914)).unwrap();
+        handle.store.set_fuel(500).unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(
+            call_i32_export(&mut handle, "get_ret"),
+            0,
+            "剩余 fuel 不足应拒绝返回 0"
+        );
+        assert!(
+            handle.store.data().pending_thrusts.is_empty(),
+            "fuel 不足的冲量不入队"
+        );
+        assert_eq!(
+            handle.store.data().thrust_fuel_cost, 0,
+            "拒绝的出力不记账 fuel 代价"
         );
     }
 }

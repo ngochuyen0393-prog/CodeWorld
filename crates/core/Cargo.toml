@@ -12,6 +12,10 @@ serde = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
 # 日志
 tracing = { workspace = true }
+# 错误定义（MaskError 等掩码管线错误枚举）
+thiserror = { workspace = true }
+# PNG 解码（D-017 掩码管线：角色图 -> 位图掩码）
+png = { workspace = true }
 
 [dev-dependencies]
 # 测试用序列化往返校验

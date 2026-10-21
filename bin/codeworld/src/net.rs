@@ -10,22 +10,34 @@
 use crate::input::IntentSink;
 use crate::players::PlayerDirectory;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::Response;
-use axum::routing::get;
-use axum::Router;
+use axum::extract::{Multipart, State};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use codeworld_core::entity::EntityId;
 use codeworld_core::world::WorldState;
 use codeworld_render::Viewport;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
+// D-017 收图通道子模块（资产登记表+上传落盘）。挂 net 下而非 main.rs——
+// 共享工作树上 main.rs 有并行在途改动，本卡零触碰（模块归属纯组织问题，
+// 对外路径 crate::net::avatars 不影响语义）
+#[path = "avatars.rs"]
+pub(crate) mod avatars;
+use self::avatars::{AvatarRegistry, UploadInput};
+
 /// 快照广播通道容量（未消费帧积压上限；慢客户端丢旧帧即可，快照有"后值覆盖"语义）
 pub(crate) const SNAPSHOT_CHANNEL_CAP: usize = 16;
+
+/// 头像资产目录（相对工作目录，与 STATIC_DIR 同基准——start.bat 已 cd 到项目根）。
+/// git 不入库（.gitignore），上传即写盘，启动扫目录重建登记表
+pub(crate) const AVATARS_DIR: &str = "assets/avatars";
 
 // ---- 上行意图协议（docs/net-protocol.md v1.2 客户端 -> 服务器，#027）----
 
@@ -242,6 +254,7 @@ pub(crate) fn build_snapshot(
 pub(crate) const STATIC_DIR: &str = "bin/codeworld/static";
 
 /// WS 服务器共享状态：快照广播 + 上行意图队列 + 操控连接令牌（#027 单连接假设）
+/// + 头像资产登记表（D-017：上传路由写入 / ws 连接建立时全量下发）
 pub(crate) struct WsState {
     pub(crate) snapshots: broadcast::Sender<String>,
     /// 与终端键盘共享的意图队列生产端（单入口双来源，input.rs 路由不区分来源）
@@ -249,6 +262,8 @@ pub(crate) struct WsState {
     /// 操控连接令牌：false=无主（下一连接即操控端）/ true=已被占用。
     /// 第一连接认领、断开释放——"本机浏览器=我"的等价物（#024 me.txt 的连接版）。
     pub(crate) ctrl_taken: Arc<AtomicBool>,
+    /// 头像资产登记表（D-017 资产层：上传落盘+内存索引，掩码连接建立时下发）
+    pub(crate) avatars: Arc<AvatarRegistry>,
 }
 
 /// 主循环持有的 WS 句柄：快照推送端 + 操控令牌观测（#025 期五第一刀）。
@@ -276,10 +291,13 @@ pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Optio
     }
     let (tx, _) = broadcast::channel(SNAPSHOT_CHANNEL_CAP);
     let port = config.ws_port;
+    // 头像资产登记表（D-017）：启动扫目录重建（坏文件 warn 跳过不拖垮世界）
+    let avatars = Arc::new(AvatarRegistry::load(Path::new(AVATARS_DIR)));
     let state = Arc::new(WsState {
         snapshots: tx.clone(),
         intents,
         ctrl_taken: Arc::new(AtomicBool::new(false)),
+        avatars,
     });
     let handle = WsHandle {
         snapshots: tx,
@@ -352,7 +370,8 @@ fn run_ws_thread(port: u16, state: Arc<WsState>) {
     }
 }
 
-/// 起服务器（axum：/ws 快照广播 + ServeDir 静态验收页一把抓）。
+/// 起服务器（axum：/ws 快照广播、/upload/avatar 收图（D-017）、/assets 原图静态
+/// 与 ServeDir 静态验收页一把抓）。
 /// shutdown future 完成即优雅停机（生产用永不完成的 pending，测试用 oneshot）。
 pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
@@ -362,7 +381,14 @@ pub(crate) async fn serve(
 ) -> std::io::Result<()> {
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .with_state(state)
+        .route("/upload/avatar", post(upload_avatar))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            avatars::MAX_AVATAR_PNG_BYTES * 2, // 2MB PNG + multipart 边界开销余量；护栏仍由 store_upload 按 PNG 字节判
+        ))
+        .with_state(state.clone())
+        // /assets：上传原图的 HTTP 直取口（前端按 URL 渲染原图；掩码走 WS 消息）。
+        // nest_service 剥 /assets 前缀：GET /assets/{id}.png -> 资产目录内 {id}.png
+        .nest_service("/assets", ServeDir::new(state.avatars.dir()))
         .fallback_service(ServeDir::new(static_dir));
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -375,6 +401,103 @@ async fn ws_handler(
     State(state): State<Arc<WsState>>,
 ) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+// ---- D-017 收图通道（POST /upload/avatar + avatar_assets 下行）----
+
+/// avatar_assets 下行单资产条目（掩码=128x128 布尔表原样；约 32KB JSON/资产，
+/// 资产数预期少可全量——资产多时改增量，注释锚）
+#[derive(Debug, Serialize)]
+struct AvatarAssetMsg<'a> {
+    asset_id: &'a str,
+    /// 原图 HTTP 直取路径（/assets 挂 ServeDir）
+    url: String,
+    /// 原图尺寸（前端按纵横比渲染原图）
+    w: u32,
+    h: u32,
+    /// 128x128 布尔表（行主序 0/1，16384 项）
+    mask: &'a [u8],
+}
+
+/// 组装 avatar_assets 消息 JSON（登记表全量快照；连接建立时一次性主动下发）
+fn avatar_assets_json(registry: &AvatarRegistry) -> String {
+    let snapshot = registry.list();
+    let assets: Vec<AvatarAssetMsg> = snapshot
+        .iter()
+        .map(|a| AvatarAssetMsg {
+            asset_id: &a.asset_id,
+            url: format!("{}{}.png", avatars::AVATAR_URL_PREFIX, a.asset_id),
+            w: a.orig_w,
+            h: a.orig_h,
+            mask: &a.mask.solid,
+        })
+        .collect();
+    serde_json::to_string(&serde_json::json!({ "type": "avatar_assets", "assets": assets }))
+        .unwrap_or_else(|_| r#"{"type":"avatar_assets","assets":[]}"#.to_string())
+}
+
+/// POST /upload/avatar（D-017）：multipart/form-data 收 PNG 角色图。
+/// 字段：file=PNG 字节（必填）/ name=角色名（必填）/ height_world=世界高度格数
+/// （选填默认 2.0，域钳制 0.05..=25.0）。HTTP 恒 200，成败看 JSON ok 字段；
+/// 非 multipart 请求由 axum 内建 rejection 拒绝（415/400 文本体）。
+/// 校验链：大小护栏->解码->降采样->连通校验，全过才落盘+登记（失败零副作用）
+async fn upload_avatar(State(state): State<Arc<WsState>>, mut mp: Multipart) -> Response {
+    let mut png: Option<Vec<u8>> = None;
+    let mut name: Option<String> = None;
+    let mut height_world: Option<f64> = None;
+    loop {
+        match mp.next_field().await {
+            Ok(Some(field)) => match field.name().unwrap_or("") {
+                "file" => match field.bytes().await {
+                    Ok(b) => png = Some(b.to_vec()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "[upload] file 字段读字节失败（bad_json）");
+                        return reject_json(avatars::RejectReason::BadJson);
+                    }
+                },
+                "name" => name = Some(field.text().await.unwrap_or_default()),
+                "height_world" => match field.text().await.unwrap_or_default().parse::<f64>() {
+                    Ok(v) => height_world = Some(v),
+                    Err(_) => {
+                        tracing::warn!("[upload] height_world 非数值（bad_json）");
+                        return reject_json(avatars::RejectReason::BadJson);
+                    }
+                },
+                _ => {} // 未知字段忽略（协议向前兼容）
+            },
+            Ok(None) => break, // 字段遍历完毕
+            Err(e) => {
+                tracing::warn!(error = %e, "[upload] multipart 解析失败（bad_json）");
+                return reject_json(avatars::RejectReason::BadJson);
+            }
+        }
+    }
+    let (Some(png_bytes), Some(name)) = (png, name) else {
+        tracing::warn!("[upload] 缺 file/name 字段（bad_json）");
+        return reject_json(avatars::RejectReason::BadJson);
+    };
+    match avatars::store_upload(
+        &state.avatars,
+        UploadInput {
+            png: &png_bytes,
+            name: &name,
+            height_world,
+        },
+    ) {
+        Ok(asset) => {
+            tracing::info!(asset_id = %asset.asset_id, "[upload] 收图成功（HTTP 200 ok:true）");
+            Json(serde_json::json!({ "ok": true, "asset_id": asset.asset_id })).into_response()
+        }
+        Err(reason) => {
+            tracing::info!(reason = reason.wire(), "[upload] 收图拒绝（HTTP 200 ok:false）");
+            reject_json(reason)
+        }
+    }
+}
+
+/// 拒绝响应体（{ok:false, reason}；HTTP 恒 200，成败看 ok 字段）
+fn reject_json(reason: avatars::RejectReason) -> Response {
+    Json(serde_json::json!({ "ok": false, "reason": reason.wire() })).into_response()
 }
 
 /// 单连接循环：下行推快照广播，上行解析意图入共享队列（仅操控连接）。
@@ -392,6 +515,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     }
     let mut rx = state.snapshots.subscribe();
     let (mut sender, mut receiver) = socket.split();
+    // D-017：连接建立即主动推一条 avatar_assets（一次性全量，先于任何快照帧；
+    // 前端缓存 asset_id->{img,mask} 做调试面板）。发送失败=socket 已死，循环首拍
+    // 自然 break 走清理
+    let assets_json = avatar_assets_json(&state.avatars);
+    if sender.send(Message::Text(assets_json)).await.is_err() {
+        tracing::debug!("[ws] avatar_assets 首帧发送失败（连接已断，走常规清理）");
+    }
     loop {
         tokio::select! {
             recv = rx.recv() => match recv {
@@ -771,15 +901,35 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<std::io::Result<()>>,
     ) {
+        let (addr, tx, queue, shutdown_tx, server, _avatars) =
+            start_test_server_with_avatars(static_dir, &temp_assets_dir("shared")).await;
+        (addr, tx, queue, shutdown_tx, server)
+    }
+
+    /// 带资产目录的测试服务器（D-017 上传通道测试用：注册表目录可指定可检查）
+    #[allow(clippy::type_complexity)]
+    async fn start_test_server_with_avatars(
+        static_dir: std::path::PathBuf,
+        avatars_dir: &std::path::Path,
+    ) -> (
+        std::net::SocketAddr,
+        broadcast::Sender<String>,
+        crate::input::IntentQueue,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        Arc<avatars::AvatarRegistry>,
+    ) {
         let (tx, _) = broadcast::channel::<String>(SNAPSHOT_CHANNEL_CAP);
         let (intents_tx, intents_rx) = crate::input::intent_channel();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let avatars = Arc::new(avatars::AvatarRegistry::load(avatars_dir));
         let state = Arc::new(WsState {
             snapshots: tx.clone(),
             intents: intents_tx,
             ctrl_taken: Arc::new(AtomicBool::new(false)),
+            avatars: avatars.clone(),
         });
         let handle = tokio::spawn(async move {
             serve(
@@ -792,7 +942,282 @@ mod tests {
             )
             .await
         });
-        (addr, tx, intents_rx, shutdown_tx, handle)
+        (addr, tx, intents_rx, shutdown_tx, handle, avatars)
+    }
+
+    /// 临时资产目录（D-017 测试用；路径带进程号防并行撞）
+    fn temp_assets_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "codeworld-net-test-{tag}-{}-assets",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    // === D-017 收图通道（上传路由 + /assets 静态服务 + avatar_assets 下发）===
+
+    /// 测试助手：RGBA8 像素 -> PNG 字节（png crate 编码，测试自产 fixtures）
+    fn solid_test_png(w: u32, h: u32, alpha: u8) -> Vec<u8> {
+        let mut px = Vec::new();
+        for _ in 0..w * h {
+            px.extend_from_slice(&[255, 0, 0, alpha]);
+        }
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().unwrap();
+            writer.write_image_data(&px).unwrap();
+        }
+        out
+    }
+
+    /// 测试助手：手拼 multipart/form-data 请求体（字段按序编码）
+    fn multipart_body(boundary: &str, fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, data) in fields {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n")
+                    .as_bytes(),
+            );
+            body.extend_from_slice(data.as_slice());
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    /// 测试助手：手写 HTTP 请求（POST/GET 通用，返回原始响应字节）
+    async fn http_request(
+        addr: &std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut req = format!("{method} {path} HTTP/1.0\r\nHost: {addr}\r\n");
+        if let Some(ct) = content_type {
+            req.push_str(&format!("Content-Type: {ct}\r\n"));
+        }
+        if let Some(b) = body {
+            req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+        }
+        req.push_str("\r\n");
+        let mut raw = req.into_bytes();
+        if let Some(b) = body {
+            raw.extend_from_slice(b);
+        }
+        stream.write_all(&raw).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        buf
+    }
+
+    /// 测试助手：响应头之后的 body 字节（\r\n\r\n 分隔；手写分割——slice split_once 未稳定）
+    fn http_body(resp: &[u8]) -> &[u8] {
+        const SEP: &[u8] = b"\r\n\r\n";
+        for i in 0..resp.len().saturating_sub(SEP.len()) {
+            if &resp[i..i + SEP.len()] == SEP {
+                return &resp[i + SEP.len()..];
+            }
+        }
+        &[]
+    }
+
+    #[tokio::test]
+    async fn upload_avatar_multipart_happy_path_serves_asset() {
+        // 场景：POST /upload/avatar 收合法 PNG -> JSON ok:true + asset_id ->
+        // PNG+元数据落盘 + 登记表在册 + GET /assets/avatars/{id}.png 原图可取
+        let static_dir = temp_static_dir("av-up");
+        let avatars_dir = temp_assets_dir("av-up");
+        let (addr, _tx, _queue, shutdown_tx, server, reg) =
+            start_test_server_with_avatars(static_dir, &avatars_dir).await;
+        let png = solid_test_png(64, 64, 255);
+        let body = multipart_body(
+            "XBOUND",
+            &[
+                ("file", png.clone()),
+                ("name", b"pioneer".to_vec()),
+                ("height_world", b"3.5".to_vec()),
+            ],
+        );
+        let resp = http_request(
+            &addr,
+            "POST",
+            "/upload/avatar",
+            Some("multipart/form-data; boundary=XBOUND"),
+            Some(&body),
+        )
+        .await;
+        let json: serde_json::Value =
+            serde_json::from_slice(http_body(&resp)).expect("响应应为 JSON");
+        assert_eq!(json["ok"], true, "合法上传应成功：{json}");
+        let id = json["asset_id"].as_str().expect("asset_id 应为字符串");
+        assert!(id.starts_with("av_"), "asset_id 前缀 av_：{id}");
+        // 登记表在册 + 参数入档
+        let list = reg.list();
+        assert_eq!(list.len(), 1, "恰一条登记");
+        assert_eq!(list[0].name, "pioneer");
+        assert_eq!(list[0].height_world, 3.5, "身高参数入档");
+        // 文件落盘（注册表目录）
+        assert!(avatars_dir.join(format!("{id}.png")).exists(), "PNG 落盘");
+        assert!(avatars_dir.join(format!("{id}.json")).exists(), "元数据落盘");
+        // 原图 HTTP 可取（/assets 静态挂载，nest 剥前缀后=资产目录内 {id}.png），
+        // 字节与上传一致
+        let raw = http_request(&addr, "GET", &format!("/assets/{id}.png"), None, None).await;
+        assert!(raw.starts_with(b"HTTP/1.0 200"), "原图应 200：{:?}", &raw[..20.min(raw.len())]);
+        assert_eq!(http_body(&raw), png.as_slice(), "原图字节应原样返回");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn upload_avatar_rejects_disconnected_png_with_isolate_fail() {
+        // 规则：断件图（两个大连通域）-> {ok:false, reason:"isolate_fail"}
+        let static_dir = temp_static_dir("av-iso");
+        let avatars_dir = temp_assets_dir("av-iso");
+        let (addr, _tx, _queue, shutdown_tx, server, reg) =
+            start_test_server_with_avatars(static_dir, &avatars_dir).await;
+        // 上下两半实心 = 两个巨型连通域
+        let mut px = vec![0u8; 128 * 128 * 4];
+        for y in 0..128u32 {
+            let a = if y < 60 || y >= 68 { 255 } else { 0 };
+            for x in 0..128u32 {
+                let i = ((y * 128 + x) * 4) as usize;
+                px[i] = 255;
+                px[i + 3] = a;
+            }
+        }
+        let mut disconnected = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut disconnected, 128, 128);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().unwrap();
+            writer.write_image_data(&px).unwrap();
+        }
+        let body = multipart_body(
+            "XB",
+            &[("file", disconnected), ("name", b"broken".to_vec())],
+        );
+        let resp = http_request(
+            &addr,
+            "POST",
+            "/upload/avatar",
+            Some("multipart/form-data; boundary=XB"),
+            Some(&body),
+        )
+        .await;
+        let json: serde_json::Value =
+            serde_json::from_slice(http_body(&resp)).expect("响应应为 JSON");
+        assert_eq!(json["ok"], false, "断件图应拒绝");
+        assert_eq!(json["reason"], "isolate_fail", "拒绝原因=断件：{json}");
+        assert!(reg.list().is_empty(), "拒绝的上传不登记");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn upload_avatar_rejects_oversize_and_corrupt() {
+        // 规则：> 2MB -> oversize；坏字节 -> decode_failed（护栏逐级生效）
+        let static_dir = temp_static_dir("av-guard");
+        let avatars_dir = temp_assets_dir("av-guard");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg) =
+            start_test_server_with_avatars(static_dir, &avatars_dir).await;
+        let big = vec![0xABu8; avatars::MAX_AVATAR_PNG_BYTES + 1];
+        for (payload, expect) in [
+            (big, "oversize"),
+            (b"definitely not png".to_vec(), "decode_failed"),
+        ] {
+            let body = multipart_body("XB", &[("file", payload), ("name", b"x".to_vec())]);
+            let resp = http_request(
+                &addr,
+                "POST",
+                "/upload/avatar",
+                Some("multipart/form-data; boundary=XB"),
+                Some(&body),
+            )
+            .await;
+            let json: serde_json::Value =
+                serde_json::from_slice(http_body(&resp)).expect("响应应为 JSON");
+            assert_eq!(json["ok"], false);
+            assert_eq!(json["reason"], expect, "护栏 reason：{json}");
+        }
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn ws_connection_receives_avatar_assets_first_frame() {
+        // 规则：连接建立后服务器主动发一条 avatar_assets（一次性全量）——
+        // 先于任何快照帧；mask=128x128=16384 项 0/1；url 可直取原图
+        let static_dir = temp_static_dir("av-ws");
+        let avatars_dir = temp_assets_dir("av-ws");
+        let (addr, tx, _queue, shutdown_tx, server, reg) =
+            start_test_server_with_avatars(static_dir, &avatars_dir).await;
+        // 先上传一张（直接走登记表，上传路由已有独立测试）
+        let png = solid_test_png(64, 64, 255);
+        let asset = avatars::store_upload(
+            &reg,
+            avatars::UploadInput {
+                png: &png,
+                name: "pioneer",
+                height_world: None,
+            },
+        )
+        .expect("预置上传应成功");
+        let mut client = connect_client(addr).await;
+        let frame: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(frame["type"], "avatar_assets", "首帧=资产消息：{frame}");
+        let assets = frame["assets"].as_array().expect("assets 数组恒有");
+        assert_eq!(assets.len(), 1, "全量=恰一张");
+        assert_eq!(assets[0]["asset_id"], asset.asset_id.as_str());
+        assert_eq!(
+            assets[0]["url"],
+            format!("/assets/{}.png", asset.asset_id),
+            "url 可直取原图"
+        );
+        assert_eq!(assets[0]["w"], 64, "原图尺寸入消息");
+        assert_eq!(assets[0]["h"], 64);
+        let mask = assets[0]["mask"].as_array().expect("mask 数组");
+        assert_eq!(mask.len(), 128 * 128, "掩码 16384 项");
+        assert!(
+            mask.iter().all(|v| v == 0 || v == 1),
+            "掩码值恒 0/1"
+        );
+        // 资产消息是首帧：之后照常收快照（推送一帧验证次序）
+        let mut world = WorldState::new();
+        world.advance_tick();
+        let dir = PlayerDirectory::disabled();
+        let vp = default_viewport();
+        push_snapshot(&tx, &world, "after-assets", &vp, &dir, None, &[]);
+        let snap: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(snap["caption"], "after-assets", "资产消息先于快照帧");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn ws_connection_with_empty_registry_still_receives_avatar_assets() {
+        // 规则：零资产也发（assets:[] 恒有）——前端不必判消息缺失
+        let static_dir = temp_static_dir("av-empty");
+        let avatars_dir = temp_assets_dir("av-empty");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg) =
+            start_test_server_with_avatars(static_dir, &avatars_dir).await;
+        let mut client = connect_client(addr).await;
+        let frame: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(frame["type"], "avatar_assets");
+        assert_eq!(
+            frame["assets"].as_array().map(Vec::len),
+            Some(0),
+            "零资产=空数组恒有"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
     }
 
     /// 轮询意图队列直到出现一条意图（backlog 保留 drain 多取的后续意图防丢；
@@ -1007,6 +1432,14 @@ mod tests {
         }
     }
 
+    /// 读掉连接首帧 avatar_assets（v2.2 起连接首帧恒为资产消息；快照类测试先消费它）
+    async fn consume_avatar_assets(ws: &mut ClientWs) -> serde_json::Value {
+        let v: serde_json::Value =
+            serde_json::from_str(&next_text(ws).await).expect("首帧应为合法 JSON");
+        assert_eq!(v["type"], "avatar_assets", "首帧恒为 avatar_assets：{v}");
+        v
+    }
+
     /// 造临时静态目录（含 index.html），供 ServeDir 伺服测试
     fn temp_static_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1025,6 +1458,7 @@ mod tests {
         let static_dir = temp_static_dir("frames");
         let (addr, tx, _queue, shutdown_tx, server) = start_test_server(static_dir.clone()).await;
         let mut client = connect_client(addr).await;
+        consume_avatar_assets(&mut client).await; // v2.2 首帧=资产消息，消费后才是快照帧
 
         let mut world = WorldState::new();
         let dir = PlayerDirectory::disabled();
@@ -1050,6 +1484,7 @@ mod tests {
 
         // 服务器仍可用：新客户端再连并收到新帧
         let mut client2 = connect_client(addr).await;
+        consume_avatar_assets(&mut client2).await;
         world.advance_tick();
         push_snapshot(&tx, &world, "f3", &vp, &dir, None, &[]);
         let frame3: serde_json::Value = serde_json::from_str(&next_text(&mut client2).await).unwrap();
@@ -1104,6 +1539,8 @@ mod tests {
         let (addr, tx, _queue, shutdown_tx, server) = start_test_server(static_dir).await;
         let mut c1 = connect_client(addr).await;
         let mut c2 = connect_client(addr).await;
+        consume_avatar_assets(&mut c1).await; // v2.2 首帧=资产消息
+        consume_avatar_assets(&mut c2).await;
 
         let mut world = WorldState::new();
         let dir = PlayerDirectory::disabled();
@@ -1407,6 +1844,7 @@ mod tests {
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(queue.drain().is_empty(), "登出连接的后续上行已丢弃");
+        consume_avatar_assets(&mut c1).await; // v2.2 首帧=资产消息（连接时排队未消费）
         let mut world = WorldState::new();
         world.advance_tick();
         let dir = PlayerDirectory::disabled();

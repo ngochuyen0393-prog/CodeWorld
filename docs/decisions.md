@@ -3,6 +3,11 @@
 > 纪律：只增不改。改主意 = 写新条目标「取代 #N」，旧条目不删不编辑。
 > 每条 ≤5 行，记「为什么」，不记「怎么实现」（实现看代码）。
 
+## #051 2026-10-21 · D-017 先行刀：收图通道+掩码管线（资产层，掩码只进渲染不挂碰撞）
+- 定案：POST /upload/avatar 收 PNG（≤2MB、≤1024px 恰等放行）→ alpha>50% 阈值化 → area-average 降采样 128x128 → 4-连通校验（两个 ≥N 大连通域=断件打回 isolate_fail；主件+小碎片收图丢弃碎片；N=8 临时默认待土豆拍板）→ 落盘 assets/avatars/（静态文件不进 SQLite 快照管线）+ 内存登记表。WS 连接首帧恒为 avatar_assets 一次性全量（掩码 32KB/资产，资产多时改增量）；原图走 /assets HTTP 直取。协议版本 **v2.2**（v2.1 已被 D-003 creation_dynamic 占用，卡面"v2.1 节"顺延）。
+- 边界：本卡=资产层，掩码不挂实体外观、不进碰撞（碰撞仍走圆半径，D-013 挂物理时直接用 128 表）；上传与 players 目录进场解耦；height_world 只登记不消费；created_tick 恒 0（世界拍钟不跨线程共享，挂实体刀再接钟）。
+- 落点：core mask.rs（decode/downsample/validate_and_prune 纯函数）+ bin avatars.rs（登记表+store_upload）+ net.rs（upload 路由+avatar_assets 首帧+/assets ServeDir+DefaultBodyLimit）+ index.html（左上角调试面板+assets 状态行）+ net-protocol v2.2 + menu 1.7 五常数。
+
 ## #050 2026-10-21 · 接触容差正名：MELEE_REACH 0.5 语义立法（土豆 A 选项仲裁，补 10-20 漏档）
 - 定案：MELEE_REACH=0.5 的语义="接触容差"非"臂长"——它是两身体半径和之外放宽的判定冗余（填"贴脸恰好相等永不命中"的数学缝：物理不许重叠（最近=恰好相切）+判据严格小于 → 贴脸站=相等=不满足=砍不中；+0.5 后半格内皆算够着）。**臂长永不立法，长武器=造物身体**（5 格大刀=造 5 格身体造物，效果跟身体走——"巨人身体沙砾心脏"的正面应用，design-ballistics 否决清单收录）。
 - 背景：10-20 土豆连环追问定案但"攒 batch 落档"未执行（1020 全量对账时已认漏）；夜班卡 t_4e155225 改名入 menu 时被 R1 复审以"无决策背书"回退（复审方看不到对话，处置正确）——本条即为决策背书，A 选项=重施改名+本条入宪。

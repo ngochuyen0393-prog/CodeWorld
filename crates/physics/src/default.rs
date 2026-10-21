@@ -363,12 +363,13 @@ impl DefaultPhysicsEngine {
         events
     }
 
-    /// 圆实体落点解析：从 from_y 以重力步长下落，返回落点 y。
-    /// max(terrain, r) 保底脚贴地不陷入；y=0 半径线是平地地形的特例）；
-    /// 落点面上有身体（水平方向与我有重叠部分的下方实体/造物）→ 落到恰好接触的高度
-    /// （圆-圆用 sqrt(s²-dxh²) 解析贴面；圆-AABB 落到盒顶+贴面）——堆叠合法，
-    /// 底下的走了上面的自然下落。落点只在 from_y 及以下取（不向上传送）。
-    fn circle_landing_y(
+    /// 圆实体脚下高度（落点解析的纯几何核，与重力步长无关）：地面（terrain
+    /// 高度插值，max(ground, r) 保脚贴地不陷入）与脚下可堆叠身体取最高——
+    /// 落点面上有身体（水平方向与我有重叠部分的下方实体/造物）→ 落到恰好
+    /// 接触的高度（圆-圆 sqrt(s²-dxh²) 解析贴面；圆-AABB 落到盒顶+贴面）。
+    /// 候选只在 from_y 及以下取（不向上传送）。D-010a 速度积分路径与
+    /// circle_landing_y 共用此核。
+    fn circle_landing_surface(
         &self,
         world: &WorldState,
         me_id: EntityId,
@@ -376,7 +377,6 @@ impl DefaultPhysicsEngine {
         me_r: f64,
         from_y: f64,
     ) -> f64 {
-        let fall_to = from_y + self.params.gravity; // gravity 为负值
         // D-016 地形：地面=高度数组插值（max(ground, r) 保脚贴地——坑深时
         // 不陷入半径线以下，与旧平地口径 ground_y.max(r) 同构）
         let mut landing = world.terrain.height(me_x).max(me_r);
@@ -411,6 +411,23 @@ impl DefaultPhysicsEngine {
                 }
             }
         }
+        landing
+    }
+
+    /// 圆实体落点解析：从 from_y 以重力步长下落，返回落点 y。
+    /// max(terrain, r) 保底脚贴地不陷入；y=0 半径线是平地地形的特例）；
+    /// 落点面上有身体→落到恰好接触的高度——堆叠合法，
+    /// 底下的走了上面的自然下落。落点只在 from_y 及以下取（不向上传送）。
+    fn circle_landing_y(
+        &self,
+        world: &WorldState,
+        me_id: EntityId,
+        me_x: f64,
+        me_r: f64,
+        from_y: f64,
+    ) -> f64 {
+        let fall_to = from_y + self.params.gravity; // gravity 为负值
+        let landing = self.circle_landing_surface(world, me_id, me_x, me_r, from_y);
         if fall_to >= landing {
             fall_to
         } else {
@@ -463,7 +480,10 @@ impl DefaultPhysicsEngine {
                 tracing::debug!(entity_id = %id.0, "[step] 悬停中，本拍免重力");
                 continue;
             }
-            let new_pos = if is_creation && !is_dyn_creation {
+            // 分支选择（顺序固定，测试锚定）：static 造物→直落地面；带速度实体
+            //（生物+dynamic 造物）→ D-010a 冲量路径（速度积分）；零速→落点制（现状）。
+            // 产物：new_pos（本拍新坐标）+ ballistic_vel（Some=冲量路径要写回的速度）
+            let (new_pos, ballistic_vel) = if is_creation && !is_dyn_creation {
                 // static 造物：直落地面（D-016：地面=terrain.height(x)，格对齐 AABB
                 // 以其覆盖列的最高地面为准——占地格不悬空），落点与身体重叠则
                 // 原位悬停（下拍重试）
@@ -484,20 +504,68 @@ impl DefaultPhysicsEngine {
                         target = ?target,
                         "[step] 造物下落落点身体重叠，悬停原位（下拍重试）"
                     );
-                    before
+                    (before, None)
                 } else {
-                    target
+                    (target, None)
+                }
+            } else if me_vel != (0.0, 0.0) {
+                // D-010a 冲量路径（带速度生物/dynamic 造物速度积分，一拍一步）。
+                // 【#021 切割声明】一次性冲量非持续推挤：已退役的"推挤"（持续重叠
+                // 互相挤开→连体 bug）是每拍重复施加的位置推力；本路径是冲量入速度
+                // 后的一次性动量积分（撞完就分），与任何重叠检测零耦合。
+                // 积分次序（测试锚定）：冲量入速度（阶段二 thrust 应用）→ 重力入
+                // 速度 → 阻力 → 世界极速钳制 → 中点位移 → 落地清零。中点位移 =
+                // 速度吃整拍定律、位移取冲量后速度与结算后速度的均值（匀加速一拍
+                // 的解析解 x += v·dt + g·dt²/2，dt=1）——若照抄弹丸半隐式欧拉（重力
+                // 后速度直接位移），地面起跳 v0=7.7 < |g|=9.8 拍 1 位移为负，起跳会
+                // 被落地解析当场吃掉跳不起来；中点法拍 1 位移 2.85，落在"跳 ≤3 格高"
+                // 锚点内（thrust_ballistic_jump_peak_within_three_grid_anchor 锚定）。
+                let mut vel = me_vel;
+                vel.1 += self.params.gravity; // 重力入速度（空中累积；落地清零见下）
+                // 阻力定律（#045 通用化口径：一切有速度实体，质量为分母）
+                vel = apply_drag(vel, me_mass, self.params.drag_coefficient);
+                // 世界极速钳制（与弹丸/dynamic 造物同款：积分后归一化压回，方向不变）
+                let speed2 = vel.0 * vel.0 + vel.1 * vel.1;
+                let max_speed = self.params.max_speed;
+                if speed2 > max_speed * max_speed {
+                    let scale = max_speed / speed2.sqrt();
+                    tracing::debug!(
+                        entity_id = %id.0,
+                        from_speed = speed2.sqrt(),
+                        to_speed = max_speed,
+                        "[step] 世界极速钳制（冲量路径）"
+                    );
+                    vel = (vel.0 * scale, vel.1 * scale);
+                }
+                // 中点位移：本拍位移 = (冲量后速度 + 定律结算后速度) / 2
+                let after = (
+                    before.0 + (me_vel.0 + vel.0) * 0.5,
+                    before.1 + (me_vel.1 + vel.1) * 0.5,
+                );
+                // 落地解析（脚下高度核复用 circle_landing_y 的几何）：位移后不高于
+                // 脚下高度即落地——贴面 + 速度全清零（vy 清零规则：落地时清、空中
+                // 不清；水平分量一并清——贴地滑行白拿位移不合法，想平移走 move_by）
+                let surface = self.circle_landing_surface(world, id, after.0, me_r, after.1);
+                if after.1 <= surface {
+                    tracing::debug!(
+                        entity_id = %id.0,
+                        from = ?before,
+                        to = ?(after.0, surface),
+                        "[step] 冲量路径落地贴面（速度清零）"
+                    );
+                    ((after.0, surface), Some((0.0, 0.0)))
+                } else {
+                    (after, Some(vel))
                 }
             } else {
-                // 生物 + dynamic 造物（D-003 全活）：同一条圆物理管线
+                // 生物 + dynamic 造物（D-003 全活）：零速走落点制（现状管线）
                 let ly = self.circle_landing_y(world, id, before.0, me_r, before.1);
-                (before.0, ly)
+                ((before.0, ly), None)
             };
-            // D-003 dynamic 造物速度矢量定律（v≡0 时零效果，与生物同款待遇）：
-            // 阻力衰减 + 世界极速钳制（#045 口径"阻力/极速从弹丸专属通用化为一切
-            // 有速度实体"）。重力走上方落点制（位置物理），不往 vy 累积——避免速度
-            // 字段与实际运动脱节；速度积分进位置（被撞飞/抛射）待 D-010/D-018。
-            if is_dyn_creation {
+            // D-003 dynamic 造物速度矢量定律（v≡0 时零效果）：阻力衰减 + 世界极速
+            // 钳制（#045 口径）。注意：带速度的 dynamic 造物上面已走冲量路径（定律
+            // 在路径内统一结算），此处只处理零速残留（恒等变换，行为零变化）
+            if is_dyn_creation && ballistic_vel.is_none() {
                 let mut vel = apply_drag(me_vel, me_mass, self.params.drag_coefficient);
                 let speed2 = vel.0 * vel.0 + vel.1 * vel.1;
                 let max_speed = self.params.max_speed;
@@ -523,6 +591,12 @@ impl DefaultPhysicsEngine {
                 }
                 tracing::debug!(entity_id = %id.0, from = ?before, to = ?new_pos, "重力落点应用");
                 changes.push(PhysicsChange::new(id, new_pos, PhysicsReason::Gravity, None));
+            }
+            // D-010a 冲量路径速度写回（空中=定律结算后的速度；落地=清零）
+            if let Some(bvel) = ballistic_vel {
+                if let Some(entity) = world.entities.get_mut(&id) {
+                    entity.set_velocity(bvel);
+                }
             }
             // 速度限制（改速度不改坐标）
             if let Some(entity) = world.entities.get_mut(&id) {
@@ -850,11 +924,13 @@ mod tests {
 
     #[test]
     fn step_dynamic_creation_velocity_drag_and_speed_limit() {
-        // D-003 速度矢量定律：v≠0 时按 drag/mass 衰减（v=10, mass=1, drag=0.05
-        // → 9.5）；速度不超过世界极速（60 → 25 归一化）。速度积分进位置待 D-010
+        // D-003 速度矢量定律 + D-010a 速度积分（语义演进：本测试锚定速度字段从
+        // "只存不动"演进为"积分进位置"——速度积分进位置原待 D-010，现落地）：
+        // v≠0 走冲量路径——重力入速度 → 阻力衰减（v=10 衰 5% → x 分量 9.5，
+        // mass=1）→ 世界极速钳制（60 → 25 归一化）→ 中点位移进位置。
         let engine = DefaultPhysicsEngine::new();
         let mut world = WorldState::new();
-        let mut a = make_dyn_creation(1, 0.0, 100.0); // 高空，落点解析不干扰速度断言
+        let mut a = make_dyn_creation(1, 0.0, 100.0); // 高空，落地解析不干扰断言
         a.set_velocity((10.0, 0.0));
         let mut b = make_dyn_creation(2, 50.0, 100.0);
         b.set_velocity((60.0, 0.0));
@@ -863,15 +939,25 @@ mod tests {
         world.entities.insert(id_a, a);
         world.entities.insert(id_b, b);
         engine.step(&mut world, &HashSet::new());
-        assert_eq!(
-            world.entities.get(&id_a).unwrap().velocity(),
-            (9.5, 0.0),
-            "阻力定律 v=10 衰 5% → 9.5（mass=1）"
-        );
-        let (vx, _) = world.entities.get(&id_b).unwrap().velocity();
+        let (avx, avy) = world.entities.get(&id_a).unwrap().velocity();
         assert!(
-            (vx - 25.0).abs() < 1e-9,
-            "超极速 60 应归一化压回 25，实际 {vx}"
+            (avx - 9.5).abs() < 1e-9,
+            "阻力定律 v=10 衰 5% → x 分量 9.5（mass=1），实际 {avx}"
+        );
+        assert!(
+            (avy - (0.0 - 9.8) * 0.95).abs() < 1e-9,
+            "重力先入速度再吃阻力 → vy=(0-9.8)×0.95，实际 {avy}"
+        );
+        assert!(
+            (world.entities.get(&id_a).unwrap().pos().0 - 9.75).abs() < 1e-9,
+            "中点位移应进位置（x 位移 = (10+9.5)/2 = 9.75），实际 {}",
+            world.entities.get(&id_a).unwrap().pos().0
+        );
+        let (bx, by) = world.entities.get(&id_b).unwrap().velocity();
+        let b_speed = (bx * bx + by * by).sqrt();
+        assert!(
+            (b_speed - 25.0).abs() < 1e-9,
+            "超极速 60 应归一化压回 25，实际 {b_speed}"
         );
     }
 
@@ -1884,5 +1970,125 @@ mod tests {
             min_1 = min.1
         );
         assert!(final_y <= 0.0 + 1e-9 || min.1 >= ground_peak - 1.0 - 1e-9);
+    }
+
+    // === D-010a 冲量小刀：带速度实体的速度积分路径（跳跃弹道锚） ===
+
+    /// 判断浮点近似相等（弹道数值断言用；半格/格级锚点用 1e-9 即可）
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn thrust_ballistic_jump_peak_within_three_grid_anchor() {
+        // 跳跃锚点（D-010a Gate）：地面生物带冲量速度 (0, 7.7) 进 physics.step，
+        // 拍 1 升空高度 ≈3 格（±0.5 容差）；次拍落地贴半径线、速度清零。
+        // 积分次序锚定：冲量入速度（阶段二 thrust 应用）→ 重力入速度 → 中点位移
+        // → 落地清零。中点位移 = v0 + g/2 = 7.7 - 4.9 = 2.8，落在锚区间内。
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut e = make_entity(1, 0.0, 0.5, 0); // r=0.5 站半径线（地面 y=0）
+        let id = e.id;
+        e.set_velocity((0.0, 7.7)); // 模拟阶段二 thrust 应用后的速度字段
+        world.entities.insert(id, e);
+        // 拍 1：升空
+        engine.step(&mut world, &HashSet::new());
+        let e = world.entities.get(&id).unwrap();
+        let peak_height = e.pos().1 - 0.5; // 相对地面高度
+        assert!(
+            (2.5..=3.5).contains(&peak_height),
+            "跳跃最高点应 ≈3 格（±0.5 容差），实测 {peak_height}"
+        );
+        assert!(
+            approx(e.velocity().1, (7.7 - 9.8) * 0.95) && approx(e.velocity().0, 0.0),
+            "拍 1 重力入速度后吃阻力（(7.7-9.8)×0.95），实测 {:?}",
+            e.velocity()
+        );
+        // 拍 2：落地清零
+        engine.step(&mut world, &HashSet::new());
+        let e = world.entities.get(&id).unwrap();
+        assert!(
+            approx(e.pos().1, 0.5) && approx(e.pos().0, 0.0),
+            "落地应贴半径线 (0, 0.5)，实测 {:?}",
+            e.pos()
+        );
+        assert_eq!(e.velocity(), (0.0, 0.0), "落地速度清零（vy 清零规则）");
+    }
+
+    #[test]
+    fn ballistic_midair_accumulates_gravity_no_teleport() {
+        // 空中不清（vy 清零规则另一半）：拍 1 升空后拍 2 空中 vy 继续累积重力
+        //（-2.1 → -11.9）；全程逐拍位移 ≤ 世界极速 25（非瞬移）。
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut e = make_entity(1, 0.0, 0.5, 0);
+        let id = e.id;
+        e.set_velocity((0.0, 7.7));
+        world.entities.insert(id, e);
+        // 拍 1
+        engine.step(&mut world, &HashSet::new());
+        let (p0, v0) = {
+            let e = world.entities.get(&id).unwrap();
+            (e.pos(), e.velocity())
+        };
+        assert!(approx(v0.1, -1.995), "拍 1 vy 应为 (7.7-9.8)×0.95，实测 {v0:?}");
+        // 拍 2（空中）：vy 累积 = -2.1 + -9.8 = -11.9
+        engine.step(&mut world, &HashSet::new());
+        let (p1, v1) = {
+            let e = world.entities.get(&id).unwrap();
+            (e.pos(), e.velocity())
+        };
+        assert!(
+            p1.1 < p0.1,
+            "拍 2 在下落（弧线回落），实测 p0={p0:?} p1={p1:?}"
+        );
+        // 落地拍位移（中点 = -2.1 + -9.8)/2 = -7.0）与起跳拍位移（+2.8）都 ≤ 极速 25
+        assert!(
+            (p1.1 - p0.1).abs() <= 25.0 && (p0.1 - 0.5).abs() <= 25.0,
+            "逐拍位移不得超过世界极速（非瞬移锚）"
+        );
+        assert!(
+            approx(v1.0, 0.0) && approx(v1.1, 0.0),
+            "拍 2 应已落地清零，实测 {v1:?}"
+        );
+    }
+
+    #[test]
+    fn ballistic_zero_velocity_entities_keep_positional_fall_regime() {
+        // 回归锚：速度恒 (0,0) 的实体走原落点制（circle_landing_y，一拍落 9.8），
+        // 不进冲量路径——空中静止实体（悬停丢失后自由落体）现状行为零变化。
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let e = make_entity(1, 0.0, 5.0, 0);
+        let id = e.id;
+        world.entities.insert(id, e);
+        engine.step(&mut world, &HashSet::new());
+        let e = world.entities.get(&id).unwrap();
+        // 落点制：fall_to = 5.0 - 9.8 = -4.8 < 地面 0.5 → 落地半径线
+        assert!(
+            approx(e.pos().1, 0.5),
+            "零速实体应走落点制落地，实测 {:?}",
+            e.pos()
+        );
+        assert_eq!(e.velocity(), (0.0, 0.0), "落点制不动速度字段");
+    }
+
+    #[test]
+    fn ballistic_dynamic_creation_with_velocity_now_integrates() {
+        // D-018③ 先行半步：dynamic 造物出生初速此前只存不动（位置走落点制），
+        // 冲量路径起造物带速度也走速度积分（被撞飞/抛射的地基）。
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut c = make_dyn_creation(1, 0.0, 0.5);
+        let id = c.id;
+        c.set_velocity((7.7, 7.7));
+        world.entities.insert(id, c);
+        engine.step(&mut world, &HashSet::new());
+        let c = world.entities.get(&id).unwrap();
+        assert!(
+            c.pos().0 > 0.5,
+            "dynamic 造物带速度应横向位移（速度积分生效），实测 {:?}",
+            c.pos()
+        );
     }
 }
