@@ -73,3 +73,29 @@
 - 常数：FIELD_FORMING_TICKS=3（CODEWORLD_FIELD_FORMING）+ field_fuel 10_000（CODEWORLD_FIELD_FUEL），入 game-menu 1.7 总账
 - 测试：workspace 1000 全绿（基线 952+48）；示例 examples/field-demo.wat（守卫测试同源）；文档 api.md（17 参+on_field+field_pulse+力场节）/ net-protocol v2.3（fields 数组）/ decisions #052 / dev-plan D-012 ✅
 - 边界注记：极速场未做；优先级未做；边界冷却防抖不做（on_field 是询问非事件）；#051 已被 D-017 两刀占用，本刀顺延 #052
+
+
+---
+
+# cc-task 进度：D-001b 外桥最小实测——本地假服务器 + 造物真外呼（2026-10-22 开工）
+
+> 任务书：超级powers 对话内联任务书（D-001a 设计定案的施工刀）。报告 $LOCALAPPDATA/Temp/cc-report-d001b.md。
+
+## 步骤
+- [x] 基线：workspace 1029 passed / 0 failed / 1 ignored（HEAD=b3be411，共享树兄弟 WIP 在途）
+- [x] U1 config 五项（CODEWORLD_BRIDGE 家族，RED→GREEN）
+- [x] U2 arena bridge_send import（16 号 import，返回码 0/1/2/3/4 全测）
+- [x] U3 call_on_bridge_reply（grow 新页投递，缺省导出零副作用，燃料不污染）
+- [x] U4 bin bridges.rs（Vault 校验+热重载 / Outbox 双通道+单工作线程 / 手搓 HTTP/1.1；变异抽查证实测试有效）
+- [x] U5 main.rs 编排（拍首 fill 快照+None 复位；阶段二 a-1 回信投递+出站收集；seq 单调/死实体丢弃/作废路径全测）
+- [x] U6 ignored 回环 e2e（bridge_e2e_reply_changes_behavior_across_ticks，进程内迷你服务器）
+- [x] U7 三件套：players/bridge-demo.wat + tools/fake-bridge-server.py + tools/bridge-e2e.bat
+- [x] U8 文档：api.md（16 imports+双词条+superseded 行）/ game-menu 1.7 外桥护栏行 / design-bridge §2.4+§2.8 / 本文件
+- [x] 亲跑 bridge-e2e.bat --ci = ALL PASS（六断言全过；26 封信 seq 单调、grow offset 逐拍递增、marker=6 连走）
+- [ ] 最终 Gate（workspace 全量+clippy+ignored e2e）+ hunk 级 stage commit + 报告
+
+## 关键裁决（详见 cc-report）
+- serde_json 无 u128 数字支持（json! 实测 panic "number out of range"）→ 信封 entity 用十进制字符串承载
+- tracing ANSI 码拆散 marker=N → bat 断言前 strip ANSI（D-007 同款坑）
+- bat 计时禁用 timeout.exe（无 tty 报错），用 ping -n；世界进程 start /B 后台+taskkill（管道范式会死锁）
+- 假服务器空闲 15s 自杀（固定生存期在连续重跑时撞文件锁）

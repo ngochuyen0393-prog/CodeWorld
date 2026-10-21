@@ -64,7 +64,7 @@
 - **失败诚实**：on_field 抛错/签名不匹配/未导出 → 本拍按出生声明结算（世界不用坏数据）。操控接管/处置等待**不豁免**询问（场是出生声明的每拍核实，与 life 同级的存在合同）。
 - **窗口注意**：on_field 执行窗口内 probe 不可用（probe 桥只挂 on_tick 窗口）；get_pos/scan/visible 照常。
 
-## 二、已开放 import（15 个）
+## 二、已开放 import（16 个）
 
 所有 import 挂在 `"env"` 命名空间下。玩家代码读到的世界状态是**本拍开始时的快照**（你动、别人也动，实际结果下一拍才感知）。
 
@@ -329,6 +329,51 @@
 (call $field_pulse) (drop)
 ```
 
+### `bridge_send(port: i32, ptr: i32, len: i32) -> i32`
+
+外桥发信（D-001b，第 16 个 import，2026-10-22 落地；机制全貌见 design-bridge.md）：把一封信送进世界邮筒——世界以自己身份把信 HTTP POST 给 `port` 对应的外部服务器（你在 `bridges.json` 登记的端点），回信下一拍经 `bridge_on_reply` 投回。**世界只当邮差**：不解释信、不代存、不重试、不看内容。
+
+- **port 是保险库别名，不是 URL**——你的沙箱内存里永远不会有服务器地址和凭证（铁律①，夺舍者只知道"有个 1 号端点"）；HTTP 由世界进程代签发出，登记的鉴权头世界贴上、沙箱看不到。
+- **异步跨拍**：返回 `0` 只表示"信进了邮筒"，不表示送达/已回复（外部服务器处理要时间，理想 N+2 拍读到回信）。
+- **返回码**：`0`=已排队；`1`=无此端点（port 未登记）；`2`=payload 超限（上限 8KB，`CODEWORLD_BRIDGE_PAYLOAD_MAX`）；`3`=本拍已发（每沙箱每拍 1 发）或在途满（上限 4 条，`CODEWORLD_BRIDGE_INFLIGHT`）；`4`=桥未启用/已吊销（世界没开 `CODEWORLD_BRIDGE=1`）。多重违规按 4→2→1→3 判序返回。
+- **内存读取**（同 attack_at）：`len<=0` / 无 memory export / 越界 → 空 payload 照常排队（空信也是信）。
+- **护栏全是工程保险丝**（防灌爆/防卡世界，与 fuel 同性质）：payload 8KB/信、每拍 1 发、在途 4 条、出站超时 5 秒（超时不投递，代码自管"发过没回声"，世界不重试）。MVP 客户端=手搓 HTTP/1.1 短连接，端点仅支持本机回环 http（127.0.0.1/localhost）；https 真客户端挂起（design-bridge §2.8）。
+- **离线退路**：无端点/桥未启用 → 返回失败码，代码跑本地降级逻辑——离线=本体基础功能照跑，在线+外接=体系满血，降级策略归你。
+
+```wat
+(import "env" "bridge_send" (func $bridge_send (param i32 i32 i32) (result i32)))
+(memory (export "memory") 1)
+(data (i32.const 0) "WHERE?")
+;; 每拍向 1 号端点发一封 6 字节的信；返回码 0=进了邮筒
+(i32.const 1) (i32.const 0) (i32.const 6) (call $bridge_send)
+```
+
+**信封格式**（世界发出去的 HTTP body，你的外脑服务器解析用；内容字段玻璃不透明）：
+
+```json
+{"world":"codeworld","entity":"330132021716898259065734489702934923585","port":1,"seq":17,"payload":[87,72,69,82,69,63]}
+```
+
+`entity`=发起实体（**十进制字符串**——u128 数字在 JSON/JS Number 装不下，parse 回整数对账）、`port`=端点别名、`seq`=单实体单调递增序号（对账/去重用）、`payload`=你发的原始字节。世界侧日志只记 entity/port/seq/字节数，**信的内容永不入日志**。
+
+### `bridge_on_reply(port: i32, ptr: i32, len: i32)`（可缺省导出）
+
+外桥收信（D-001b）：世界收到外部服务器的 HTTP 响应 body 后，下一拍 collect 阶段调用此导出——回信字节已由世界 **grow 新页**写进你的线性内存（`ptr`=新页偏移，`len`=回信字节数，新增零页永不覆盖你的数据；与 D-012 场信箱的"末尾保留段"不冲突：信箱是世界保留区约定，回信是 grow 追加区）。`port`=当初发信的端点别名。
+
+- **缺省导出 = 收不到回信**（世界零副作用丢弃+日志）——不要回信的生物不导出即可。
+- **死亡竞态诚实条款**：你死前发的信照发，回信你收不到（载体不存活≠消息没发出）；超时/非 2xx 不投递——超时逻辑你自己的代码管（"我发过 seq=17 没收到回声"自己记）。
+- **投递时点固定在拍边界**（确定性锚）：回信到达时刻在拍中任意点，但调用固定在下一拍 collect 阶段。
+- **独立小预算包裹**（默认 10_000 指令，同 probe/on_contact 档 `CODEWORLD_PROBE_FUEL`）——回信处理不占你的 tick 配额，恶意死循环最多烧预算。
+- **不做** bridge_poll/bridge_status（回信即投递无需轮询；诊断=发一封"你活着吗"的信自己问）。
+
+```wat
+;; 收信：扫回信字节找第一个 ASCII 数字当指令（demo 全文见 players/bridge-demo.wat）
+(func (export "bridge_on_reply") (param $port i32) (param $ptr i32) (param $len i32)
+  ;; f32/f64 无关——回信是任意字节，怎么解释是你的事
+  ;; 例：数字 3 = 连走 3 拍向东（外脑回 {"dx":3}）
+  ...)
+```
+
 ## 二点五、力场（D-012）——场是出生声明，不是特殊品类
 
 **法律事实**：场 = 造物的一种出生声明（`field_radius`/`field_gravity_scale`/`field_drag_delta`，与 radius/mass/binding/motion 并列）——**"场造物"作为特殊品类在法律上不存在**，世界只认声明不认身份。场源=物理身体（能被攻击、能被夺舍、死了场即消失），效果=参数改写区（无形体：不占位、不拦截碰撞、不挡路）。
@@ -391,7 +436,7 @@
 
 | 接口 | 归属 | 状态 |
 |---|---|---|
-| `register_endpoint` / `on_external_event` | 连接锚（外部通道，超时自动降级本体逻辑） | 未开放 |
+| `register_endpoint` / `on_external_event` | 连接锚（外部通道，超时自动降级本体逻辑） | superseded——被 `bridge_send` / `bridge_on_reply`（二、已开放 import）替代：端点登记走世界目录 bridges.json（凭证保险库），事件投递走回信即投递（注入无门） |
 | 产权链转让/继承 | 攻占城池 / 服务挂载（destroy 只开放了"毁自家造物"，攻杀与继承未开放） | 未开放 |
 | 网络登录进场 | 门一升级版（连接替代文件信号） | 未开放 |
 

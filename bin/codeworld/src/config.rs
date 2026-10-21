@@ -96,6 +96,21 @@ pub struct Config {
     /// ⚠️ 临时值待土豆拍板（同 MASK_FRAG_DROP_N 先例）。CODEWORLD_ASSET_QUOTA 覆盖；
     /// 0/非法值回退默认（0 会让空模块换血也被拒，无"禁皮"语义，坏值不进世界）。
     pub asset_quota: usize,
+    /// 外桥开关（D-001b），默认 0=禁用。禁用时 bridge_send 恒返 4（桥未启用）。
+    /// CODEWORLD_BRIDGE 覆盖（非 0 数值=启用，非法值保持禁用）。
+    pub bridge_enabled: bool,
+    /// 桥保险库文件路径（D-001b：外部端点登记表），默认 "bridges.json"
+    ///（世界目录，与 codeworld.db 同级）。CODEWORLD_BRIDGE_CONFIG 覆盖。
+    pub bridge_config: String,
+    /// 桥 payload 单信上限字节数（D-001b 护栏），默认 8192（8KB，侦查画图/弹道表
+    /// 够用，防大文件搬运滥用）。CODEWORLD_BRIDGE_PAYLOAD_MAX 覆盖。
+    pub bridge_payload_max: usize,
+    /// 桥出站 HTTP 超时秒数（D-001b 护栏），默认 5（超时后不投递 bridge_on_reply，
+    /// 代码自管——世界不重试不代放弃）。CODEWORLD_BRIDGE_TIMEOUT_S 覆盖。
+    pub bridge_timeout_s: u64,
+    /// 每沙箱桥在途信件上限（D-001b 护栏），默认 4（防灌爆出站队列；途满再发返 3，
+    /// 世界不排队不重试）。CODEWORLD_BRIDGE_INFLIGHT 覆盖。
+    pub bridge_inflight: u32,
 }
 
 impl Default for Config {
@@ -126,6 +141,11 @@ impl Default for Config {
             field_fuel: 10_000,
             field_forming_ticks: codeworld_core::physics::FIELD_FORMING_TICKS,
             asset_quota: codeworld_arena::assets::SANDBOX_ASSET_QUOTA_BYTES,
+            bridge_enabled: false,
+            bridge_config: "bridges.json".to_string(),
+            bridge_payload_max: 8192,
+            bridge_timeout_s: 5,
+            bridge_inflight: 4,
         }
     }
 }
@@ -246,6 +266,23 @@ impl Config {
             } else {
                 cfg.asset_quota = n;
             }
+        }
+        // D-001b 外桥（CODEWORLD_BRIDGE 家族）：默认禁用；非 0 数值=启用（"1" 是
+        // bat 脚本惯用值）；护栏四项数值类容错（解析失败回退默认，同其他数值项）
+        if let Some(v) = env_u64("CODEWORLD_BRIDGE") {
+            cfg.bridge_enabled = v > 0;
+        }
+        if let Ok(val) = std::env::var("CODEWORLD_BRIDGE_CONFIG") {
+            cfg.bridge_config = val;
+        }
+        if let Some(n) = env_usize("CODEWORLD_BRIDGE_PAYLOAD_MAX") {
+            cfg.bridge_payload_max = n;
+        }
+        if let Some(n) = env_u64("CODEWORLD_BRIDGE_TIMEOUT_S") {
+            cfg.bridge_timeout_s = n;
+        }
+        if let Some(n) = env_u64("CODEWORLD_BRIDGE_INFLIGHT") {
+            cfg.bridge_inflight = n as u32;
         }
         cfg
     }
@@ -772,6 +809,61 @@ mod tests {
     }
 
     // === 单沙箱资产配额（#051 皮入沙箱，CODEWORLD_ASSET_QUOTA）===
+
+    // === 外桥（D-001b：CODEWORLD_BRIDGE 家族）===
+
+    #[test]
+    fn default_bridge_disabled_and_guardrails_match_taskbook() {
+        // 创建：桥默认禁用（0=禁用），护栏默认值=任务书 2.5 工程保险丝口径
+        let c = Config::default();
+        assert!(!c.bridge_enabled, "外桥默认应禁用（CODEWORLD_BRIDGE 未设置=0）");
+        assert_eq!(c.bridge_config, "bridges.json", "保险库文件默认应为 bridges.json");
+        assert_eq!(c.bridge_payload_max, 8192, "payload 上限默认应为 8KB");
+        assert_eq!(c.bridge_timeout_s, 5, "出站超时默认应为 5 秒");
+        assert_eq!(c.bridge_inflight, 4, "在途上限默认应为 4 条");
+    }
+
+    #[test]
+    fn load_bridge_env_overrides_default() {
+        // 修改：CODEWORLD_BRIDGE=1 启用 + 四项护栏覆盖
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_BRIDGE", "1");
+        std::env::set_var("CODEWORLD_BRIDGE_CONFIG", "my-bridges.json");
+        std::env::set_var("CODEWORLD_BRIDGE_PAYLOAD_MAX", "4096");
+        std::env::set_var("CODEWORLD_BRIDGE_TIMEOUT_S", "3");
+        std::env::set_var("CODEWORLD_BRIDGE_INFLIGHT", "2");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_BRIDGE");
+        std::env::remove_var("CODEWORLD_BRIDGE_CONFIG");
+        std::env::remove_var("CODEWORLD_BRIDGE_PAYLOAD_MAX");
+        std::env::remove_var("CODEWORLD_BRIDGE_TIMEOUT_S");
+        std::env::remove_var("CODEWORLD_BRIDGE_INFLIGHT");
+        assert!(c.bridge_enabled, "CODEWORLD_BRIDGE=1 应启用外桥");
+        assert_eq!(c.bridge_config, "my-bridges.json");
+        assert_eq!(c.bridge_payload_max, 4096);
+        assert_eq!(c.bridge_timeout_s, 3);
+        assert_eq!(c.bridge_inflight, 2);
+    }
+
+    #[test]
+    fn load_bridge_numeric_guardrail_invalid_falls_back() {
+        // 边界：护栏数值非法 -> 回退默认（容错语义同其他数值项）；
+        // CODEWORLD_BRIDGE 非法值不算启用（默认禁用语义）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_BRIDGE", "yes-please");
+        std::env::set_var("CODEWORLD_BRIDGE_PAYLOAD_MAX", "not-a-number");
+        std::env::set_var("CODEWORLD_BRIDGE_TIMEOUT_S", "soon");
+        std::env::set_var("CODEWORLD_BRIDGE_INFLIGHT", "-1");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_BRIDGE");
+        std::env::remove_var("CODEWORLD_BRIDGE_PAYLOAD_MAX");
+        std::env::remove_var("CODEWORLD_BRIDGE_TIMEOUT_S");
+        std::env::remove_var("CODEWORLD_BRIDGE_INFLIGHT");
+        assert!(!c.bridge_enabled, "非法启用值不应启用外桥");
+        assert_eq!(c.bridge_payload_max, 8192);
+        assert_eq!(c.bridge_timeout_s, 5);
+        assert_eq!(c.bridge_inflight, 4);
+    }
 
     #[test]
     fn default_asset_quota_matches_arena_constant() {
