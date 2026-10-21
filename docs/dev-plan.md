@@ -170,7 +170,8 @@
 ### D-004 渲染升级：Three.js 组合方案 [2026-10-22 定案·可排期] 🔒排期锚：物理章收官后
 - **路线**：PixiJS（2D/UI层）+ Three.js（3D世界层）官方混搭渐进迁移（官方指南 pixijs.com/8.x/guides/third-party/mixing-three-and-pixi）；WebGL2 底座，WebGPU 可选后端（WebGPURenderer 一行切换；2026 已全浏览器默认开启，兼容底座仍 WebGL2）。
 - **原神级卡渲=三块 MIT 零件拼装**（deleg_d7358e79 深挖验证）：①pixiv/three-vrm 的 MToon（2232★/工业级维护/双后端）=材质架构地基；②KallkaGo/ToonShading（活跃，SDF 面部阴影+ramp+描边+金属高光全套 GLSL 已验）=起步代码；③Gaolingx/GenshinCelShaderURP（780★/MIT 可直译）=补各向异性头发高光（KallkaGo 缺，自写 1-2 周最大不确定点）。自建 GenshinToonMaterial extends THREE.ShaderMaterial。
-- **否决记录**：toonlab（6★/商业双轨/非原神管线）；StarRailNPRShader+ChillyHub CRP（**GPL 传染——抄一行=全游戏被迫开源**，只学思想）；Bevy+WASM（web 实测慢于 JS+玩家必须写 Rust 违背自绘灵魂）；Unity（MCP 能开发但运行时 IL2CPP 焊死玩家代码进不去——造"微信"满分，造"小程序平台"结构不合；"只借工厂"也不成立：编辑器调校焊死自家卖场，能搬的只有模型而模型它不生产）；UE5（无浏览器原生构建，Pixel Streaming 违背薄客户端）。
+- **否决记录**：toonlab（6★/商业双轨/非原神管线）；StarRailNPRShader+ChillyHub CRP（**GPL 传染——抄一行=全游戏被迫开源**，只学思想）；Bevy+WASM（web 实测慢于 JS+玩家必须写 Rust 违背自绘灵魂）；Unity（MCP 能开发但运行时 IL2CPP 焊死玩家代码进不去——造"微信"满分，造"小程序平台"结构不合；"只借工厂"也不成立：编辑器调校焊死自家卖场，能搬的只有模型而模型它不生产）；UE5（无浏览器原生构建，Pixel Streaming 违背薄客户端）；Babylon.js（生态小 Three.js 一个量级，卡渲生态近零）；pixi3d（社区版停更三年+官方 3D beta 鸽着）；Godot NPR（需打引擎补丁才能正确卡渲光照+WASM 导出体积大，只借 shader 思想）。
+- **备件库**（不动用，需要时按 deleg_d7358e79 报告取）：three-liltoon（47★/MIT——Unity shader→网页自动移植管线的先例，证明 HLSL 直译 GLSL 成熟）；genshin-engine（npm/Apache-2.0——three.js WebGPU 上的动漫开放世界引擎，TSL 写法参考）；MMD 接入兜底双路=three.js 官方 MMDLoader（浏览器直载 PMX）+yohawing/three-mmd-loader（WebGPU 版）+mmd2gltf-gui（离线批量转 glTF）。
 - **美术生产管线**：Blender MCP（CC 操控，造默认模型/MMD 转换 PMX→glTF）+生图贴图+CC 写 shader；模型格式 glTF（Three.js 原生）。MMD 版权红线：主推 VRM 生态（VRoid 授权分级），上传强制授权声明+侵权下架机制。
 - **四阶段路径**（预估 6-10 周到可玩 demo）：1 跑通参考（KallkaGo demo+读 MToon 源码）→ 2 抽取自建（shader 入仓包 GenshinToonMaterial）→ 3 补短板（头发天使光自写+ILM 贴图管线对齐）→ 4 性能管线（同屏10-30角色：共享材质/ramp atlas/instancing/LOD；移动端3-8）。
 - **验收门（土豆 1022 拍板）**：第 1 步完成即"跑通 demo 给土豆过目"——眼见为实再决定继续，风险锁死在第一周。
