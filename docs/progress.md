@@ -3,7 +3,7 @@
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
 ## 现在（2026-10-22 D-051a 皮入沙箱 收工更新）
-- 在做：D-051a 已落地（沙箱资产段+配额+镜像分发——沙箱三段论代码/数据/皮，夺沙箱=夺全套；沙箱 SandboxData.assets+Entity.assets 双处镜像、换血随行+配额门（拒绝换血资产不丢）、AssetMirror sha256 去重、快照 v2.4 asset_ids 恒有字段+前端取图兜底；快照版本 v2.4（卡面写 v2.3 已被 D-012 占用顺延）；1029 测试全绿。与并发会话共做一张卡——mirror/config 实现由兄弟会话完成，本会话完成 arena/core/main/net/前端/docs，详见报告）
+- 在做：D-051a 已落地并双审闭环（沙箱资产段+配额+镜像分发——沙箱三段论代码/数据/皮，夺沙箱=夺全套；沙箱 SandboxData.assets+Entity.assets 双处镜像、换血随行+配额门（拒绝换血资产不丢）、AssetMirror sha256 去重、快照 v2.4 asset_ids 恒有字段+前端取图兜底；快照版本 v2.4（卡面写 v2.3 已被 D-012 占用顺延）。宪法级审查链完整：实现三连 commit（cbf609c/2952db7/3721e69）→ R1 审查（P1×1 配额门 fail-closed+P2×3）→ 返工 198fbed → **R2 确认双审双 PASS**（质量 sonnet/需求 opus 跨模型只读——质量审四项必改全 CONFIRMED 无新缺陷、需求审卡面五点全 SATISFIED 边界三项如实未越界）；当前 workspace 1063 全绿 clippy 0 错。与并发会话共做一张卡——mirror/config 实现由兄弟会话完成，本会话完成 arena/core/main/net/前端/docs，详见报告）
 - 卡在：浏览器取图/贴图渲染人工验收留土豆（沙箱无浏览器权限）；单沙箱资产配额 1MB 待土豆拍板
 - 下一步：① D-051a 人工验收（土豆：上传两张同图→日志看 [mirror] 同指纹去重；换血带皮实体→日志 [skin] 资产随行；浏览器看皮肤贴图渲染+断网兜底圆形）② 出生装戴=spawn 参数化挂皮刀（装戴清单写入通路+SandboxAssetQuota.admit 接 runtime）③ D-003 人工验收（土豆：api.md spawn 节 motion 行+ decisions #048 + 浏览器看 creation_dynamic 圆渲染；或跑测试 process_spawns_dynamic_* / step_dynamic_creation_* 族）④ D-007 人工验收（watch 日志看 [shoot-unreachable]/[contact]/[will] 三族日志行，或直接跑 start.bat 观察地雷/遗嘱玩法雏形）⑤ 期五第六刀人工验收（土豆浏览器五场景：地面点高空的 S→真弧线高抛命中；点超远目标→灰字"够不着"不发弹；哑弹落地→灰圈尘点无红✕，步骤见 cc-report.md）⑥ 期五第五刀人工验收（断线常驻四场景，见上轮 cc-report.md）⑦ design-binding.md 排期：活弹+外接算力桥同期（大件）→弹弹相撞（中刀）⑧ wasmtime out-of-fuel trap 生产化阻断（.cc-bugs #5，D-007 遗嘱预算同样受制）⑨ 已知 MVP 缺口同前（probe 残影答 on_probe/门二销毁通路/弹丸互撞拦截射弹）⑩ 期五候补：物理场调制接口、发射痕迹进快照
 
