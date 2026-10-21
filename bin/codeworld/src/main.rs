@@ -14,6 +14,7 @@
 mod config;
 mod dispose;
 mod input;
+mod mirror;
 mod net;
 mod players;
 
@@ -139,6 +140,12 @@ struct EntitySandboxMap {
     /// push_snapshot 随快照广播后由 tick 下一拍清空（读走即清，无观众=丢弃）。
     /// 只缓冲一拍（事件是新闻不是档案）
     attack_events: Vec<AttackEventRecord>,
+    /// 资产镜像仓（#051 皮入沙箱）：换血配额校验按指纹查实大小用。main() 从
+    /// D-017 登记表建仓（同图全局一份）；测试基线空仓
+    asset_mirror: mirror::AssetMirror,
+    /// 单沙箱资产配额（#051：引擎+魂+皮合计封顶）。main() 从 config.asset_quota
+    /// 装配（CODEWORLD_ASSET_QUOTA 覆盖）；测试基线取 arena 常数默认
+    asset_quota: usize,
 }
 
 impl EntitySandboxMap {
@@ -192,6 +199,8 @@ impl EntitySandboxMap {
             attack_events: Vec::new(),
             projectiles: HashMap::new(),
             traces: Vec::new(),
+            asset_mirror: mirror::AssetMirror::new(),
+            asset_quota: codeworld_arena::assets::SANDBOX_ASSET_QUOTA_BYTES,
         })
     }
 
@@ -259,6 +268,15 @@ impl EntitySandboxMap {
     /// 移除实体沙箱（实体死亡时调用，销毁 WASM 实例释放内存）
     fn remove(&mut self, entity_id: &EntityId) {
         if let Some(handle) = self.sandboxes.remove(entity_id) {
+            // #051 存在性同构：沙箱亡=资产段亡（drop 即亡零代码；带皮销毁 INFO 留痕）
+            let carried = handle.store.data().assets.len();
+            if carried > 0 {
+                tracing::info!(
+                    entity_id = %entity_id.0,
+                    count = carried,
+                    "[skin] 资产随沙箱消亡（资产生命周期=沙箱生命周期）"
+                );
+            }
             self.manager.destroy_sandbox(handle);
             tracing::debug!(entity_id = %entity_id.0, "沙箱销毁");
         }
@@ -628,6 +646,51 @@ impl EntitySandboxMap {
             };
             (handle.store.get_fuel()?, handle.store.data().fuel_limit)
         };
+        // #051 皮入沙箱·换血配额门（拒绝换血，资产不丢）：新模块字节+随行资产
+        // 合计超配额 → 拒绝（夺取方装不下自己的 payload 那是夺取失败）。校验在
+        // remove 之前——旧沙箱从未离开映射表，资产天然不丢。资产大小按指纹查
+        // 镜像仓实大小（不信任玩家自报）；查不到按 0 记 warn（容错不炸换血）
+        let module_bytes = if payload.is_empty() {
+            DEFAULT_KILL_WASM.len()
+        } else {
+            payload.len()
+        };
+        let carried: Vec<(String, usize)> = {
+            let Some(handle) = self.sandboxes.get(target_id) else {
+                anyhow::bail!("目标 {:?} 无沙箱，无法换血", target_id);
+            };
+            handle
+                .store
+                .data()
+                .assets
+                .iter()
+                .map(|id| {
+                    let size = self.asset_mirror.size_of(id).unwrap_or_else(|| {
+                        tracing::warn!(
+                            entity_id = %target_id.0,
+                            asset_id = %id,
+                            "[skin] 资产不在镜像仓，配额按 0 记（容错）"
+                        );
+                        0
+                    });
+                    (id.clone(), size)
+                })
+                .collect()
+        };
+        // 无皮/有皮同一扇门：配额语义=引擎+皮合计（空清单=纯模块校验）
+        let quota = codeworld_arena::assets::SandboxAssetQuota::with_limit(self.asset_quota);
+        if let Err(over) = quota.admit_swap(module_bytes, &carried) {
+            let assets_bytes: usize = carried.iter().map(|(_, s)| s).sum();
+            tracing::warn!(
+                entity_id = %target_id.0,
+                module_bytes,
+                assets_bytes,
+                quota = self.asset_quota,
+                over,
+                "[skin] 换血拒绝：新模块+随行资产超配额（拒绝换血，资产不丢）"
+            );
+            anyhow::bail!("换血失败：模块+资产超配额（超额 {over} 字节）");
+        }
         let old = self
             .sandboxes
             .remove(target_id)
@@ -661,6 +724,17 @@ impl EntitySandboxMap {
             fuel_limit_restored = old_limit,
             "[replace_code] 目标沙箱已替换（路线A，fuel 继承剩余量，配额恢复原值）"
         );
+        // #051 夺沙箱=夺全套：资产段已随行进新沙箱（转移本体在 arena
+        // replace_sandbox 的 Ok 分支）；非空才打日志（换血频发，空清单不刷屏）
+        let carried_ids = self.sandboxes[target_id].store.data().assets.clone();
+        if !carried_ids.is_empty() {
+            tracing::info!(
+                entity = %target_id.0,
+                count = carried_ids.len(),
+                ids = ?carried_ids,
+                "[skin] 资产随行"
+            );
+        }
         // 检查 life()：false=击杀成功。
         // P1 修复（审查第一轮）：life() 无法执行（Err）= 攻击结果未知，按架构 4.2 默认行为
         // 处理（life 维持原值，不被覆写）-> 不判死。防止防守 fuel 被磨穿的边界下
@@ -901,6 +975,14 @@ fn main() -> Result<()> {
     sandbox_map.field_fuel = config.field_fuel;
     sandbox_map.field_forming_ticks = config.field_forming_ticks;
     sandbox_map.death_fuel = config.death_fuel;
+    // #051 皮入沙箱装配：资产镜像仓从 D-017 登记表建仓（同图全局一份，sha256
+    // 去重）+ 单沙箱资产配额（CODEWORLD_ASSET_QUOTA 覆盖）。登记表独立 load 一份
+    //（ws 线程的登记表归 net 模块，跨线程不共享句柄——镜像仓只在主循环侧用）
+    sandbox_map.asset_mirror =
+        mirror::AssetMirror::from_registry(&net::avatars::AvatarRegistry::load(std::path::Path::new(
+            net::AVATARS_DIR,
+        )));
+    sandbox_map.asset_quota = config.asset_quota;
     // 世界实体上限装配（门二 spawn 配套，decisions.md #020）
     sandbox_map.max_entities = config.max_entities;
 
@@ -5974,6 +6056,103 @@ mod tests {
             !to_kill.contains(&id),
             "失败后原沙箱应可继续 on_tick/life（to_kill={:?}）",
             to_kill
+        );
+    }
+
+    // === #051 皮入沙箱：换血随行 + 配额门（夺沙箱=夺全套，拒绝换血资产不丢）===
+
+    /// 测试助手：给镜像仓播种一条已知大小的资产（配额测试用；大小自定不依赖盘上文件）
+    fn seed_mirror_asset(map: &mut EntitySandboxMap, asset_id: &str, bytes: usize) {
+        map.asset_mirror.insert(mirror::MirroredAsset {
+            asset_id: asset_id.to_string(),
+            sha256: mirror::sha256_hex(&vec![0u8; bytes]),
+            bytes,
+            name: "quota-test".to_string(),
+            orig_w: 1,
+            orig_h: 1,
+            height_world: 2.0,
+            mask: codeworld_core::mask::AvatarMask::new(128, 128),
+        });
+    }
+
+    #[test]
+    fn replace_code_rejects_when_payload_plus_assets_exceed_quota() {
+        // 负面（卡面负面路径②，bin 端到端）：新模块字节+随行资产超配额 ->
+        // 拒绝换血（Err），旧沙箱原样保留、资产不丢（夺沙箱=夺全套：夺取方
+        // 装不下自己的 payload 那是夺取失败）
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(21));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        // 沙箱带着一张"大图"（镜像仓记账 1000B）；配额钳到 1000B，payload 本身
+        // 已占数百字节 -> 合计必超
+        map.sandboxes
+            .get_mut(&target_id)
+            .unwrap()
+            .store
+            .data_mut()
+            .assets = vec!["av_0123456789abcdef".to_string()];
+        seed_mirror_asset(&mut map, "av_0123456789abcdef", 1000);
+        map.asset_quota = 1000;
+        let payload = wasm(TARGET_WAT);
+        assert!(
+            map.replace_code(&target_id, &payload).is_err(),
+            "payload+资产超配额应拒绝换血"
+        );
+        // 资产不丢：旧沙箱仍在且清单原样
+        assert!(map.sandboxes.contains_key(&target_id), "拒绝后旧沙箱应保留");
+        assert_eq!(
+            map.sandboxes[&target_id].store.data().assets,
+            vec!["av_0123456789abcdef".to_string()],
+            "拒绝换血后资产清单应原样保留（不丢）"
+        );
+    }
+
+    #[test]
+    fn replace_code_transfers_assets_to_new_sandbox() {
+        // 正面（换血随行端到端）：replace_code 成功后新沙箱读得到完整资产清单
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(22));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        map.sandboxes
+            .get_mut(&target_id)
+            .unwrap()
+            .store
+            .data_mut()
+            .assets = vec![
+            "av_0123456789abcdef".to_string(),
+            "av_fedcba9876543210".to_string(),
+        ];
+        let killed = map
+            .replace_code(&target_id, &wasm(TARGET_WAT))
+            .expect("默认配额下合法 payload 应换血成功");
+        assert!(!killed, "life=true payload 不击杀");
+        assert_eq!(
+            map.sandboxes[&target_id].store.data().assets,
+            vec![
+                "av_0123456789abcdef".to_string(),
+                "av_fedcba9876543210".to_string()
+            ],
+            "换血后新沙箱应读得到完整资产清单（随行）"
+        );
+    }
+
+    #[test]
+    fn sandbox_removal_drops_assets_with_sandbox() {
+        // 死亡随行（#051 存在性同构）：沙箱销毁=资产段随沙箱亡——remove 后
+        // 沙箱条目消失，资产段无载体（不存在独立于沙箱的资产残留）
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(23));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        map.sandboxes
+            .get_mut(&target_id)
+            .unwrap()
+            .store
+            .data_mut()
+            .assets = vec!["av_0123456789abcdef".to_string()];
+        map.remove(&target_id);
+        assert!(
+            !map.sandboxes.contains_key(&target_id),
+            "沙箱销毁后条目应消失（资产段随沙箱亡，零残留）"
         );
     }
 

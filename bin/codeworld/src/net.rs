@@ -170,6 +170,11 @@ pub(crate) struct EntitySnapshot {
     pub disposition: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_left: Option<u64>,
+    /// 装戴清单指纹（v2.3，#051 皮入沙箱）：asset_id 列表，恒有字段空数组
+    /// （空盒省字段是优化，恒有=前端零可选分支，同 attacks/fields 先例）；
+    /// 快照只带指纹不带货——前端首见按 id 走 /assets HTTP 取图（世界只搬运
+    /// 不理解，修路不跑车）
+    pub asset_ids: Vec<String>,
 }
 
 /// kind 判定（纯映射，任务书定案）：开局四生物=npc；creation=造物（static 钉死）；
@@ -230,6 +235,7 @@ pub(crate) fn build_snapshot(
                     .then(|| e.owner.0.to_string()),
                 disposition: disposed.map(|s| s.wire_name()),
                 wait_left: disposed.and_then(|s| s.wait_left(now)),
+                asset_ids: e.assets.clone(),
             }
         })
         .collect();
@@ -744,6 +750,46 @@ mod tests {
             json["attacks"].as_array().map(Vec::len),
             Some(0),
             "attacks 空数组恒有"
+        );
+    }
+
+    // === v2.3 资产指纹（#051 皮入沙箱：快照只带 asset_id 不带货）===
+
+    #[test]
+    fn snapshot_entity_carries_asset_ids() {
+        // 规则（v2.3）：带皮实体的快照条目带 asset_ids（装戴清单指纹序列，
+        // 与 entity.assets 镜像一致；前端首见按 id 走 /assets HTTP 取图）
+        let mut world = WorldState::new();
+        let (id, _) = put_entity(&mut world, "attacker", "A", "red", (0.0, 0.0));
+        world
+            .entities
+            .get_mut(&id)
+            .unwrap()
+            .assets = vec!["av_0123456789abcdef".to_string()];
+        let dir = PlayerDirectory::disabled();
+        let json = build(&world, &dir, None);
+        let e = &json["entities"][0];
+        assert_eq!(
+            e["asset_ids"],
+            serde_json::json!(["av_0123456789abcdef"]),
+            "快照应携带装戴清单指纹（不带货）"
+        );
+    }
+
+    #[test]
+    fn snapshot_asset_ids_empty_array_always_present() {
+        // 规则（v2.3）：无皮实体 asset_ids=[] 恒有字段（空盒省字段是优化，恒有=
+        // 前端零可选分支，同 attacks/fields 先例）
+        let mut world = WorldState::new();
+        put_entity(&mut world, "attacker", "A", "red", (0.0, 0.0));
+        let dir = PlayerDirectory::disabled();
+        let json = build(&world, &dir, None);
+        assert_eq!(
+            json["entities"][0]["asset_ids"]
+                .as_array()
+                .map(Vec::len),
+            Some(0),
+            "asset_ids 空数组恒有"
         );
     }
 

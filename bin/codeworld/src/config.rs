@@ -89,6 +89,12 @@ pub struct Config {
     /// 力场成型期拍数（D-012 可视铁律：诞生 N 拍内不结算物理但已可见，给进攻
     /// 方反应窗），默认 FIELD_FORMING_TICKS=3。CODEWORLD_FIELD_FORMING 覆盖。
     pub field_forming_ticks: u64,
+    /// 单沙箱资产配额（#051 皮入沙箱：引擎+魂+皮合计封顶，Screeps 5MB 思路），
+    /// 默认 SANDBOX_ASSET_QUOTA_BYTES=1MB（与 64MB 内存上限≈1/64，资产=富余量
+    /// 非主粮）。换血时新模块+随行资产超配额 → 拒绝换血（资产不丢）。
+    /// ⚠️ 临时值待土豆拍板（同 MASK_FRAG_DROP_N 先例）。CODEWORLD_ASSET_QUOTA 覆盖；
+    /// 0/非法值回退默认（0 会让空模块换血也被拒，无"禁皮"语义，坏值不进世界）。
+    pub asset_quota: usize,
 }
 
 impl Default for Config {
@@ -118,6 +124,7 @@ impl Default for Config {
             death_fuel: 200_000,
             field_fuel: 10_000,
             field_forming_ticks: codeworld_core::physics::FIELD_FORMING_TICKS,
+            asset_quota: codeworld_arena::assets::SANDBOX_ASSET_QUOTA_BYTES,
         }
     }
 }
@@ -227,6 +234,17 @@ impl Config {
         }
         if let Some(n) = env_u64("CODEWORLD_FIELD_FORMING") {
             cfg.field_forming_ticks = n;
+        }
+        // #051 单沙箱资产配额（解析失败/0 保留默认值——0 无"禁皮"语义，坏值不进世界）
+        if let Some(n) = env_usize("CODEWORLD_ASSET_QUOTA") {
+            if n == 0 {
+                tracing::warn!(
+                    value = n,
+                    "[config] CODEWORLD_ASSET_QUOTA=0 无效（会拒绝一切换血），回退默认 1MB"
+                );
+            } else {
+                cfg.asset_quota = n;
+            }
         }
         cfg
     }
@@ -750,5 +768,45 @@ mod tests {
             codeworld_core::terrain::TerrainPreset::Flat,
             "非法值装配层 parse 应回退平地"
         );
+    }
+
+    // === 单沙箱资产配额（#051 皮入沙箱，CODEWORLD_ASSET_QUOTA）===
+
+    #[test]
+    fn default_asset_quota_matches_arena_constant() {
+        // 创建：默认 1MB 与 arena 常数同源（game-menu 1.7 总账锚，⚠️ 待拍板）
+        let c = Config::default();
+        assert_eq!(
+            c.asset_quota,
+            codeworld_arena::assets::SANDBOX_ASSET_QUOTA_BYTES,
+            "资产配额默认应与 arena 常数同源"
+        );
+    }
+
+    #[test]
+    fn load_asset_quota_env_overrides_default() {
+        // 修改：CODEWORLD_ASSET_QUOTA 覆盖默认（临时值可调）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_ASSET_QUOTA", "4096");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_ASSET_QUOTA");
+        assert_eq!(c.asset_quota, 4096, "环境变量应覆盖资产配额");
+    }
+
+    #[test]
+    fn load_asset_quota_invalid_or_zero_falls_back_to_default() {
+        // 边界：非法值/0 -> 回退默认 1MB（0 会拒绝一切换血，无"禁皮"语义；
+        // 容错语义同其他数值项）
+        let _g = ENV_LOCK.lock().unwrap();
+        for bad in ["0", "not-a-number"] {
+            std::env::set_var("CODEWORLD_ASSET_QUOTA", bad);
+            let c = Config::load();
+            std::env::remove_var("CODEWORLD_ASSET_QUOTA");
+            assert_eq!(
+                c.asset_quota,
+                codeworld_arena::assets::SANDBOX_ASSET_QUOTA_BYTES,
+                "非法值 {bad} 应回退默认资产配额"
+            );
+        }
     }
 }

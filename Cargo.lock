@@ -222,6 +222,7 @@ dependencies = [
  "png",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite 0.21.0",
  "tower-http",

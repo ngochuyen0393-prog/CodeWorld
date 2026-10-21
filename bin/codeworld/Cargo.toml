@@ -35,6 +35,8 @@ tower-http = { version = "0.5", features = ["fs"] }
 futures-util = "0.3"
 # 资产 ID 生成（D-017 头像资产 av_ + UUID 前 16 hex）
 uuid = { workspace = true }
+# SHA-256 指纹（#051 资产镜像仓：同图全局一份——内容寻址去重判据）
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # 测试构造固定 EntityId

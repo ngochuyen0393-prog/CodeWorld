@@ -263,6 +263,8 @@
   var logoutPanelBusy = false;  // 弹窗决策/淡出进行中：禁一切面板交互（防双发 logout）
   var avatarAssets = [];        // D-017 资产调试面板 [{id,url,w,h,canvas}]——canvas=128x128
                                 // 离屏掩码图（实心白半透明），avatar_assets 消息到达即重建
+  var skinCache = new Map();    // #051 皮入沙箱：asset_id -> {img, state:'loading'|'ready'|'failed'}
+                                // 已见 id 复用缓存（同图全局一份）；failed 恒兜底圆形不再重试
 
   // ---- 快照接收：入缓冲 + 帧间隔滚动平均 ----
   function onMessage(ev) {
@@ -331,6 +333,14 @@
     projPrev = newProjPrev;
     // 和解（第四刀 A3）：P 的服务器坐标与该 tick 的预测坐标对账
     reconcileSnapshot(snap.tick, ents, now);
+    // 皮取图触发（#051）：快照里首见的 asset_id 起一次 HTTP 拉图入缓存；
+    // 已见 id 复用缓存（同图全局一份），failed 恒兜底圆形不再重试
+    ents.forEach(function (e) {
+      var ids = e.asset_ids;
+      if (Array.isArray(ids)) {
+        for (var si = 0; si < ids.length; si++) ensureSkin(ids[si]);
+      }
+    });
     // 状态栏数字取最新帧（实时性优先；插值只作用于画面位置）
     tickEl.textContent = String(snap.tick);
     cntEl.textContent = String(snap.entities.length);
@@ -372,7 +382,18 @@
     assetsEl.textContent = String(built.length);
   }
 
-  // 调试面板渲染（画布左上角）：每张掩码 64x64 + asset_id 前 8 位——
+  // ---- #051 皮入沙箱：皮肤贴图缓存（首见拉图，已见复用，失败恒兜底圆形）----
+  function ensureSkin(id) {
+    if (!id || typeof id !== 'string' || skinCache.has(id)) return;
+    var img = new Image();
+    var entry = { img: img, state: 'loading' };
+    img.onload = function () { entry.state = 'ready'; };
+    img.onerror = function () { entry.state = 'failed'; };
+    img.src = '/assets/avatars/' + id + '.png'; // D-017 ServeDir 同源路径（net-protocol §9）
+    skinCache.set(id, entry);
+  }
+
+  // 调试面板渲染（画布左上角）：每张掩码 64x64 + asset_id 首 8 位——
   // 肉眼验收"掩码对得上原图"；掩码挂实体渲染=后续刀，本卡不碰
   function drawAvatarPanel() {
     if (avatarAssets.length === 0) return;
@@ -1100,6 +1121,24 @@
         ctx.strokeStyle = '#ffffff';              // 操控目标白色描边框
         ctx.lineWidth = 2;
         ctx.strokeRect(p.x - half - 2, p.y - half - 2, half * 2 + 4, half * 2 + 4);
+      }
+      // 皮渲染（#051）：装戴清单里的资产按实体 radius 贴图（等比适配身体圆外
+      // 接方，像素风关平滑）；图未加载/加载失败 → 不画（VRChat 替身兜底：回落
+      // 上面已画的默认身体圆+glyph，前端零阻塞）
+      var ids = e.asset_ids;
+      if (Array.isArray(ids)) {
+        for (var ski = 0; ski < ids.length; ski++) {
+          var sk = skinCache.get(ids[ski]);
+          if (!sk || sk.state !== 'ready' || !sk.img.naturalWidth) continue;
+          var rPx = Math.max(cell * (e.radius || 0.5), 6);
+          var iw = sk.img.naturalWidth, ih = sk.img.naturalHeight;
+          var dw = rPx * 2, dh = rPx * 2;
+          if (iw > ih) { dh = dw * ih / iw; } else { dw = dh * iw / ih; } // 等比适配
+          ctx.save();
+          ctx.imageSmoothingEnabled = false; // 像素风缩放（锐利不糊）
+          ctx.drawImage(sk.img, p.x - dw / 2, p.y - dh / 2, dw, dh);
+          ctx.restore();
+        }
       }
       ctx.fillStyle = e.color;
       ctx.fillText(e.glyph, p.x, p.y);
