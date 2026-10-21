@@ -280,9 +280,10 @@ impl Terrain {
         // 域外段处理（近似口径，如实记录）：域外地面语义=域边高度恒定延伸
         //（与 height() 钳制一致），实现上把域外 x 钳进边格、在边格线性段的
         // 延长线上解根——平地（边格等高）时延长线与延伸面重合无误差；边格
-        // 有坡度时是外推近似，误差随域外距离按段斜率放大（斜率≤max_slope×
-        // spacing）。恒定面精确解为已知改进项（.cc-bugs #20），平地射程标定
-        // 等既有用例不受影响（边格等高时两口径逐位一致）
+        // 有坡度时是外推近似，误差随域外距离线性放大（每采样段高差
+        // ≤max_slope×spacing，即每格坡度≤max_slope）。恒定面精确解为已知
+        // 改进项（.cc-bugs #20），平地射程标定等既有用例不受影响（边格等高
+        // 时两口径逐位一致）
         let dir = dx.signum();
         let cell_of = |x: f64| -> usize {
             (((x - TERRAIN_X_MIN) / TERRAIN_SPACING).floor() as i64)
@@ -312,7 +313,7 @@ impl Terrain {
             // 浮点噪声，绝不能用半格级容差：段的延长线处真实地面已偏离
             // 该段线性，外推根=假落点）。
             // 例外：边格延伸——i=0（左界）/i=n-2（右界）的段在域外按上述
-            // 近似口径放行延长线根（见函数头"域外段处理"注记）
+            // 近似口径放行延长线根（见上文"域外段处理"注记）
             let tx = x0 + t * dx;
             let xa = TERRAIN_X_MIN + i as f64 * TERRAIN_SPACING;
             let xb = TERRAIN_X_MIN + (i + 1) as f64 * TERRAIN_SPACING;
