@@ -13,6 +13,8 @@ use codeworld_core::terrain::{TERRAIN_SPACING, TERRAIN_X_MIN};
 use codeworld_core::world::WorldState;
 use std::collections::{HashMap, HashSet};
 
+use crate::fields::{effective_gravity_drag, FieldEffect};
+
 /// 接触对（两个身体相触的实体，detect_touching 产出）
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollisionPair {
@@ -207,12 +209,15 @@ impl DefaultPhysicsEngine {
     ///    #031 判据复用，打不中 = 哑弹）
     ///
     /// - `shooters`：弹丸 -> 发射者映射（主程序持有；出生拍起豁免发射者的数据源）
+    /// - `fields`：本拍场清单（D-012：弹丸是场的第一消费者——护弹道场域内弹丸
+    ///   按改后重力/阻力被积分；域外/空清单=世界默认，零回归锚）
     /// - 返回事件按弹丸 id 升序（确定序，主程序结算不依赖遍历随机性）
     pub fn step_projectiles(
         &self,
         world: &mut WorldState,
         current_tick: u64,
         shooters: &HashMap<EntityId, EntityId>,
+        fields: &[FieldEffect],
     ) -> Vec<ProjectileEvent> {
         let mut events = Vec::new();
         let mut ids: Vec<EntityId> = world
@@ -239,10 +244,11 @@ impl DefaultPhysicsEngine {
                 events.push(ProjectileEvent::Expired { projectile: pid });
                 continue;
             }
-            // 2. 重力（吃满，无 aloft 豁免）
-            vel.1 += self.params.gravity;
-            // 3. 阻力定律（质量为分母）
-            vel = apply_drag(vel, mass, self.params.drag_coefficient);
+            // 2. 重力（吃满，无 aloft 豁免；D-012 力场域内用生效重力）
+            // 3. 阻力定律（质量为分母；域内用生效阻力——护弹道场第一消费者）
+            let (eff_gravity, eff_drag) = effective_gravity_drag(before, &self.params, fields);
+            vel.1 += eff_gravity;
+            vel = apply_drag(vel, mass, eff_drag);
             // 3.5 世界极速钳制（#034 修订一，双审 P1-A 修复）：积分后（重力+阻力）、
             // 位移前归一化压回——重力累积从此封顶，弹丸一拍位移不超过极速。
             // 视觉可读性常数：攻击永远看得见飞过来（发射端钳制见 arena shoot import，
@@ -418,6 +424,8 @@ impl DefaultPhysicsEngine {
     /// max(terrain, r) 保底脚贴地不陷入；y=0 半径线是平地地形的特例）；
     /// 落点面上有身体→落到恰好接触的高度——堆叠合法，
     /// 底下的走了上面的自然下落。落点只在 from_y 及以下取（不向上传送）。
+    /// `gravity`：本拍生效重力（D-012 力场域内=叠加 v2 结算值，域外=世界默认——
+    /// 由调用方传 effective_gravity_drag 产物，本函数不做域判定）
     fn circle_landing_y(
         &self,
         world: &WorldState,
@@ -425,8 +433,9 @@ impl DefaultPhysicsEngine {
         me_x: f64,
         me_r: f64,
         from_y: f64,
+        gravity: f64,
     ) -> f64 {
-        let fall_to = from_y + self.params.gravity; // gravity 为负值
+        let fall_to = from_y + gravity; // 生效重力为负值（域钳制保证 ≤0）
         let landing = self.circle_landing_surface(world, me_id, me_x, me_r, from_y);
         if fall_to >= landing {
             fall_to
@@ -438,14 +447,24 @@ impl DefaultPhysicsEngine {
     /// 执行完整默认物理步骤：重力落点解析 -> 速度限制（#030 半径物理）
     ///
     /// - `aloft`：本拍悬停实体集合（操控层飞行意图注入）——免重力（被挡≠坠落，
-    ///   期四第五刀 bug 根治；升力是意图层持续作用，不随移动被挡取消）
+    ///   期四第五刀 bug 根治；升力是意图层持续作用，不随移动被挡取消）。
+    ///   aloft 优先级高于场（D-012）：悬停声明本拍免重力，场不覆盖它——每拍
+    ///   重申语义不变，悬停在世界重力前短路
+    /// - `fields`：本拍场清单（main 每拍收集，登记制刷场）——域内实体按改后
+    ///   参数被结算（叠加 v2 代数和+域钳制，见 fields::effective_gravity_drag）；
+    ///   空清单=无场世界，行为与 D-012 前逐位一致（零回归锚）
     /// - 圆实体：落点解析（地面=半径线 / 落在身体上=接触即停，见 circle_landing_y）
     /// - 造物（creation，格对齐 AABB）：直落地面（y≥ground_y），落点身体重叠则
     ///   悬停原位下拍重试（造物运动罕见，MVP 不做 AABB 堆叠解析）
     /// - 弹丸（#034）：跳过——弹丸是速度积分制物体，由 step_projectiles 接管；
     ///   本步的位置重力制（落到半径线）会瞬移弹丸
     /// - 实体按 EntityId 升序处理（确定序，与移动裁决同源）
-    pub fn step(&self, world: &mut WorldState, aloft: &HashSet<EntityId>) -> Vec<PhysicsChange> {
+    pub fn step(
+        &self,
+        world: &mut WorldState,
+        aloft: &HashSet<EntityId>,
+        fields: &[FieldEffect],
+    ) -> Vec<PhysicsChange> {
         let mut changes = Vec::new();
         // 实体 id 升序（裁决确定序）
         let mut ids: Vec<EntityId> = world.entities.keys().copied().collect();
@@ -480,6 +499,9 @@ impl DefaultPhysicsEngine {
                 tracing::debug!(entity_id = %id.0, "[step] 悬停中，本拍免重力");
                 continue;
             }
+            // D-012 力场：本实体所处位置的生效重力/阻力（叠加 v2；空清单快速路径
+            // 逐位返回默认值——无场世界行为与力场刀前一致）
+            let (eff_gravity, eff_drag) = effective_gravity_drag(before, &self.params, fields);
             // 分支选择（顺序固定，测试锚定）：static 造物→直落地面；带速度实体
             //（生物+dynamic 造物）→ D-010a 冲量路径（速度积分）；零速→落点制（现状）。
             // 产物：new_pos（本拍新坐标）+ ballistic_vel（Some=冲量路径要写回的速度）
@@ -490,7 +512,7 @@ impl DefaultPhysicsEngine {
                 let ground_here = terrain_ground_for_creation(world, before.0);
                 let target = (
                     before.0,
-                    (before.1 + self.params.gravity).max(ground_here),
+                    (before.1 + eff_gravity).max(ground_here),
                 );
                 let (tmin, tmax) = creation_aabb(target);
                 let blocked = world.entities.iter().any(|(oid, e)| {
@@ -521,9 +543,10 @@ impl DefaultPhysicsEngine {
                 // 被落地解析当场吃掉跳不起来；中点法拍 1 位移 2.85，落在"跳 ≤3 格高"
                 // 锚点内（thrust_ballistic_jump_peak_within_three_grid_anchor 锚定）。
                 let mut vel = me_vel;
-                vel.1 += self.params.gravity; // 重力入速度（空中累积；落地清零见下）
-                // 阻力定律（#045 通用化口径：一切有速度实体，质量为分母）
-                vel = apply_drag(vel, me_mass, self.params.drag_coefficient);
+                vel.1 += eff_gravity; // 生效重力入速度（空中累积；落地清零见下）
+                // 阻力定律（#045 通用化口径：一切有速度实体，质量为分母；域内用
+                // 生效阻力——护弹道场在生物/dynamic 造物上的直接作用点）
+                vel = apply_drag(vel, me_mass, eff_drag);
                 // 世界极速钳制（与弹丸/dynamic 造物同款：积分后归一化压回，方向不变）
                 let speed2 = vel.0 * vel.0 + vel.1 * vel.1;
                 let max_speed = self.params.max_speed;
@@ -559,14 +582,14 @@ impl DefaultPhysicsEngine {
                 }
             } else {
                 // 生物 + dynamic 造物（D-003 全活）：零速走落点制（现状管线）
-                let ly = self.circle_landing_y(world, id, before.0, me_r, before.1);
+                let ly = self.circle_landing_y(world, id, before.0, me_r, before.1, eff_gravity);
                 ((before.0, ly), None)
             };
             // D-003 dynamic 造物速度矢量定律（v≡0 时零效果）：阻力衰减 + 世界极速
             // 钳制（#045 口径）。注意：带速度的 dynamic 造物上面已走冲量路径（定律
             // 在路径内统一结算），此处只处理零速残留（恒等变换，行为零变化）
             if is_dyn_creation && ballistic_vel.is_none() {
-                let mut vel = apply_drag(me_vel, me_mass, self.params.drag_coefficient);
+                let mut vel = apply_drag(me_vel, me_mass, eff_drag);
                 let speed2 = vel.0 * vel.0 + vel.1 * vel.1;
                 let max_speed = self.params.max_speed;
                 if speed2 > max_speed * max_speed {
@@ -751,7 +774,7 @@ mod tests {
         let e = make_entity(1, 5.0, 10.0, 0);
         let id = e.id;
         world.entities.insert(id, e);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id).unwrap().pos(), (5.0, 0.5), "落点=半径线 y=0.5");
     }
 
@@ -763,7 +786,7 @@ mod tests {
         let e = make_entity(1, 5.0, 0.5, 0);
         let id = e.id;
         world.entities.insert(id, e);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id).unwrap().pos(), (5.0, 0.5));
     }
 
@@ -779,7 +802,7 @@ mod tests {
         let id_h = h.id;
         world.entities.insert(id_d, d);
         world.entities.insert(id_h, h);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id_h).unwrap().pos(), (10.0, 1.5), "落在 D 头上");
         assert_eq!(world.entities.get(&id_d).unwrap().pos(), (10.0, 0.5), "底下的不受影响");
     }
@@ -795,12 +818,12 @@ mod tests {
         let id_h = h.id;
         world.entities.insert(id_d, d);
         world.entities.insert(id_h, h);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id_h).unwrap().pos(), (10.0, 1.5), "D 在脚下时 H 稳定");
         let mut d = world.entities.remove(&id_d).unwrap();
         d.set_pos((20.0, 0.5)); // D 挪走
         world.entities.insert(id_d, d);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id_h).unwrap().pos(), (10.0, 0.5), "D 走了 H 落地");
     }
 
@@ -815,7 +838,7 @@ mod tests {
         let id_h = h.id;
         world.entities.insert(id_t, t);
         world.entities.insert(id_h, h);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id_h).unwrap().pos(), (10.5, 1.5), "落在塔顶");
     }
 
@@ -830,7 +853,7 @@ mod tests {
         let id_h = h.id;
         world.entities.insert(id_d, d);
         world.entities.insert(id_h, h);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id_h).unwrap().pos(), (11.6, 0.5), "从旁边落过到地面");
         let _ = id_d;
     }
@@ -845,7 +868,7 @@ mod tests {
         world.entities.insert(id, e);
         let mut aloft = HashSet::new();
         aloft.insert(id);
-        engine.step(&mut world, &aloft);
+        engine.step(&mut world, &aloft, &[]);
         assert_eq!(world.entities.get(&id).unwrap().pos(), (5.0, 10.0), "悬停中不落");
     }
 
@@ -857,7 +880,7 @@ mod tests {
         let t = make_creation(1, 10.0, 5.0);
         let id = t.id;
         world.entities.insert(id, t);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id).unwrap().pos(), (10.0, 0.0), "造物落地 y=0");
     }
 
@@ -872,7 +895,7 @@ mod tests {
         let id_t = t.id;
         world.entities.insert(id_d, d);
         world.entities.insert(id_t, t);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id_t).unwrap().pos(), (10.0, 5.0), "落点重叠悬停原位");
     }
 
@@ -895,7 +918,7 @@ mod tests {
         assert!(codeworld_core::collision::is_dynamic_creation(&t));
         let id = t.id;
         world.entities.insert(id, t);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(
             world.entities.get(&id).unwrap().pos(),
             (10.0, 0.5),
@@ -914,7 +937,7 @@ mod tests {
         let id_b = ball.id;
         world.entities.insert(id_t, tower);
         world.entities.insert(id_b, ball);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(
             world.entities.get(&id_b).unwrap().pos(),
             (10.5, 1.5),
@@ -938,7 +961,7 @@ mod tests {
         let id_b = b.id;
         world.entities.insert(id_a, a);
         world.entities.insert(id_b, b);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         let (avx, avy) = world.entities.get(&id_a).unwrap().velocity();
         assert!(
             (avx - 9.5).abs() < 1e-9,
@@ -970,7 +993,7 @@ mod tests {
         t.set_velocity((99.0, 0.0)); // 即使被硬塞速度，static 造物也不吃物理
         let id = t.id;
         world.entities.insert(id, t);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(
             world.entities.get(&id).unwrap().pos(),
             (10.0, 0.0),
@@ -996,13 +1019,13 @@ mod tests {
         let id2 = e2.id;
         world.entities.insert(id1, e1);
         world.entities.insert(id2, e2);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "id 小者落地");
         assert!(
             (world.entities.get(&id2).unwrap().pos().1 - 2.2).abs() < 1e-9,
             "e2 自由落到 e1 上方（浮点容差断言）"
         );
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 1.5), "e2 落在 e1 头上");
     }
 
@@ -1017,7 +1040,7 @@ mod tests {
         let id2 = e2.id;
         world.entities.insert(id1, e1);
         world.entities.insert(id2, e2);
-        let changes = engine.step(&mut world, &HashSet::new());
+        let changes = engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.5), "异常重叠不推挤");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (5.0, 0.5), "异常重叠不推挤");
         assert!(
@@ -1035,7 +1058,7 @@ mod tests {
         e.kill();
         let id = e.id;
         world.entities.insert(id, e);
-        let changes = engine.step(&mut world, &HashSet::new());
+        let changes = engine.step(&mut world, &HashSet::new(), &[]);
         assert!(changes.is_empty(), "死亡实体不应产生物理变更");
         assert_eq!(world.entities.get(&id).unwrap().pos(), (5.0, 100.0)); // y 未减
     }
@@ -1048,14 +1071,14 @@ mod tests {
         let e = make_entity(1, 5.0, 100.0, 0);
         let id = e.id;
         world.entities.insert(id, e);
-        let changes = engine.step(&mut world, &HashSet::new());
+        let changes = engine.step(&mut world, &HashSet::new(), &[]);
         assert!(
             changes.iter().any(|c| c.reason == PhysicsReason::Gravity),
             "应产生重力变更"
         );
         assert_eq!(world.entities.get(&id).unwrap().pos(), (5.0, 90.2), "单拍 -9.8");
         for _ in 0..20 {
-            engine.step(&mut world, &HashSet::new());
+            engine.step(&mut world, &HashSet::new(), &[]);
         }
         assert_eq!(world.entities.get(&id).unwrap().pos(), (5.0, 0.5), "最终落到半径线");
     }
@@ -1200,10 +1223,10 @@ mod tests {
         let p = make_projectile(1, (0.0, 10.0), (4.0, 9.8), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
         assert!(events.is_empty(), "前两拍无事件（还在飞）");
         assert!(near(world.entities.get(&pid).unwrap().pos(), (3.8, 10.0)));
-        engine.step_projectiles(&mut world, 2, &HashMap::new());
+        engine.step_projectiles(&mut world, 2, &HashMap::new(), &[]);
         assert!(near(world.entities.get(&pid).unwrap().pos(), (7.41, 0.69)));
     }
 
@@ -1218,7 +1241,7 @@ mod tests {
         let p = make_projectile(1, (3.0, 0.2), (1.0, 0.0), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
         assert_eq!(events.len(), 1);
         match &events[0] {
             ProjectileEvent::Landed { projectile, point } => {
@@ -1241,7 +1264,7 @@ mod tests {
         let p = make_projectile(1, (0.0, 10.0), (5.0, 9.8), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        let events = engine.step_projectiles(&mut world, PROJECTILE_MAX_AGE_TICKS + 1, &HashMap::new());
+        let events = engine.step_projectiles(&mut world, PROJECTILE_MAX_AGE_TICKS + 1, &HashMap::new(), &[]);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], ProjectileEvent::Expired { projectile: pid });
         assert!(!world.entities.get(&pid).unwrap().is_alive());
@@ -1265,9 +1288,9 @@ mod tests {
         let p = make_projectile(1, (0.0, 10.0), (1.8, 19.6), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
         assert!(events.is_empty(), "第一拍未接触");
-        let events = engine.step_projectiles(&mut world, 2, &HashMap::new());
+        let events = engine.step_projectiles(&mut world, 2, &HashMap::new(), &[]);
         assert_eq!(events.len(), 1, "第二拍接触命中");
         match &events[0] {
             ProjectileEvent::HitBody { projectile, target, .. } => {
@@ -1295,7 +1318,7 @@ mod tests {
         let mut shooters = HashMap::new();
         shooters.insert(pid, sid);
         for t in 1..=6 {
-            let events = engine.step_projectiles(&mut world, t, &shooters);
+            let events = engine.step_projectiles(&mut world, t, &shooters, &[]);
             assert!(
                 events.iter().all(|e| !matches!(e, ProjectileEvent::HitBody { .. })),
                 "第 {t} 拍不应命中发射者"
@@ -1314,11 +1337,11 @@ mod tests {
         world.entities.insert(p1.id, p1);
         world.entities.insert(p2.id, p2);
         for t in 1..=2 {
-            let events = engine.step_projectiles(&mut world, t, &HashMap::new());
+            let events = engine.step_projectiles(&mut world, t, &HashMap::new(), &[]);
             assert!(events.is_empty(), "第 {t} 拍弹丸互穿不应有事件");
         }
         // 第三拍双双坠地（Landed），但仍无任何 HitBody（互穿语义）
-        let events = engine.step_projectiles(&mut world, 3, &HashMap::new());
+        let events = engine.step_projectiles(&mut world, 3, &HashMap::new(), &[]);
         assert!(
             events.iter().all(|e| !matches!(e, ProjectileEvent::HitBody { .. })),
             "弹丸互穿：坠地不算互撞，实际 {events:?}"
@@ -1338,7 +1361,7 @@ mod tests {
         world.entities.insert(cid, creation);
         let p = make_projectile(1, (0.0, 10.0), (3.0, 0.0), 0);
         world.entities.insert(p.id, p);
-        engine.step_projectiles(&mut world, 1, &HashMap::new());
+        engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
         assert_eq!(world.entities.get(&nid).unwrap().pos(), (8.0, 0.5), "普通实体不动");
         assert_eq!(world.entities.get(&cid).unwrap().pos(), (12.0, 0.0), "造物不动");
     }
@@ -1352,7 +1375,7 @@ mod tests {
         let p = make_projectile(1, (0.0, 10.0), (3.0, 0.0), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(
             world.entities.get(&pid).unwrap().pos(),
             (0.0, 10.0),
@@ -1376,7 +1399,7 @@ mod tests {
         world.entities.insert(pid, p);
         let mut range = None;
         for t in 1..=60 {
-            let events = engine.step_projectiles(&mut world, t, &HashMap::new());
+            let events = engine.step_projectiles(&mut world, t, &HashMap::new(), &[]);
             if let Some(ProjectileEvent::Landed { point, .. }) = events.first() {
                 range = Some(point.0 - x0);
                 break;
@@ -1414,7 +1437,7 @@ mod tests {
         world.entities.insert(pid, p);
         let mut peak = 0.0f64;
         for t in 1..=29 {
-            engine.step_projectiles(&mut world, t, &HashMap::new());
+            engine.step_projectiles(&mut world, t, &HashMap::new(), &[]);
             let (vx, vy) = world.entities.get(&pid).unwrap().velocity();
             let speed = (vx * vx + vy * vy).sqrt();
             peak = peak.max(speed);
@@ -1440,7 +1463,7 @@ mod tests {
         world.entities.insert(pid, p);
         for t in 1..=29 {
             let before = world.entities.get(&pid).unwrap().pos();
-            engine.step_projectiles(&mut world, t, &HashMap::new());
+            engine.step_projectiles(&mut world, t, &HashMap::new(), &[]);
             let after = world.entities.get(&pid).unwrap().pos();
             let moved = ((after.0 - before.0).powi(2) + (after.1 - before.1).powi(2)).sqrt();
             assert!(
@@ -1462,7 +1485,7 @@ mod tests {
         let p = make_projectile(1, (0.0, 10.0), (25.0, 0.0), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        engine.step_projectiles(&mut world, 1, &HashMap::new());
+        engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
         assert_eq!(
             world.entities.get(&pid).unwrap().velocity(),
             (25.0, 0.0),
@@ -1499,7 +1522,7 @@ mod tests {
         let p = make_projectile(1, (0.0, 20.0), (20.0, 0.0), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
         assert_eq!(events.len(), 1, "路径中点目标必须命中（点检查必漏的反例）");
         match &events[0] {
             ProjectileEvent::HitBody { target: t, .. } => assert_eq!(*t, tid),
@@ -1522,7 +1545,7 @@ mod tests {
         let p = make_projectile(1, (0.0, 20.0), (20.0, 0.0), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
         assert_eq!(events.len(), 1);
         match &events[0] {
             ProjectileEvent::HitBody { target, .. } => {
@@ -1541,7 +1564,7 @@ mod tests {
         let p = make_projectile(1, (0.0, 1.0), (20.0, -2.0), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
         assert_eq!(events.len(), 1);
         match &events[0] {
             ProjectileEvent::Landed { point, .. } => {
@@ -1560,7 +1583,7 @@ mod tests {
         let p = make_projectile(1, (0.0, 1.0), (20.0, -2.0), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        let _ = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        let _ = engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
         let corpse = world.entities.get(&pid).unwrap();
         assert!(
             (corpse.pos().1 - 0.15).abs() < 1e-9,
@@ -1582,7 +1605,7 @@ mod tests {
         let p = make_projectile(1, (0.0, 0.3), (10.0, -1.0), 0);
         let pid = p.id;
         world.entities.insert(pid, p);
-        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
         assert_eq!(events.len(), 1);
         match &events[0] {
             ProjectileEvent::HitBody { target: t, .. } => assert_eq!(*t, tid, "先触身体应撞体结算"),
@@ -1627,8 +1650,8 @@ mod tests {
         // shooters 表两遍共用（实现只 .get 点查不遍历，无关序）
         let mut shooters = HashMap::new();
         shooters.insert(EntityId(Uuid::from_u128(1)), EntityId(Uuid::from_u128(9)));
-        let ev_a = engine.step_projectiles(&mut world_a, 1, &shooters);
-        let ev_b = engine.step_projectiles(&mut world_b, 1, &shooters);
+        let ev_a = engine.step_projectiles(&mut world_a, 1, &shooters, &[]);
+        let ev_b = engine.step_projectiles(&mut world_b, 1, &shooters, &[]);
         // 事件序列逐位一致（ProjectileEvent 派生 PartialEq；含命中点坐标）
         assert_eq!(ev_a, ev_b, "同状态必然同事件序列（#044 纯函数要求）");
         assert!(!ev_a.is_empty(), "场景应产生事件（撞体/落地），空则锚退化");
@@ -1681,7 +1704,7 @@ mod tests {
                     world.entities.insert(e.id, e);
                 }
             }
-            let ev = engine.step_projectiles(&mut world, 1, &HashMap::new());
+            let ev = engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
             let mut fin: Vec<(EntityId, (f64, f64), bool)> = world
                 .entities
                 .iter()
@@ -1714,7 +1737,7 @@ mod tests {
             world.entities.insert(tid, target);
             let p = make_projectile(1, (0.0, 20.0), (speed, 0.0), 0);
             world.entities.insert(p.id, p);
-            let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
+            let events = engine.step_projectiles(&mut world, 1, &HashMap::new(), &[]);
             assert_eq!(
                 events.len(),
                 1,
@@ -1753,7 +1776,7 @@ mod tests {
         world.entities.insert(id, e);
         // 多拍下落到稳定（落点解析：落点=max(ground(x), r)——山顶尖上圆心=peak_h+r）
         for _ in 0..5 {
-            engine.step(&mut world, &HashSet::new());
+            engine.step(&mut world, &HashSet::new(), &[]);
         }
         let final_y = world.entities.get(&id).unwrap().pos().1;
         let expect = peak_h.max(0.5);
@@ -1786,7 +1809,7 @@ mod tests {
         let id = e.id;
         world.entities.insert(id, e);
         for _ in 0..5 {
-            engine.step(&mut world, &HashSet::new());
+            engine.step(&mut world, &HashSet::new(), &[]);
         }
         let final_y = world.entities.get(&id).unwrap().pos().1;
         let expect = valley_h.max(0.5);
@@ -1804,7 +1827,7 @@ mod tests {
         let e = make_entity(1, 5.0, 10.0, 0);
         let id = e.id;
         world.entities.insert(id, e);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         assert_eq!(
             world.entities.get(&id).unwrap().pos(),
             (5.0, 0.5),
@@ -1838,7 +1861,7 @@ mod tests {
         world.entities.insert(pid, p);
         let mut landed = None;
         for tick in 1..=30 {
-            let events = engine.step_projectiles(&mut world, tick, &HashMap::new());
+            let events = engine.step_projectiles(&mut world, tick, &HashMap::new(), &[]);
             if let Some(ProjectileEvent::Landed { point, .. }) = events.first() {
                 landed = Some(*point);
                 break;
@@ -1950,12 +1973,12 @@ mod tests {
         world.entities.insert(cid, c);
         let mut last = None;
         for _ in 0..8 {
-            engine.step(&mut world, &HashSet::new());
+            engine.step(&mut world, &HashSet::new(), &[]);
             last = Some(world.entities.get(&cid).unwrap().pos().1);
         }
         let final_y = last.unwrap();
         // 落地稳定（连续两拍同位）
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         let stable_y = world.entities.get(&cid).unwrap().pos().1;
         assert_eq!(final_y, stable_y, "造物落地应稳定不抖动");
         // 不悬空：AABB 底边 floor(y) 不高于占地格地形峰值
@@ -1992,7 +2015,7 @@ mod tests {
         e.set_velocity((0.0, 7.7)); // 模拟阶段二 thrust 应用后的速度字段
         world.entities.insert(id, e);
         // 拍 1：升空
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         let e = world.entities.get(&id).unwrap();
         let peak_height = e.pos().1 - 0.5; // 相对地面高度
         assert!(
@@ -2005,7 +2028,7 @@ mod tests {
             e.velocity()
         );
         // 拍 2：落地清零
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         let e = world.entities.get(&id).unwrap();
         assert!(
             approx(e.pos().1, 0.5) && approx(e.pos().0, 0.0),
@@ -2026,14 +2049,14 @@ mod tests {
         e.set_velocity((0.0, 7.7));
         world.entities.insert(id, e);
         // 拍 1
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         let (p0, v0) = {
             let e = world.entities.get(&id).unwrap();
             (e.pos(), e.velocity())
         };
         assert!(approx(v0.1, -1.995), "拍 1 vy 应为 (7.7-9.8)×0.95，实测 {v0:?}");
         // 拍 2（空中）：vy 累积 = -2.1 + -9.8 = -11.9
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         let (p1, v1) = {
             let e = world.entities.get(&id).unwrap();
             (e.pos(), e.velocity())
@@ -2062,7 +2085,7 @@ mod tests {
         let e = make_entity(1, 0.0, 5.0, 0);
         let id = e.id;
         world.entities.insert(id, e);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         let e = world.entities.get(&id).unwrap();
         // 落点制：fall_to = 5.0 - 9.8 = -4.8 < 地面 0.5 → 落地半径线
         assert!(
@@ -2083,12 +2106,126 @@ mod tests {
         let id = c.id;
         c.set_velocity((7.7, 7.7));
         world.entities.insert(id, c);
-        engine.step(&mut world, &HashSet::new());
+        engine.step(&mut world, &HashSet::new(), &[]);
         let c = world.entities.get(&id).unwrap();
         assert!(
             c.pos().0 > 0.5,
             "dynamic 造物带速度应横向位移（速度积分生效），实测 {:?}",
             c.pos()
+        );
+    }
+
+    // === D-012 力场：物理步接入（域内实体按改后参数被结算）===
+
+    #[test]
+    fn step_entity_in_zero_gravity_field_does_not_fall() {
+        // 场影响生物落点：零重力场（scale=0）域内生物本拍不落（重力被场改写为 0）；
+        // 对照组域外同况实体照常下落
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut in_field = make_entity(1, 5.0, 10.0, 0);
+        in_field.set_velocity((0.5, 0.0)); // 微速度走冲量路径（重力在速度上累积）
+        let mut outside = make_entity(2, 50.0, 10.0, 0);
+        outside.set_velocity((0.5, 0.0));
+        let id_in = in_field.id;
+        let id_out = outside.id;
+        world.entities.insert(id_in, in_field);
+        world.entities.insert(id_out, outside);
+        let fields = [crate::fields::FieldEffect {
+            source_id: EntityId(Uuid::from_u128(9)),
+            pos: (5.0, 10.0),
+            radius: 3.0,
+            gravity_scale: 0.0,
+            drag_delta: 0.0,
+        }];
+        engine.step(&mut world, &HashSet::new(), &fields);
+        let (vx_in, vy_in) = world.entities.get(&id_in).unwrap().velocity();
+        assert!(
+            vy_in.abs() < 1e-12,
+            "零重力场域内速度 vy 不应累积重力，实际 {vy_in}"
+        );
+        let (_, vy_out) = world.entities.get(&id_out).unwrap().velocity();
+        assert!(
+            (vy_out - (0.0 - 9.8) * 0.95).abs() < 1e-9,
+            "域外实体照常吃世界重力（阻力后 -9.31），实际 {vy_out}"
+        );
+        let _ = vx_in;
+    }
+
+    #[test]
+    fn step_entity_outside_field_unaffected_vs_baseline() {
+        // 域外实体不受影响锚：与无场基线逐位一致（无场世界行为不变）
+        let engine = DefaultPhysicsEngine::new();
+        let mut base = WorldState::new();
+        let mut plain = make_entity(1, 5.0, 10.0, 0);
+        plain.set_velocity((1.0, 0.0));
+        let id_p = plain.id;
+        base.entities.insert(id_p, plain);
+        engine.step(&mut base, &HashSet::new(), &[]);
+        // 场世界：同一实体挪到远处的场外（域判定只看距离，同引擎同参数）
+        let mut fworld = WorldState::new();
+        let mut shadow = make_entity(1, 5.0, 10.0, 0);
+        shadow.set_velocity((1.0, 0.0));
+        let id_s = shadow.id;
+        fworld.entities.insert(id_s, shadow);
+        let fields = [crate::fields::FieldEffect {
+            source_id: EntityId(Uuid::from_u128(9)),
+            pos: (40.0, 40.0),
+            radius: 2.0,
+            gravity_scale: 0.0,
+            drag_delta: 2.0,
+        }];
+        engine.step(&mut fworld, &HashSet::new(), &fields);
+        assert_eq!(
+            base.entities.get(&id_p).unwrap().pos(),
+            fworld.entities.get(&id_s).unwrap().pos(),
+            "域外实体位置应与无场基线逐位一致"
+        );
+        assert_eq!(
+            base.entities.get(&id_p).unwrap().velocity(),
+            fworld.entities.get(&id_s).unwrap().velocity(),
+            "域外实体速度应与无场基线逐位一致"
+        );
+    }
+
+    #[test]
+    fn step_projectiles_field_changes_trajectory() {
+        // 弹道场第一消费者锚：零重力场域内弹丸不吃重力（vy 不累积），对照弹丸
+        //（域外）照常下坠——护弹道场的直接作用
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut in_proj = make_entity(1, 5.0, 10.0, 0);
+        in_proj.set_velocity((3.0, 0.0));
+        in_proj.set_radius(0.15);
+        in_proj.code_hash = codeworld_core::collision::PROJECTILE_CODE.to_string();
+        let mut out_proj = make_entity(2, 60.0, 10.0, 0);
+        out_proj.set_velocity((3.0, 0.0));
+        out_proj.set_radius(0.15);
+        out_proj.code_hash = codeworld_core::collision::PROJECTILE_CODE.to_string();
+        let id_in = in_proj.id;
+        let id_out = out_proj.id;
+        world.entities.insert(id_in, in_proj);
+        world.entities.insert(id_out, out_proj);
+        let fields = [crate::fields::FieldEffect {
+            source_id: EntityId(Uuid::from_u128(9)),
+            pos: (5.0, 10.0),
+            radius: 3.0,
+            gravity_scale: 0.0,
+            drag_delta: 0.0,
+        }];
+        let events = engine.step_projectiles(&mut world, 1, &HashMap::new(), &fields);
+        assert!(
+            events.is_empty(),
+            "两弹丸域内/域外都不应撞地/撞体，实际 {events:?}"
+        );
+        assert!(
+            (world.entities.get(&id_in).unwrap().velocity().1).abs() < 1e-12,
+            "域内弹丸 vy 不累积（零重力场）"
+        );
+        let vy_out = world.entities.get(&id_out).unwrap().velocity().1;
+        assert!(
+            (vy_out + 9.8 * 0.95).abs() < 1e-12,
+            "域外弹丸照常吃重力（阻力后 -9.8×0.95），实际 {vy_out}"
         );
     }
 }

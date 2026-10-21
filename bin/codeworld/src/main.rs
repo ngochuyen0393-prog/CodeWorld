@@ -20,7 +20,8 @@ mod players;
 use anyhow::{Context, Result};
 use codeworld_arena::attack::{PendingAttack, DEFAULT_KILL_WASM};
 use codeworld_arena::sandbox::{
-    PendingDestroy, PendingSpawn, PendingThrust, ProbeBridge, SandboxHandle, SandboxManager,
+    PendingDestroy, PendingFieldPulse, PendingSpawn, PendingThrust, ProbeBridge, SandboxHandle,
+    SandboxManager,
 };
 use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 use codeworld_core::pending::PendingChange;
@@ -102,6 +103,16 @@ struct EntitySandboxMap {
     /// on_death 遗嘱预算（D-007 ③，架构 3.3 同族 death_instruction_limit；
     /// main() 从 config.death_fuel 设置，默认 200_000——遗嘱有字数上限=预算即上限）
     death_fuel: u64,
+    /// on_field 询问独立小 fuel 预算（D-012 协议 v3，架构 3.3 同族；
+    /// main() 从 config.field_fuel 设置，默认 10_000）
+    field_fuel: u64,
+    /// 场成型期拍数（D-012：诞生 N 拍内不结算物理但已可见；main() 从
+    /// config.field_forming_ticks 设置，默认 FIELD_FORMING_TICKS=3）
+    field_forming_ticks: u64,
+    /// on_field 本拍应答覆盖（D-012：场返回非 0 → 临时改写本拍 drag_delta，
+    /// 场有表达权世界有结算权）。run_player_code 阶段一写入、a1.4 collect_fields
+    /// 消费清空——不跨拍残留（每拍询问每拍应答）
+    field_delta_overrides: std::collections::HashMap<EntityId, f64>,
     /// 本拍会话级离场登记（登出 take #025 + 残影到期消散 #013）：两类 kill 都在
     /// d 步遗嘱窗口【之前】发生且都会清掉自己的目录记录（remove_online/ghosts.remove），
     /// d 步 is_ghost 判不到"刚消散的残影"——故在 kill 处直接挂号，遗嘱窗口据此
@@ -171,6 +182,9 @@ impl EntitySandboxMap {
             last_touching: std::collections::HashSet::new(),
             contact_fuel: 10_000,
             death_fuel: 200_000,
+            field_fuel: 10_000,
+            field_forming_ticks: codeworld_core::physics::FIELD_FORMING_TICKS,
+            field_delta_overrides: std::collections::HashMap::new(),
             session_takes: std::collections::HashSet::new(),
             move_stall: None,
             conn_event: None,
@@ -371,6 +385,57 @@ impl EntitySandboxMap {
             handle.store.data_mut().probe_bridge = std::ptr::null_mut();
             // D-016 地形快照窗口同关（life 调用期判空回退平地判据，契约同上）
             handle.store.data_mut().terrain = std::ptr::null();
+            // D-012 力场询问（协议 v3）：成型场源每拍被世界询问一次（field_radius>0
+            // 且过了成型期）。操控/处置抑制不豁免——场是出生声明的每拍核实（与
+            // life 同级的存在合同），不是自主行为。host 先把域内实体清单（EntityId
+            // 低 64 位 LE，不含场源自己、只报"谁在"不报"谁是谁"）写进场信箱
+            //（沙箱线性内存末尾保留区），应答 0=维持出生声明 / 非 0=本拍
+            // drag_delta 覆盖（场有表达权世界有结算权）。失联即灭天然成立：
+            // 收集侧 alive 过滤，场源死了场即消失。
+            if let Some(fe) = world.entities.get(&entity_id) {
+                let formed =
+                    world.tick().saturating_sub(fe.created_tick) >= self.field_forming_ticks;
+                if fe.field_radius() > 0.0 && formed {
+                    let (fx, fy) = fe.pos();
+                    let fr = fe.field_radius();
+                    let mut domain: Vec<u64> = world
+                        .entities
+                        .iter()
+                        .filter(|(oid, other)| {
+                            **oid != entity_id
+                                && other.is_alive()
+                                && {
+                                    let (ox, oy) = other.pos();
+                                    let dx = ox - fx;
+                                    let dy = oy - fy;
+                                    dx * dx + dy * dy < fr * fr
+                                }
+                        })
+                        .map(|(oid, _)| oid.0.as_u128() as u64)
+                        .collect();
+                    domain.sort_unstable(); // 确定序（清单顺序不依赖遍历随机性）
+                    match self.manager.call_on_field(handle, &domain, self.field_fuel) {
+                        Ok(Some(0)) => {} // 维持出生声明（笨场几步完事）
+                        Ok(Some(k)) => {
+                            tracing::info!(
+                                entity_id = %entity_id.0,
+                                answer = k,
+                                domain = domain.len(),
+                                "[field] on_field 应答覆盖本拍 drag_delta"
+                            );
+                            self.field_delta_overrides.insert(entity_id, k as f64);
+                        }
+                        Ok(None) => {} // 未导出/信箱放不下：按出生声明结算
+                        Err(err) => {
+                            tracing::warn!(
+                                entity_id = %entity_id.0,
+                                errMsg = %err,
+                                "[field] on_field 调用失败，本拍按出生声明结算"
+                            );
+                        }
+                    }
+                }
+            }
             // 调 life()：false 或调用失败均标记死亡
             match self.manager.call_life(handle) {
                 Ok(true) => {} // 仍存活
@@ -400,6 +465,14 @@ impl EntitySandboxMap {
             tracing::info!(count = all.len(), "[collect_pending_attacks] 收集攻击请求");
         }
         all
+    }
+
+    /// 取走本拍 on_field 应答覆盖（D-012：场有表达权世界有结算权）
+    ///
+    /// 阶段一 run_player_code 逐场询问时写入；tick a1.4 collect_fields 消费后
+    /// 清空——不跨拍残留（每拍询问每拍应答）。
+    fn take_field_delta_overrides(&mut self) -> std::collections::HashMap<EntityId, f64> {
+        std::mem::take(&mut self.field_delta_overrides)
     }
 
     /// 收集本 tick 所有沙箱排队的移动请求（env.move_by 推入，阶段二并入 pending 队列）
@@ -823,6 +896,10 @@ fn main() -> Result<()> {
     sandbox_map.probe_fuel = config.probe_fuel;
     // D-007 三兄弟预算装配（接触回调/遗嘱钩子，模式同 probe_fuel）
     sandbox_map.contact_fuel = config.contact_fuel;
+    // D-012 力场常数装配（架构 3.3 同族技术保护可调）：
+    // field_fuel = on_field 询问独立预算；field_forming_ticks = 成型期拍数
+    sandbox_map.field_fuel = config.field_fuel;
+    sandbox_map.field_forming_ticks = config.field_forming_ticks;
     sandbox_map.death_fuel = config.death_fuel;
     // 世界实体上限装配（门二 spawn 配套，decisions.md #020）
     sandbox_map.max_entities = config.max_entities;
@@ -916,6 +993,7 @@ fn main() -> Result<()> {
                 &sandbox_map.players,
                 renderer.controlled(),
                 &attack_events,
+                sandbox_map.field_forming_ticks,
             );
         }
         std::thread::sleep(config.tick_interval());
@@ -1386,10 +1464,32 @@ fn tick_with_intents(
     //       放在攻击处理之前：造物出生即进入世界（本拍攻击队列已定，下拍才会与之交互）
     process_spawns(world, sandbox_map, current_tick);
 
+    //   a1.4 力场清单收集（D-012 登记制刷场）：每拍全量重算覆盖关系（无 enter/
+    //       exit 缓存挂摘——0.1s 判例的实现底座就是每拍刷）。成型期过滤（诞生
+    //       N 拍内不结算物理但已可见）+ on_field 应答覆盖（场有表达权世界有
+    //       结算权）。产物喂物理两步（弹道步+位置重力步）。
+    let field_overrides = sandbox_map.take_field_delta_overrides();
+    let fields = codeworld_physics::fields::collect_fields(
+        world,
+        current_tick,
+        sandbox_map.field_forming_ticks,
+        &field_overrides,
+    );
+    if !fields.is_empty() {
+        tracing::info!(tick = current_tick, count = fields.len(), "[field] 本拍场清单收集");
+    }
+
+    //   a1.45 力场脉冲应用（D-012 交付物 8：分离式发射器）：排在弹道步之前——
+    //       本拍被推的弹丸照常参与 step_projectiles 积分（推膛内炮弹→当拍出膛）
+    let field_pulses = collect_field_pulses(sandbox_map);
+    if !field_pulses.is_empty() {
+        apply_field_pulses(world, field_pulses, physics.params().max_speed);
+    }
+
     //   a1.5 弹道步（#034 弹道系统）：
     //       ① 发射落地：env.shoot 排队请求 -> 弹丸实体（离体即世界物体，出手前归代码）
     //       ② 整场积分：弹丸吃重力/阻力/位移（速度积分制，弹丸不吃 aloft——它就是要落地的），
-    //          撞身体/落地/超时产出事件（飞行中归世界）
+    //          撞身体/落地/超时产出事件（飞行中归世界）；域内弹丸按改后参数被结算（D-012）
     process_shoots(world, sandbox_map, current_tick);
     // 发射痕迹清算（#034 修订三）：寿命尽的痕迹消亡（排在 process_shoots 之后——
     // 本拍刚诞生的痕迹当拍不清，次拍起的眼睛层可见一至三拍）
@@ -1400,7 +1500,7 @@ fn tick_with_intents(
             .iter()
             .map(|(p, meta)| (*p, meta.shooter))
             .collect();
-        physics.step_projectiles(world, current_tick, &shooters)
+        physics.step_projectiles(world, current_tick, &shooters, &fields)
     };
 
     //   a2. 处理攻击（架构 4.2 两阶段模型：阶段一 on_tick 调 env.attack_at 排队的请求在此统一执行）
@@ -1426,8 +1526,9 @@ fn tick_with_intents(
     //       弹即无/塔即无——排在攻击与衰减之后，本拍所有死亡来源都已落地）
     enforce_binding_deaths(world, sandbox_map);
 
-    //   c. 物理规则（#030 半径物理：重力落点解析 + 悬停免重力，架构 4.1 b 步）
-    let changes = physics.step(world, &aloft);
+    //   c. 物理规则（#030 半径物理：重力落点解析 + 悬停免重力，架构 4.1 b 步；
+    //      D-012：域内实体按改后参数被结算，aloft 优先级高于场）
+    let changes = physics.step(world, &aloft, &fields);
     if !changes.is_empty() {
         tracing::debug!(tick = current_tick, change_count = changes.len(), "物理变更");
     }
@@ -1691,6 +1792,88 @@ fn apply_thrust_requests(
             impulse = ?t.impulse,
             to = ?new_v,
             "[thrust] 冲量应用（速度累加+极速钳制）"
+        );
+    }
+}
+
+/// 收集本拍各沙箱排队的力场脉冲请求（D-012 交付物 8：分离式发射器）
+///
+/// drain 各沙箱 pending_field_pulses 后清空（不跨拍残留）。在 tick 阶段二
+/// a1.4（process_spawns 之后、弹道步之前）调用：本拍被推的弹丸照常参与
+/// step_projectiles 积分（推膛内炮弹→当拍出膛）。
+fn collect_field_pulses(sandbox_map: &mut EntitySandboxMap) -> Vec<PendingFieldPulse> {
+    let mut all = Vec::new();
+    for handle in sandbox_map.sandboxes.values_mut() {
+        all.append(&mut handle.store.data_mut().pending_field_pulses);
+    }
+    if !all.is_empty() {
+        tracing::info!(count = all.len(), "[field_pulse] 收集脉冲请求");
+    }
+    all
+}
+
+/// 应用力场脉冲（D-012 交付物 8：物理推，不是规则层）
+///
+/// 每条脉冲：以 (x,y) 为中心 radius 圆域内，给所有**带速度实体**（弹丸+dynamic
+/// 造物+任何 velocity≠0 的实体）速度一次性加上 (vx,vy)，推完照常受世界极速
+/// 钳制（归一化压回）。对 velocity≡0 的实体无效（推不动静止的——物理推是
+/// 速度叠加，D-010 冲量三件套的碰撞响应另刀）。域内实体按 EntityId 升序
+/// 遍历（确定序，与全世界结算定序同源）。场不认人：无所有权豁免。
+fn apply_field_pulses(
+    world: &mut WorldState,
+    pulses: Vec<PendingFieldPulse>,
+    max_speed: f64,
+) {
+    for p in pulses {
+        // 域内带速度实体清单（id 升序确定序）
+        let mut targets: Vec<EntityId> = world
+            .entities
+            .iter()
+            .filter(|(_, e)| {
+                e.is_alive()
+                    && e.velocity() != (0.0, 0.0)
+                    && {
+                        let (ex, ey) = e.pos();
+                        let dx = ex - p.x;
+                        let dy = ey - p.y;
+                        dx * dx + dy * dy < p.radius * p.radius
+                    }
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        targets.sort_by_key(|id| id.0);
+        let mut pushed = 0usize;
+        for tid in targets {
+            let Some(entity) = world.entities.get_mut(&tid) else {
+                continue;
+            };
+            let old = entity.velocity();
+            let summed = (old.0 + p.vx, old.1 + p.vy);
+            // 推完照常受极速钳制（归一化压回，方向不变）
+            let speed2 = summed.0 * summed.0 + summed.1 * summed.1;
+            let new_v = if speed2 > max_speed * max_speed {
+                let scale = max_speed / speed2.sqrt();
+                (summed.0 * scale, summed.1 * scale)
+            } else {
+                summed
+            };
+            entity.set_velocity(new_v);
+            tracing::info!(
+                entity = %tid.0,
+                from = ?old,
+                impulse = ?(p.vx, p.vy),
+                to = ?new_v,
+                source = %p.source.0,
+                "[field_pulse] 被推（速度叠加+极速钳制）"
+            );
+            pushed += 1;
+        }
+        tracing::info!(
+            source = %p.source.0,
+            center = ?(p.x, p.y),
+            radius = p.radius,
+            pushed,
+            "[field_pulse] 脉冲结算完成"
         );
     }
 }
@@ -2017,6 +2200,12 @@ fn process_spawn_requests(
         // D-003 spawn 第 10 参 motion：运动身份写进造物数据（import 层已钳制，
         // 此处直存）——dynamic 造物即刻受完整物理（身体=声明 radius 的圆）
         entity.set_motion(req.motion);
+        // D-012 spawn 第 15/16/17 参力场三参：场声明写进造物数据（import 层已
+        // 钳制，此处直存）——0/1.0/0=无场现状语义零回归；成型期满后物理步按
+        // 叠加 v2 结算，前端按快照 fields 画环
+        entity.set_field_radius(req.field_radius);
+        entity.set_field_gravity_scale(req.field_gravity_scale);
+        entity.set_field_drag_delta(req.field_drag_delta);
         // 出生初速（spawn 第 11/12 参，D-018 一体式发射提前落地）：import 层已校验
         // （有限+模长 ≤ 世界极速），此处写进造物 velocity 字段。位置积分（造物被
         // 初速带着飞）不做——那是 D-018「通用有速度实体物理」的活；velocity 字段
@@ -4169,7 +4358,7 @@ mod tests {
             ids.push(e.id);
             world.entities.insert(e.id, e);
         }
-        engine.step(&mut world, &std::collections::HashSet::new());
+        engine.step(&mut world, &std::collections::HashSet::new(), &[]);
         for id in ids {
             let e = world.entities.get(&id).unwrap();
             let (x, y) = e.pos();
@@ -9403,7 +9592,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -9420,6 +9609,9 @@ mod tests {
     f64.const 0.0
     i32.const 0
     i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -9611,6 +9803,9 @@ mod tests {
                 vx: 3.0,
                 vy: -4.0,
                 blob: Vec::new(),
+                field_radius: 0.0,
+                field_gravity_scale: 1.0,
+                field_drag_delta: 0.0,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 7);
@@ -9650,7 +9845,7 @@ mod tests {
         let escaped = wat_escape(creation_code);
         let spawner = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -9666,6 +9861,9 @@ mod tests {
     i32.const 0
     f64.const 3.0 f64.const -4.0
     i32.const 8500 i32.const 5
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -9820,7 +10018,7 @@ mod tests {
                 "motion={motion_wat} 造物应诞生"
             );
             let physics = DefaultPhysicsEngine::new();
-            physics.step(&mut world, &std::collections::HashSet::new());
+            physics.step(&mut world, &std::collections::HashSet::new(), &[]);
             let c = world
                 .entities
                 .values()
@@ -9863,6 +10061,9 @@ mod tests {
                 vx: 0.0,
                 vy: 0.0,
                 blob: Vec::new(),
+                field_radius: 0.0,
+                field_gravity_scale: 1.0,
+                field_drag_delta: 0.0,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -9956,13 +10157,55 @@ mod tests {
     /// 文档示例与测试同源：这文件语法坏了/逻辑改了，冒烟立刻红。
     const SENTINEL_WAT: &str = include_str!("../../../examples/sentinel.wat");
 
+    /// 力场哨塔示例（D-012）：examples/ 目录真文件，示例即文档——语法坏了/
+    /// 场参数改了守卫测试立刻红
+    const FIELD_DEMO_WAT: &str = include_str!("../../../examples/field-demo.wat");
+
+    #[test]
+    fn field_demo_example_compiles_and_declares_field() {
+        // 示例守卫：field-demo.wat 是自包含玩家模块（第一拍立场塔，17 参带场
+        // 声明）——全文作为玩家代码走真实管线：语法坏/参数改/17 参签名漂移
+        // 都会在此红（示例即文档，SENTINEL_WAT 同款守卫哲学）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(41));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(41, 62, (10.0, 0.0)));
+        let mut map = test_sandbox_map();
+        map.create(creator, &wasm(FIELD_DEMO_WAT), 1_000_000).unwrap();
+        map.run_player_code(&world, &unbounded_bb());
+        process_spawns(&mut world, &mut map, 7);
+        let tower = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .expect("field-demo 场塔应诞生（示例语法/参数坏了会在此红）");
+        assert_eq!(tower.pos(), (15.0, 0.0), "场塔应立在 +5 格");
+        assert_eq!(tower.field_radius(), 3.0, "示例声明的场域半径应落库");
+        assert_eq!(tower.field_gravity_scale(), 1.0, "示例不缩放重力");
+        assert!(
+            (tower.field_drag_delta() - 1.95).abs() < 1e-9,
+            "40 倍阻力 = 0.05×40-0.05 = +1.95 delta，实际 {}",
+            tower.field_drag_delta()
+        );
+        // 场塔的 on_field 已导出（内嵌塔代码）：世界询问走通，应答 0=维持出生声明
+        let mut handle = map.sandboxes.get_mut(&tower.id).unwrap();
+        assert_eq!(
+            map.manager
+                .call_on_field(&mut handle, &[1, 2], map.field_fuel)
+                .unwrap(),
+            Some(0),
+            "示例 on_field 应答 0=维持出生声明（笨场）"
+        );
+    }
+
     /// 只 spawn 一次的玩家进场代码（$done 全局节流，README 示例同款模式）：
     /// 第一拍把哨塔造到身边 (x,y)，之后不再造（防逐拍刷造物撞上限）
     fn once_spawner_wat(code: &str, x: &str, y: &str) -> String {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -9986,6 +10229,9 @@ mod tests {
         (f64.const 0.0)
         (i32.const 0)
         (i32.const 0)
+        (f64.const 0.0)
+        (f64.const 1.0)
+        (f64.const 0.0)
         (call $spawn)
         (drop))))
   (func (export "life") (result i32) i32.const 1))"#,
@@ -10082,7 +10328,7 @@ mod tests {
         let escaped = wat_escape(relic_code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "R\00")
@@ -10100,6 +10346,9 @@ mod tests {
     f64.const 0.0
     i32.const 0
     i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
     call $spawn drop))"#,
             escaped = escaped,
             len = relic_code.len(),
@@ -10471,5 +10720,261 @@ mod tests {
             -1,
             "drag=0.3 同参数应改判够不着（警告码 -N）——装配阻力必须透传"
         );
+    }
+
+    // === D-012 力场：main 级接线（17 参端到端/场结算/脉冲/快照/成型期）===
+
+    /// 指定 field 三参的造物方 WAT（birth_motion_spawner_wat 的 D-012 扩展版：
+    /// 17 参签名 + field 三参压栈）
+    fn birth_field_spawner_wat(
+        code: &str,
+        x: &str,
+        y: &str,
+        motion: &str,
+        fr: &str,
+        fgs: &str,
+        fdd: &str,
+    ) -> String {
+        let escaped = wat_escape(code);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "F\00")
+  (data (i32.const 8256) "lime\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const {x} f64.const {y}
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1.0
+    i32.const 0
+    {motion}
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
+    f64.const {fr}
+    f64.const {fgs}
+    f64.const {fdd}
+    call $spawn drop)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = code.len(),
+            x = x,
+            y = y,
+            motion = motion,
+            fr = fr,
+            fgs = fgs,
+            fdd = fdd,
+        )
+    }
+
+    #[test]
+    fn spawn_17_params_field_declaration_lands_in_entity() {
+        // 17 参端到端：创造者 on_tick 调 env.spawn 带 field 三参（3.0/0.5/-0.04）
+        // -> 阶段二造物落库，场声明原样写进实体数据（import 钳制直存）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(31));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(31, 60, (10.0, 0.0)));
+        let mut map = test_sandbox_map();
+        let spawner = birth_field_spawner_wat(
+            PLAYER_WAT,
+            "12.0",
+            "0.0",
+            "i32.const 0",
+            "3.0",
+            "0.5",
+            "-0.04",
+        );
+        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+        map.run_player_code(&world, &unbounded_bb());
+        process_spawns(&mut world, &mut map, 7);
+        let creation = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .expect("造物应落库");
+        assert_eq!(creation.field_radius(), 3.0, "第 15 参场域半径应落库");
+        assert_eq!(creation.field_gravity_scale(), 0.5, "第 16 参重力缩放应落库");
+        assert_eq!(creation.field_drag_delta(), -0.04, "第 17 参阻力改写量应落库");
+    }
+
+    #[test]
+    fn field_affects_creature_gravity_landing_via_collect_fields() {
+        // 场影响生物重力落点：域内生物在零重力场本拍不落（collect_fields 收集
+        // -> physics.step 用生效重力），域外同况生物照常下落——main 装配口径
+        let mut world = WorldState::new();
+        let mut in_c = make_entity_of_owner(1, 70, (5.0, 10.0));
+        in_c.set_velocity((0.5, 0.0)); // 微速度走冲量路径（重力在速度上累积）
+        let mut out_c = make_entity_of_owner(2, 70, (50.0, 10.0));
+        out_c.set_velocity((0.5, 0.0));
+        let id_in = in_c.id;
+        let id_out = out_c.id;
+        world.entities.insert(id_in, in_c);
+        world.entities.insert(id_out, out_c);
+        // 场源：成型（created_tick=0，当前 10 >> 成型期 3）
+        let mut source = make_entity_of_owner(3, 70, (5.0, 10.0));
+        source.set_field_radius(3.0);
+        source.set_field_gravity_scale(0.0);
+        world.entities.insert(source.id, source);
+        let map = test_sandbox_map();
+        let fields = codeworld_physics::fields::collect_fields(
+            &world,
+            10,
+            map.field_forming_ticks,
+            &map.field_delta_overrides,
+        );
+        assert_eq!(fields.len(), 1, "成型场源应入账");
+        let engine = DefaultPhysicsEngine::new();
+        engine.step(&mut world, &std::collections::HashSet::new(), &fields);
+        let (_, vy_in) = world.entities.get(&id_in).unwrap().velocity();
+        assert!(vy_in.abs() < 1e-12, "域内生物 vy 不累积重力，实际 {vy_in}");
+        let (_, vy_out) = world.entities.get(&id_out).unwrap().velocity();
+        assert!(
+            (vy_out + 9.8 * 0.95).abs() < 1e-9,
+            "域外生物照常吃重力（阻力后），实际 {vy_out}"
+        );
+    }
+
+    #[test]
+    fn field_pulse_pushes_dynamic_creation_in_domain() {
+        // 分离式发射器：域内带速度 dynamic 造物被推（速度叠加+极速钳制）；
+        // 零速实体推不动（物理推是速度叠加）；域外不受影响
+        let mut world = WorldState::new();
+        let mut moving = make_entity_of_owner(1, 70, (10.0, 5.0));
+        moving.set_motion(codeworld_core::entity::MOTION_DYNAMIC);
+        moving.set_velocity((1.0, 0.0));
+        let mut still = make_entity_of_owner(2, 70, (11.0, 5.0));
+        still.set_motion(codeworld_core::entity::MOTION_DYNAMIC);
+        let mut outside = make_entity_of_owner(3, 70, (50.0, 5.0));
+        outside.set_motion(codeworld_core::entity::MOTION_DYNAMIC);
+        outside.set_velocity((1.0, 0.0));
+        let id_m = moving.id;
+        let id_s = still.id;
+        let id_o = outside.id;
+        world.entities.insert(id_m, moving);
+        world.entities.insert(id_s, still);
+        world.entities.insert(id_o, outside);
+        let source = EntityId(Uuid::from_u128(99));
+        let pulses = vec![PendingFieldPulse {
+            source,
+            x: 10.0,
+            y: 5.0,
+            vx: 2.0,
+            vy: 0.0,
+            radius: 3.0,
+        }];
+        apply_field_pulses(&mut world, pulses, 25.0);
+        assert_eq!(
+            world.entities.get(&id_m).unwrap().velocity(),
+            (3.0, 0.0),
+            "域内带速 dynamic 造物应被推 +2"
+        );
+        assert_eq!(
+            world.entities.get(&id_s).unwrap().velocity(),
+            (0.0, 0.0),
+            "零速实体推不动（物理推是速度叠加）"
+        );
+        assert_eq!(
+            world.entities.get(&id_o).unwrap().velocity(),
+            (1.0, 0.0),
+            "域外实体不受影响"
+        );
+    }
+
+    #[test]
+    fn field_pulse_pushes_projectile_in_domain() {
+        // 分离式发射器×弹丸：域内弹丸被推（D-018 退役工程的初速来源——
+        // 推存量炮弹）；推完受极速钳制
+        let mut world = WorldState::new();
+        let mut shell = make_entity_of_owner(1, 70, (10.0, 5.0));
+        shell.code_hash = codeworld_core::collision::PROJECTILE_CODE.to_string();
+        shell.set_velocity((1.0, 0.0));
+        let id_s = shell.id;
+        world.entities.insert(id_s, shell);
+        let pulses = vec![PendingFieldPulse {
+            source: EntityId(Uuid::from_u128(99)),
+            x: 10.0,
+            y: 5.0,
+            vx: 20.0,
+            vy: 0.0,
+            radius: 3.0,
+        }];
+        apply_field_pulses(&mut world, pulses, 25.0);
+        let (vx, _) = world.entities.get(&id_s).unwrap().velocity();
+        assert_eq!(vx, 21.0, "域内弹丸应被推 +20（21 < 极速 25 不钳）");
+    }
+
+    #[test]
+    fn snapshot_contains_fields_with_forming_flag() {
+        // 快照协议：fields 数组恒有（空=无场世界）；成型态按 forming_ticks 判
+        //（虚线环=成型中给进攻方反应窗，实线环=已成型）
+        let mut world = WorldState::new();
+        for _ in 0..10 {
+            world.advance_tick(); // 拨到 tick=10（让老场过成型期）
+        }
+        let mut formed = make_entity_of_owner(1, 70, (5.0, 0.0));
+        formed.set_field_radius(3.0);
+        // 老场 created_tick=0（age=10 ≥ 3 → 已成型）；新场 created_tick=9
+        //（age=1 < 3 → 成型中）
+        let mut forming = make_entity_of_owner(2, 70, (20.0, 0.0));
+        forming.set_field_radius(4.0);
+        let mut forming_e = forming;
+        forming_e.created_tick = 9;
+        world.entities.insert(formed.id, formed);
+        world.entities.insert(forming_e.id, forming_e);
+        let dir = crate::players::PlayerDirectory::disabled();
+        let snap = net::build_snapshot(
+            &world,
+            "cap",
+            &Viewport::new((0.0, 0.0), 50.0, 25.0, 50, 80),
+            &dir,
+            None,
+            &[],
+            3,
+        );
+        assert_eq!(snap.fields.len(), 2, "两个场源都应投影");
+        let f_formed = snap
+            .fields
+            .iter()
+            .find(|f| (f.x - 5.0).abs() < 1e-9)
+            .expect("应有 5.0 处的场");
+        assert!(f_formed.formed, "老场应已成型（实线环）");
+        let f_forming = snap
+            .fields
+            .iter()
+            .find(|f| (f.x - 20.0).abs() < 1e-9)
+            .expect("应有 20.0 处的场");
+        assert!(!f_forming.formed, "新场应成型中（虚线环）");
+    }
+
+    #[test]
+    fn field_forming_ticks_boundary_wiring() {
+        // 成型期拍数接线：默认 FIELD_FORMING_TICKS=3（menu 1.7 总账入账值）；
+        // collect_fields 以 map.field_forming_ticks 为准——诞生拍起 3 拍内不入账
+        let map = test_sandbox_map();
+        assert_eq!(
+            map.field_forming_ticks,
+            codeworld_core::physics::FIELD_FORMING_TICKS,
+            "测试装配默认成型期应取世界常数"
+        );
+        let mut world = WorldState::new();
+        let mut source = make_entity_of_owner(5, 70, (5.0, 0.0));
+        source.set_field_radius(3.0);
+        let sid = source.id;
+        world.entities.insert(sid, source);
+        // 成型期第 1/2 拍（age=1,2 < 3）：不入账；第 3 拍（age=3）：入账
+        assert!(codeworld_physics::fields::collect_fields(&world, 1, map.field_forming_ticks, &std::collections::HashMap::new()).is_empty());
+        assert!(codeworld_physics::fields::collect_fields(&world, 2, map.field_forming_ticks, &std::collections::HashMap::new()).is_empty());
+        assert_eq!(
+            codeworld_physics::fields::collect_fields(&world, 3, map.field_forming_ticks, &std::collections::HashMap::new()).len(),
+            1,
+            "成型期满应入账（第 3 拍起结算物理）"
+        );
+        let _ = sid;
     }
 }

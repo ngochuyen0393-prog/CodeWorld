@@ -96,6 +96,14 @@ impl PhysicsOverride {
 /// 重标定（不自动公式耦合，明改明公告）。
 pub const WORLD_MAX_SPEED: f64 = 25.0;
 
+/// 力场成型期拍数（D-012 可视铁律：场从诞生到生效有 N 拍成型期——成型期内
+/// 不结算物理（可穿过）但已可见（前端画虚线环=成型中，实线环=已成型），
+/// 给进攻方反应窗（Kinetic Field 判例）。
+/// 标定锚：极速 25 下横穿一个半径 3 的场域不到 1 拍——3 拍成型期给守方布场
+/// 时间、给攻方拆场窗口，两头都不突袭。拍速变更时随世界常数批次重标定。
+/// config 可调（CODEWORLD_FIELD_FORMING），入 game-menu 1.7 常数总账。
+pub const FIELD_FORMING_TICKS: u64 = 3;
+
 /// 默认物理规则参数（框架内置，不可删除，可通过覆盖替换行为）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DefaultPhysics {

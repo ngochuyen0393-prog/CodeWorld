@@ -132,6 +132,24 @@ pub struct Entity {
     #[serde(default = "default_motion")]
     motion: i32,
 
+    // 力场出生声明家族（D-012：spawn 第 15/16/17 参，decisions.md #040——
+    // "场造物"作为特殊品类在法律上不存在，世界只认声明不认身份；场源=物理
+    // 身体，效果=以身体为锚向外延伸的参数改写区）。
+    // 场域半径：以造物身体中心（pos）为锚向外延伸的参数改写区半径；
+    /// serde default：旧快照无此字段时回退 0.0=无场（现状语义，存储向后兼容）
+    #[serde(default = "default_field_radius")]
+    field_radius: f64,
+    // 重力缩放系数：生效重力 = 世界重力 × scale（乘法式缩放，叠加 v2 代数形式：
+    // 多场叠乘，负向抵消靠 scale>1 实现）。
+    /// serde default：旧快照无此字段时回退 1.0=中性缩放（重力不变）
+    #[serde(default = "default_field_gravity_scale")]
+    field_gravity_scale: f64,
+    // 阻力改写量：加法式 delta（不是缩放——叠加 v2 代数抵消语义要求改写量是
+    // delta，正负互吃：+2 与 -2 归零，对冲场是真实战术）。生效阻力 = 世界阻力 + Σdelta。
+    /// serde default：旧快照无此字段时回退 0.0=中性（加 0 不改写）
+    #[serde(default = "default_field_drag_delta")]
+    field_drag_delta: f64,
+
     // 外观与动作状态
     /// 渲染数据
     pub appearance: Appearance,
@@ -169,6 +187,21 @@ fn default_motion() -> i32 {
     MOTION_STATIC
 }
 
+/// 场域半径默认值（D-012：新实体与旧快照回退共用 0.0=无场——现状语义）
+fn default_field_radius() -> f64 {
+    0.0
+}
+
+/// 场重力缩放默认值（D-012：新实体与旧快照回退共用 1.0=中性——重力不变）
+fn default_field_gravity_scale() -> f64 {
+    1.0
+}
+
+/// 场阻力改写量默认值（D-012：新实体与旧快照回退共用 0.0=中性——加 0 不改写）
+fn default_field_drag_delta() -> f64 {
+    0.0
+}
+
 /// 运动身份档位（D-003 motion 出生声明，dev-plan 拍板 2026-10-17；kinematic 剧本档缓立）
 /// - static（默认=现状）：造物钉死——格对齐 AABB 身体，无速度矢量物理
 /// - dynamic：造物全活——受完整物理（重力/阻力/极速），身体=声明 radius 的圆
@@ -187,6 +220,77 @@ pub fn clamp_motion(v: i32) -> i32 {
             MOTION_STATIC
         }
     }
+}
+
+/// 场域半径合法上限（D-012：域 [0.0, 25.0]——0=无场，25=世界尺度护栏，
+/// 与 radius 身体上限同值：场再大盖不过世界一格内的身体上限尺度）
+pub const FIELD_RADIUS_MAX: f64 = 25.0;
+
+/// 场重力缩放合法上限（D-012：域 [0.0, 10.0]——0=零重力域，10=十倍上限）
+pub const FIELD_GRAVITY_SCALE_MAX: f64 = 10.0;
+
+/// 场重力生效值钳制下限（D-012 叠加 v2 域钳制兜底：-98.0 = 世界重力 9.8 ×
+/// 缩放上限 10——堆场买不到定律外胜利：不许向上飞的重力、不许超过十倍）
+pub const FIELD_GRAVITY_EFFECTIVE_MIN: f64 = -98.0;
+
+/// 场阻力生效值钳制区间（D-012 叠加 v2 域钳制兜底：[0.0, 25.0]——阻力永不
+/// 负值（负阻力=凭空加速，不合法），上限恰与世界极速同值不同义）
+pub const FIELD_DRAG_EFFECTIVE_MIN: f64 = 0.0;
+pub const FIELD_DRAG_EFFECTIVE_MAX: f64 = 25.0;
+
+/// 场域半径校验钳制（spawn 第 15 参口径）：域 [0.0, 25.0]，负值/非有限钳 0
+/// （无场最保守回退）并 warn，超上限钳 25.0——出生声明家族哲学：超界钳回+
+/// 警告非拒绝
+pub fn clamp_field_radius(v: f64) -> f64 {
+    if !v.is_finite() {
+        tracing::warn!(value = v, clamped = 0.0, "[field] 场域半径非有限值，钳 0（无场）");
+        return 0.0;
+    }
+    if v < 0.0 {
+        tracing::warn!(value = v, clamped = 0.0, "[field] 场域半径为负，钳 0（无场）");
+        return 0.0;
+    }
+    if v > FIELD_RADIUS_MAX {
+        tracing::warn!(value = v, clamped = FIELD_RADIUS_MAX, "[field] 场域半径超上限，钳制");
+        return FIELD_RADIUS_MAX;
+    }
+    v
+}
+
+/// 场重力缩放校验钳制（spawn 第 16 参口径）：域 [0.0, 10.0]，负值钳 0、
+/// 非有限钳 1.0（中性缩放）并 warn，超上限钳 10.0
+pub fn clamp_field_gravity_scale(v: f64) -> f64 {
+    if !v.is_finite() {
+        tracing::warn!(value = v, clamped = 1.0, "[field] 重力缩放非有限值，钳 1.0（中性）");
+        return 1.0;
+    }
+    if v < 0.0 {
+        tracing::warn!(value = v, clamped = 0.0, "[field] 重力缩放为负，钳 0（零重力域）");
+        return 0.0;
+    }
+    if v > FIELD_GRAVITY_SCALE_MAX {
+        tracing::warn!(value = v, clamped = FIELD_GRAVITY_SCALE_MAX, "[field] 重力缩放超上限，钳制");
+        return FIELD_GRAVITY_SCALE_MAX;
+    }
+    v
+}
+
+/// 场阻力改写量校验钳制（spawn 第 17 参口径）：域 [-1.0, +25.0]，非有限钳 0
+/// （中性）并 warn，超域钳边界——加法式 delta，正负互吃（叠加 v2 代数抵消）
+pub fn clamp_field_drag_delta(v: f64) -> f64 {
+    if !v.is_finite() {
+        tracing::warn!(value = v, clamped = 0.0, "[field] 阻力改写量非有限值，钳 0（中性）");
+        return 0.0;
+    }
+    if v < -1.0 {
+        tracing::warn!(value = v, clamped = -1.0, "[field] 阻力改写量低于下限，钳 -1.0");
+        return -1.0;
+    }
+    if v > FIELD_DRAG_EFFECTIVE_MAX {
+        tracing::warn!(value = v, clamped = FIELD_DRAG_EFFECTIVE_MAX, "[field] 阻力改写量超上限，钳 25.0");
+        return FIELD_DRAG_EFFECTIVE_MAX;
+    }
+    v
 }
 
 /// 绑定契约档位（#034 修订四，design-binding.md 机制层 MVP 三档）
@@ -237,6 +341,9 @@ impl Entity {
             binding: default_binding(),
             bound_to: None,
             motion: default_motion(),
+            field_radius: default_field_radius(),
+            field_gravity_scale: default_field_gravity_scale(),
+            field_drag_delta: default_field_drag_delta(),
             appearance,
             action_state: ActionState::Idle,
             instruction_guard: InstructionGuard::new(per_tick_instruction_limit),
@@ -328,6 +435,36 @@ impl Entity {
     /// 设置运动身份（import 层已 clamp_motion，此处直存）
     pub fn set_motion(&mut self, motion: i32) {
         self.motion = motion;
+    }
+
+    /// 场域半径（D-012：0.0=无场）
+    pub fn field_radius(&self) -> f64 {
+        self.field_radius
+    }
+
+    /// 设置场域半径（import 层已 clamp_field_radius，此处直存）
+    pub fn set_field_radius(&mut self, field_radius: f64) {
+        self.field_radius = field_radius;
+    }
+
+    /// 场重力缩放系数（D-012：1.0=中性）
+    pub fn field_gravity_scale(&self) -> f64 {
+        self.field_gravity_scale
+    }
+
+    /// 设置场重力缩放（import 层已 clamp_field_gravity_scale，此处直存）
+    pub fn set_field_gravity_scale(&mut self, field_gravity_scale: f64) {
+        self.field_gravity_scale = field_gravity_scale;
+    }
+
+    /// 场阻力改写量（D-012：加法式 delta，0.0=中性）
+    pub fn field_drag_delta(&self) -> f64 {
+        self.field_drag_delta
+    }
+
+    /// 设置场阻力改写量（import 层已 clamp_field_drag_delta，此处直存）
+    pub fn set_field_drag_delta(&mut self, field_drag_delta: f64) {
+        self.field_drag_delta = field_drag_delta;
     }
 
     /// 设置坐标（物理规则校验与变换管线由 space/physics 模块负责，此处只存）
@@ -711,5 +848,134 @@ mod tests {
         assert_eq!(clamp_motion(2), MOTION_STATIC);
         assert_eq!(clamp_motion(-1), MOTION_STATIC);
         assert_eq!(clamp_motion(i32::MAX), MOTION_STATIC);
+    }
+
+    // === field 出生声明家族（D-012 力场：field_radius/field_gravity_scale/
+    // === field_drag_delta 与 radius/mass/binding/motion 并列，世界只认声明不认身份）===
+
+    #[test]
+    fn clamp_field_radius_boundary_and_valid() {
+        // 校验：边界值原样通过（0.0=无场默认 / 25.0=上限），域内值原样保留
+        assert_eq!(clamp_field_radius(0.0), 0.0);
+        assert_eq!(clamp_field_radius(25.0), 25.0);
+        assert_eq!(clamp_field_radius(3.0), 3.0);
+        assert_eq!(clamp_field_radius(0.1), 0.1);
+    }
+
+    #[test]
+    fn clamp_field_radius_rejects_negative_and_overflow() {
+        // 校验：负值=无场钳 0（域下限），超上限钳 25.0（出生声明家族哲学：
+        // 超界钳回+警告非拒绝）
+        assert_eq!(clamp_field_radius(-0.5), 0.0);
+        assert_eq!(clamp_field_radius(100.0), 25.0);
+    }
+
+    #[test]
+    fn clamp_field_radius_non_finite_to_no_field() {
+        // 校验：非有限值（NaN/±inf）钳 0=无场（最保守回退）
+        assert_eq!(clamp_field_radius(f64::NAN), 0.0);
+        assert_eq!(clamp_field_radius(f64::INFINITY), 0.0);
+        assert_eq!(clamp_field_radius(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn clamp_field_gravity_scale_boundary_and_valid() {
+        // 校验：边界值原样通过（0.0=零重力域 / 10.0=十倍上限），域内值保留
+        assert_eq!(clamp_field_gravity_scale(0.0), 0.0);
+        assert_eq!(clamp_field_gravity_scale(10.0), 10.0);
+        assert_eq!(clamp_field_gravity_scale(0.5), 0.5);
+        assert_eq!(clamp_field_gravity_scale(2.0), 2.0);
+    }
+
+    #[test]
+    fn clamp_field_gravity_scale_rejects_negative_and_overflow() {
+        // 校验：负值钳 0（缩放无负语义），超上限钳 10.0
+        assert_eq!(clamp_field_gravity_scale(-1.0), 0.0);
+        assert_eq!(clamp_field_gravity_scale(50.0), 10.0);
+    }
+
+    #[test]
+    fn clamp_field_gravity_scale_non_finite_to_neutral() {
+        // 校验：非有限值钳 1.0=中性缩放（重力不变，与 serde default 同语义）
+        assert_eq!(clamp_field_gravity_scale(f64::NAN), 1.0);
+        assert_eq!(clamp_field_gravity_scale(f64::INFINITY), 1.0);
+        assert_eq!(clamp_field_gravity_scale(f64::NEG_INFINITY), 1.0);
+    }
+
+    #[test]
+    fn clamp_field_drag_delta_boundary_and_valid() {
+        // 校验：边界值原样通过（-1.0=下限 / +25.0=上限），域内值保留（加法式
+        // 改写量：正负互吃是叠加 v2 的代数抵消根基）
+        assert_eq!(clamp_field_drag_delta(-1.0), -1.0);
+        assert_eq!(clamp_field_drag_delta(25.0), 25.0);
+        assert_eq!(clamp_field_drag_delta(2.0), 2.0);
+        assert_eq!(clamp_field_drag_delta(-0.5), -0.5);
+    }
+
+    #[test]
+    fn clamp_field_drag_delta_rejects_out_of_domain() {
+        // 校验：低于 -1.0 钳 -1.0，高于 +25.0 钳 +25.0
+        assert_eq!(clamp_field_drag_delta(-5.0), -1.0);
+        assert_eq!(clamp_field_drag_delta(100.0), 25.0);
+    }
+
+    #[test]
+    fn clamp_field_drag_delta_non_finite_to_neutral() {
+        // 校验：非有限值钳 0=中性（加 0=不改写，与 serde default 同语义）
+        assert_eq!(clamp_field_drag_delta(f64::NAN), 0.0);
+        assert_eq!(clamp_field_drag_delta(f64::INFINITY), 0.0);
+        assert_eq!(clamp_field_drag_delta(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn entity_field_defaults_are_no_field() {
+        // 创建：新实体默认无场（radius=0=无场 / gravity_scale=1=缩放中性 /
+        // drag_delta=0=加法中性）——现状语义零回归
+        let e = sample_entity();
+        assert_eq!(e.field_radius(), 0.0);
+        assert_eq!(e.field_gravity_scale(), 1.0);
+        assert_eq!(e.field_drag_delta(), 0.0);
+    }
+
+    #[test]
+    fn entity_field_setters_direct_store() {
+        // 修改：三个 setter 直存（import 层已钳制，照 set_motion 直存模式）
+        let mut e = sample_entity();
+        e.set_field_radius(3.0);
+        e.set_field_gravity_scale(0.5);
+        e.set_field_drag_delta(-0.04);
+        assert_eq!(e.field_radius(), 3.0);
+        assert_eq!(e.field_gravity_scale(), 0.5);
+        assert_eq!(e.field_drag_delta(), -0.04);
+    }
+
+    #[test]
+    fn entity_field_survives_serialize_roundtrip() {
+        // 读写：场声明序列化往返保留（快照存档不断档）
+        let mut e = sample_entity();
+        e.set_field_radius(5.0);
+        e.set_field_gravity_scale(0.25);
+        e.set_field_drag_delta(1.5);
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.field_radius(), 5.0);
+        assert_eq!(back.field_gravity_scale(), 0.25);
+        assert_eq!(back.field_drag_delta(), 1.5);
+    }
+
+    #[test]
+    fn entity_field_serde_backcompat_old_snapshot() {
+        // 边界：旧快照（无 field 三字段）反序列化回退无场语义（radius=0/
+        // scale=1/delta=0——serde default 与无场语义严格一致，旧存量造物零
+        // 行为变化，存储向后兼容 radius/mass/binding/motion 同款先例）
+        let mut obj: serde_json::Value = serde_json::to_value(sample_entity()).unwrap();
+        obj.as_object_mut().unwrap().remove("field_radius");
+        obj.as_object_mut().unwrap().remove("field_gravity_scale");
+        obj.as_object_mut().unwrap().remove("field_drag_delta");
+        let json = serde_json::to_string(&obj).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.field_radius(), 0.0, "旧快照应回退无场");
+        assert_eq!(back.field_gravity_scale(), 1.0);
+        assert_eq!(back.field_drag_delta(), 0.0);
     }
 }

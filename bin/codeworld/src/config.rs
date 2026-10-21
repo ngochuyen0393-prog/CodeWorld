@@ -83,6 +83,12 @@ pub struct Config {
     /// 字数上限=预算即上限，烧尽即遗嘱写不完，世界不补偿不重试）。
     /// CODEWORLD_DEATH_FUEL 覆盖。
     pub death_fuel: u64,
+    /// on_field 询问独立小 fuel 预算（D-012 协议 v3，架构 3.3 同族），默认
+    /// 10_000（与 contact/probe 同档——轻量应答）。CODEWORLD_FIELD_FUEL 覆盖。
+    pub field_fuel: u64,
+    /// 力场成型期拍数（D-012 可视铁律：诞生 N 拍内不结算物理但已可见，给进攻
+    /// 方反应窗），默认 FIELD_FORMING_TICKS=3。CODEWORLD_FIELD_FORMING 覆盖。
+    pub field_forming_ticks: u64,
 }
 
 impl Default for Config {
@@ -110,6 +116,8 @@ impl Default for Config {
             terrain_seed: 0,
             contact_fuel: 10_000,
             death_fuel: 200_000,
+            field_fuel: 10_000,
+            field_forming_ticks: codeworld_core::physics::FIELD_FORMING_TICKS,
         }
     }
 }
@@ -212,6 +220,13 @@ impl Config {
         }
         if let Some(f) = env_u64("CODEWORLD_DEATH_FUEL") {
             cfg.death_fuel = f;
+        }
+        // D-012 力场常数（解析失败保留默认值；成型期默认 FIELD_FORMING_TICKS=3）
+        if let Some(f) = env_u64("CODEWORLD_FIELD_FUEL") {
+            cfg.field_fuel = f;
+        }
+        if let Some(n) = env_u64("CODEWORLD_FIELD_FORMING") {
+            cfg.field_forming_ticks = n;
         }
         cfg
     }
@@ -625,6 +640,32 @@ mod tests {
         let c = Config::load();
         std::env::remove_var("CODEWORLD_DEATH_FUEL");
         assert_eq!(c.death_fuel, 200_000, "非法值应回退默认遗嘱预算");
+    }
+
+    #[test]
+    fn load_field_fuel_and_forming_env_overrides_default() {
+        // 修改：CODEWORLD_FIELD_FUEL / CODEWORLD_FIELD_FORMING 覆盖默认（D-012
+        // 力场常数世界可调；成型期默认 FIELD_FORMING_TICKS=3）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_FIELD_FUEL", "900");
+        std::env::set_var("CODEWORLD_FIELD_FORMING", "5");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_FIELD_FUEL");
+        std::env::remove_var("CODEWORLD_FIELD_FORMING");
+        assert_eq!(c.field_fuel, 900, "环境变量应覆盖 on_field 预算");
+        assert_eq!(c.field_forming_ticks, 5, "环境变量应覆盖成型期拍数");
+    }
+
+    #[test]
+    fn load_field_defaults_match_world_constants() {
+        // 创建：field 两常数默认值与世界常数总账同源（成型期=FIELD_FORMING_TICKS）
+        let c = Config::default();
+        assert_eq!(c.field_fuel, 10_000);
+        assert_eq!(
+            c.field_forming_ticks,
+            codeworld_core::physics::FIELD_FORMING_TICKS,
+            "成型期默认应取世界常数"
+        );
     }
 
     #[test]

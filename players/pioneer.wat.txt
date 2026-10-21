@@ -16,7 +16,7 @@
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
 
   (memory (export "memory") 1)
 
@@ -67,7 +67,10 @@
             (f64.const 0.0)                                   ;; vx（第11参出生初速x，0=零速落地不动）
             (f64.const 0.0)                                   ;; vy（第12参出生初速y）
             (i32.const 0)                                     ;; blob_ptr（第13参出生数据包指针，0=无包）
-            (i32.const 0)))                                   ;; blob_len（第14参出生数据包长度，0=无包）
+            (i32.const 0)                                     ;; blob_len（第14参出生数据包长度，0=无包）
+            (f64.const 0.0)                                   ;; field_radius（D-012 第15参，0=无场）
+            (f64.const 1.0)                                   ;; field_gravity_scale（第16参，1=中性缩放）
+            (f64.const 0.0)))                                 ;; field_drag_delta（第17参，0=不改写）
         (i32.const 5) (call $log)                             ;; marker 5 = 立塔信号
         (global.set $tower_done (i32.const 1))
         (return)))

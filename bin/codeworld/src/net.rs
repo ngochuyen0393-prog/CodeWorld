@@ -96,6 +96,24 @@ pub(crate) struct WorldSnapshot {
     /// 旧前端忽略未知字段，向后兼容）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terrain: Option<TerrainInfo>,
+    /// 力场环投影（D-012 可视铁律：场必须可视——温迪气流环范本，纯数值场配
+    /// 贴地特效）。每拍全量（恒有字段，空数组=无场世界，前端无需可选分支）；
+    /// 场源造物本体已照常渲染（fields 层只画"可见气流环"）。formed=false=
+    /// 成型中（前端画虚线环，给进攻方反应窗），true=已成型（实线环）
+    pub fields: Vec<FieldSnapshot>,
+}
+
+/// 单个力场投影（D-012：场源坐标+半径+成型态）
+#[derive(Debug, Serialize)]
+pub(crate) struct FieldSnapshot {
+    /// 场源 x（圆心）
+    pub x: f64,
+    /// 场源 y
+    pub y: f64,
+    /// 场域半径
+    pub radius: f64,
+    /// 是否已成型（current_tick - created_tick >= forming_ticks）
+    pub formed: bool,
 }
 
 /// 地形投影（D-016：前端折线渲染数据源；非平地才发全量，平地发 None 省带宽）
@@ -184,6 +202,7 @@ pub(crate) fn build_snapshot(
     players: &PlayerDirectory,
     controlled: Option<EntityId>,
     attack_events: &[crate::AttackEventRecord],
+    field_forming_ticks: u64,
 ) -> WorldSnapshot {
     let (min_x, max_x) = viewport.world_x_range();
     let (min_y, max_y) = viewport.world_y_range();
@@ -235,6 +254,22 @@ pub(crate) fn build_snapshot(
             heights: world.terrain.samples().to_vec(),
         }
     });
+    // 力场环投影（D-012 可视铁律）：每拍全量（空数组恒有）；成型态按
+    // forming_ticks 判（虚线环=成型中给进攻方反应窗，实线环=已成型）
+    let fields: Vec<FieldSnapshot> = world
+        .entities
+        .values()
+        .filter(|e| e.is_alive() && e.field_radius() > 0.0)
+        .map(|e| {
+            let (x, y) = e.pos();
+            FieldSnapshot {
+                x,
+                y,
+                radius: e.field_radius(),
+                formed: world.tick().saturating_sub(e.created_tick) >= field_forming_ticks,
+            }
+        })
+        .collect();
     WorldSnapshot {
         tick: world.tick(),
         caption: caption.to_string(),
@@ -247,6 +282,7 @@ pub(crate) fn build_snapshot(
         entities,
         attacks,
         terrain,
+        fields,
     }
 }
 
@@ -594,6 +630,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
 
 /// tick 侧推送（std 主循环每拍调用）：无观众不组装（零客户端零开销），
 /// 序列化成功推广播通道；无接收者 send 报错属正常（忽略）。
+/// 8 参系快照契约全量投影（tick/caption/viewport/players/controlled/attacks/
+/// forming_ticks）——clippy too_many_arguments 豁免：参数组与 build_snapshot
+/// 一一对应，结构体化反而多一层拆装
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn push_snapshot(
     tx: &broadcast::Sender<String>,
     world: &WorldState,
@@ -602,11 +642,12 @@ pub(crate) fn push_snapshot(
     players: &PlayerDirectory,
     controlled: Option<EntityId>,
     attack_events: &[crate::AttackEventRecord],
+    field_forming_ticks: u64,
 ) {
     if tx.receiver_count() == 0 {
         return;
     }
-    let snapshot = build_snapshot(world, caption, viewport, players, controlled, attack_events);
+    let snapshot = build_snapshot(world, caption, viewport, players, controlled, attack_events, field_forming_ticks);
     match serde_json::to_string(&snapshot) {
         Ok(json) => {
             if tx.send(json).is_err() {
@@ -660,7 +701,7 @@ mod tests {
         players: &PlayerDirectory,
         controlled: Option<EntityId>,
     ) -> serde_json::Value {
-        let snap = build_snapshot(world, "cap", &default_viewport(), players, controlled, &[]);
+        let snap = build_snapshot(world, "cap", &default_viewport(), players, controlled, &[], 3);
         serde_json::to_value(&snap).expect("快照应可序列化")
     }
 
@@ -680,7 +721,7 @@ mod tests {
             target: t,
             target_pos: (1.0, 2.0),
         }];
-        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &events);
+        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &events, 3);
         let json = serde_json::to_value(&snap).expect("快照应可序列化");
         let atk = &json["attacks"];
         assert_eq!(atk.as_array().map(Vec::len), Some(1), "恰一条命中事件");
@@ -697,7 +738,7 @@ mod tests {
         let mut world = WorldState::new();
         put_entity(&mut world, "attacker", "A", "red", (0.0, 0.0));
         let dir = PlayerDirectory::disabled();
-        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &[]);
+        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &[], 3);
         let json = serde_json::to_value(&snap).expect("快照应可序列化");
         assert_eq!(
             json["attacks"].as_array().map(Vec::len),
@@ -860,9 +901,9 @@ mod tests {
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
         world.advance_tick();
-        push_snapshot(&tx, &world, "c1", &vp, &dir, None, &[]);
+        push_snapshot(&tx, &world, "c1", &vp, &dir, None, &[], 3);
         world.advance_tick();
-        push_snapshot(&tx, &world, "c2", &vp, &dir, None, &[]);
+        push_snapshot(&tx, &world, "c2", &vp, &dir, None, &[], 3);
         let f1: serde_json::Value =
             serde_json::from_str(&tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("第一帧应在 2s 内到达").unwrap()).unwrap();
         let f2: serde_json::Value =
@@ -880,7 +921,7 @@ mod tests {
         let world = WorldState::new();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        push_snapshot(&tx, &world, "c", &vp, &dir, None, &[]);
+        push_snapshot(&tx, &world, "c", &vp, &dir, None, &[], 3);
         assert_eq!(tx.receiver_count(), 0, "无观众场景保持零接收者");
     }
 
@@ -1194,7 +1235,7 @@ mod tests {
         world.advance_tick();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        push_snapshot(&tx, &world, "after-assets", &vp, &dir, None, &[]);
+        push_snapshot(&tx, &world, "after-assets", &vp, &dir, None, &[], 3);
         let snap: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         assert_eq!(snap["caption"], "after-assets", "资产消息先于快照帧");
         shutdown_tx.send(()).ok();
@@ -1464,9 +1505,9 @@ mod tests {
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
         world.advance_tick();
-        push_snapshot(&tx, &world, "f1", &vp, &dir, None, &[]);
+        push_snapshot(&tx, &world, "f1", &vp, &dir, None, &[], 3);
         world.advance_tick();
-        push_snapshot(&tx, &world, "f2", &vp, &dir, None, &[]);
+        push_snapshot(&tx, &world, "f2", &vp, &dir, None, &[], 3);
 
         let frame1: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         let frame2: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
@@ -1486,7 +1527,7 @@ mod tests {
         let mut client2 = connect_client(addr).await;
         consume_avatar_assets(&mut client2).await;
         world.advance_tick();
-        push_snapshot(&tx, &world, "f3", &vp, &dir, None, &[]);
+        push_snapshot(&tx, &world, "f3", &vp, &dir, None, &[], 3);
         let frame3: serde_json::Value = serde_json::from_str(&next_text(&mut client2).await).unwrap();
         assert_eq!(frame3["tick"], 3, "断开后新客户端照常收帧");
 
@@ -1546,7 +1587,7 @@ mod tests {
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
         world.advance_tick();
-        push_snapshot(&tx, &world, "shared", &vp, &dir, None, &[]);
+        push_snapshot(&tx, &world, "shared", &vp, &dir, None, &[], 3);
 
         let f1: serde_json::Value = serde_json::from_str(&next_text(&mut c1).await).unwrap();
         let f2: serde_json::Value = serde_json::from_str(&next_text(&mut c2).await).unwrap();
@@ -1849,7 +1890,7 @@ mod tests {
         world.advance_tick();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        push_snapshot(&tx, &world, "after-logout", &vp, &dir, None, &[]);
+        push_snapshot(&tx, &world, "after-logout", &vp, &dir, None, &[], 3);
         let frame: serde_json::Value = serde_json::from_str(&next_text(&mut c1).await).unwrap();
         assert_eq!(frame["caption"], "after-logout", "登出连接下行快照照收（观战）");
 

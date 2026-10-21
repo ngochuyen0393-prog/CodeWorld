@@ -257,6 +257,7 @@
   var camEdges = null;          // 相机贴边标记 {l,r,b,t}（viewport 边界线可视化用）
   var view = null;              // 当前可视世界窗口（全景=viewport；跟随=相机窗口）
   var terrainData = null;       // 地形折线 {x0,dx,heights}（D-016；null=平地/旧协议，回落 y=0 横线）
+  var fieldsData = [];          // 力场环 [{x,y,radius,formed}]（D-012：radius=spawn 第15参 field_radius 投影；空=无场世界；formed=false=成型中虚线环）
   var loggedOut = null;         // 已登出的处置（'take'|'stay_auto'|'stay_ai'，#025）；null=未登出
                                 // 登出后连接降级观战继续直播；此时断线不自动重连（重连=抢回操控）
   var logoutPanelBusy = false;  // 弹窗决策/淡出进行中：禁一切面板交互（防双发 logout）
@@ -301,6 +302,8 @@
     // 地形折线（D-016）：有则换新（世界创建后地形不变，重发幂等）；缺席
     //（平地世界不发/旧协议前端）清空回落 y=0 横线
     terrainData = snap.terrain || null;
+    // 力场环（D-012）：每拍全量数组（空=无场世界）；formed=false=成型中（虚线环）
+    fieldsData = snap.fields || [];
     // 击杀标记（第四刀 B2）：相邻两帧对比，消失的实体在最后坐标留渐隐 ✕
     if (prevFrame) {
       var kills = collectKills(prevFrame.ents, ents);
@@ -398,6 +401,7 @@
     lastRecvT = null;
     projPrev = null; // 弹丸尾迹锚点随缓冲清空（重连后无历史方向，尾迹从零起步）
     terrainData = null; // 地形折线随缓冲清空（下一帧快照按 terrain 字段有无重建）
+    fieldsData = [];    // 力场环随缓冲清空（下一帧快照按 fields 字段重建，D-012）
     itvEl.textContent = '-';
   }
 
@@ -1025,6 +1029,26 @@
         ctx.lineTo(viewW, bty);
       }
       ctx.stroke();
+    }
+
+    // 力场环（D-012 可视铁律：场必须可视——温迪气流环范本，半透明描边一圈
+    // stroke，不做粒子）。实线=已成型（结算物理），虚线=成型中（可穿过但已
+    // 可见——给进攻方反应窗，Kinetic Field 判例；成型期 FIELD_FORMING_TICKS=3）。
+    // 画在实体层之下（环是区域标注不是身体，造物本体照常画在上面）
+    if (fieldsData && fieldsData.length) {
+      ctx.lineWidth = 2;
+      for (var fi = 0; fi < fieldsData.length; fi++) {
+        var fd = fieldsData[fi];
+        var fp = worldToScreen(fd.x, fd.y);
+        var fr = fd.radius * cell;
+        if (fr < 2) continue; // 视口外/过小剔除
+        ctx.strokeStyle = fd.formed ? 'rgba(88, 196, 220, 0.38)' : 'rgba(88, 196, 220, 0.22)';
+        ctx.setLineDash(fd.formed ? [] : [6, 6]);
+        ctx.beginPath();
+        ctx.arc(fp.x, fp.y, fr, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
     }
 
     // 实体：glyph 居中画在插值后的连续世界坐标上；活动实体按 radius 画身体圆

@@ -67,3 +67,9 @@
 - net-protocol.md 升 v2.0（顶层 attacks 数组空数组恒有+3.2 节字段表）；dev-plan D-017 定案原文兑现："本来在广播命中，多带字段，账本不变"
 - 测试锚 6 则：击杀记事件/击晕也记+实况坐标非点击坐标/落空不记/拦截不记/防守失败不记/死者之刀与死目标不记+快照带事件字段+空数组恒有
 - 提交方式：共享树上 8 卡并行，用临时 index + commit-tree 选择性提交本卡 hunks（不碰兄弟在途工作区改动）；隔离 worktree 全量测试验证
+
+## 2026-10-22 D-012 力场落地（当前状态）
+- **现在**：力场全链路在跑——spawn 17 参（第 15/16/17 参 field 三参，serde default=无场零回归）；物理步域内结算（叠加 v2：重力叠乘+阻力代数和+域钳制，纯函数 effective_gravity_drag 五锚测试）；on_field 询问协议 v3（成型场源每拍被问，场信箱=沙箱内存末尾 516B，应答非 0 临时改本拍阻力）；field_pulse 分离式发射器（第 15 个 import，D-018 依赖就绪）；成型期 3 拍（虚线环→实线环）；前端半透明圆环；零计费兑现。
+- 常数：FIELD_FORMING_TICKS=3（CODEWORLD_FIELD_FORMING）+ field_fuel 10_000（CODEWORLD_FIELD_FUEL），入 game-menu 1.7 总账
+- 测试：workspace 1000 全绿（基线 952+48）；示例 examples/field-demo.wat（守卫测试同源）；文档 api.md（17 参+on_field+field_pulse+力场节）/ net-protocol v2.3（fields 数组）/ decisions #052 / dev-plan D-012 ✅
+- 边界注记：极速场未做；优先级未做；边界冷却防抖不做（on_field 是询问非事件）；#051 已被 D-017 两刀占用，本刀顺延 #052

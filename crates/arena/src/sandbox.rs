@@ -37,6 +37,19 @@ pub const MAX_SHOOT_SPEED: f64 = codeworld_core::physics::WORLD_MAX_SPEED;
 /// 防无界扫描线性内存。
 pub const MAX_META_LEN: usize = 64;
 
+/// field_pulse 脉冲半径合法下限（D-012：域 [0.1, 25.0]——0.1 防零/微半径刷屏）
+pub const FIELD_PULSE_RADIUS_MIN: f64 = 0.1;
+/// field_pulse 脉冲半径合法上限（D-012：与世界尺度护栏同值——脉冲再大盖不过
+/// 身体 radius 上限尺度）
+pub const FIELD_PULSE_RADIUS_MAX: f64 = 25.0;
+
+/// on_field 场信箱容量（D-012 协议 v3：host 写域内实体清单的缓冲区槽数上限）
+///
+/// 世界实体上限 64（#045），域内实体（不含场源自己）最多 63——64 槽恒够，
+/// 信箱永不截断。信箱=线性内存末尾 4+64×8=516 字节（世界保留，玩家勿占用，
+/// api.md 载明）。
+pub const FIELD_MAILBOX_CAP: usize = 64;
+
 /// spawn 出生数据包最大字节数（64KB，D-017 挂靠立法：世界不解释内容）
 ///
 /// blob_len 超限 → 整次 spawn 拒绝（在读内存之前拦下防大拷贝）；
@@ -104,6 +117,13 @@ pub struct PendingSpawn {
     /// 代际遗传/子弹带任务参数，通道归世界内容归玩家。blob_len≤0 = 空包合法；
     /// > MAX_SPAWN_BLOB_LEN 整次拒绝不裁剪。随造物沙箱存活，经 env.birth_blob 读回）
     pub blob: Vec<u8>,
+    /// 场域半径（D-012 spawn 第 15 参；import 层已钳制 [0.0, 25.0]，0=无场默认）
+    pub field_radius: f64,
+    /// 场重力缩放（D-012 spawn 第 16 参；import 层已钳制 [0.0, 10.0]，1.0=中性）
+    pub field_gravity_scale: f64,
+    /// 场阻力改写量（D-012 spawn 第 17 参；加法式 delta，import 层已钳制
+    /// [-1.0, +25.0]，0.0=中性）
+    pub field_drag_delta: f64,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
 }
@@ -140,6 +160,29 @@ pub struct PendingDestroy {
     pub destroyer: EntityId,
     /// 目标实体（i64 两半重建）
     pub target: EntityId,
+}
+
+/// 本 tick 排队的力场脉冲请求（D-012 交付物 8：分离式发射器，env.field_pulse
+/// 推入，阶段二收集统一应用）
+///
+/// 语义：以 (x,y) 为中心 radius 半径圆域内，给所有带速度实体（弹丸+dynamic
+/// 造物+任何 velocity≠0 的实体）速度一次性加上 (vx,vy) 冲量——物理推，不是
+/// 规则层（velocity≡0 的实体推不动：物理推是速度叠加，碰撞响应另刀）。
+/// D-018 shoot 退役工程的初速来源：存量炮弹+炮身（场造物）每拍 pulse 推膛内炮弹。
+#[derive(Debug, Clone)]
+pub struct PendingFieldPulse {
+    /// 脉冲发起者（沙箱所属实体；与脉冲作用域无豁免关系——场不认人）
+    pub source: EntityId,
+    /// 脉冲中心 x（import 层已校验：有限、调用者快照 ±10 格内）
+    pub x: f64,
+    /// 脉冲中心 y
+    pub y: f64,
+    /// 冲量 x 分量（import 层已校验：有限、模长 ≤ 世界极速，恰等放行）
+    pub vx: f64,
+    /// 冲量 y 分量
+    pub vy: f64,
+    /// 脉冲半径（import 层已钳制 [0.1, 25.0]）
+    pub radius: f64,
 }
 
 /// 沙箱用户数据（Store data，用于被动观测，架构 4.3）
@@ -194,6 +237,9 @@ pub struct SandboxData {
     pub pending_spawns: Vec<PendingSpawn>,
     /// 本 tick 排队的销毁请求（env.destroy 推入，阶段二产权校验后 drain 清空）
     pub pending_destroys: Vec<PendingDestroy>,
+    /// 本 tick 排队的力场脉冲请求（D-012 env.field_pulse 推入，阶段二收集统一
+    /// 应用后 drain 清空；每实体每拍限 1 次在 import 层保证）
+    pub pending_field_pulses: Vec<PendingFieldPulse>,
     /// 本 tick 排队的射击请求（#034 env.shoot 推入，阶段二收集后 drain 清空；
     /// 每实体每拍限 1 发在 import 层保证）
     pub pending_shoots: Vec<PendingShoot>,
@@ -961,6 +1007,9 @@ impl SandboxManager {
         //   - 出生数据包第 13/14 参：blob_len ≤0 = 空包合法（无包语义）；
         //     > MAX_SPAWN_BLOB_LEN 整次拒绝（读内存前拦下防大拷贝，不裁剪——
         //     裁剪数据包=偷改玩家数据）；D-017 挂靠立法：世界不解释内容
+        //   - 力场第 15/16/17 参（D-012）：field_radius 钳 [0,25]（0=无场）、
+        //     field_gravity_scale 钳 [0,10]（非有限钳 1.0）、field_drag_delta 钳
+        //     [-1,+25]（非有限钳 0）——出生声明家族哲学：超界钳回+警告非拒绝
         // 产权链 owner 继承、世界实体上限、WAT 编译都在阶段二判（返回 1=已排队，
         // 阶段二拒绝以日志为准，api.md 载明）。
         linker.func_wrap(
@@ -980,7 +1029,10 @@ impl SandboxManager {
                   vx: f64,
                   vy: f64,
                   blob_ptr: i32,
-                  blob_len: i32|
+                  blob_len: i32,
+                  field_radius: f64,
+                  field_gravity_scale: f64,
+                  field_drag_delta: f64|
                   -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
@@ -1118,6 +1170,13 @@ impl SandboxManager {
                 let binding = codeworld_core::entity::clamp_binding(binding);
                 // D-003 第 10 参 motion 校验钳制（非法值钳 static，warn）
                 let motion = codeworld_core::entity::clamp_motion(motion);
+                // D-012 第 15/16/17 参力场三参校验钳制（超界钳回+warn 非拒绝：
+                // 0=无场 / 1.0=中性缩放 / 0.0=中性 delta 都是无场现状语义）
+                let field_radius = codeworld_core::entity::clamp_field_radius(field_radius);
+                let field_gravity_scale =
+                    codeworld_core::entity::clamp_field_gravity_scale(field_gravity_scale);
+                let field_drag_delta =
+                    codeworld_core::entity::clamp_field_drag_delta(field_drag_delta);
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
@@ -1131,6 +1190,9 @@ impl SandboxManager {
                     vy,
                     blob_len = blob.len(),
                     code_len = code.len(),
+                    field_radius,
+                    field_gravity_scale,
+                    field_drag_delta,
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
                 caller
@@ -1149,6 +1211,9 @@ impl SandboxManager {
                         vx,
                         vy,
                         blob,
+                        field_radius,
+                        field_gravity_scale,
+                        field_drag_delta,
                         fuel_limit,
                     });
                 1
@@ -1355,6 +1420,100 @@ impl SandboxManager {
                 1
             },
         )?;
+        // env.field_pulse(x: f64, y: f64, vx: f64, vy: f64, radius: f64) -> i32：
+        // 力场脉冲（D-012 交付物 8，第 15 个玩家 import，分离式发射器）——以
+        // (x,y) 为中心 radius 圆域内，给所有带速度实体一次性速度叠加 (vx,vy)。
+        // 物理推不是规则层：velocity≡0 的实体推不动（速度叠加对零速无效果，
+        // 推别人走碰撞/击退是 D-010 碰撞响应的活）。import 层只做零 world 校验：
+        //   - 限流：每实体每 tick 最多 1 次（与 spawn/shoot 同款），多余拒绝
+        //   - x/y/vx/vy 有限性（NaN/inf 拒绝）
+        //   - 冲量模长 ≤ 世界极速（严格 > 拒绝恰等放行，与 spawn 初速同口径）
+        //   - radius 钳 [0.1, 25.0]（超界钳回不拒绝——出生声明家族哲学）
+        //   - (x,y) 在调用者快照 ±10 格内（SPAWN_RANGE 同款防远程）
+        // 域内结算/被推者清单/极速钳制在阶段二（import 拿不到 world）。
+        linker.func_wrap(
+            "env",
+            "field_pulse",
+            move |mut caller: Caller<SandboxData>,
+                  x: f64,
+                  y: f64,
+                  vx: f64,
+                  vy: f64,
+                  radius: f64|
+                  -> i32 {
+                caller.data_mut().api_calls.push("field_pulse".to_string());
+                let source = caller.data().entity_id;
+                // 限流：每实体每 tick 最多 1 次脉冲
+                if !caller.data().pending_field_pulses.is_empty() {
+                    tracing::warn!(
+                        entity_id = %source.0,
+                        "[field_pulse] 本 tick 已有脉冲请求，限流拒绝（1 次/tick）"
+                    );
+                    return 0;
+                }
+                // 有限性校验（五参数全部要有限）
+                if !x.is_finite() || !y.is_finite() || !vx.is_finite() || !vy.is_finite() || !radius.is_finite() {
+                    tracing::warn!(
+                        entity_id = %source.0,
+                        x, y, vx, vy, radius,
+                        "[field_pulse] 参数非有限，拒绝"
+                    );
+                    return 0;
+                }
+                // 冲量模长 ≤ 世界极速（经装配 max_speed；严格 > 拒绝，恰等放行）
+                let speed2 = vx * vx + vy * vy;
+                if speed2 > max_speed * max_speed {
+                    tracing::warn!(
+                        entity_id = %source.0,
+                        impulse = speed2.sqrt(),
+                        max = max_speed,
+                        "[field_pulse] 冲量模长超世界极速，拒绝（恰等放行）"
+                    );
+                    return 0;
+                }
+                // (x,y) 必须在调用者本拍快照 ±10 格内（SPAWN_RANGE 同款防远程）
+                let (px, py) = caller.data().pos;
+                if (x - px).abs() > SPAWN_RANGE || (y - py).abs() > SPAWN_RANGE {
+                    tracing::warn!(
+                        entity_id = %source.0,
+                        caller_pos = ?(px, py),
+                        center = ?(x, y),
+                        range = SPAWN_RANGE,
+                        "[field_pulse] 脉冲中心超出调用者 ±10 格，拒绝"
+                    );
+                    return 0;
+                }
+                // radius 钳 [0.1, 25.0]（超界钳回+警告非拒绝；非有限已被上拦）
+                let clamped_radius = radius.clamp(FIELD_PULSE_RADIUS_MIN, FIELD_PULSE_RADIUS_MAX);
+                if clamped_radius != radius {
+                    tracing::warn!(
+                        entity_id = %source.0,
+                        requested = radius,
+                        clamped = clamped_radius,
+                        "[field_pulse] 脉冲半径校验钳制"
+                    );
+                }
+                tracing::info!(
+                    source = %source.0,
+                    center = ?(x, y),
+                    impulse = ?(vx, vy),
+                    radius = clamped_radius,
+                    "[field_pulse] 脉冲请求已排队（阶段二统一应用）"
+                );
+                caller
+                    .data_mut()
+                    .pending_field_pulses
+                    .push(PendingFieldPulse {
+                        source,
+                        x,
+                        y,
+                        vx,
+                        vy,
+                        radius: clamped_radius,
+                    });
+                1
+            },
+        )?;
         Ok(linker)
     }
 
@@ -1557,6 +1716,90 @@ impl SandboxManager {
         call_result?;
         tracing::info!(fuel_used = used, "call on_death");
         Ok(Some(used))
+    }
+
+    /// 调用 on_field(n_ptr, ids_cap, ids_ptr) -> i32（D-012 协议 v3：力场询问
+    /// 应答制，host→沙箱调用，第 14 个玩家函数契约）
+    ///
+    /// 通信契约（api.md 载明）：host 把域内实体数 n（i32 LE）写进 `n_ptr`、
+    /// 清单（EntityId 低 64 位，每实体 8 字节 LE，最多 min(n, FIELD_MAILBOX_CAP)
+    /// 条）写进 `[ids_ptr, ids_ptr+8×写入数)`，然后把三个地址作为参数调 on_field。
+    /// **场信箱 = 沙箱线性内存末尾 516 字节（世界保留，玩家勿占用）**——地址由
+    /// host 选在内存顶端：玩家声明的内存多大，信箱就跟到多高，玩家数据段压不进。
+    ///
+    /// 返回值（场有表达权，世界有结算权）：
+    /// - `Ok(Some(0))` = 维持出生声明（笨场几步完事）；
+    /// - `Ok(Some(k))`（k≠0）= 本拍 drag_delta 应答覆盖值（k as f64）；
+    /// - `Ok(None)` = 未导出 on_field / 内存太小放不下信箱（按出生声明结算，
+    ///   no-op 防御，与 on_attack 未导出同款）；
+    /// - `Err` = 调用失败（签名不匹配等）——调用方按出生声明结算（世界诚实，
+    ///   不用坏数据）。
+    ///
+    /// 预算包裹（on_contact 同款三步）：存剩余量 -> set 预算 -> 调 -> 恢复；
+    /// fuel_consumed 元数据按原尺度重算（包裹期间预算尺度是假象，防污染）。
+    pub fn call_on_field(
+        &self,
+        handle: &mut SandboxHandle,
+        ids: &[u64],
+        budget: u64,
+    ) -> Result<Option<i32>> {
+        if !self.has_export(handle, "on_field")? {
+            tracing::debug!("[field] on_field 未导出，按出生声明结算");
+            return Ok(None);
+        }
+        let Some(memory) = handle.instance.get_memory(&mut handle.store, "memory") else {
+            tracing::warn!("[field] 场源未导出 memory，无法投递域内清单，按出生声明结算");
+            return Ok(None);
+        };
+        // 场信箱选址：线性内存末尾（4 字节 n + 64×8 字节清单 = 516 字节保留区）
+        let reserve = 4 + FIELD_MAILBOX_CAP * 8;
+        let mem_size = memory.data_size(&handle.store);
+        if mem_size < reserve {
+            tracing::warn!(
+                mem_size,
+                reserve,
+                "[field] 线性内存小于场信箱保留区，按出生声明结算"
+            );
+            return Ok(None);
+        }
+        let ids_ptr = mem_size - FIELD_MAILBOX_CAP * 8;
+        let n_ptr = ids_ptr - 4;
+        let n = ids.len().min(FIELD_MAILBOX_CAP);
+        // 签名核验先于预算包裹（签名不匹配 Err 时原剩余量分毫不动）
+        let func = handle.instance.get_typed_func::<(i32, i32, i32), i32>(
+            &mut handle.store,
+            "on_field",
+        )?;
+        // 剩余量快照在写信【前】——wasmtime 的 host 侧 memory.write 也会计量
+        // fuel（实测约 4 步），那是世界投递清单的通信成本，不烧场源 tick 配额；
+        // 预算包裹恢复到本快照=场只为自己 on_field 的计算付费
+        let limit = handle.store.data().fuel_limit;
+        let prev_fuel = handle.store.get_fuel()?;
+        // 先写 n（i32 LE），再写清单（每实体 8 字节 LE，EntityId 低 64 位）
+        memory.write(&mut handle.store, n_ptr, &(n as i32).to_le_bytes())?;
+        for (i, v) in ids.iter().take(n).enumerate() {
+            memory.write(&mut handle.store, ids_ptr + i * 8, &v.to_le_bytes())?;
+        }
+        // 预算包裹：set 预算 -> 调 -> 恢复（无论成败都恢复到写信前快照）
+        if let Err(e) = handle.store.set_fuel(budget) {
+            anyhow::bail!("[field] 预算设置失败: {e}");
+        }
+        let call_result = func.call(&mut handle.store, (n_ptr as i32, FIELD_MAILBOX_CAP as i32, ids_ptr as i32));
+        let fuel_left = handle.store.get_fuel().unwrap_or(budget);
+        let used = budget.saturating_sub(fuel_left);
+        if let Err(e) = handle.store.set_fuel(prev_fuel) {
+            tracing::warn!(error = %e, "[field] fuel 恢复失败");
+        }
+        handle.store.data_mut().fuel_consumed = limit.saturating_sub(prev_fuel);
+        let answer = call_result?;
+        tracing::info!(
+            entity_id = %handle.store.data().entity_id.0,
+            n,
+            answer,
+            fuel_used = used,
+            "[field] call on_field（询问应答完成）"
+        );
+        Ok(Some(answer))
     }
 
     /// 引擎引用
@@ -2920,7 +3163,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -2937,6 +3180,9 @@ mod tests {
     {vx} {vy}
     i32.const 0
     i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -2956,7 +3202,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
@@ -2975,6 +3221,9 @@ mod tests {
     f64.const 0.0
     i32.const 0
     i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
@@ -2987,6 +3236,9 @@ mod tests {
     f64.const 0.0
     i32.const 0
     i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
@@ -2998,7 +3250,7 @@ mod tests {
 
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
@@ -3015,6 +3267,9 @@ mod tests {
     f64.const 0.0
     i32.const 0
     i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -3024,7 +3279,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -3042,6 +3297,9 @@ mod tests {
     f64.const 0.0
     i32.const 0
     i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -3091,7 +3349,7 @@ mod tests {
         // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
         let wat_text = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -3108,6 +3366,9 @@ mod tests {
     f64.const 0.0
     i32.const 0
     i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -3121,6 +3382,317 @@ mod tests {
         let spawns = &handle.store.data().pending_spawns;
         assert_eq!(spawns.len(), 1);
         assert_eq!(spawns[0].mass, 100.0, "超上限 mass 应钳到 100.0");
+    }
+
+    // === D-012 力场出生声明（spawn 第 15/16/17 参）===
+
+    /// 指定 field 三参的造物方 WAT（D-012 spawn 第 15/16/17 参，17 参签名）：
+    /// field 三参压栈序 = radius / gravity_scale / drag_delta
+    fn field_spawner_wat(radius: &str, scale: &str, delta: &str) -> String {
+        let escaped = wat_escape(SPAWNED_CODE);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const 1.0 f64.const 1.0
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
+    f64.const {radius}
+    f64.const {scale}
+    f64.const {delta}
+    call $spawn global.set $ret)
+  (global $ret (mut i32) (i32.const -1))
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = SPAWNED_CODE.len(),
+            radius = radius,
+            scale = scale,
+            delta = delta,
+        )
+    }
+
+    #[test]
+    fn spawn_import_queues_field_params() {
+        // env.spawn 第 15/16/17 参透传：合法域内值原样进 PendingSpawn（import 层
+        // 钳制后存档，阶段二 set_field_* 直存落库）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = field_spawner_wat("3.0", "0.5", "1.5");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(811))
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns.len(), 1, "合法 field 请求应排队");
+        assert_eq!(spawns[0].field_radius, 3.0, "第 15 参场域半径应透传");
+        assert_eq!(spawns[0].field_gravity_scale, 0.5, "第 16 参重力缩放应透传");
+        assert_eq!(spawns[0].field_drag_delta, 1.5, "第 17 参阻力改写量应透传");
+    }
+
+    #[test]
+    fn spawn_import_clamps_field_radius() {
+        // 第 15 参场域半径护栏：100 超上限钳 25.0；-1 负值钳 0（无场最保守回退）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = field_spawner_wat("100.0", "1.0", "0.0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(812))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns[0].field_radius, 25.0, "超上限场域半径应钳 25.0");
+    }
+
+    #[test]
+    fn spawn_import_clamps_field_gravity_scale() {
+        // 第 16 参重力缩放护栏：50 超上限钳 10.0；非有限值钳 1.0（中性缩放）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = field_spawner_wat("0.0", "50.0", "0.0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(813))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns[0].field_gravity_scale, 10.0, "超上限重力缩放应钳 10.0");
+    }
+
+    #[test]
+    fn spawn_import_clamps_field_drag_delta() {
+        // 第 17 参阻力改写量护栏：100 超上限钳 25.0；-5 低下限钳 -1.0
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = field_spawner_wat("0.0", "1.0", "-5.0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(814))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns[0].field_drag_delta, -1.0, "低下限阻力改写位应钳 -1.0");
+    }
+
+    // === D-012 协议 v3：on_field 询问应答（host→沙箱调用，第 14 个玩家函数契约）===
+
+    /// 场源 WAT：导出 on_field(n_ptr, ids_cap, ids_ptr) -> i32——读 n（n_ptr 处
+    /// i32）存入全局，返回常数 42（非 0=本拍 drag_delta 应答覆盖值）
+    fn field_source_wat() -> String {
+        r#"(module
+  (memory (export "memory") 1)
+  (global $n (mut i32) (i32.const -1))
+  (global $first_id_hi (mut i32) (i32.const -1))
+  (func (export "on_field") (param $n_ptr i32) (param $cap i32) (param $ids_ptr i32) (result i32)
+    (global.set $n (i32.load (local.get $n_ptr)))
+    (global.set $first_id_hi (i32.load (local.get $ids_ptr)))
+    (i32.const 42))
+  (func (export "get_n") (result i32) (global.get $n))
+  (func (export "get_first_id_hi") (result i32) (global.get $first_id_hi))
+  (func (export "life") (result i32) (i32.const 1)))"#
+            .to_string()
+    }
+
+    #[test]
+    fn call_on_field_skips_if_no_export() {
+        // 未导出 on_field：按出生声明结算（no-op 防御，与 on_attack 未导出同款），
+        // 返回 Ok(None)
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(LIFE_TRUE_WAT), 100_000, id(820))
+            .unwrap();
+        let out = mgr.call_on_field(&mut handle, &[1, 2, 3], 10_000).unwrap();
+        assert!(out.is_none(), "未导出 on_field 应返回 None");
+    }
+
+    #[test]
+    fn call_on_field_writes_ids_and_reads_answer() {
+        // 预算包裹 + 通信锚：host 把 n 写进 n_ptr、清单写进 [ids_ptr, +8n)，
+        // on_field 读到 n=2 与首个 id 低 32 位；返回 42 透传；fuel 预算独立
+        //（包裹后恢复原剩余，fuel_consumed 元数据按原尺度重算）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&field_source_wat()), 100_000, id(821))
+            .unwrap();
+        // 显式置满 fuel 再包裹（实例化会吃掉几个 fuel，与 on_contact 恢复测试
+        // 同款前置，断言"包裹恢复原值"不被实例化开销污染）
+        handle.store.set_fuel(100_000).unwrap();
+        let ids: [u64; 2] = [0x1122334455667788, 0x0102030405060708];
+        let before = handle.store.get_fuel().unwrap();
+        let out = mgr.call_on_field(&mut handle, &ids, 10_000).unwrap();
+        let after = handle.store.get_fuel().unwrap();
+        assert_eq!(out, Some(42), "on_field 返回值应透传");
+        assert_eq!(call_i32_export(&mut handle, "get_n"), 2, "n 应写入 n_ptr 处");
+        assert_eq!(
+            call_i32_export(&mut handle, "get_first_id_hi"),
+            0x5566_7788_u32 as i32,
+            "首个 id 低 64 位 LE 的低 32 位应可读"
+        );
+        // 燃料恢复：预算包裹不烧目标 tick 配额（剩余量回原值；断言带实测值
+        // 便于诊断包裹外泄漏）
+        assert_eq!(
+            after, before,
+            "包裹后 fuel 应恢复到调用前剩余（before={before} after={after}）"
+        );
+    }
+
+    #[test]
+    fn call_on_field_signature_mismatch_is_err_not_panic() {
+        // Err 路径（host 侧等价构造，.cc-bugs #5 红线：不用 wasm 内 trap）：
+        // on_field 签名不匹配 -> Err 上抛，调用方按出生声明结算；fuel 不丢
+        let mgr = SandboxManager::new().unwrap();
+        let bad = r#"(module
+  (memory (export "memory") 1)
+  (func (export "on_field") (result i32) (i32.const 7))
+  (func (export "life") (result i32) (i32.const 1)))"#;
+        let mut handle = mgr.create_sandbox(&wasm(bad), 100_000, id(822)).unwrap();
+        handle.store.set_fuel(100_000).unwrap();
+        let out = mgr.call_on_field(&mut handle, &[1], 10_000);
+        assert!(out.is_err(), "签名不匹配应 Err 上抛");
+        assert_eq!(
+            handle.store.get_fuel().unwrap(),
+            100_000,
+            "Err 路径 fuel 不应被弄丢"
+        );
+    }
+
+    // === D-012 交付物 8：field_pulse 分离式发射器（第 15 个 env import）===
+
+    /// field_pulse 调用方 WAT：on_tick 调 env.field_pulse(x,y,vx,vy,radius)，
+    /// 返回值存全局供断言
+    fn pulse_wat(x: &str, y: &str, vx: &str, vy: &str, radius: &str) -> String {
+        format!(
+            r#"(module
+  (import "env" "field_pulse" (func $field_pulse (param f64 f64 f64 f64 f64) (result i32)))
+  (memory (export "memory") 1)
+  (global $ret (mut i32) (i32.const -1))
+  (func (export "on_tick")
+    (global.set $ret (call $field_pulse (f64.const {x}) (f64.const {y}) (f64.const {vx}) (f64.const {vy}) (f64.const {radius}))))
+  (func (export "get_ret") (result i32) (global.get $ret))
+  (func (export "life") (result i32) (i32.const 1)))"#,
+            x = x,
+            y = y,
+            vx = vx,
+            vy = vy,
+            radius = radius,
+        )
+    }
+
+    #[test]
+    fn field_pulse_import_queues_pending_pulse() {
+        // 合法脉冲排队：PendingFieldPulse 入队（source=沙箱绑定实体），返回 1
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&pulse_wat("1.0", "2.0", "3.0", "4.0", "3.0")), 100_000, id(830))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "合法脉冲应返回 1");
+        let pulses = &handle.store.data().pending_field_pulses;
+        assert_eq!(pulses.len(), 1);
+        assert_eq!(pulses[0].source, id(830));
+        assert_eq!(pulses[0].x, 1.0);
+        assert_eq!(pulses[0].radius, 3.0);
+    }
+
+    #[test]
+    fn field_pulse_rejects_non_finite() {
+        // 校验一：坐标/冲量非有限拒绝
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&pulse_wat("nan", "2.0", "3.0", "4.0", "3.0")), 100_000, id(831))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "非有限应拒绝");
+        assert!(handle.store.data().pending_field_pulses.is_empty());
+    }
+
+    #[test]
+    fn field_pulse_rejects_impulse_over_world_max_speed() {
+        // 校验二：冲量模长超世界极速拒绝（30,0 → 模长 30 > 25）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&pulse_wat("1.0", "2.0", "30.0", "0.0", "3.0")), 100_000, id(832))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超极速冲量应拒绝");
+        assert!(handle.store.data().pending_field_pulses.is_empty());
+    }
+
+    #[test]
+    fn field_pulse_allows_impulse_exactly_max_speed() {
+        // 校验三：恰等极速放行（与 spawn 初速同口径：严格 > 拒绝）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&pulse_wat("1.0", "2.0", "7.0", "24.0", "3.0")), 100_000, id(833))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "恰等极速应放行");
+    }
+
+    #[test]
+    fn field_pulse_clamps_radius() {
+        // 校验四：radius 钳 [0.1, 25.0]（100 → 25）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&pulse_wat("1.0", "2.0", "1.0", "1.0", "100.0")), 100_000, id(834))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "radius 钳制不是拒绝");
+        assert_eq!(
+            handle.store.data().pending_field_pulses[0].radius, 25.0,
+            "超上限 radius 应钳 25.0"
+        );
+    }
+
+    #[test]
+    fn field_pulse_rejects_out_of_caller_range() {
+        // 校验五：(x,y) 超出调用者快照 ±10 格拒绝（SPAWN_RANGE 同款防远程）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&pulse_wat("20.0", "2.0", "1.0", "1.0", "3.0")), 100_000, id(835))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超 ±10 格应拒绝");
+        assert!(handle.store.data().pending_field_pulses.is_empty());
+    }
+
+    #[test]
+    fn field_pulse_rate_limited_per_tick() {
+        // 限流：每实体每拍 1 次（与 spawn/shoot 同款）
+        let mgr = SandboxManager::new().unwrap();
+        let double = r#"(module
+  (import "env" "field_pulse" (func $field_pulse (param f64 f64 f64 f64 f64) (result i32)))
+  (memory (export "memory") 1)
+  (global $r1 (mut i32) (i32.const -1))
+  (global $r2 (mut i32) (i32.const -1))
+  (func (export "on_tick")
+    (global.set $r1 (call $field_pulse (f64.const 1.0) (f64.const 1.0) (f64.const 1.0) (f64.const 1.0) (f64.const 2.0)))
+    (global.set $r2 (call $field_pulse (f64.const 2.0) (f64.const 1.0) (f64.const 1.0) (f64.const 1.0) (f64.const 2.0))))
+  (func (export "get_r1") (result i32) (global.get $r1))
+  (func (export "get_r2") (result i32) (global.get $r2))
+  (func (export "life") (result i32) (i32.const 1)))"#;
+        let mut handle = mgr.create_sandbox(&wasm(double), 100_000, id(836)).unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_r1"), 1, "首脉冲排队");
+        assert_eq!(call_i32_export(&mut handle, "get_r2"), 0, "第二脉冲限流拒绝");
+        assert_eq!(handle.store.data().pending_field_pulses.len(), 1);
     }
 
     // === D-003 motion 出生声明（spawn 第 10 参）===
@@ -3325,7 +3897,7 @@ mod tests {
         let blob_escaped: String = blob_data.iter().map(|b| format!("\\{b:02x}")).collect();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -3343,6 +3915,9 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     {blob_ptr} {blob_len}
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,

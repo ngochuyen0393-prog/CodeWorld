@@ -7,5 +7,7 @@
 
 pub mod conflict;
 pub mod default;
+// D-012 力场：field 出生声明家族的物理结算（FieldEffect/叠加 v2/登记制收集）
+pub mod fields;
 // `override` 是 Rust 保留关键字，用 r# 转义（文件名仍为 override.rs，符合架构文档十）
 pub mod r#override;
