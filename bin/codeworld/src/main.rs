@@ -540,7 +540,7 @@ impl EntitySandboxMap {
     /// 回信投递（D-001b 阶段二 a-1 前半）：drain 回信通道，逐封投递
     ///
     /// - 实体已死/沙箱已销毁 -> 回信无人认领，丢弃+INFO（design-bridge 2.3 死亡
-    ///   竞态：你死前发的信照发，回信你收不到）
+    ///   竞态：信件出站时点需发件人存活；已出站的信照飞，回信抵达时人已死则丢弃）
     /// - 回信超 payload_max -> 截断投递（诚实交付前缀；坏服务器的超大回信不涨
     ///   沙箱内存配额外账——grow 页数也随截断缩）
     /// - 预算复用 probe_fuel（同族外部回调；on_contact/on_field 同档小预算）
@@ -640,7 +640,7 @@ impl EntitySandboxMap {
     /// - 死实体信件丢弃+INFO+inflight 结算（死者信不送）
     /// - port 热重载后消失 -> 作废+INFO+inflight 结算（design-bridge 吊销语义）
     /// - 正常信：取单调 seq -> vault 解析端点 -> INFO 出站一条 -> 推出站通道
-    ///   （信封由工作线程组装；内容永不入日志，日志只记 entity/port/seq/字节数）
+    ///   （信封由工作线程组装；日志只记 entity/port/seq/字节数/端点 url，信内容零入日志）
     fn collect_bridge_sends(&mut self, world: &WorldState) {
         let Some(outbox) = self.bridge.as_mut() else {
             return;

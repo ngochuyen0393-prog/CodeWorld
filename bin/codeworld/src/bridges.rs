@@ -6,6 +6,7 @@
 //!
 //! MVP 客户端边界：手搓 HTTP/1.1 短连接，仅支持本机回环 http（127.0.0.1/localhost）
 //!——禁新增依赖（无 reqwest/ureq），https 真客户端挂起（design-bridge §2.8）。
+//! 客户端局限：不支持 Transfer-Encoding: chunked（MVP，回信需 Content-Length/短连接 EOF）。
 //!
 //! 线程模型：设计值 8 出站线程，MVP 单工作线程先行——每秒 64 封理论上限远超
 //! 单线程 5s 超时窗的消化能力风险存在，实测积压信号出现再扩线程（挂起项）。
@@ -54,7 +55,8 @@ pub(crate) struct BridgeVault {
     path: PathBuf,
     /// 校验通过的端点（登记顺序，重复 port 已去重）
     endpoints: Vec<BridgeEndpoint>,
-    /// 上次加载时的 mtime（None=文件不存在；热重载判定依据）
+    /// 上次加载时的 mtime（None=文件不存在或瞬时读取失败——后者保留重试语义；
+    /// 热重载判定依据）
     mtime: Option<std::time::SystemTime>,
 }
 
@@ -73,13 +75,17 @@ struct BridgeEndpointRaw {
 impl BridgeVault {
     /// 加载保险库（文件不存在=空表首启；JSON 坏=warn 空表不崩世界）
     pub fn load(path: &Path) -> Self {
-        let mtime = std::fs::metadata(path)
+        let mut mtime = std::fs::metadata(path)
             .ok()
             .and_then(|m| m.modified().ok());
         let endpoints = match std::fs::read_to_string(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
+                // P2-B：瞬时读取失败（杀软/备份锁等非 NotFound 错误）不缓存 mtime
+                //（置 None）——保留"下拍重试"语义，防"空表+新 mtime"把桥钉死到
+                // 下次手改文件
                 tracing::warn!(error = %e, path = %path.display(), "[bridge] 保险库读取失败，按空表运行");
+                mtime = None;
                 Vec::new()
             }
             Ok(text) => match serde_json::from_str::<Vec<BridgeEndpointRaw>>(&text) {
@@ -129,12 +135,13 @@ impl BridgeVault {
                 tracing::warn!(port = raw.port, url = %raw.url, "[bridge] 非_http scheme 不支持，拒收");
                 continue;
             }
-            // host 校验：MVP 客户端只做本机回环
+            // host 校验：MVP 客户端只做本机回环（localhost 大小写不敏感——
+            // http://LocalHost:8080 与 http://localhost 等价，P2-D）
             let Some((host, port_num, path)) = parse_http_url(&raw.url) else {
                 tracing::warn!(port = raw.port, url = %raw.url, "[bridge] URL 解析失败，拒收");
                 continue;
             };
-            if host != "127.0.0.1" && host != "localhost" {
+            if host != "127.0.0.1" && !host.eq_ignore_ascii_case("localhost") {
                 tracing::warn!(
                     port = raw.port,
                     url = %raw.url,
@@ -211,6 +218,21 @@ fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
         return None;
     }
     Some((host, port, path))
+}
+
+/// host→SocketAddr 解析（P1-A：connect 必须走 connect_timeout——`TcpStream::connect`
+/// 不受 set_read/write_timeout 约束，对静默丢 SYN 的端口 connect 走 OS 默认
+///（Windows ~21s），单工作线程队头阻塞远超 5s 护栏承诺）
+///
+/// 保险库已限定 host ∈ {127.0.0.1, localhost}（validate 侧 localhost 大小写
+/// 不敏感）：localhost 各形态直接映射 127.0.0.1（不走 DNS 解析，杜绝悬挂）；
+/// 其他 host 返回 None（护栏双重防御，调用侧归超时路径不投递）。
+fn resolve_host_addr(host: &str, port_num: u16) -> Option<std::net::SocketAddr> {
+    if host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") {
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], port_num)))
+    } else {
+        None
+    }
 }
 
 /// 出站信件（collect 出站时组装，worker 消费）
@@ -353,35 +375,72 @@ impl BridgeOutbox {
 fn worker_loop(rx: mpsc::Receiver<Letter>, reply_tx: mpsc::Sender<ReplyEvent>, timeout: Duration) {
     // recv 返回 Err（全部发送端 drop=世界关闭）即迭代结束，线程自然退出
     for letter in rx {
-        // 出站信封（design-bridge 2.1）：世界生成，entity/port/seq 供玩家对账，
-        // payload 原样内嵌（内容永不入日志，也不进世界侧任何展示）
-        let body = envelope_json(
-            letter.entity.0.as_u128(),
-            letter.port,
-            letter.seq,
-            &letter.payload,
-        );
-        match http_post(&letter.endpoint, &body, timeout) {
-            Ok(body) => {
-                let _ = reply_tx.send(ReplyEvent::Reply {
-                    entity: letter.entity,
-                    port: letter.port,
-                    seq: letter.seq,
-                    body,
-                });
-            }
-            Err(e) => {
-                tracing::debug!(
+        // P2-C：每信一包 panic 护栏——worker 线程 panic 不能静默死掉（线程死了
+        // 出站队列无人消化=整条桥哑掉且无日志可查）。panic 信归超时路径（信的
+        // 生命周期必须终结，否则 inflight 计数泄漏堵死该沙箱），warn 留痕线程存活
+        let _ = catch_letter_panic(
+            || handle_letter(&letter, &reply_tx, timeout),
+            |payload| {
+                tracing::warn!(
                     entity = %letter.entity.0,
                     seq = letter.seq,
-                    error = %e,
-                    "[bridge] 出站失败（归超时路径）"
+                    panic = ?payload,
+                    "[bridge] 出站处理 panic（已捕获，工作线程存活；信归超时路径）"
                 );
                 let _ = reply_tx.send(ReplyEvent::Timeout {
                     entity: letter.entity,
                     seq: letter.seq,
                 });
-            }
+            },
+        );
+    }
+}
+
+/// 单信处理（worker_loop 的工作单元，拆出便于 panic 护栏包裹）
+fn handle_letter(letter: &Letter, reply_tx: &mpsc::Sender<ReplyEvent>, timeout: Duration) {
+    // 出站信封（design-bridge 2.1）：世界生成，entity/port/seq 供玩家对账，
+    // payload 原样内嵌（内容永不入日志，也不进世界侧任何展示）
+    let body = envelope_json(
+        letter.entity.0.as_u128(),
+        letter.port,
+        letter.seq,
+        &letter.payload,
+    );
+    match http_post(&letter.endpoint, &body, timeout) {
+        Ok(body) => {
+            let _ = reply_tx.send(ReplyEvent::Reply {
+                entity: letter.entity,
+                port: letter.port,
+                seq: letter.seq,
+                body,
+            });
+        }
+        Err(e) => {
+            tracing::debug!(
+                entity = %letter.entity.0,
+                seq = letter.seq,
+                error = %e,
+                "[bridge] 出站失败（归超时路径）"
+            );
+            let _ = reply_tx.send(ReplyEvent::Timeout {
+                entity: letter.entity,
+                seq: letter.seq,
+            });
+        }
+    }
+}
+
+/// 单信 panic 护栏（P2-C）：工作单元 panic 被捕获转交 on_panic（不静默），
+/// 调用方存活返回 None；正常路径原样返回 Some(结果)
+fn catch_letter_panic<R>(
+    work: impl FnOnce() -> R + std::panic::UnwindSafe,
+    on_panic: impl FnOnce(Box<dyn std::any::Any + Send>),
+) -> Option<R> {
+    match std::panic::catch_unwind(work) {
+        Ok(result) => Some(result),
+        Err(payload) => {
+            on_panic(payload);
+            None
         }
     }
 }
@@ -391,7 +450,15 @@ fn worker_loop(rx: mpsc::Receiver<Letter>, reply_tx: mpsc::Sender<ReplyEvent>, t
 /// 写请求（含代签头）-> 读响应到 EOF（或保险丝上限）-> 解析 status+body。
 /// 非 2xx / 响应畸形 -> Err（归超时路径不投递）。
 fn http_post(endpoint: &BridgeEndpoint, body: &[u8], timeout: Duration) -> std::io::Result<Vec<u8>> {
-    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port_num))?;
+    // P1-A：connect 也吃超时——host 预解析成 SocketAddr 后走 connect_timeout
+    //（裸 connect() 不受 set_*_timeout 约束，静默丢 SYN 时队头阻塞 OS 级超时窗）
+    let addr = resolve_host_addr(&endpoint.host, endpoint.port_num).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("非本机回环 host：{}", endpoint.host),
+        )
+    })?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     // 请求头：世界代签（登记的鉴权头原样贴上——凭证不落沙箱内存）
@@ -568,6 +635,47 @@ mod tests {
     }
 
     #[test]
+    fn vault_host_case_insensitive_accepts_localhost_variants() {
+        // P2-D：host 比较大小写不敏感——http://LocalHost:8080 应被接受
+        //（等价 127.0.0.1）；非回环 host 即使大写形态仍拒收
+        let path = write_vault(
+            r#"[
+                {"port": 1, "url": "http://LocalHost:8080"},
+                {"port": 2, "url": "http://LOCALHOST"},
+                {"port": 3, "url": "http://Example.COM"}
+            ]"#,
+        );
+        let vault = BridgeVault::load(&path);
+        assert!(vault.resolve(1).is_some(), "LocalHost 混合大小写应接受");
+        assert!(vault.resolve(2).is_some(), "LOCALHOST 全大写应接受");
+        assert!(vault.resolve(3).is_none(), "非回环 host（大写形态）仍拒收");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn vault_transient_read_failure_keeps_mtime_uncached_for_retry() {
+        // P2-B：瞬时读取失败（目录替代法——metadata 对目录成功、read_to_string
+        // 对目录报错且非 NotFound，等价杀软/备份锁的瞬时失败形态）不得缓存 mtime：
+        // 下拍 reload_if_changed 必须仍触发重试，防"空表+新 mtime"把桥卡死到
+        // 下次手改文件
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("cw-bridge-dir-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut vault = BridgeVault::load(&dir);
+        assert!(vault.ports().is_empty(), "读取失败按空表运行");
+        assert!(
+            vault.mtime.is_none(),
+            "瞬时读取失败不得缓存 mtime（否则下拍不再重试，桥被钉死）"
+        );
+        assert!(
+            vault.reload_if_changed(),
+            "mtime 未被坏读取钉死：下拍应仍触发重载重试"
+        );
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
     fn outbox_without_worker_collects_outbound_letters() {
         // 无 worker 构造：不起线程，测试直接收出站信件（字段齐）
         let path = write_vault(r#"[{"port": 1, "url": "http://127.0.0.1:18080"}]"#);
@@ -653,6 +761,43 @@ mod tests {
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{\"dx\":3}")?;
         stream.flush()?;
         Ok(req)
+    }
+
+    #[test]
+    fn resolve_host_addr_maps_localhost_variants_to_loopback() {
+        // P1-A：host→SocketAddr 解析——127.0.0.1 与 localhost 全部大小写形态
+        // 都映射 127.0.0.1（不走 DNS 悬挂）；其他 host 一律 None（护栏双重防御，
+        // 调用侧归超时路径不投递）
+        for host in ["127.0.0.1", "localhost", "LocalHost", "LOCALHOST"] {
+            let addr = resolve_host_addr(host, 8080)
+                .unwrap_or_else(|| panic!("本机回环 host {host} 应可解析"));
+            assert_eq!(
+                addr,
+                std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+                "host {host} 应映射回环地址"
+            );
+        }
+        assert!(resolve_host_addr("example.com", 8080).is_none(), "非回环 host 应 None");
+        assert!(resolve_host_addr("", 8080).is_none(), "空 host 应 None");
+    }
+
+    #[test]
+    fn catch_letter_panic_swallows_panic_and_reports() {
+        // P2-C：护栏行为——工作单元 panic 不炸调用方（工作线程存活语义），
+        // panic 载荷转交 on_panic（不静默）；正常路径原样返回且不触发 on_panic
+        let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hit2 = hit.clone();
+        let r = catch_letter_panic(
+            || -> &'static str { panic!("模拟处理中 panic"); },
+            |_payload| hit2.store(true, std::sync::atomic::Ordering::SeqCst),
+        );
+        assert!(r.is_none(), "panic 路径应返 None");
+        assert!(
+            hit.load(std::sync::atomic::Ordering::SeqCst),
+            "on_panic 应被调用（线程存活状态可见，不静默）"
+        );
+        let r2 = catch_letter_panic(|| 42_i32, |_| panic!("成功路径不应触发 on_panic"));
+        assert_eq!(r2, Some(42), "正常路径应原样返回");
     }
 
     #[test]

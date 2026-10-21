@@ -1979,6 +1979,12 @@ impl SandboxManager {
             tracing::warn!("[bridge] 未导出 memory，回信无处落笔，投递作废");
             return Ok(None);
         };
+        // 签名核验先于 grow+写回（P2-A：坏签名导出时不留"字节已落内存但回调
+        // 没跑"的半副作用），也先于预算包裹（签名不匹配 Err 时原剩余量分毫不动）
+        let func = handle.instance.get_typed_func::<(i32, i32, i32), ()>(
+            &mut handle.store,
+            "bridge_on_reply",
+        )?;
         // grow 分配：offset = 调 grow 前的内存字节数（新增零页永不覆盖玩家数据）。
         // 空回信 grow 0 页（offset 指向旧末尾也无妨——len=0 不读字节）。
         // grow 失败（超 64MB 上限）= 投递作废，不崩世界（诚实丢弃，世界不重试）。
@@ -2000,11 +2006,6 @@ impl SandboxManager {
             tracing::warn!(error = %e, offset, "[bridge] 回信写入失败，投递作废");
             return Ok(None);
         }
-        // 签名核验先于预算包裹（签名不匹配 Err 时原剩余量分毫不动）
-        let func = handle.instance.get_typed_func::<(i32, i32, i32), ()>(
-            &mut handle.store,
-            "bridge_on_reply",
-        )?;
         let limit = handle.store.data().fuel_limit;
         let prev_fuel = handle.store.get_fuel()?;
         if let Err(e) = handle.store.set_fuel(budget) {
@@ -2584,6 +2585,39 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// 坏签名模块：导出了 bridge_on_reply 但签名不符（无参返 i32——
+    /// has_export 用 get_func 探测会过，get_typed_func 才暴露签名不匹配）
+    const REPLY_BAD_SIG_WAT: &str = r#"(module
+  (memory (export "memory") 1)
+  (func (export "bridge_on_reply") (result i32) i32.const 7)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn call_on_bridge_reply_bad_signature_leaves_no_half_side_effect() {
+        // P2-A：签名核验先于 grow+写回——错误签名导出时投递 Err，且内存分毫
+        // 不动（不再留下"字节已落内存但回调没跑"的半副作用残局）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(REPLY_BAD_SIG_WAT), 1000, id(84))
+            .unwrap();
+        let before = handle
+            .instance
+            .get_memory(&mut handle.store, "memory")
+            .unwrap()
+            .size(&handle.store);
+        assert!(
+            mgr.call_on_bridge_reply(&mut handle, 1, b"123", 10_000)
+                .is_err(),
+            "签名不匹配应 Err（get_typed_func 失败）"
+        );
+        let after = handle
+            .instance
+            .get_memory(&mut handle.store, "memory")
+            .unwrap()
+            .size(&handle.store);
+        assert_eq!(after, before, "签名核验失败不得动内存（无 grow 半副作用）");
     }
 
     #[test]

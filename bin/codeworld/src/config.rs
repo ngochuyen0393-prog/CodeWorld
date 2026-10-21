@@ -279,7 +279,13 @@ impl Config {
             cfg.bridge_payload_max = n;
         }
         if let Some(n) = env_u64("CODEWORLD_BRIDGE_TIMEOUT_S") {
-            cfg.bridge_timeout_s = n;
+            // 护栏（P2-E）：0 = 非法（0 秒超时=一切信必超时，无合法语义）->
+            // 按既有"非法回退默认"惯例回退 5，坏值不进世界
+            if n == 0 {
+                tracing::warn!(value = n, "[config] CODEWORLD_BRIDGE_TIMEOUT_S=0 无效（零秒超时=一切信必超时），回退默认 5");
+            } else {
+                cfg.bridge_timeout_s = n;
+            }
         }
         if let Some(n) = env_u64("CODEWORLD_BRIDGE_INFLIGHT") {
             cfg.bridge_inflight = n as u32;
@@ -863,6 +869,17 @@ mod tests {
         assert_eq!(c.bridge_payload_max, 8192);
         assert_eq!(c.bridge_timeout_s, 5);
         assert_eq!(c.bridge_inflight, 4);
+    }
+
+    #[test]
+    fn load_bridge_timeout_zero_falls_back_to_default() {
+        // 边界（P2-E）：0 = 非法（0 秒超时=一切信必超时，无合法语义）->
+        // 按既有"非法回退默认"惯例回退 5 秒，坏值不进世界
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_BRIDGE_TIMEOUT_S", "0");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_BRIDGE_TIMEOUT_S");
+        assert_eq!(c.bridge_timeout_s, 5, "0 应回退默认超时 5 秒");
     }
 
     #[test]
