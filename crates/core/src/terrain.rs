@@ -173,7 +173,7 @@ impl Terrain {
             // 4. 幅度定标
             heights.push(params.base_amplitude * v);
         }
-        // 4. 坡度钳制（防不可爬陡坡）：相邻采样高度差 ≤ max_slope * spacing。
+        // 5. 坡度钳制（防不可爬陡坡）：相邻采样高度差 ≤ max_slope * spacing。
         //    前向+后向两遍（经典斜率限制器）：前向压上升沿、后向压下降沿，
         //    单向偏置被第二遍抵消；只把值拉向邻点，全局极值只减不增。
         let max_delta = params.max_slope * TERRAIN_SPACING;
@@ -244,6 +244,7 @@ impl Terrain {
     ///（0.25 格/段），路径是线性参数曲线——每段内方程对 t 线性，逐段解析求解，
     /// 取路径方向上第一个有效根。返回 t ∈ [0,1]；None = 全程在地形上方（不落地）。
     /// 起步已在地面下（异常态兜底）：返回 Some(0.0) 立即触地（与旧平地口径一致）。
+    /// 纯查表无 IO、每拍热路径：日志豁免，可观测性以锚测试为主。
     pub fn segment_first_contact(
         &self,
         from: (f64, f64),
@@ -272,21 +273,26 @@ impl Terrain {
         if n < 2 {
             return None;
         }
-        // 路径覆盖的采样格区间 [ia, ib]（沿路径方向遍历，保证取到的是"最先"接触）。
-        // 域外段处理：域外地面=域边高度延伸（与 height() 钳制语义一致）——
-        // 把域外路径段的 x 坐标全部钳进域边格（等效于在边格段上解交点，
-        // 高度恒定段的延长线与延伸面重合，解不失真）
+        // 路径覆盖的采样格区间（沿路径方向遍历，保证取到的是时间上"最先"接触）：
+        // dx>0 从起点格升序、dx<0 从起点格降序——反向路径若仍按格下标升序扫，
+        // 先解出的是时间上"后发生"的出口侧根（R84 复审缺陷 1：左向穿山返回
+        // 出口侧 t 而非入口侧）。
+        // 域外段处理（近似口径，如实记录）：域外地面语义=域边高度恒定延伸
+        //（与 height() 钳制一致），实现上把域外 x 钳进边格、在边格线性段的
+        // 延长线上解根——平地（边格等高）时延长线与延伸面重合无误差；边格
+        // 有坡度时是外推近似，误差随域外距离按段斜率放大（斜率≤max_slope×
+        // spacing）。恒定面精确解为已知改进项（.cc-bugs #20），平地射程标定
+        // 等既有用例不受影响（边格等高时两口径逐位一致）
         let dir = dx.signum();
         let cell_of = |x: f64| -> usize {
             (((x - TERRAIN_X_MIN) / TERRAIN_SPACING).floor() as i64)
                 .clamp(0, (n - 2) as i64) as usize
         };
-        let (ia, ib) = if dir > 0.0 {
-            (cell_of(x0), cell_of(x1))
-        } else {
-            (cell_of(x1), cell_of(x0))
-        };
-        for i in ia..=ib {
+        let lo = cell_of(x0).min(cell_of(x1));
+        let hi = cell_of(x0).max(cell_of(x1));
+        // 按路径方向枚举格：dir>0 升序（lo→hi），dir<0 降序（hi→lo）
+        for k in 0..=(hi - lo) {
+            let i = if dir > 0.0 { lo + k } else { hi - k };
             let ga = self.heights[i];
             let gb = self.heights[i + 1];
             // 该格内 ground(x) = ga + (x - xa)/spacing * (gb - ga)；
@@ -305,8 +311,8 @@ impl Terrain {
             // 格点处相邻两段值相同，边界根在邻格同样解出——容差只需吸收
             // 浮点噪声，绝不能用半格级容差：段的延长线处真实地面已偏离
             // 该段线性，外推根=假落点）。
-            // 例外：边格延伸——i=0（左界）/i=n-2（右界）的段在域外是恒定高度
-            // 延伸面（与 height() 钳制同语义），域外根照收不失真
+            // 例外：边格延伸——i=0（左界）/i=n-2（右界）的段在域外按上述
+            // 近似口径放行延长线根（见函数头"域外段处理"注记）
             let tx = x0 + t * dx;
             let xa = TERRAIN_X_MIN + i as f64 * TERRAIN_SPACING;
             let xb = TERRAIN_X_MIN + (i + 1) as f64 * TERRAIN_SPACING;
@@ -487,13 +493,14 @@ mod tests {
             .enumerate()
             .find(|(_, &h)| h > 5.0)
             .map(|(i, _)| TERRAIN_X_MIN + i as f64 * TERRAIN_SPACING);
-        if let Some(x) = x_deep {
-            assert_eq!(
-                t.segment_first_contact((x, 3.0), (x + 1.0, 2.0), 0.5),
-                Some(0.0),
-                "地下起步应立即触地"
-            );
-        }
+        // 硬化（R84 审查 P2）：找不到高采样点必须响亮失败，禁条件空转假绿
+        //（山地 seed=8 峰值锚 >4.0，实测 ≈5.92，>5.0 前提恒成立）
+        let x = x_deep.expect("山地 seed=8 必有高度 >5.0 的采样点（峰锚在案）");
+        assert_eq!(
+            t.segment_first_contact((x, 3.0), (x + 1.0, 2.0), 0.5),
+            Some(0.0),
+            "地下起步应立即触地"
+        );
     }
 
     #[test]
@@ -544,6 +551,79 @@ mod tests {
             t.segment_first_contact((valley_x - 5.0, valley_h + 20.0), (valley_x + 5.0, valley_h + 20.0), 0.5),
             None,
             "谷顶 20 格平飞不应落地"
+        );
+    }
+
+    #[test]
+    fn ccd_mountain_crossing_first_contact_both_directions_match_brute_force() {
+        // D-016 R84 复审返工锚：左向穿山一拍整段穿越（表面被穿两次）时必须返回
+        // 时间上"最先"的接触（入口侧），不是出口侧——方向序错误的回归锚。
+        // 参考=独立暴力扫描（1e-6 步长 + 二分精化），不复用被测函数逻辑。
+        let terrain = Terrain::new(TerrainPreset::Mountain, 8);
+        let (peak_i, &peak_h) = terrain
+            .samples()
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let peak_x = TERRAIN_X_MIN + peak_i as f64 * TERRAIN_SPACING;
+        let c = peak_h - 0.5; // 水平弹道高度：峰下 0.5，必穿山面两次
+        let r = 0.3;
+        let (xl, xr) = (peak_x - 5.0, peak_x + 5.0);
+        // 前提自检：两端点都在接触线上方（路径表面被穿两次，方向序才有意义）
+        for &x in &[xl, xr] {
+            assert!(c > terrain.height(x) + r, "前提：端点 x={x} 应在接触线上方");
+        }
+        // 独立暴力参考：t∈[0,1] 步长 1e-6 扫描首次穿透，命中后二分 40 轮精化
+        let brute_first_contact = |from: (f64, f64), to: (f64, f64)| -> Option<f64> {
+            const STEPS: u32 = 1_000_000;
+            let dt = 1.0 / STEPS as f64;
+            let pen = |tt: f64| -> bool {
+                let x = from.0 + (to.0 - from.0) * tt;
+                let y = from.1 + (to.1 - from.1) * tt;
+                y < terrain.height(x) + r
+            };
+            if pen(0.0) {
+                return Some(0.0); // 起步穿透兜底（本测试路径不会走到）
+            }
+            let mut prev_t = 0.0f64;
+            for s in 1..=STEPS {
+                let tt = s as f64 * dt;
+                if pen(tt) {
+                    let (mut lo, mut hi) = (prev_t, tt);
+                    for _ in 0..40 {
+                        let mid = (lo + hi) / 2.0;
+                        if pen(mid) {
+                            hi = mid;
+                        } else {
+                            lo = mid;
+                        }
+                    }
+                    return Some((lo + hi) / 2.0);
+                }
+                prev_t = tt;
+            }
+            None
+        };
+        // 右向（dx>0）：修前已碰巧正确（左→右扫格=时间序）
+        let ref_r = brute_first_contact((xl, c), (xr, c)).expect("右向路径必穿山触地");
+        let got_r = terrain
+            .segment_first_contact((xl, c), (xr, c), r)
+            .expect("右向必返回接触");
+        assert!((got_r - ref_r).abs() < 5e-6, "右向首接触 t={got_r} 应=暴力参考 {ref_r}");
+        // 左向（dx<0，R84 缺陷主场景）：修前返回出口侧 t≈0.558，真值≈0.099（入口侧）
+        let ref_l = brute_first_contact((xr, c), (xl, c)).expect("左向路径必穿山触地");
+        let got_l = terrain
+            .segment_first_contact((xr, c), (xl, c), r)
+            .expect("左向必返回接触");
+        assert!(
+            (got_l - ref_l).abs() < 5e-6,
+            "左向首接触 t={got_l} 应=暴力参考 {ref_l}（时间上最先=入口侧）"
+        );
+        // 方向不对称性自检：两方向首接触 t 必不同（山形非对称，两交点 t 不互补）
+        assert!(
+            (ref_l - ref_r).abs() > 1e-3,
+            "前提自检失败：两方向首接触 t 应不同（左向={ref_l} 右向={ref_r}），否则锚不住方向序"
         );
     }
 
