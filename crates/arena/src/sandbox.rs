@@ -1906,6 +1906,17 @@ impl SandboxManager {
         let ids_ptr = mem_size - FIELD_MAILBOX_CAP * 8;
         let n_ptr = ids_ptr - 4;
         let n = ids.len().min(FIELD_MAILBOX_CAP);
+        // 截断显式警告（D-012 收尾刀 P1-2）：max_entities 可经 CODEWORLD_MAX_ENTITIES
+        // 调大 >64，静默截断会让模块把"恰好 64"误读为"全部在场"——warn 一行让
+        // 排障有迹可循（信箱容量推导是结构改动，非收尾刀范围）
+        if ids.len() > FIELD_MAILBOX_CAP {
+            tracing::warn!(
+                entity_id = %handle.store.data().entity_id.0,
+                ids_in_domain = ids.len(),
+                cap = FIELD_MAILBOX_CAP,
+                "[field] 域内实体数超场信箱容量，清单截断（模块只见前 64 条）"
+            );
+        }
         // 签名核验先于预算包裹（签名不匹配 Err 时原剩余量分毫不动）
         let func = handle.instance.get_typed_func::<(i32, i32, i32), i32>(
             &mut handle.store,
@@ -4077,6 +4088,27 @@ mod tests {
             handle.store.get_fuel().unwrap(),
             100_000,
             "Err 路径 fuel 不应被弄丢"
+        );
+    }
+
+    #[test]
+    fn call_on_field_truncates_mailbox_without_panic() {
+        // D-012 收尾刀 P1-2：域内实体数 > FIELD_MAILBOX_CAP（max_entities 可经
+        // CODEWORLD_MAX_ENTITIES 调大）时清单截断——warn 一行 + 不 panic +
+        // 模块读到的 n 恒 ≤ cap（信箱写入边界永不越界）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&field_source_wat()), 100_000, id(823))
+            .unwrap();
+        handle.store.set_fuel(100_000).unwrap();
+        // 70 个 id（> 64 槽）：截断到 64，n 写入 64，on_field 正常应答
+        let ids: Vec<u64> = (0..70).map(|i| i as u64 + 1).collect();
+        let out = mgr.call_on_field(&mut handle, &ids, 10_000).unwrap();
+        assert_eq!(out, Some(42), "截断不影响应答透传");
+        assert_eq!(
+            call_i32_export(&mut handle, "get_n"),
+            FIELD_MAILBOX_CAP as i32,
+            "超容清单写入模块读到的 n 应为截断后的 cap 值"
         );
     }
 

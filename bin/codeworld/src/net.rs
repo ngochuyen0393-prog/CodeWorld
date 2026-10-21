@@ -106,6 +106,8 @@ pub(crate) struct WorldSnapshot {
 /// 单个力场投影（D-012：场源坐标+半径+成型态）
 #[derive(Debug, Serialize)]
 pub(crate) struct FieldSnapshot {
+    /// 场源实体 id（帧序稳定键，D-012 收尾刀 P2 排序用）
+    pub id: u128,
     /// 场源 x（圆心）
     pub x: f64,
     /// 场源 y
@@ -261,14 +263,17 @@ pub(crate) fn build_snapshot(
         }
     });
     // 力场环投影（D-012 可视铁律）：每拍全量（空数组恒有）；成型态按
-    // forming_ticks 判（虚线环=成型中给进攻方反应窗，实线环=已成型）
-    let fields: Vec<FieldSnapshot> = world
+    // forming_ticks 判（虚线环=成型中给进攻方反应窗，实线环=已成型）。
+    // 定序纪律（D-012 收尾刀 P2）：按 id 升序，与 entities 帧序稳定要求同款
+    // ——纯渲染层差异（半透明环叠序），但快照逐帧 diff 依赖帧序稳定
+    let mut fields: Vec<FieldSnapshot> = world
         .entities
         .values()
         .filter(|e| e.is_alive() && e.field_radius() > 0.0)
         .map(|e| {
             let (x, y) = e.pos();
             FieldSnapshot {
+                id: e.id.0.as_u128(),
                 x,
                 y,
                 radius: e.field_radius(),
@@ -276,6 +281,7 @@ pub(crate) fn build_snapshot(
             }
         })
         .collect();
+    fields.sort_by_key(|f| f.id);
     WorldSnapshot {
         tick: world.tick(),
         caption: caption.to_string(),

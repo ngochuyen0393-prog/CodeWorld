@@ -2151,9 +2151,15 @@ fn collect_field_pulses(sandbox_map: &mut EntitySandboxMap) -> Vec<PendingFieldP
 /// 遍历（确定序，与全世界结算定序同源）。场不认人：无所有权豁免。
 fn apply_field_pulses(
     world: &mut WorldState,
-    pulses: Vec<PendingFieldPulse>,
+    mut pulses: Vec<PendingFieldPulse>,
     max_speed: f64,
 ) {
+    // 跨源确定序（D-012 收尾刀 P1-1，#044 确定性红线）：collect 按 HashMap
+    // 迭代序收集，同拍多脉冲命中同一实体时应用顺序影响结果（极速钳制非线性，
+    // v=20 先 +10 后 -15 得 10、反序得 15）——应用前按 source EntityId 升序
+    // 排死（与 thrust 的 moves.sort_by_key 同款先例，两台机器看同一个世界
+    // 必然同样结算）
+    pulses.sort_by_key(|p| p.source.0);
     for p in pulses {
         // 域内带速度实体清单（id 升序确定序）
         let mut targets: Vec<EntityId> = world
@@ -11042,14 +11048,48 @@ mod tests {
             tower.field_drag_delta()
         );
         // 场塔的 on_field 已导出（内嵌塔代码）：世界询问走通，应答 0=维持出生声明
-        let mut handle = map.sandboxes.get_mut(&tower.id).unwrap();
+        let handle = map.sandboxes.get_mut(&tower.id).unwrap();
         assert_eq!(
             map.manager
-                .call_on_field(&mut handle, &[1, 2], map.field_fuel)
+                .call_on_field(handle, &[1, 2], map.field_fuel)
                 .unwrap(),
             Some(0),
             "示例 on_field 应答 0=维持出生声明（笨场）"
         );
+    }
+
+    /// D-012 收尾刀 P1-1：跨源脉冲应用序确定（#044 确定性红线锚）
+    ///
+    /// 两脉冲同拍命中同一 dynamic 造物：+10 与 -15 的应用顺序在极速钳制
+    /// （非线性）下产生不同终值（正序 25→10 / 反序 5→15）——应用前按
+    /// source EntityId 升序排死后，Vec 传入顺序不再影响结果。
+    #[test]
+    fn field_pulse_application_order_is_source_sorted() {
+        use codeworld_core::entity::EntityId;
+        let mut world = WorldState::new();
+        let target = EntityId(Uuid::from_u128(100));
+        let mut e = make_entity_of_owner(100, 50, (0.0, 0.0));
+        e.set_velocity((20.0, 0.0));
+        world.entities.insert(target, e);
+        let mk = |source: u128, vx: f64| PendingFieldPulse {
+            source: EntityId(Uuid::from_u128(source)),
+            x: 0.0,
+            y: 0.0,
+            vx,
+            vy: 0.0,
+            radius: 5.0,
+        };
+        // source=1 (+10) 与 source=2 (-15) 命中同一实体：正反两序传入，
+        // apply 内部按 source 排序后结果必须一致（source 小者先应用：
+        // 20+10=30 钳 25，25-15=10）
+        let mut w1 = world.clone();
+        let mut w2 = world;
+        apply_field_pulses(&mut w1, vec![mk(2, -15.0), mk(1, 10.0)], 25.0);
+        apply_field_pulses(&mut w2, vec![mk(1, 10.0), mk(2, -15.0)], 25.0);
+        let v1 = w1.entities.get(&target).unwrap().velocity();
+        let v2 = w2.entities.get(&target).unwrap().velocity();
+        assert_eq!(v1, v2, "脉冲应用结果不得依赖传入顺序（确定性）");
+        assert!((v1.0 - 10.0).abs() < 1e-9, "source 升序：+10 先、-15 后 → 10，实际 {v1:?}");
     }
 
     /// 只 spawn 一次的玩家进场代码（$done 全局节流，README 示例同款模式）：

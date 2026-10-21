@@ -85,10 +85,10 @@ pub fn effective_gravity_drag(
         .clamp(codeworld_core::entity::FIELD_DRAG_EFFECTIVE_MIN, codeworld_core::entity::FIELD_DRAG_EFFECTIVE_MAX);
     tracing::debug!(
         pos = ?pos,
-        fields_covered = fields.iter().len(),
+        fields_total = fields.iter().len(),
         gravity,
         drag,
-        "[field] 生效参数结算（叠加 v2 代数和+域钳制）"
+        "[field] 生效参数结算（叠加 v2 代数和+域钳制；fields_total=清单总数非覆盖数）"
     );
     (gravity, drag)
 }
