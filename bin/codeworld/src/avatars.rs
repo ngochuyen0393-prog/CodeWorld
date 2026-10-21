@@ -81,6 +81,8 @@ impl From<MaskError> for RejectReason {
             MaskError::Decode(_) => RejectReason::DecodeFailed,
             MaskError::TooLarge { .. } => RejectReason::OversizeDim,
             MaskError::Isolate => RejectReason::IsolateFail,
+            // BadDims=内部不变量被破（管线恒产 128 表），防御分支归 decode_failed
+            MaskError::BadDims { .. } => RejectReason::DecodeFailed,
         }
     }
 }
@@ -111,6 +113,7 @@ impl AvatarRegistry {
         };
         let mut loaded = 0usize;
         let mut skipped = 0usize;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut metas: Vec<(PathBuf, AvatarMeta)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
@@ -124,7 +127,15 @@ impl AvatarRegistry {
             };
             match serde_json::from_str::<AvatarMeta>(&text) {
                 Ok(meta) => {
-                    if is_canonical_asset_id(&meta.asset_id) {
+                    // 查重（R1 审查）：多份 json 声明同一 asset_id 只收先到者
+                    if !seen.insert(meta.asset_id.clone()) {
+                        tracing::warn!(
+                            file = %path.display(),
+                            asset_id = %meta.asset_id,
+                            "[avatars] asset_id 重复（多份 json 同 id），跳过"
+                        );
+                        skipped += 1;
+                    } else if is_canonical_asset_id(&meta.asset_id) {
                         metas.push((path, meta));
                     } else {
                         tracing::warn!(
@@ -227,8 +238,8 @@ pub(crate) struct UploadInput<'a> {
     pub height_world: Option<f64>,
 }
 
-/// 上传主流程（校验->掩码->落盘->登记）：任何一步失败即整体拒绝（无副作用），
-/// 落盘成功才登记（磁盘与内存一致）
+/// 上传主流程（校验->掩码->落盘->登记）：任何一步失败即整体拒绝；落盘半途
+/// 失败清理已写文件（无孤儿垃圾），落盘成功才登记（磁盘与内存一致）
 pub(crate) fn store_upload(
     reg: &AvatarRegistry,
     input: UploadInput,
@@ -237,6 +248,11 @@ pub(crate) fn store_upload(
     if input.png.len() > MAX_AVATAR_PNG_BYTES {
         tracing::info!(bytes = input.png.len(), "[avatars] 上传拒绝：超 2MB（oversize）");
         return Err(RejectReason::Oversize);
+    }
+    // ①b name 校验（R1 双审）：非空且 ≤64 字节（UTF-8 合法字节数，中文角色名合法）
+    if input.name.is_empty() || input.name.len() > 64 {
+        tracing::info!(name_len = input.name.len(), "[avatars] 上传拒绝：name 空或超 64 字节（bad_json）");
+        return Err(RejectReason::BadJson);
     }
     // ② 原图尺寸（元数据 w/h 用）与掩码生成（解码+阈值化+降采样）
     let (orig_w, orig_h) = png_dimensions(input.png).map_err(RejectReason::from)?;
@@ -265,7 +281,8 @@ pub(crate) fn store_upload(
     )
     .map_err(|e| {
         tracing::error!(path = %meta_path.display(), error = %e, "[avatars] 元数据落盘失败");
-        RejectReason::BadJson
+        cleanup_partial_write(reg.dir(), &asset_id); // 清孤儿 png（不留垃圾）
+        RejectReason::BadJson // IO 失败无专属 reason，归 bad_json + error 日志（协议文档注记）
     })?;
     tracing::info!(
         asset_id = %asset_id,
@@ -290,7 +307,8 @@ pub(crate) fn store_upload(
 }
 
 /// 身高参数钳制：缺省 2.0；域 0.05..=25.0（与 radius 域一致，卡面定案=钳制非拒绝）；
-/// NaN/非有限值回落默认（f64::clamp 遇 NaN 返回 NaN，必须先拦）
+/// NaN/非有限值回落默认（f64::clamp 遇 NaN 返回 NaN，必须先拦）。
+/// 日志豁免：trivial helper——结果随 store_upload 收图日志一并留痕
 pub(crate) fn clamp_height(h: Option<f64>) -> f64 {
     const DEFAULT: f64 = 2.0;
     const MIN: f64 = 0.05;
@@ -302,10 +320,22 @@ pub(crate) fn clamp_height(h: Option<f64>) -> f64 {
     }
 }
 
-/// 资产 ID：`av_` + UUID 前 16 hex（ASCII 路径安全；碰撞概率 2^-64 忽略）
+/// 资产 ID：`av_` + UUID 前 16 hex（ASCII 路径安全；碰撞概率 2^-64 忽略）。
+/// 日志豁免：trivial helper——id 随 store_upload/登记日志一并留痕
 fn new_asset_id() -> String {
     let hex = uuid::Uuid::new_v4().simple().to_string();
     format!("av_{}", &hex[..16])
+}
+
+/// 半途失败清理：删除已落盘的 png（json 写失败时调用，不留孤儿垃圾）。
+/// 文件不存在=静默幂等（首次上传失败路径 png 也可能没写成）
+fn cleanup_partial_write(dir: &Path, asset_id: &str) {
+    let png_path = dir.join(format!("{asset_id}.png"));
+    match std::fs::remove_file(&png_path) {
+        Ok(()) => tracing::warn!(path = %png_path.display(), "[avatars] 半途失败清理：孤儿 png 已删"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // 没写过，静默
+        Err(e) => tracing::error!(path = %png_path.display(), error = %e, "[avatars] 孤儿 png 清理失败（重启扫描会跳过，无害垃圾）"),
+    }
 }
 
 /// asset_id 规范校验：av_ + 16 hex（路径拼接安全不变量——加载/下发前先验，
@@ -491,6 +521,64 @@ mod tests {
         assert_eq!(clamp_height(Some(0.01)), 0.05, "超下限钳到 0.05");
         assert_eq!(clamp_height(Some(f64::NAN)), 2.0, "NaN 回默认（clamp 防御）");
         assert_eq!(clamp_height(Some(f64::INFINITY)), 25.0, "+inf 钳到上限");
+    }
+
+    #[test]
+    fn registry_load_dedupes_same_asset_id() {
+        // 规则（R1 质量审 P1-1 残留子项）：两个 json 声明同一 asset_id = 重复注册——
+        // 扫目录加载按 asset_id 查重，后到者跳过（先到者优先，日志留痕）
+        let dir = tmp_assets_dir("dup");
+        let reg = AvatarRegistry::load(&dir);
+        let a = good_upload(&reg, "first");
+        // 手造同 id 第二份 png+json（文件名不同、内部 asset_id 相同）
+        let png = solid_png(8, 8, 255);
+        let other_name = format!("{}.png", uuid::Uuid::new_v4().simple());
+        std::fs::write(dir.join(&other_name), &png).unwrap();
+        std::fs::write(
+            dir.join(other_name.replace(".png", ".json")),
+            format!(
+                r#"{{"asset_id":"{}","name":"dup","height_world":2.0,"w":8,"h":8,"created_tick":0}}"#,
+                a.asset_id
+            ),
+        )
+        .unwrap();
+        let reg2 = AvatarRegistry::load(&dir);
+        assert_eq!(reg2.list().len(), 1, "同 id 只注册一次");
+    }
+
+    #[test]
+    fn upload_rejects_empty_or_oversize_name() {
+        // 规则（R1 双审 P2 合并）：name 非空且 ≤64 字节（UTF-8；中文角色名合法，
+        // 协议文档不设 ASCII 限定）——空串/超长按 bad_json 拒绝不落盘
+        let dir = tmp_assets_dir("name");
+        let reg = AvatarRegistry::load(&dir);
+        let png = solid_png(8, 8, 255);
+        let bads: Vec<String> = vec![String::new(), "x".repeat(65)];
+        for bad in &bads {
+            assert_eq!(
+                store_upload(&reg, UploadInput { png: &png, name: bad, height_world: None }),
+                Err(RejectReason::BadJson),
+                "非法 name 应拒绝：{:?}",
+                &bad[..bad.len().min(8)]
+            );
+        }
+        // 边界内合法：恰 64 字节 + 中文名
+        let ok64 = "x".repeat(64);
+        assert!(store_upload(&reg, UploadInput { png: &png, name: &ok64, height_world: None }).is_ok());
+        assert!(store_upload(&reg, UploadInput { png: &png, name: "皮蛋", height_world: None }).is_ok());
+    }
+
+    #[test]
+    fn cleanup_partial_write_removes_stray_png() {
+        // 规则（R1 质量审 P2-1）：json 落盘失败时清理已写的 png（不留孤儿垃圾）——
+        // 清理函数单元行为：目标文件存在则删、不存在则静默
+        let dir = tmp_assets_dir("cleanup");
+        let stray = dir.join("av_0123456789abcdef.png");
+        std::fs::write(&stray, b"png-bytes").unwrap();
+        cleanup_partial_write(&dir, "av_0123456789abcdef");
+        assert!(!stray.exists(), "孤儿 png 应被清理");
+        // 不存在的文件静默（幂等）
+        cleanup_partial_write(&dir, "av_0123456789abcdef");
     }
 
     #[test]

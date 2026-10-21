@@ -74,9 +74,13 @@ pub enum MaskError {
     /// 连通性校验失败：无实心内容或存在多个大连通域（断件图）
     #[error("连通性校验失败：断件图（多大连通域或全空）")]
     Isolate,
+    /// 掩码表尺寸非 MASK_SIZE（公开 API 防御边界——连通域坐标换算按 128 硬约束）
+    #[error("掩码表尺寸非 {MASK_SIZE}: {w}x{h}")]
+    BadDims { w: u16, h: u16 },
 }
 
-/// PNG 原图尺寸（只读头不解码像素；上传元数据 w/h 用）
+/// PNG 原图尺寸（只读头不解码像素；上传元数据 w/h 用）。
+/// 日志豁免：trivial helper——成功路径由调用方（store_upload 收图日志）携带尺寸
 pub fn png_dimensions(png_bytes: &[u8]) -> Result<(u32, u32), MaskError> {
     let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
     let reader = decoder
@@ -181,6 +185,11 @@ fn downsample_to_mask(src_w: u32, src_h: u32, solid_src: &[u8]) -> AvatarMask {
 /// 连通域面积 >= MASK_FRAG_DROP_N -> Err(Isolate)（断件打回）；
 /// 全部小碎片清零丢弃。全空图（0 实心格）= 无主件 -> Err(Isolate)
 pub fn validate_and_prune(mask: &mut AvatarMask) -> Result<usize, MaskError> {
+    // 尺寸硬约束（公开 API 防御边界）：连通域换算按 MASK_SIZE，非 128 表显式
+    // 报错而非静默算错（R1 审查 P2：AvatarMask 字段 pub，防将来误传非 128 表）
+    if mask.w != MASK_SIZE as u16 || mask.h != MASK_SIZE as u16 {
+        return Err(MaskError::BadDims { w: mask.w, h: mask.h });
+    }
     let n = mask.solid.len();
     // 只读源快照（flood fill 与修剪期间原表被改写，克隆 16KB 换借用干净）
     let solid = mask.solid.clone();
@@ -578,6 +587,18 @@ mod tests {
             png_dimensions(b"garbage"),
             Err(MaskError::Decode(_))
         ), "坏数据同样报 Decode");
+    }
+
+    #[test]
+    fn validate_prune_rejects_non_128_table() {
+        // 规则（R1 双审 P2）：连通域坐标换算按 MASK_SIZE 硬约束——非 128 表显式
+        // Err(BadDims) 而非静默算错（公开 API + pub 字段的防御边界）
+        let mut m = AvatarMask::new(64, 64);
+        m.set(0, 0, 1);
+        assert_eq!(
+            validate_and_prune(&mut m),
+            Err(MaskError::BadDims { w: 64, h: 64 })
+        );
     }
 
     #[test]

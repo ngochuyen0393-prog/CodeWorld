@@ -317,14 +317,14 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
   | 字段 | 必填 | 说明 |
   |------|------|------|
   | `file` | 是 | PNG 字节（透明底角色图；≤2MB=MAX_AVATAR_PNG_BYTES，边长 ≤1024=MAX_AVATAR_PNG_DIM 恰等放行；调色板/灰度/16 位自动归一，真彩 RGBA/RGB 全收） |
-  | `name` | 是 | 角色名（ASCII string） |
+  | `name` | 是 | 角色名（string，UTF-8；非空且 ≤64 字节，中文名合法） |
   | `height_world` | 否 | 世界高度格数 f64（默认 2.0，域钳制 0.05..=25.0——与 radius 域一致；本版只登记不消费，挂实体刀用） |
 - 响应：**HTTP 恒 200**，成败看 JSON `ok` 字段：
   - 成功：`{"ok":true,"asset_id":"av_<16hex>"}`
   - 拒绝：`{"ok":false,"reason":"<枚举>"}`，reason 全 ASCII 小写：
     | reason | 触发 |
     |--------|------|
-    | `bad_json` | multipart 缺 file/name 字段 / height_world 非数值 / 请求体解析失败 |
+    | `bad_json` | multipart 缺 file/name 字段 / name 空或超 64 字节 / height_world 非数值 / 请求体解析失败 / **磁盘 IO 失败降级**（服务器 error 日志留痕，排查看日志） |
     | `oversize` | PNG 超 2MB |
     | `oversize_dim` | 原图边长超 1024（恰等放行另一侧） |
     | `decode_failed` | PNG 解码失败/截断/不支持格式 |
