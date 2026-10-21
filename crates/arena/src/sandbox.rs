@@ -260,6 +260,12 @@ pub struct SandboxData {
     /// env.birth_blob 随时读回——世界不解释内容，通道归世界内容归玩家。随沙箱
     /// 存活不持久化，跨重启不保留；玩家进场与弹丸无包，读回恒 0）
     pub birth_blob: Vec<u8>,
+    /// 沙箱资产段（#051 皮入沙箱）：装戴清单——asset_id 列表（av_+16hex，指向
+    /// bin 侧 AssetMirror 全局镜像仓；同图全局一份，MC 同款去重）。数据非执行：
+    /// 不烧 fuel、不参与编译实例化；配额由 crate::assets::SandboxAssetQuota
+    /// 引擎侧记账（不信任玩家自报）。装戴时由 host 写入，与 birth_blob 同生命
+    /// 周期（随沙箱存活，不持久化，换血时随行转移——replace_sandbox_assets）。
+    pub assets: Vec<String>,
     /// 地形快照指针（D-016：move_by/spawn 的钻地判据从 y<0 改 y<ground(x)）。
     /// 与 probe_bridge 同款窗口契约：仅主循环阶段一执行玩家代码的窗口内非空
     ///（host 挂载 -> call -> 置空同一循环体作用域），窗口外恒 null——
@@ -1551,7 +1557,7 @@ impl SandboxManager {
     /// fuel 语义：新沙箱配额由调用方传入（attack 路径传旧沙箱剩余量，防反复被攻击回满刷配额）。
     pub fn replace_sandbox(
         &self,
-        handle: SandboxHandle,
+        mut handle: SandboxHandle,
         new_wasm_bytes: &[u8],
         fuel: u64,
     ) -> std::result::Result<SandboxHandle, (SandboxHandle, anyhow::Error)> {
@@ -1568,6 +1574,10 @@ impl SandboxManager {
                         "旧沙箱仍有未处理攻击请求，随替换丢弃"
                     );
                 }
+                // #051 夺沙箱=夺全套：资产段随行（在拆旧前转移——失败路径根本
+                // 进不了这里，旧沙箱随 Err 原样带回，资产自然不丢）
+                let mut new_handle = new_handle;
+                Self::replace_sandbox_assets(&mut handle, &mut new_handle);
                 drop(handle);
                 tracing::debug!(entity_id = %entity_id.0, "沙箱替换（路线A，先建后拆）");
                 Ok(new_handle)
@@ -1580,6 +1590,19 @@ impl SandboxManager {
                 );
                 Err((handle, e))
             }
+        }
+    }
+
+    /// 换血接线（#051 夺取语义：沙箱易主=资产随行）——旧沙箱资产段整体转移进
+    /// 新沙箱（移动非复制：转移后旧沙箱资产段清空，防双重持有）。
+    /// replace_sandbox 的 Ok 分支已内置调用（拆旧前转移，失败路径资产自然留在
+    /// 旧沙箱随 Err 原样带回）；独立成方法供测试与未来装戴刀复用。
+    pub fn replace_sandbox_assets(old: &mut SandboxHandle, new: &mut SandboxHandle) {
+        let moved = std::mem::take(&mut old.store.data_mut().assets);
+        let count = moved.len();
+        new.store.data_mut().assets = moved;
+        if count > 0 {
+            tracing::debug!(count, "[skin] 沙箱资产段随行转移（夺沙箱=夺全套）");
         }
     }
 
@@ -2250,6 +2273,85 @@ mod tests {
         );
         // 旧沙箱 entity_id 身份不变
         assert_eq!(old_handle.store.data().entity_id, owner, "旧沙箱身份应不变");
+    }
+
+    // === #051 皮入沙箱：沙箱资产段（装戴清单随沙箱走，夺沙箱=夺全套）===
+
+    #[test]
+    fn replace_sandbox_transfers_assets_to_new_sandbox() {
+        // 规则（#051）：换血=夺全套——replace_sandbox 成功建新后，旧沙箱资产段
+        // 整体转移进新沙箱（装戴清单随沙箱易主随行，无拆分选项）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(LIFE_TRUE_WAT), 1000, id(1)).unwrap();
+        // 装戴清单由 host 写入（未来装戴刀的入口；本测直接落 SandboxData 验转移语义）
+        handle.store.data_mut().assets = vec![
+            "av_0123456789abcdef".to_string(),
+            "av_fedcba9876543210".to_string(),
+        ];
+        let new_handle = mgr
+            .replace_sandbox(handle, &wasm(LIFE_FALSE_WAT), 1000)
+            .unwrap();
+        assert_eq!(
+            new_handle.store.data().assets,
+            vec![
+                "av_0123456789abcdef".to_string(),
+                "av_fedcba9876543210".to_string()
+            ],
+            "换血后新沙箱应读得到完整资产清单（随行转移）"
+        );
+    }
+
+    #[test]
+    fn replace_sandbox_failure_keeps_assets_in_old_sandbox() {
+        // 负面（卡面负面路径②的 arena 层锚）：换血失败（payload 非法）时旧沙箱
+        // 原样带回——资产清单必须还在旧沙箱里（拒绝换血，资产不丢）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(LIFE_TRUE_WAT), 1000, id(2)).unwrap();
+        handle.store.data_mut().assets = vec!["av_0123456789abcdef".to_string()];
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        let Err((old_handle, _)) = mgr.replace_sandbox(handle, garbage, 1000) else {
+            panic!("非法 payload 应替换失败并带回旧沙箱");
+        };
+        assert_eq!(
+            old_handle.store.data().assets,
+            vec!["av_0123456789abcdef".to_string()],
+            "换血失败资产应留在旧沙箱（原样带回）"
+        );
+    }
+
+    #[test]
+    fn replaced_sandbox_assets_writable_by_new_code() {
+        // 卡面 5（改皮写口存在性）：换血后新沙箱 assets 段可被新代码/host 改写
+        // 并读回——接触通道的换血路径本身就是写口，本测锚定写口存在（改皮战术
+        // "金龙旗改黑龙旗=占领宣示" 的通路基础，零新 import）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(LIFE_TRUE_WAT), 1000, id(3)).unwrap();
+        handle.store.data_mut().assets = vec!["av_0123456789abcdef".to_string()];
+        let mut new_handle = mgr
+            .replace_sandbox(handle, &wasm(LIFE_FALSE_WAT), 1000)
+            .unwrap();
+        // 改皮：新主人整表换新（黑龙旗替金龙旗）
+        new_handle.store.data_mut().assets = vec!["av_ffffffffffffffff".to_string()];
+        assert_eq!(
+            new_handle.store.data().assets,
+            vec!["av_ffffffffffffffff".to_string()],
+            "换血后资产段可写且写后可读回（改皮战术通路）"
+        );
+    }
+
+    #[test]
+    fn replace_sandbox_assets_empties_old_sandbox() {
+        // 边界：转移是 take（移动语义）——转移后旧沙箱资产段为空，防双重持有
+        let mgr = SandboxManager::new().unwrap();
+        let mut old = mgr.create_sandbox(&wasm(LIFE_TRUE_WAT), 1000, id(4)).unwrap();
+        let mut new = mgr.create_sandbox(&wasm(LIFE_TRUE_WAT), 1000, id(5)).unwrap();
+        old.store.data_mut().assets = vec!["av_0123456789abcdef".to_string()];
+        SandboxManager::replace_sandbox_assets(&mut old, &mut new);
+        assert!(
+            old.store.data().assets.is_empty(),
+            "转移后旧沙箱资产段应清空（移动非复制）"
+        );
+        assert_eq!(new.store.data().assets.len(), 1, "新沙箱应收下清单");
     }
 
     // === P1：payload 大小上限（import 层拒绝超限）===

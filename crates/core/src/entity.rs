@@ -165,6 +165,14 @@ pub struct Entity {
     alive: bool,
     /// 创建 tick
     pub created_tick: u64,
+
+    // 沙箱资产装戴清单（#051 皮入沙箱）
+    /// 沙箱资产装戴清单（#051 皮入沙箱）：asset_id 列表（av_+16hex，指向 bin 侧
+    /// AssetMirror 镜像仓）。serde default 空（旧快照兼容）。与沙箱 SandboxData.assets
+    /// 镜像一致（换血随行语义见 arena replace_sandbox_assets）；出生装戴由玩家声明
+    /// （挂实体刀的 spawn 参数化后续刀），夺舍转移时随行不变（资产跟沙箱走）。
+    #[serde(default)]
+    pub assets: Vec<String>,
 }
 
 /// radius 默认值（新实体与旧快照回退共用：四生物/玩家/测试构造器全兼容）
@@ -350,6 +358,7 @@ impl Entity {
             survival: SurvivalPoints::initial(created_tick),
             alive: true,
             created_tick,
+            assets: Vec::new(),
         };
         tracing::debug!(
             entity_id = %e.id.0,
@@ -977,5 +986,44 @@ mod tests {
         assert_eq!(back.field_radius(), 0.0, "旧快照应回退无场");
         assert_eq!(back.field_gravity_scale(), 1.0);
         assert_eq!(back.field_drag_delta(), 0.0);
+    }
+
+    // === #051 皮入沙箱：实体装戴清单（asset_id 列表，与 SandboxData.assets 镜像一致）===
+
+    #[test]
+    fn entity_assets_serde_roundtrip() {
+        // 规则：装戴清单随实体序列化（存档/快照管线携带；夺沙箱=夺全套的
+        // 持久化侧基础）
+        let mut e = sample_entity();
+        e.assets = vec!["av_0123456789abcdef".to_string()];
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.assets,
+            vec!["av_0123456789abcdef".to_string()],
+            "装戴清单应随实体序列化往返"
+        );
+    }
+
+    #[test]
+    fn entity_assets_serde_backcompat_old_snapshot() {
+        // 负面（卡面负面路径④）：旧快照（无 assets 字段）反序列化回空清单
+        //（serde default，存储向后兼容，radius/mass/binding/motion/field 同款先例）
+        let mut obj: serde_json::Value = serde_json::to_value(sample_entity()).unwrap();
+        obj.as_object_mut().unwrap().remove("assets");
+        let json = serde_json::to_string(&obj).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert!(
+            back.assets.is_empty(),
+            "旧快照无 assets 字段应反序列化回空清单"
+        );
+    }
+
+    #[test]
+    fn new_entity_starts_with_empty_assets() {
+        // 边界：新实体装戴清单默认空（出生装戴归 spawn 参数化后续刀，本刀
+        // 只挂字段；玩家进场/弹丸恒无皮）
+        let e = sample_entity();
+        assert!(e.assets.is_empty(), "新实体装戴清单应为空");
     }
 }
