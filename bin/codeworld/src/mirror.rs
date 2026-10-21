@@ -5,8 +5,9 @@
 //! 消费面=配额记账查实大小（bin main.rs 换血配额校验）+指纹去重账；原图字节
 //! 落盘/伺服仍归 D-017 avatars.rs（镜像仓只存元数据，不存内容副本）。
 //!
-//! 装戴清单指向镜像仓：沙箱 SandboxData.assets 里的 asset_id 在镜像仓可查
-//! （查不到=大小按 0 记并 warn，容错不炸换血）。
+//! 装戴清单指向镜像仓：沙箱 SandboxData.assets 里的 asset_id 必须在镜像仓可查
+//! （查不到=换血配额无法核实，调用方 fail-closed 拒绝换血——诚实性优先于
+//! 可用性；装戴刀落地时"上传→镜像仓 insert"接通，正常路径永不触发）。
 
 use crate::net::avatars::AvatarRegistry;
 use codeworld_core::mask::AvatarMask;
@@ -55,8 +56,8 @@ impl AssetMirror {
 
     /// 启动建仓：从 D-017 登记表全量投影，每资产读盘上 PNG 算 sha256 指纹。
     /// 同指纹去重（后到 id 复用先到 id 的内容账，日志留痕）；PNG 不可读的条目
-    /// 跳过（镜像仓缺条目=配额查大小按 0 记 warn，与登记表"坏文件跳过不拖垮
-    /// 启动"同一容错哲学）。
+    /// 跳过（镜像仓缺该条目=换血携带此 id 将 fail-closed 拒绝，与登记表"坏文件
+    /// 跳过不拖垮启动"同一容错哲学）。
     pub fn from_registry(reg: &AvatarRegistry) -> Self {
         let mut mirror = Self::new();
         for asset in reg.list() {
@@ -65,7 +66,7 @@ impl AssetMirror {
                 tracing::warn!(
                     asset_id = %asset.asset_id,
                     path = %png_path.display(),
-                    "[mirror] PNG 不可读，镜像仓跳过该条目（配额按 0 记）"
+                    "[mirror] PNG 不可读，镜像仓跳过该条目（携带此 id 的换血将 fail-closed 拒绝）"
                 );
                 continue;
             };
@@ -241,7 +242,8 @@ mod tests {
 
     #[test]
     fn size_of_unknown_id_is_none() {
-        // 负面：镜像仓无此 id → None（调用方按 0 记 warn，不炸换血）
+        // 负面：镜像仓无此 id → None（调用方 fail-closed 拒绝换血——
+        // replace_code_rejects_when_asset_id_missing_from_mirror 端到端锚）
         let m = AssetMirror::new();
         assert_eq!(m.size_of("av_ffffffffffffffff"), None);
         assert!(m.is_empty());

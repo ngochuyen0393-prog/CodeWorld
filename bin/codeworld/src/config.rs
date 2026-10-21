@@ -89,9 +89,10 @@ pub struct Config {
     /// 力场成型期拍数（D-012 可视铁律：诞生 N 拍内不结算物理但已可见，给进攻
     /// 方反应窗），默认 FIELD_FORMING_TICKS=3。CODEWORLD_FIELD_FORMING 覆盖。
     pub field_forming_ticks: u64,
-    /// 单沙箱资产配额（#051 皮入沙箱：引擎+魂+皮合计封顶，Screeps 5MB 思路），
-    /// 默认 SANDBOX_ASSET_QUOTA_BYTES=1MB（与 64MB 内存上限≈1/64，资产=富余量
-    /// 非主粮）。换血时新模块+随行资产超配额 → 拒绝换血（资产不丢）。
+    /// 单沙箱资产配额（#051 皮入沙箱：配额账两源=引擎+皮；魂走 64MB 内存上限
+    /// 独立账，两账并行。Screeps 5MB 思路），默认 SANDBOX_ASSET_QUOTA_BYTES=1MB
+    ///（与 64MB 内存上限≈1/64，资产=富余量非主粮）。换血时新模块+随行资产
+    /// 超配额 → 拒绝换血（资产不丢）。
     /// ⚠️ 临时值待土豆拍板（同 MASK_FRAG_DROP_N 先例）。CODEWORLD_ASSET_QUOTA 覆盖；
     /// 0/非法值回退默认（0 会让空模块换血也被拒，无"禁皮"语义，坏值不进世界）。
     pub asset_quota: usize,

@@ -262,9 +262,9 @@ pub struct SandboxData {
     pub birth_blob: Vec<u8>,
     /// 沙箱资产段（#051 皮入沙箱）：装戴清单——asset_id 列表（av_+16hex，指向
     /// bin 侧 AssetMirror 全局镜像仓；同图全局一份，MC 同款去重）。数据非执行：
-    /// 不烧 fuel、不参与编译实例化；配额由 crate::assets::SandboxAssetQuota
-    /// 引擎侧记账（不信任玩家自报）。装戴时由 host 写入，与 birth_blob 同生命
-    /// 周期（随沙箱存活，不持久化，换血时随行转移——replace_sandbox_assets）。
+    /// 不烧 fuel、不参与编译实例化；换血配额门按镜像仓实大小核实（不信任玩家
+    /// 自报，查不到 fail-closed 拒绝换血）。装戴时由 host 写入，与 birth_blob 同
+    /// 生命周期（随沙箱存活，不持久化，换血时随行转移——replace_sandbox_assets）。
     pub assets: Vec<String>,
     /// 地形快照指针（D-016：move_by/spawn 的钻地判据从 y<0 改 y<ground(x)）。
     /// 与 probe_bridge 同款窗口契约：仅主循环阶段一执行玩家代码的窗口内非空

@@ -649,7 +649,9 @@ impl EntitySandboxMap {
         // #051 皮入沙箱·换血配额门（拒绝换血，资产不丢）：新模块字节+随行资产
         // 合计超配额 → 拒绝（夺取方装不下自己的 payload 那是夺取失败）。校验在
         // remove 之前——旧沙箱从未离开映射表，资产天然不丢。资产大小按指纹查
-        // 镜像仓实大小（不信任玩家自报）；查不到按 0 记 warn（容错不炸换血）
+        // 镜像仓实大小（不信任玩家自报）；任一随行 id 查不到 → fail-closed 拒绝
+        //（R1 P1：世界核实不了就不记账，诚实性优先于可用性——按 0 记=静默刷
+        // 配额洞；装戴刀接"上传→镜像仓 insert"后正常路径永不触发）
         let module_bytes = if payload.is_empty() {
             DEFAULT_KILL_WASM.len()
         } else {
@@ -659,23 +661,19 @@ impl EntitySandboxMap {
             let Some(handle) = self.sandboxes.get(target_id) else {
                 anyhow::bail!("目标 {:?} 无沙箱，无法换血", target_id);
             };
-            handle
-                .store
-                .data()
-                .assets
-                .iter()
-                .map(|id| {
-                    let size = self.asset_mirror.size_of(id).unwrap_or_else(|| {
-                        tracing::warn!(
-                            entity_id = %target_id.0,
-                            asset_id = %id,
-                            "[skin] 资产不在镜像仓，配额按 0 记（容错）"
-                        );
-                        0
-                    });
-                    (id.clone(), size)
-                })
-                .collect()
+            let mut sized = Vec::with_capacity(handle.store.data().assets.len());
+            for id in &handle.store.data().assets {
+                let Some(size) = self.asset_mirror.size_of(id) else {
+                    tracing::warn!(
+                        entity_id = %target_id.0,
+                        asset_id = %id,
+                        "[skin] 换血拒绝：资产 id 不在镜像仓，配额无法核实（fail-closed）"
+                    );
+                    anyhow::bail!("换血失败：资产 id 不在镜像仓，配额无法核实（fail-closed）");
+                };
+                sized.push((id.clone(), size));
+            }
+            sized
         };
         // 无皮/有皮同一扇门：配额语义=引擎+皮合计（空清单=纯模块校验）
         let quota = codeworld_arena::assets::SandboxAssetQuota::with_limit(self.asset_quota);
@@ -6110,6 +6108,7 @@ mod tests {
     #[test]
     fn replace_code_transfers_assets_to_new_sandbox() {
         // 正面（换血随行端到端）：replace_code 成功后新沙箱读得到完整资产清单
+        //（fail-closed 契约：随行 id 须在镜像仓可核实——两 id 先播种）
         let mut map = test_sandbox_map();
         let target_id = EntityId(Uuid::from_u128(22));
         map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
@@ -6122,6 +6121,8 @@ mod tests {
             "av_0123456789abcdef".to_string(),
             "av_fedcba9876543210".to_string(),
         ];
+        seed_mirror_asset(&mut map, "av_0123456789abcdef", 100);
+        seed_mirror_asset(&mut map, "av_fedcba9876543210", 100);
         let killed = map
             .replace_code(&target_id, &wasm(TARGET_WAT))
             .expect("默认配额下合法 payload 应换血成功");
@@ -6153,6 +6154,35 @@ mod tests {
         assert!(
             !map.sandboxes.contains_key(&target_id),
             "沙箱销毁后条目应消失（资产段随沙箱亡，零残留）"
+        );
+    }
+
+    #[test]
+    fn replace_code_rejects_when_asset_id_missing_from_mirror() {
+        // 负面（R1 P1 fail-closed）：随行 id 不在镜像仓 → 配额无法核实 → 拒绝换血
+        //（世界核实不了就不记账——诚实性优先于可用性；镜像仓启动建仓后不更新，
+        // 启动后上传的资产 id 全走此路，按 0 记=静默刷配额洞）。配额留默认 1MB
+        //（模块本身装得下），拒绝的唯一原因=fail-closed，与超限拒绝同路径：
+        // 旧沙箱原样保留、资产清单不变
+        let mut map = test_sandbox_map();
+        let target_id = EntityId(Uuid::from_u128(24));
+        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+        map.sandboxes
+            .get_mut(&target_id)
+            .unwrap()
+            .store
+            .data_mut()
+            .assets = vec!["av_ffffffffffffffff".to_string()]; // 镜像仓故意不播种
+        let payload = wasm(TARGET_WAT);
+        assert!(
+            map.replace_code(&target_id, &payload).is_err(),
+            "随行 id 不在镜像仓应拒绝换血（fail-closed）"
+        );
+        assert!(map.sandboxes.contains_key(&target_id), "拒绝后旧沙箱应保留");
+        assert_eq!(
+            map.sandboxes[&target_id].store.data().assets,
+            vec!["av_ffffffffffffffff".to_string()],
+            "拒绝后资产清单应原样（不丢）"
         );
     }
 
