@@ -531,8 +531,15 @@ impl DefaultPhysicsEngine {
                         let (tid, bt) = swept_body.expect("hit_ground=false 时必有撞体 t");
                         let disp = ((after.0 - before.0).powi(2) + (after.1 - before.1).powi(2))
                             .sqrt();
+                        // 上限 1.0 + 1e-2/disp（D-018b 端点相切，P2-7）：首触恰为
+                        // 线段末端（bt∈[1-1e-9,1]）时旧上限 1.0 把推进量吞掉——
+                        // 停点=末端=数学恰切点，浮点距离漂到 0.65 之上即漏接触
+                        //（实测 1 ULP 即发生，锚测试
+                        // ccd_endpoint_tangency_advances_into_contact_window）。
+                        // 1+ε 处线性外推 = 末端再沿位移方向 1cm（与中途首触的
+                        // 推进语义同族）；首触在中途时 min 仍取 bt+ε 不受影响
                         let bt = if disp > 1e-12 {
-                            (bt + 1e-2 / disp).min(1.0)
+                            (bt + 1e-2 / disp).min(1.0 + 1e-2 / disp)
                         } else {
                             bt
                         };
@@ -1292,6 +1299,58 @@ mod tests {
         assert_eq!(shell.velocity(), (0.0, 0.0), "撞体截断速度清零");
         assert!(shell.is_alive(), "造物弹撞体停驻不消亡（结算归接触通道）");
         assert!(world.entities.get(&tid).unwrap().is_alive(), "物理步不动目标");
+    }
+
+    #[test]
+    fn ccd_endpoint_tangency_advances_into_contact_window() {
+        // P2-7 端点相切缺口（D-018b）：首触点恰为线段末端（bt∈[1-1e-9,1]）时，
+        // 旧实现 (bt + 1e-2/disp).min(1.0) 把推进量钳回 1.0——停点=末端，悬在
+        // detect_touching 的 ≤ 边界（0.65）上靠浮点运气（边界值向上漂 1 ULP
+        // 即漏接触）。修法：上限放宽到 1.0 + 1e-2/disp——bt 参数化在 1+ε 处
+        // 线性外推=末端+沿位移方向 1cm，与中途首触的推进语义同族。
+        // 固定坐标（算死禁随机，ULP 实测定标）：重力 0 引擎、目标圆心 (10,0.5)
+        // r 和 0.65、弹中点位移 9.75（初速 10 → 阻力后 9.5）。端点取 9.35 下方
+        // 1 ULP（ulp(9.35)=2^-49）= 9.349999999999998：数学上端点已在接触圆内
+        //（swept 找到首触 bt≈1），但浮点下停点距离=0.6500000000000002 > 0.65
+        // ——旧实现 (bt+1e-2/disp).min(1.0) 把推进量钳回 1.0，停点=端点，
+        // detect_touching 的 ≤ 边界判不到接触（漏接触，实测探针 k=-1 档）
+        let engine = DefaultPhysicsEngine::new_with_params(codeworld_core::physics::DefaultPhysics {
+            gravity: 0.0,
+            ground_y: 0.0,
+            collision_enabled: true,
+            max_velocity: 100.0,
+            drag_coefficient: 0.05,
+            max_speed: 25.0,
+        });
+        let mut world = WorldState::new();
+        let target = make_entity(2, 10.0, 0.5, 0);
+        let tid = target.id;
+        world.entities.insert(tid, target);
+        let endpoint_x = 9.349999999999998_f64; // 恰切点 9.35 下方 1 ULP
+        let before_x = endpoint_x - 9.75;
+        let p = make_shell(1, (before_x, 0.5), (10.0, 0.0), 0.15, 1.0);
+        let pid = p.id;
+        world.entities.insert(pid, p);
+        engine.step(&mut world, &HashSet::new(), &[]);
+        let shell = world.entities.get(&pid).unwrap();
+        let (tx, ty) = world.entities.get(&tid).unwrap().pos();
+        let dx = shell.pos().0 - tx;
+        let dy = shell.pos().1 - ty;
+        let dist = (dx * dx + dy * dy).sqrt();
+        assert!(
+            dist <= 0.65,
+            "端点相切也必须推进落进接触窗口（≤0.65），实际 {dist}"
+        );
+        assert_eq!(shell.velocity(), (0.0, 0.0), "撞体截断速度清零");
+        assert!(shell.is_alive(), "停驻存活");
+        // 接触通道 payoff：停点落进窗口 → detect_touching 判接触成立
+        let pairs = engine.detect_touching(&world.entities);
+        assert!(
+            pairs
+                .iter()
+                .any(|pr| (pr.a == pid && pr.b == tid) || (pr.a == tid && pr.b == pid)),
+            "停点应被 detect_touching 判为接触，实际 {pairs:?}"
+        );
     }
 
     #[test]
@@ -2478,4 +2537,3 @@ mod tests {
         assert!((e.g_final - 0.0).abs() < 1e-12, "等密度全浸应悬浮");
     }
 }
-

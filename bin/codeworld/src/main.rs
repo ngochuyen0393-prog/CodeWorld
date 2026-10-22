@@ -1632,7 +1632,7 @@ fn tick_with_intents(
                     }
                     let (sx, sy) = e.pos();
                     let r_self = e.radius();
-                    match solve_launch_vector(sx, sy, *tx, *ty, CTRL_SHOOT_SPEED) {
+                    match solve_launch_vector(sx, sy, *tx, *ty, CTRL_SHOOT_SPEED, &world.terrain) {
                         Some((vx, vy)) => {
                             // 发射点外推（投掷器模板教学点）：出生点沿发射方向前移
                             // (r_self + r_bullet + 0.1)——出生重叠拒绝（#030）的
@@ -1661,7 +1661,11 @@ fn tick_with_intents(
                                     color,
                                     radius: CTRL_SHELL_RADIUS,
                                     mass: CTRL_SHOOT_MASS,
-                                    binding: 0,
+                                    // #035 修订四声明通道（D-018b 立法重接）：grace_owner
+                                    // ——操控射击"出手不伤自己"（shoot 时代飞行全程
+                                    // 豁免发射者的同款 UX 承诺），走的是出生声明立法
+                                    // 通道非特殊 hack：造物出刀永不结算 bound_to 主人
+                                    binding: codeworld_core::entity::BINDING_GRACE_OWNER,
                                     motion: codeworld_core::entity::MOTION_DYNAMIC,
                                     vx,
                                     vy,
@@ -1865,7 +1869,7 @@ fn tick_with_intents(
 
     //   b1. 绑定契约托管清算（#034 修订四：fade_on_death 随主消亡，主人死那一拍
     //       弹即无/塔即无——排在攻击与衰减之后，本拍所有死亡来源都已落地）
-    enforce_binding_deaths(world, sandbox_map);
+    enforce_binding_deaths(world);
 
     //   c. 物理规则（#030 半径物理：重力落点解析 + 悬停免重力，架构 4.1 b 步；
     //      D-012：域内实体按改后参数被结算，aloft 优先级高于场；
@@ -2732,7 +2736,10 @@ fn shell_wat_escaped() -> String {
 /// +两轮细化，每个候选按真实物理步序（重力→阻力→极速钳→中点位移，与
 /// physics step 冲量路径同序镜像）模拟弹道全程，取全程最小距离。
 /// 判据（0.65=CCD 撞体窗口）与服务器接触通道一致——解算"说能打中"当且仅当
-/// 世界物理"真的会命中"（接触触发），不哑弹。每次解算 ≤5 档 ×~28 角 ×30 拍
+/// 世界物理"真的会命中"（接触触发），不哑弹。【D-018b 地形拦截】该 iff 承诺
+/// 自本刀起在平地+地形两态都真成立：simulate_path 每拍位移线段查
+/// terrain.segment_first_contact（与 step CCD 同判据），山体挡弹的弹道在
+/// 预测侧同样截断，"解算无解=世界打不着"两侧一致。每次解算 ≤5 档 ×~28 角 ×30 拍
 /// 模拟，微秒级。
 ///
 /// 弧线分支（决定搜索区间）：近距（<[`CTRL_SOLVE_CLOSE_RANGE`]）一律低弧
@@ -2753,6 +2760,10 @@ pub fn solve_launch_vector(
     // 改速度梯搜索后此参被忽略不再进解算（梯表 CTRL_SHOOT_SPEED_LADDER 内嵌）；
     // 保留占位免翻动十余处调用面（前端镜像 solveLaunchVector 同构无此参）
     _base_speed: f64,
+    // terrain：解算世界地形（D-018b 地形拦截）——simulate_path 逐拍位移线段
+    // 查 terrain.segment_first_contact（与 step CCD 同判据），非平地世界山体
+    // 挡弹时弹道截断到触地面，命中判据只看真实弹道。测试侧传 Terrain::flat()
+    terrain: &codeworld_core::terrain::Terrain,
 ) -> Option<(f64, f64)> {
     let dx = tx - sx;
     let dy = ty - sy;
@@ -2763,14 +2774,16 @@ pub fn solve_launch_vector(
     let phys = codeworld_core::physics::DefaultPhysics::default();
     let high_arc = d >= CTRL_SOLVE_CLOSE_RANGE && dy > 0.0;
     // 模拟弹道全程：真实物理步序（与 crates/physics step 冲量路径同序镜像：
-    // 重力→阻力→极速钳→中点位移），返回逐拍末坐标（含起点），落地 y<半径截断。
-    // 【#044 子步宪法锚·弹道积分】逐拍 N=1 整步积分，步数只由弹丸状态决定
-    // （落地 y<半径 或 模拟寿命截断）——纯状态驱动，无任何机器数据参与。
+    // 重力→阻力→极速钳→中点位移），返回逐拍末坐标（含起点）。闭包捕获 terrain
+    // ——每拍位移线段查地形首触（D-018b 地形拦截，见下）。
+    // 【#044 子步宪法锚·弹道积分】逐拍 N=1 整步积分，步数只由弹道状态决定
+    // （地形触面 或 模拟寿命截断）——纯状态驱动，无任何机器数据参与。
     let simulate_path = |mut vx: f64, mut vy: f64| -> Vec<(f64, f64)> {
         let r = CTRL_SHELL_RADIUS;
         let mut pts = vec![(sx, sy)];
         let (mut x, mut y) = (sx, sy);
         for _ in 0..CTRL_SOLVE_MAX_TICKS {
+            let (px, py) = (x, y); // 本拍位移左端点（地形截断参照点）
             let (vx0, vy0) = (vx, vy); // 定律前速度（本拍位移的左端点）
             vy += phys.gravity;
             let f = 1.0 - phys.drag_coefficient / CTRL_SHOOT_MASS;
@@ -2785,10 +2798,18 @@ pub fn solve_launch_vector(
             // 中点位移（step 冲量路径同款）：位移 = (定律前 + 定律后) / 2
             x += (vx0 + vx) * 0.5;
             y += (vy0 + vy) * 0.5;
-            pts.push((x, y));
-            if y < r {
+            // 地形拦截（D-018b，#028 iff 契约补全）：每拍位移线段先查地形首触
+            //（与 step CCD 同判据 segment_first_contact）——非平地世界山体挡弹，
+            // 弹道截断到触地点终止后续帧；命中判据只看截断后的真实弹道。
+            // 平地（全零高度数组）与旧 y<半径 逐拍末判据同语义（交点=半径线，
+            // 差异只是末点精确到贴面，不再越过半径线悬空采样）
+            if let Some(t) = terrain.segment_first_contact((px, py), (x, y), r) {
+                x = px + (x - px) * t;
+                y = py + (y - py) * t;
+                pts.push((x, y));
                 break;
             }
+            pts.push((x, y));
         }
         pts
     };
@@ -2951,7 +2972,7 @@ pub(crate) struct AttackEventRecord {
 ///   与塔同一扇门，零特殊通道）
 /// - grace_owner：不在此清算（豁免在 deliver_attacks 结算路径执行）
 /// - unbound：跳过（离体即世界之物，同生不共死=现状默认）
-fn enforce_binding_deaths(world: &mut WorldState, _sandbox_map: &mut EntitySandboxMap) {
+fn enforce_binding_deaths(world: &mut WorldState) {
     use codeworld_core::entity::BINDING_FADE_ON_DEATH;
     // 造物与一切声明体：binding=fade 且绑定对象已死/不在 → 消亡
     //（塔随创造者消亡；bound_to=None 的 fade 声明视为主人已失，即刻消亡）
@@ -3081,21 +3102,34 @@ fn deliver_attacks(
             );
             continue;
         };
-        // 接触门（#034 贴身刀语义）：点找得到目标，但够不着 = 落空。
-        // 严格 <（恰好等于判距=落空，collision.rs melee_in_reach 测试锚定）。
-        // 弹丸结算不走本门（contact_exempt=true）：弹丸撞身体本身就是接触事实——
-        // 离体之物是攻击者手臂的延伸，再判发射者贴身会把弹道打回瞬发瞬达。
-        // #034 修订四攻击豁免条款（声明式）：grace_owner 弹命中发射者本人（现实
-        // 场景=落点在自己脚下的落地弹；飞行撞体在物理步已全程豁免发射者）→ 哑弹。
-        // unbound 不豁免——落地砸自己合法（世界不豁免，豁免是声明）
-        if atk.grace_owner && target_id == atk.attacker {
+        // 绑定契约 grace_owner（#035 修订四，D-018b 立法重接）：豁免=deliver 现场
+        // 读攻击者实体的出生声明——造物 binding=2 且 bound_to=本次命中目标（即
+        // bound_to 主人）时，造物出刀不结算主人（哑弹）。契约=出生声明写进造物
+        // 数据、世界每拍托管，本来就不该每刀携带数据——PendingAttack.grace_owner
+        // 字段随 D-018 命中改走接触通道而生产恒 false（接线已断），本分支是其
+        // 立法形态在新链路的等价迁移，非新立法。unbound 造物出刀伤主人合法——
+        // 世界不豁免，豁免是声明（#035 修订四原文）
+        let grace_exempt = world
+            .entities
+            .get(&atk.attacker)
+            .map(|e| {
+                e.binding() == codeworld_core::entity::BINDING_GRACE_OWNER
+                    && e.bound_to() == Some(target_id)
+            })
+            .unwrap_or(false);
+        if grace_exempt {
             tracing::info!(
                 attacker = %atk.attacker.0,
+                target = %target_id.0,
                 pos = ?atk.target_pos,
-                "[binding] grace_owner 豁免生效：弹丸落地不结算发射者（哑弹消亡）"
+                "[binding] grace_owner 豁免生效：造物出刀不结算 bound_to 主人（哑弹）"
             );
             continue;
         }
+        // 接触门（#034 贴身刀语义）：点找得到目标，但够不着 = 落空。
+        // 严格 <（恰好等于判距=落空，collision.rs melee_in_reach 测试锚定）。
+        // 【D-018b】contact_exempt 字段退役：#045 替代链下命中=接触通道代码攻
+        //（CCD 撞体截断停点天然贴身），出刀走的就是接触门本身，无需豁免标记。
         let attacker = &world.entities[&atk.attacker];
         let target = &world.entities[&target_id];
         let in_reach = codeworld_core::collision::melee_in_reach(
@@ -3104,7 +3138,7 @@ fn deliver_attacks(
             target.pos(),
             target.radius(),
         );
-        if !in_reach && !atk.contact_exempt {
+        if !in_reach {
             out_of_reach += 1;
             let (ax, ay) = attacker.pos();
             let (tx, ty) = target.pos();
@@ -9358,27 +9392,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn projectile_strike_bypasses_contact_gate() {
-        // #034 弹丸结算豁免贴身判距：接触事实由弹丸完成（离体之物=手臂延伸），
-        // 发射者在 5 格外弹丸命中照样结算
-        let mut world = WorldState::new();
-        let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (0.0, 0.5), PLAYER_WAT);
-        let target = make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.5), TARGET_WAT);
-        let attacks = vec![PendingAttack::projectile_strike(shooter, (5.0, 0.5), vec![], false)];
-        process_attacks(&mut world, &mut map, &attacks);
-        assert!(
-            !world.entities.get(&target).unwrap().is_alive(),
-            "弹丸命中不受发射者贴身判距约束"
-        );
-        assert_eq!(
-            world.entities.get(&shooter).unwrap().survival.points(),
-            4,
-            "击杀掠夺归发射者"
-        );
-    }
-
     // === #036 期五第五刀：操控定装弹（WS 远程射击；驾驶档，自定义弹道=玩家拼投掷器）===
 
     /// 世界内造物弹计数（断言辅助，【D-018】弹=dynamic 小半径造物）
@@ -9390,10 +9403,17 @@ mod tests {
 
     /// 弹道模拟采样（测试辅助）：定装造物弹从 出发逐拍推演，与 physics step
     /// 冲量路径同序（重力→阻力→极速钳→中点位移，【D-018】积分器同步），
-    /// 落地 y<半径截断。返回逐拍末坐标（含起点）。
-    /// 【#044 子步宪法锚】N=1 整步积分，步数由状态决定（落地/寿命截断），
+    /// 地形触面截断（D-018b：与 simulate_path/step CCD 同判据
+    /// segment_first_contact）。返回逐拍末坐标（含起点）。
+    /// 【#044 子步宪法锚】N=1 整步积分，步数由状态决定（触面/寿命截断），
     /// 纯状态驱动零机器数据——与 solve_launch_vector 内 simulate_path 同构。
-    fn sim_trajectory(sx: f64, sy: f64, mut vx: f64, mut vy: f64) -> Vec<(f64, f64)> {
+    fn sim_trajectory(
+        sx: f64,
+        sy: f64,
+        mut vx: f64,
+        mut vy: f64,
+        terrain: &codeworld_core::terrain::Terrain,
+    ) -> Vec<(f64, f64)> {
         let p = codeworld_core::physics::DefaultPhysics::default();
         let r = CTRL_SHELL_RADIUS;
         let mut pts = vec![(sx, sy)];
@@ -9410,12 +9430,17 @@ mod tests {
                 vx *= k;
                 vy *= k;
             }
+            let (px, py) = (x, y); // 位移左端点（地形截断参照）
             x += (vx0 + vx) * 0.5;
             y += (vy0 + vy) * 0.5;
-            pts.push((x, y));
-            if y < r {
+            // 地形触面截断（D-018b 镜像同步）：与 simulate_path/step CCD 同判据
+            if let Some(t) = terrain.segment_first_contact((px, py), (x, y), r) {
+                x = px + (x - px) * t;
+                y = py + (y - py) * t;
+                pts.push((x, y));
                 break;
             }
+            pts.push((x, y));
         }
         pts
     }
@@ -9445,9 +9470,9 @@ mod tests {
         // bug 回归（battle.log 四发哑弹）：地面打高空 S(25,12)——60° 定角顶点
         // ~9.6 < 12 全部落脚下；解算器高弧解顶点必须越过 S 并进入命中窗口
         //（CCD 撞体判据：r弹0.15 + r身0.5 = 0.65）
-        let sol = solve_launch_vector(30.0, 0.5, 25.0, 12.0, CTRL_SHOOT_SPEED)
+        let sol = solve_launch_vector(30.0, 0.5, 25.0, 12.0, CTRL_SHOOT_SPEED, &codeworld_core::terrain::Terrain::flat())
             .expect("高空目标 S(25,12) 必须够得着（本刀修复的核心验收）");
-        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1);
+        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1, &codeworld_core::terrain::Terrain::flat());
         let apex = pts.iter().map(|p| p.1).fold(f64::MIN, f64::max);
         // 顶点 ≥ 目标高度-容差（拍末采样顶点与 CCD 线段穿高的几何余量一致）
         assert!(
@@ -9461,7 +9486,7 @@ mod tests {
     #[test]
     fn solve_launch_vector_hits_ground_target_via_low_arc() {
         // 地面目标 D（15 格外）：低弧平飞命中（|vy| ≤ |vx|——弹道压得平）
-        let sol = solve_launch_vector(30.0, 0.5, 15.0, 0.5, CTRL_SHOOT_SPEED)
+        let sol = solve_launch_vector(30.0, 0.5, 15.0, 0.5, CTRL_SHOOT_SPEED, &codeworld_core::terrain::Terrain::flat())
             .expect("15 格地面目标必须够得着（剧本 D 站桩位）");
         assert!(
             sol.1.abs() <= sol.0.abs(),
@@ -9469,7 +9494,7 @@ mod tests {
             sol.0,
             sol.1
         );
-        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1);
+        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1, &codeworld_core::terrain::Terrain::flat());
         let best = traj_min_dist(&pts, (15.0, 0.5));
         assert!(best < 0.65, "弹道最近点 {best} 必须进入命中窗口 0.65");
     }
@@ -9477,11 +9502,11 @@ mod tests {
     #[test]
     fn solve_launch_vector_none_when_target_unreachable() {
         // 超远目标：无解 None——解不出就明示，不打必落空的哑弹（业界惯例）
-        assert!(solve_launch_vector(30.0, 0.5, 80.0, 0.5, CTRL_SHOOT_SPEED).is_none());
+        assert!(solve_launch_vector(30.0, 0.5, 80.0, 0.5, CTRL_SHOOT_SPEED, &codeworld_core::terrain::Terrain::flat()).is_none());
         // 高不可攀：火力上限内够不到的贴身高空（20 格高且水平贴脸）
-        assert!(solve_launch_vector(30.0, 0.5, 30.5, 30.0, CTRL_SHOOT_SPEED).is_none());
+        assert!(solve_launch_vector(30.0, 0.5, 30.5, 30.0, CTRL_SHOOT_SPEED, &codeworld_core::terrain::Terrain::flat()).is_none());
         // 零距离（贴脸坐标）：不在此解算（前端走 attack 贴身刀分流）
-        assert!(solve_launch_vector(30.0, 0.5, 30.0, 0.5, CTRL_SHOOT_SPEED).is_none());
+        assert!(solve_launch_vector(30.0, 0.5, 30.0, 0.5, CTRL_SHOOT_SPEED, &codeworld_core::terrain::Terrain::flat()).is_none());
     }
 
     #[test]
@@ -9489,7 +9514,7 @@ mod tests {
         // 近贴目标（~1.5 格）：补偿档（13.8，不爬坡）+ 弹道直达（全程进入
         // 命中窗口）——近距高弧解（近乎垂直吊射自己脑门）是反直觉坏解，
         // <2 格一律低弧；离散拍下"直射"体现为弹道线段扫过目标而非拍末逼近
-        let sol = solve_launch_vector(30.0, 0.5, 31.5, 0.8, CTRL_SHOOT_SPEED)
+        let sol = solve_launch_vector(30.0, 0.5, 31.5, 0.8, CTRL_SHOOT_SPEED, &codeworld_core::terrain::Terrain::flat())
             .expect("近贴目标应有解");
         let v = (sol.0.powi(2) + sol.1.powi(2)).sqrt();
         // 上界断言：斜向目标的 vx 含水平方位缩放（世界系模长 ≤ 档位值）
@@ -9497,7 +9522,7 @@ mod tests {
             v <= CTRL_SHOOT_SPEED * CTRL_SHOOT_DRAG_COMP + 1e-9,
             "近贴目标应用补偿档（不爬坡），实际 {v}"
         );
-        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1);
+        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1, &codeworld_core::terrain::Terrain::flat());
         let best = traj_min_dist(&pts, (31.5, 0.8));
         assert!(best < 0.65, "近贴弹道应直达目标，实际最近 {best}");
     }
@@ -9506,14 +9531,14 @@ mod tests {
     fn solve_launch_vector_muzzle_speed_bounded_and_backed() {
         // 模长下界=定装补偿档 13.8（12×1.15 阻力补偿），上界=自适应火力上限：
         // 近距目标（补偿档射程内）用首档；高空目标（12 格高）物理上需爬坡
-        let near = solve_launch_vector(30.0, 0.5, 40.0, 0.5, CTRL_SHOOT_SPEED).unwrap();
+        let near = solve_launch_vector(30.0, 0.5, 40.0, 0.5, CTRL_SHOOT_SPEED, &codeworld_core::terrain::Terrain::flat()).unwrap();
         let v_near = (near.0.powi(2) + near.1.powi(2)).sqrt();
         assert!(
             (v_near - CTRL_SHOOT_SPEED * CTRL_SHOOT_DRAG_COMP).abs() < 1e-9,
             "10 格内地面目标应用补偿档 {v_near} != {}",
             CTRL_SHOOT_SPEED * CTRL_SHOOT_DRAG_COMP
         );
-        let high = solve_launch_vector(30.0, 0.5, 25.0, 12.0, CTRL_SHOOT_SPEED).unwrap();
+        let high = solve_launch_vector(30.0, 0.5, 25.0, 12.0, CTRL_SHOOT_SPEED, &codeworld_core::terrain::Terrain::flat()).unwrap();
         let v_high = (high.0.powi(2) + high.1.powi(2)).sqrt();
         assert!(
             v_high > CTRL_SHOOT_SPEED * CTRL_SHOOT_DRAG_COMP,
@@ -9537,10 +9562,61 @@ mod tests {
             (30.0, 0.5, 25.0, 12.0),  // 高弧：12 格高空
             (30.0, 0.5, 80.0, 0.5),   // 无解：超射程
         ] {
-            let a = solve_launch_vector(sx, sy, tx, ty, CTRL_SHOOT_SPEED);
-            let b = solve_launch_vector(sx, sy, tx, ty, CTRL_SHOOT_SPEED);
+            let a = solve_launch_vector(sx, sy, tx, ty, CTRL_SHOOT_SPEED, &codeworld_core::terrain::Terrain::flat());
+            let b = solve_launch_vector(sx, sy, tx, ty, CTRL_SHOOT_SPEED, &codeworld_core::terrain::Terrain::flat());
             assert_eq!(a, b, "同输入必须同解（#044 纯函数）：({sx},{sy})->({tx},{ty})");
         }
+    }
+
+    #[test]
+    fn solve_launch_vector_mountain_terrain_blocks_buried_target() {
+        // P2-1 地形拦截（#028 iff 契约补全，D-018b）：非平地世界山体挡弹——
+        // simulate_path 每拍位移线段查 terrain.segment_first_contact（与 step
+        // CCD 同判据），埋在山体内的目标必被拦截：任何到达路径必先穿山面，
+        // 触地点距目标 ≥1.0 > 命中窗口 0.65 → 物理上不可能命中 → 解算 None。
+        // 对照：同坐标平地世界可达（证明 None 归因于地形拦截而非火力上限）
+        // 固定种子表确定性探测（同代码同种子表必同选择，零随机源零机器数据）：
+        // 取首个满足「发射位附近低地 + x∈[32,52] 有 ≥3 格正峰」的 Mountain 种子
+        let mut picked = None;
+        for seed in 1u64..=10 {
+            let t = codeworld_core::terrain::Terrain::new(
+                codeworld_core::terrain::TerrainPreset::Mountain,
+                seed,
+            );
+            if t.height(30.0) >= 1.0 {
+                continue; // 发射位被山体埋住会让拦截退化为出发即触面（非本测目标）
+            }
+            let samples = t.samples();
+            let mut peak = (40.0f64, f64::MIN);
+            for (i, &h) in samples.iter().enumerate() {
+                let x = codeworld_core::terrain::TERRAIN_X_MIN
+                    + i as f64 * codeworld_core::terrain::TERRAIN_SPACING;
+                if (32.0..=52.0).contains(&x) && h > peak.1 {
+                    peak = (x, h);
+                }
+            }
+            if peak.1 >= 3.0 {
+                picked = Some((seed, t, peak));
+                break;
+            }
+        }
+        let (seed, terrain, peak) = picked.expect("Mountain 前 10 个种子必有合格峰");
+        assert!(
+            peak.1 > 1.65,
+            "应有峰高>1.65（埋深后目标仍高于平地半径线），实际 {peak:?}"
+        );
+        let (tx, ty) = (peak.0, peak.1 - 1.0); // 埋进峰体 1 格
+        assert!(
+            solve_launch_vector(30.0, 0.5, tx, ty, CTRL_SHOOT_SPEED, &terrain).is_none(),
+            "埋在山体内的目标必被地形拦截（解算 None），seed={seed} peak={peak:?}"
+        );
+        // 对照：平地世界同坐标可达（None 来自山体拦截，不是打不着这个坐标）
+        let flat = codeworld_core::terrain::Terrain::flat();
+        let sol = solve_launch_vector(30.0, 0.5, tx, ty, CTRL_SHOOT_SPEED, &flat)
+            .unwrap_or_else(|| panic!("平地世界同目标应有解，peak={peak:?} ty={ty}"));
+        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1, &flat);
+        let best = traj_min_dist(&pts, (tx, ty));
+        assert!(best < CTRL_SOLVE_TOLERANCE, "平地弹道应进命中窗口，best={best}");
     }
 
     #[test]
@@ -9550,10 +9626,10 @@ mod tests {
         // 弹飞的拍数 > 低初速弹，截断条件=落地 y<半径 或寿命 30 拍，全是
         // 弹丸自身状态非机器数据）。将来解算器若引入自适应采样（tier>1），
         // 本锚必须随宪法一起更新（tier 读上拍状态+滞回带+换档记日志）。
-        let slow = sim_trajectory(30.0, 0.5, 6.0, 6.0);
-        let fast = sim_trajectory(30.0, 0.5, 14.0, 14.0);
+        let slow = sim_trajectory(30.0, 0.5, 6.0, 6.0, &codeworld_core::terrain::Terrain::flat());
+        let fast = sim_trajectory(30.0, 0.5, 14.0, 14.0, &codeworld_core::terrain::Terrain::flat());
         // 同一初条件重跑逐位一致（确定性）
-        let slow2 = sim_trajectory(30.0, 0.5, 6.0, 6.0);
+        let slow2 = sim_trajectory(30.0, 0.5, 6.0, 6.0, &codeworld_core::terrain::Terrain::flat());
         assert_eq!(slow, slow2, "同初条件必须逐位一致（#044）");
         // 快弹飞更远、在空中更多拍（状态驱动步数的最小证据）
         assert!(
@@ -9590,9 +9666,9 @@ mod tests {
         // 首步位置=出生点（发射点外推 0.75）+ 解算初速经首拍物理（重力+阻力→
         // 中点位移）的消费结果——与纯函数解算逐位一致（镜像铁律的服务器内侧锚；
         // x 向直射目标，外推 ux=1）
-        let sol = solve_launch_vector(30.0, 0.5, 45.0, 0.5, CTRL_SHOOT_SPEED)
+        let sol = solve_launch_vector(30.0, 0.5, 45.0, 0.5, CTRL_SHOOT_SPEED, &world.terrain)
             .expect("15 格地面目标应有解");
-        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1);
+        let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1, &world.terrain);
         let (ex, ey) = pts[1];
         let (px, py) = p.pos();
         assert!(
@@ -9601,7 +9677,11 @@ mod tests {
         );
         assert!(py > 0.6, "首步 y 应离地上升（弹道离地），实际 {py}");
         assert_eq!(p.mass(), CTRL_SHOOT_MASS, "定装质量");
-        assert_eq!(p.binding(), 0, "定装绑定=unbound");
+        assert_eq!(
+            p.binding(),
+            codeworld_core::entity::BINDING_GRACE_OWNER,
+            "定装绑定=grace_owner（出手不伤自己，#035 修订四声明通道）"
+        );
         assert_eq!(p.owner, owner, "产权链：造物弹归属操控目标 owner");
         assert!(world.entities.get(&pid).unwrap().is_alive(), "操控目标存活");
     }
@@ -9762,7 +9842,7 @@ mod tests {
         world.entities.insert(unbound_tower.id, unbound_tower);
         // 创造者死亡 -> 托管清算
         world.entities.get_mut(&creator).unwrap().kill();
-        enforce_binding_deaths(&mut world, &mut map);
+        enforce_binding_deaths(&mut world);
         assert!(
             !world.entities.get(&EntityId(Uuid::from_u128(201))).unwrap().is_alive(),
             "同生塔随主消亡"
@@ -9773,54 +9853,89 @@ mod tests {
         );
     }
 
+    /// 绑定造物弹实体构造（D-018b grace 测试辅助）：deliver 层实体驱动断言用——
+    /// 豁免=deliver 现场读攻击者实体的出生声明（binding/bound_to），刀本身
+    /// 不携带豁免数据（契约=出生声明由世界每拍托管，本来就不该每刀携带）
+    fn make_bound_shell(
+        id_u: u128,
+        owner: PlayerId,
+        pos: (f64, f64),
+        creator: EntityId,
+        binding: i32,
+    ) -> Entity {
+        let mut e = Entity::new(
+            EntityId(Uuid::from_u128(id_u)),
+            owner,
+            "creation".to_string(),
+            pos,
+            Appearance::new(".".to_string(), "red".to_string(), 1.0),
+            1,
+            1_000_000,
+        );
+        e.set_radius(0.15);
+        e.set_binding(binding);
+        e.set_bound_to(Some(creator));
+        e
+    }
+
     #[test]
     fn grace_owner_landing_does_not_settle_shooter() {
-        // 攻击豁免条款（声明式）：grace_owner 弹落地结算不伤发射者（P1-B 定案：
-        // 世界不豁免，豁免是声明——unbound 落地砸自己合法）
+        // 攻击豁免条款（声明式，D-018b 立法重接）：造物弹实体声明 binding=2 且
+        // bound_to=发射者 → 造物出刀不结算 bound_to 主人（哑弹）。豁免=deliver
+        // 现场读攻击者实体出生声明（世界每拍托管，#035 修订四原立法形态在接触
+        // 通道的等价迁移）；世界不豁免，豁免是声明——unbound 造物出刀伤主人
+        // 合法（对照测试 unbound_landing_still_settles_shooter）
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        let grace = PendingAttack {
-            attacker: shooter,
-            target_pos: (5.0, 0.5), // 落点在发射者自己身体内
-            payload: vec![],
-            contact_exempt: true,
-            grace_owner: true,
-        };
-        let strikes = deliver_attacks(&world, &mut map, &[grace]);
-        assert!(strikes.is_empty(), "grace_owner 落地弹不结算发射者（哑弹）");
+        let owner = world.entities[&shooter].owner;
+        let shell =
+            make_bound_shell(301, owner, (5.2, 0.5), shooter, codeworld_core::entity::BINDING_GRACE_OWNER);
+        let shell_id = shell.id;
+        world.entities.insert(shell_id, shell);
+        let strikes = deliver_attacks(
+            &world,
+            &mut map,
+            &[PendingAttack::strike(shell_id, (5.0, 0.5), vec![])],
+        );
+        assert!(strikes.is_empty(), "grace 造物出刀不结算 bound_to 主人（哑弹）");
         assert!(world.entities.get(&shooter).unwrap().is_alive());
     }
 
     #[test]
     fn unbound_landing_still_settles_shooter() {
-        // P1-B 定案回归锚：unbound 弹落地砸自己合法（世界不豁免，豁免是声明）
+        // P1-B 定案回归锚：unbound 造物出刀伤 bound_to 主人合法（世界不豁免，
+        // 豁免是声明）——同几何同刀，只差 binding 出生声明
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        let unbound = PendingAttack {
-            attacker: shooter,
-            target_pos: (5.0, 0.5),
-            payload: vec![],
-            contact_exempt: true,
-            grace_owner: false,
-        };
-        let strikes = deliver_attacks(&world, &mut map, &[unbound]);
-        assert_eq!(strikes.len(), 1, "unbound 落地砸自己照常进结算");
-        assert_eq!(strikes[0].target, shooter, "目标就是发射者自己");
+        let owner = world.entities[&shooter].owner;
+        let shell =
+            make_bound_shell(302, owner, (5.2, 0.5), shooter, codeworld_core::entity::BINDING_UNBOUND);
+        let shell_id = shell.id;
+        world.entities.insert(shell_id, shell);
+        let strikes = deliver_attacks(
+            &world,
+            &mut map,
+            &[PendingAttack::strike(shell_id, (5.0, 0.5), vec![])],
+        );
+        assert_eq!(strikes.len(), 1, "unbound 造物出刀照常进结算");
+        assert_eq!(strikes[0].target, shooter, "目标就是 bound_to 主人");
     }
     #[test]
-    fn grace_owner_upward_shell_lands_at_feet_without_self_kill() {
-        // 端到端冒烟（进程内代 headless，【D-018】造物弹版）：grace_owner 上抛
-        // 造物弹（spawn 第 9 参 binding=2）垂直升空 -> CCD 落回贴身旁停驻 ->
-        // 贴身接触触发 on_contact 出刀被 grace 豁免 -> 发射者无伤。
-        // 造物弹出生点外推 0.75 格贴身旁（#030 出生重叠拒绝），初速 (0,14.7)
-        // 垂直上抛——落点在发射者贴身邻域（宽限接触通道触发）
+    fn grace_owner_shell_return_strike_duds_without_self_kill() {
+        // 端到端冒烟（进程内代 headless，D-018b 真接触路径重造）：grace_owner
+        // 造物弹（spawn 第 9 参 binding=2）出生贴身旁 0.75 格、水平初速 (-3,0)
+        // 朝发射者——一拍内 CCD 撞体截断（首触 t+1cm 推进落进接触窗口 0.65）
+        // → detect_touching 触发 → on_contact 出刀（attack_at=发射者圆心）
+        // → deliver 查弹实体声明 binding=2 + bound_to=发射者 → 哑弹。发射者无伤。
+        // 【空转退役注记】旧测试垂直上抛落点距发射者 0.75 > 接触窗口 0.65，
+        // on_contact 从未触发、binding 声明全程零作用——断言空转（D-018b 重造）。
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
         let points_before = world.entities.get(&shooter).unwrap().survival.points();
-        // 主程序直发造物弹（spawn 路径同款构造）：binding=2 grace_owner、垂直初速
+        // 主程序直发造物弹（spawn 路径同款构造）：binding=2 grace_owner、水平初速回打
         let shell = PendingSpawn {
             creator: shooter,
             pos: (5.75, 0.5),
@@ -9831,8 +9946,8 @@ mod tests {
             mass: 1.0,
             binding: codeworld_core::entity::BINDING_GRACE_OWNER,
             motion: codeworld_core::entity::MOTION_DYNAMIC,
-            vx: 0.0,
-            vy: 14.7,
+            vx: -3.0,
+            vy: 0.0,
             blob: Vec::new(),
             field_radius: 0.0,
             field_gravity_scale: 1.0,
@@ -9847,24 +9962,73 @@ mod tests {
         let mut renderer = test_renderer();
         let mut storage = StorageEngine::open_in_memory().unwrap();
         let mut pending: Vec<PendingChange> = Vec::new();
-        for _ in 0..8 {
+        // tick1：CCD 撞体截断（弹停在发射者接触窗口内，速度清零）→ detect_touching
+        // → on_contact 出刀（attack 排队）；tick2：deliver 查弹声明 → 哑弹
+        for _ in 0..2 {
             tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
         }
-        let me = world.entities.get(&shooter).expect("发射者存活未清理");
-        assert!(me.is_alive(), "grace_owner 上抛弹落回脚下不炸自己");
+        let me = world.entities.get(&shooter).expect("发射者在册");
+        assert!(me.is_alive(), "grace_owner 回打弹不结算发射者（哑弹）");
         assert_eq!(
             me.survival.points(),
             points_before,
-            "豁免结算无掠夺（点数不动）"
+            "哑弹无掠夺（点数不动）"
         );
-        // 弹已落定（停驻贴地面/贴身，速度清零）——grace 豁免场景下不炸发射者
-        if let Some(shell_entity) = world.entities.values().find(|e| is_creation_shell(e)) {
-            assert_eq!(
-                shell_entity.velocity(),
-                (0.0, 0.0),
-                "上抛弹应已落定（CCD 触地截断贴面）"
-            );
+        // 弹停在接触窗口内（CCD 撞体截断速度清零；寿命未到仍在场）
+        let shell_entity = world
+            .entities
+            .values()
+            .find(|e| is_creation_shell(e))
+            .expect("造物弹仍在场（2 拍 < 命中后 2 拍延迟消亡）");
+        assert_eq!(
+            shell_entity.velocity(),
+            (0.0, 0.0),
+            "弹应已撞体截断停驻（速度清零）"
+        );
+    }
+
+    #[test]
+    fn unbound_shell_return_strike_kills_shooter_world_no_exemption() {
+        // 同型对照（世界不豁免的回归锚）：binding=0 的弹同路径回打出刀 →
+        // 发射者被默认击杀（payload 空=DEFAULT_KILL 换血）——豁免是声明，
+        // 没声明就真死（对照 grace_owner_shell_return_strike_duds_without_self_kill）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+        let shell = PendingSpawn {
+            creator: shooter,
+            pos: (5.75, 0.5),
+            code: CTRL_SHELL_WAT.to_string(),
+            glyph: ".".to_string(),
+            color: "red".to_string(),
+            radius: 0.15,
+            mass: 1.0,
+            binding: codeworld_core::entity::BINDING_UNBOUND,
+            motion: codeworld_core::entity::MOTION_DYNAMIC,
+            vx: -3.0,
+            vy: 0.0,
+            blob: Vec::new(),
+            field_radius: 0.0,
+            field_gravity_scale: 1.0,
+            field_drag_delta: 0.0,
+            liquid_density: 0.0,
+            liquid_drag: 0.0,
+            fuel_limit: 1_000_000,
+        };
+        process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        // 同款两拍：tick1 接触出刀；tick2 结算——unbound 无豁免，发射者被杀移除
+        for _ in 0..2 {
+            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
         }
+        assert!(
+            !world.entities.contains_key(&shooter),
+            "unbound 回打弹击杀发射者（世界不豁免，d 步已移除遗体）"
+        );
     }
 
     #[test]

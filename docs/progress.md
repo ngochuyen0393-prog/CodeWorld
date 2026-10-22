@@ -2,7 +2,12 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-22 D-005 决斗制攻杀 刀0 最小原型 落地）
+## 现在（2026-10-23 D-018b 收尾清扫 落地）
+- 在做：D-018b 收口——D-018 弹丸退役+R1 后遗留 P2 清扫四件套：①**grace_owner 立法重接**（decisions #035 修订四在案立法在新链路的等价迁移，非新立法）：PendingAttack.grace_owner/contact_exempt 字段+projectile_strike 构造器删除（D-018 命中改走接触通道后生产恒 false 接线已断），deliver_attacks 现场读攻击者实体出生声明（binding()==BINDING_GRACE_OWNER && bound_to()==目标=哑弹，INFO 文案改"造物出刀不结算 bound_to 主人"）；操控射击模板 binding 0→2（"出手不伤自己"既有 UX 走声明立法通道）；api.md binding 行补 `2`；空转测试重造为真接触路径（旧版落点距发射者 0.75>接触窗口 0.65，on_contact 从未触发断言空转——新版水平回打 CCD 撞体截断→on_contact→deliver 哑弹，附 binding=0 对照=世界不豁免回归锚）。②解算器地形拦截（P2-1 选"补拦截"）：simulate_path 每拍位移线段查 terrain.segment_first_contact（与 step CCD 同判据，与旧 y<半径 平地判据同语义），非平地世界"解算说能打中=世界真命中" #028 iff 契约补全（Mountain seed 探测测试锚定 None+平地对照 Some）；前端 simTrajectory 镜像同步 terrainFirstContact（terrainData 分段线性求交 JS 复刻，null=平地回落旧判据零变化，3D 层零触碰）。③CCD 端点相切（P2-7）：撞体截断推进上限 1.0→1.0+1e-2/disp（bt 在 1+ε 线性外推=末端沿位移方向 1cm，与中途首触推进同族）——ULP 实测定标锚测试（恰切点下方 1 ULP 旧实现停点 0.6500000000000021>0.65 漏接触）。④死路径清理：enforce_binding_deaths 未用参数 `_sandbox_map` 删除；entity.rs 绑定常量注释同步接触通道口径；docs/ideas.md 寿命管理第二课一行（⏸待土豆拍板）。
+- Gate：workspace **1092 绿 / 0 failed**（基线 1074+决斗 16=1090，本刀净增 2：Mountain 拦截+CCD 端点相切+unbound e2e 对照 −1 删 projectile_strike_bypasses_contact_gate）；clippy 本刀 hunks 零新警告（6 条既有警告全在 mask/avatars/net/liquid/决斗区 hunk）；TDD 全程红绿（grace 两测+e2e RED 实证、Mountain 拦截 TEMP-禁用 RED 实证、CCD ULP 探针 RED 实证 0.6500000000000021>0.65）。
+- 发现告知：docs/newbie-first-thrower.md 第 64 行模板注释仍写 `binding 0=unbound`（教学模板自身未列本刀改动面；若土豆要让教学模板同享 grace 语义，随下刀顺手改一行）。
+
+## 上一轮（2026-10-22 D-005 决斗制攻杀 刀0 最小原型 落地）
 - 在做：D-005 刀0 收口——决斗制最小原型（宪法 #038/#046/#047 工程落地，design-duel v0.3）：命中=开决斗会话不再直接换血。①arena 三硬件原语：duel_read/duel_write（内存映射直连，越界 Err）+ call_duel_step（游魂窗口：每拍临时实例化最小 linker 环境——import 只有 duel_read/duel_write/duel_round 三件，走私多余 import 拒绝实例化；on_duel 返回 1=宣布完成收尾；host 侧守方 fuel 快照/恢复守卫=账本铁律 #046 落地）②bin 会话记账：DuelSession 表挂 EntitySandboxMap（赌注=攻方 fuel_limit 快照继承制 #047；按 (defender,attacker) 字典序确定序每拍一窗；收尾三路=油尽驱逐/游魂崩溃/实体死亡，世界零裁判零胜负判定）③settle_attacks 分流：空 payload=裸奔特例（换血收尾一步到位，A/D/H/S/pioneer 与造物弹零破坏）；非空 payload=开会话（残影守方同开会话=游魂打空城）④config duel_step_fuel 10_000（CODEWORLD_DUEL_STEP_FUEL）⑤examples/duel-demo.wat（土豆验收样本，include_str 冒烟同源）⑥api.md 攻击语义节+「五点一、决斗制」节。刀外事项（双向互授/夺舍确权/偷魂外传/实例池化）全按任务书 §8 只记录不实现。
 - Gate：workspace **1090 绿 / 0 failed**（基线 1074 + 新增 16：arena 8 + bin 7 + config 1）；clippy --workspace -D warnings 零警告。改写 4 个旧换血语义测试（two_attackers_one_intercepted/none_intercepted_order/first_killer_blocks/ghost_skips_defense_inquiry）至决斗语义，断言核心不变（确定序/拦截/先杀封刀/残影跳防守）。
 - 待土豆人工验收：跑世界起 A/D，或看 examples/duel-demo.wat 冒烟（游魂读守方头部 16 字节→战利品回写→签名章→round>2 收工）。

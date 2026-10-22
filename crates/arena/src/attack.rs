@@ -2,6 +2,11 @@
 //!
 //! PendingAttack：玩家代码调 env.attack_at import 时排队的攻击请求（阶段二统一处理）。
 //! DEFAULT_KILL_WAT/WASM：payload 为空时框架用的默认击杀模块（life()=false）。
+//! 【#045 替代链口径】命中=接触通道代码攻：一切出刀都从实体出（env.attack_at 的
+//! attacker=出刀实体自身，造物弹的独立沙箱自飞自攻），贴身判距门由物理事实天然
+//! 成立（CCD 撞体截断停点落进接触窗口，deliver 只复核距离）；无弹丸专属结算路径，
+//! contact_exempt/grace_owner 出刀携带字段已随 D-018 链路退役——grace_owner 豁免
+//! 改读攻击者实体的出生声明（#035 修订四，deliver 现场查 binding/bound_to）。
 
 use codeworld_core::entity::EntityId;
 use std::sync::LazyLock;
@@ -12,49 +17,25 @@ use std::sync::LazyLock;
 /// 故只把请求推入 SandboxData.pending_attacks，阶段二统一处理（与 PendingChange 模式一致）。
 #[derive(Debug, Clone)]
 pub struct PendingAttack {
-    /// 攻击方实体ID（import 函数从 SandboxData.entity_id 获知攻击者是谁）
+    /// 攻击方实体ID（import 函数从 SandboxData.entity_id 获知攻击者是谁——
+    /// #045 替代链：造物弹命中时 attacker=弹实体自身，独立沙箱自飞自攻）
     pub attacker: EntityId,
     /// 目标坐标（架构 4.2：attack_at 攻击坐标不是 EntityId，目标移动可能 miss）
     pub target_pos: (f64, f64),
     /// 攻击 payload：WASM 模块字节码（路线A整模块替换）。空=用 DEFAULT_KILL_WASM 默认击杀
     pub payload: Vec<u8>,
-    /// #034 接触门豁免：贴身刀判距只约束 attack_at 直出之手（出手者与目标身体相触
-    /// 才砍得着）；弹丸命中结算不走本门——弹丸撞身体本身就是接触事实，离体之物是
-    /// 攻击者手臂的延伸（env.attack_at 传 false，弹丸结算传 true）。
-    pub contact_exempt: bool,
-    /// #034 修订四攻击豁免条款（声明式）：true=弹丸结算命中发射者本人时豁免
-    /// （落地不砸自己；飞行撞体本就全程豁免发射者，#034 既有口径）。
-    /// 由弹丸绑定契约 grace_owner 携带；unbound 弹落地砸自己合法（世界不豁免，
-    /// 豁免是声明）
-    pub grace_owner: bool,
 }
 
 impl PendingAttack {
-    /// 普通出刀（attack_at/操控攻击：走 #034 接触门）
+    /// 出刀（attack_at/操控攻击/接触通道造物弹同款：attacker=出刀实体自身）。
+    /// 贴身判距门只约束物理上的"够不够得着"（deliver 复核 melee_in_reach）——
+    /// 接触通道的出刀由 CCD 撞体截断天然贴身，门当拍成立；grace_owner 豁免
+    /// 归 deliver 现场读攻击者实体出生声明（binding/bound_to），不在刀上携带。
     pub fn strike(attacker: EntityId, target_pos: (f64, f64), payload: Vec<u8>) -> Self {
         Self {
             attacker,
             target_pos,
             payload,
-            contact_exempt: false,
-            grace_owner: false,
-        }
-    }
-
-    /// 弹丸命中结算（#034：接触事实已由弹丸完成，豁免贴身判距）。
-    /// `grace_owner`：发射者是否声明了对自己的豁免（绑定契约 grace_owner）
-    pub fn projectile_strike(
-        attacker: EntityId,
-        target_pos: (f64, f64),
-        payload: Vec<u8>,
-        grace_owner: bool,
-    ) -> Self {
-        Self {
-            attacker,
-            target_pos,
-            payload,
-            contact_exempt: true,
-            grace_owner,
         }
     }
 }
@@ -77,7 +58,8 @@ mod tests {
 
     #[test]
     fn pending_attack_stores_fields() {
-        // 创建：PendingAttack 字段正确存取（attacker/坐标/payload/接触门豁免）
+        // 创建：PendingAttack 字段正确存取（attacker/坐标/payload——#045 替代链：
+        // 刀只带身份/坐标/payload 三件，豁免归实体出生声明，不在刀上携带）
         let atk = PendingAttack::strike(
             EntityId(Uuid::from_u128(1)),
             (5.0, 5.0),
@@ -86,22 +68,6 @@ mod tests {
         assert_eq!(atk.attacker, EntityId(Uuid::from_u128(1)));
         assert_eq!(atk.target_pos, (5.0, 5.0));
         assert_eq!(atk.payload, vec![1, 2, 3]);
-        assert!(!atk.contact_exempt, "普通出刀走接触门");
-        assert!(!atk.grace_owner, "普通出刀无发射者豁免");
-        let proj = PendingAttack::projectile_strike(
-            EntityId(Uuid::from_u128(2)),
-            (6.0, 6.0),
-            vec![],
-            false,
-        );
-        assert!(proj.contact_exempt, "弹丸命中豁免贴身判距");
-        let grace = PendingAttack::projectile_strike(
-            EntityId(Uuid::from_u128(2)),
-            (6.0, 6.0),
-            vec![],
-            true,
-        );
-        assert!(grace.grace_owner, "弹丸契约可携带发射者豁免");
     }
 
     #[test]

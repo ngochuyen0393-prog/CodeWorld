@@ -784,6 +784,49 @@
   var PROJ_MAX_AGE = 30;              // 解算模拟步数上限（拍，=CTRL_SOLVE_MAX_TICKS）——#045 后世界无统一弹寿命：造物弹自管 life()，弹幕总量上限=世界实体上限 64
   var PROJ_TRAIL = 1.5;               // 弹丸尾迹世界长度（格；0.6→1.5 期五第六刀）
 
+  // 地形首触查表（D-018b 镜像：crates/core terrain.segment_first_contact 同口径，
+  // #028 镜像铁律）——每拍位移线段 vs 地形折线（terrainData={x0,dx,heights}，
+  // 快照 terrain 字段）逐格解 A+B·t=0 取沿路径方向最先触；null=平地/旧协议
+  //（回落 y<半径 旧判据，行为零变化）。与 Rust 逐位同构：域外钳边格、
+  // 按路径方向遍历格序、段内根校验（±1e-9）、边格延长线放行
+  function terrainFirstContact(x0, y0, x1, y1, r) {
+    if (!terrainData || !terrainData.heights || terrainData.heights.length < 2) return null;
+    var hs = terrainData.heights, tx0 = terrainData.x0, dg = terrainData.dx;
+    function groundAt(x) {
+      var xc = Math.max(tx0, Math.min(tx0 + dg * (hs.length - 1), x));
+      var fi = (xc - tx0) / dg, gi = Math.floor(fi);
+      if (gi >= hs.length - 1) return hs[hs.length - 1];
+      return hs[gi] + (hs[gi + 1] - hs[gi]) * (fi - gi);
+    }
+    var dx = x1 - x0, dy = y1 - y0;
+    if (y0 < groundAt(x0) + r) return 0;
+    if (Math.abs(dx) < 1e-12) {
+      var surface = groundAt(x0) + r;
+      if (y1 < surface && y0 > y1) return Math.max(0, Math.min(1, (y0 - surface) / (y0 - y1)));
+      return null;
+    }
+    var dir = dx > 0 ? 1 : -1;
+    function cellOf(x) {
+      return Math.max(0, Math.min(hs.length - 2, Math.floor((x - tx0) / dg)));
+    }
+    var lo = Math.min(cellOf(x0), cellOf(x1)), hi = Math.max(cellOf(x0), cellOf(x1));
+    for (var k = 0; k <= hi - lo; k++) {
+      var gi = dir > 0 ? lo + k : hi - k;
+      var ga = hs[gi], gb = hs[gi + 1];
+      var slope = (gb - ga) / dg;
+      var a = y0 - r - ga - (x0 - (tx0 + gi * dg)) * slope;
+      var b = dy - dx * slope;
+      if (Math.abs(b) < 1e-15) continue;
+      var t = -a / b;
+      if (t < 0 || t > 1) continue;
+      var txx = x0 + t * dx;
+      var xa = tx0 + gi * dg, xb = tx0 + (gi + 1) * dg;
+      var ext = (gi === 0 && txx < xa - 1e-9) || (gi === hs.length - 2 && txx > xb + 1e-9);
+      if ((txx >= xa - 1e-9 && txx <= xb + 1e-9) || ext) return t;
+    }
+    return null;
+  }
+
   // 弹道模拟采样（镜像 main.rs solve_launch_vector 内 simulate_path：与
   // crates/physics step 冲量路径同序——重力→阻力→极速钳→中点位移），
   // 返回逐拍末坐标（含起点），落地 y<半径截断。
@@ -792,12 +835,16 @@
   // step 通用路径），预测侧必须同步——#028 镜像铁律，否则"弧线说打得到=
   // 世界真命中"契约断裂（与 main.rs 侧中点位移同步落地）。
   // 【#044 子步宪法锚·弹道积分/预览采样】N=1 整步积分，步数只由弹道状态
-  // 决定（落地 y<半径 或步数上限截断）——纯状态驱动，零机器数据
-  // （墙钟/CPU/帧率），同输入必然同弧线（decisions #044 / D-015）
+  // 决定（地形触面/平地落地 或步数上限截断）——纯状态驱动，零机器数据
+  // （墙钟/CPU/帧率），同输入必然同弧线（decisions #044 / D-015）。
+  // 【D-018b 地形拦截镜像】非平地世界（terrainData 非空）每拍位移线段查
+  // terrainFirstContact（与服务器 step CCD/simulate_path 同判据）——山体挡弹
+  // 弧线止于山面，"解算说能打中=世界真命中" iff 契约两态成立（平地+地形）
   function simTrajectory(sx, sy, vx, vy) {
     var pts = [{ x: sx, y: sy }];
     var x = sx, y = sy;
     for (var i = 0; i < PROJ_MAX_AGE; i++) {
+      var px = x, py = y; // 本拍位移左端点（地形截断参照）
       var vx0 = vx, vy0 = vy; // 定律前速度（本拍位移的左端点）
       vy += PROJ_GRAVITY;
       var f = 1 - PROJ_DRAG / PROJ_MASS;
@@ -805,8 +852,14 @@
       var sp = Math.sqrt(vx * vx + vy * vy);
       if (sp > PROJ_MAX_SPEED) { var k = PROJ_MAX_SPEED / sp; vx *= k; vy *= k; }
       x += (vx0 + vx) / 2; y += (vy0 + vy) / 2; // 中点位移（step 冲量路径同款）
+      var th = terrainFirstContact(px, py, x, y, PROJ_BODY);
+      if (th != null) {
+        x = px + (x - px) * th; y = py + (y - py) * th;
+        pts.push({ x: x, y: y });
+        break; // 触面截断
+      }
       pts.push({ x: x, y: y });
-      if (y < PROJ_BODY) break; // 落地截断
+      if (terrainData == null && y < PROJ_BODY) break; // 平地落地截断（旧判据，行为零变化）
     }
     return pts;
   }

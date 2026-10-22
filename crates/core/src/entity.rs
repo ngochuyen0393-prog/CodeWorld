@@ -363,8 +363,9 @@ pub fn clamp_field_drag_delta(v: f64) -> f64 {
 /// 绑定契约档位（#034 修订四，design-binding.md 机制层 MVP 三档）
 /// - unbound（默认）：离体即世界之物——主人死照飞照命中（弹丸）/独立存在（造物）
 /// - fade_on_death（同生）：主人死→在飞弹丸/造物当拍即刻消亡（世界每拍托管执行）
-/// - grace_owner（攻击豁免）：弹丸落地结算不伤发射者（飞行撞体本就全程豁免发射者，
-///   #034 既有口径）；不声明则落地砸自己合法——世界不豁免，豁免是声明
+/// - grace_owner（攻击豁免）：造物出刀不结算 bound_to 主人（命中主人=哑弹，
+///   deliver 现场读声明，D-018b 接触通道重接）；不声明则误伤主人合法——
+///   世界不豁免，豁免是声明
 pub const BINDING_UNBOUND: i32 = 0;
 pub const BINDING_FADE_ON_DEATH: i32 = 1;
 pub const BINDING_GRACE_OWNER: i32 = 2;
