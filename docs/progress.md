@@ -2,7 +2,12 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-23 D-011 世界内链路段 落地）
+## 现在（2026-10-23 D-004c 渲染升级第 3 步 落地）
+- 在做：D-004c 头发天使圈+rim 泛化——前端渲染纯 JS 刀（commit a83abcf 施工+1ce47ef R1 双审加固，零 Rust）。三件套：①**头发天使光圈**（Kajiya-Kay 移位切线 aniso 自实现：`pow(sqrt(max(1-dot(T+shift·N,H)²,0)),shininess)`，主+副条带，CW_HAIR_ANISO 只对 hair 材质编译；双约束 lamberStep 背光不出圈+hair ILM .g 受光区 mask——实测 .g 双峰 0.5/0，smoothstep(.25,.5) 校准，首版 (g-.5)*2 把受光主体全灭是条带不可见根因）。②**rim 泛化**五参数（uRimColor 独立颜色默认白=回归安全/uRimShadeMix 背光压暗默认 0/uRimByMatId 分区宽度调制默认 0/uRimThreshold 0.12+uRimFadeout 1.0 旧硬编码参数化）。③材质面板+4 滑条（天使圈强度/位移/rim 色调/背光压暗）+hash 开关 `&a=N/&r=0|1`（无头对照+土豆亲验同入口）。行为变化申报：dress 从 hair 贴图组回归 body 组（裙面显现花纹）；hair ramp 接回 hairRampMap（D-004b 死加载勘误）。双审：代码质量（glm-5.3）+需求匹配双 PASS，5 条 P3 中 2 条已修（hash a=NaN/负值拦截+缺 TANGENT 天使圈静默关）。
+- Gate：视觉回归亲验复算——aniso 开/关正脸 max 410/765（0.63% 超阈，热区=双马尾发梢）、左45° 303/765；rim 开/关 138/164；console.error 透传 0；node --check 全绿（8 shader/材质文件+module 段提取）；GPL 红线自查 diff 0 命中（StarRail 仅 LICENSE 思想声明）；默认档=D-004b 等价白 rim。天使圈默认 0.6 在浅发色上偏柔（浅色底与白条带对比低——机制正确、a=3 时条带明显），留土豆亲验调档：`#d3d` →「材质」面板拉强度/位移。
+- 建议土豆亲验（效果类验收无法全自动）：①`#d3d` 开层拉天使圈滑条看发梢条带走向；②`#d3d-still` vs `#d3d-still&a=0` 左右对比；③rim 色调 0.6+背光压暗 0.6 转视角；④dress 裙面花纹变化是否接受；⑤hair 发色是否更正（hairRamp 接回）。
+
+## 上一轮（2026-10-23 D-011 世界内链路段 落地）
 - 在做：D-011 收口——宪法 #038 世界内段实施刀（链=纵向家庭通道+消息=横向陌生通道+存储=公开块，全程零内容解释）。①core：Entity.link_to（Option<EntityId>，serde default None 旧快照零迁移）+Entity.storage（Vec<u8> 公开块随实体入快照=比沙箱内存耐用）+LINK_UNLINKED/LINK_ACTIVE 常量+clamp_link（非法钳 0）。②arena：五 import（command 下行广播/ report 沿链上行/send 视口内坐标寻址/storage_write 全量覆盖自己的公开块/storage_read 贴身读对方块）+deliver_message 通用投递器（call_on_bridge_reply 六步全套：签名核验先于 grow+写 P2-A 零半副作用/offset=旧末尾零页/probe_fuel 预算包裹/缺省导出 Ok(None) 零副作用）+spawn 第 20 参 link（func_new 20 参，全仓 19 参调用方 17 处机械迁移：arena 8+main 9+WAT 文件 4+文档 2）。③bin：a-1 投递相位（先投上拍 inbox 两拍节律=外桥回信同款，同拍多消息（目标,源）EntityId 升序）+collect 分流（command 按链账本扇出升序/StorageWrite 落世界侧真源当拍闭环）+断链清算（母体死当拍 link_to 清 None+INFO 汇总，不杀造物——电话挂了人活着）+spawn 接线（link=1→set_link_to(creator)；遗嘱造物母体已死=出生即放生）+config 两护栏（CODEWORLD_LINK_PAYLOAD_MAX=8192/CODEWORLD_STORAGE_CAP=4096）。④文档：api.md 二点四节（五 import+三回调完整节）+导出表 7→10 行+21 import；decisions.md **#054**（#053 已被 D-009 占用顺延——任务书写作时 D-009 未落地）；menu 1.7 链护栏一行；players/link-demo.wat（风筝演示对：风筝手每 8 拍 command 广播转向 f64+侦察弹 link=1 每拍 report 坐标+on_command 改向，include_str 全管线守卫测试放飞实证）。
 - Gate：workspace 测试全绿 0 failed（本刀净增约 30 锚：core 8+arena 14+bin 8+config 3，G1 数字见 cc-report）；clippy 本刀文件零新警告；G3 grep 证据齐；G4 link-demo.wat 真实编译+放飞跑通。TDD 全程红绿（core/arena/bin 三层各自先测后码，RED 实证=编译期特性缺失）。
 - 实施口径与设计书的差异（诚实记档）：链消息采用**跨拍缓冲**（collect 当拍压 link_inbox、下一拍 a-1 投递）实现任务书"两拍节律/与外桥回信一致"锚；storage_read 查找集=视口内实体快照（-1 无实体/-2 够不着两态可区分），读自己走镜像特判；command 返回值=拍首孩子数快照（死亡竞态时实际投递数以日志为准）。
