@@ -101,6 +101,25 @@ pub(crate) struct WorldSnapshot {
     /// 场源造物本体已照常渲染（fields 层只画"可见气流环"）。formed=false=
     /// 成型中（前端画虚线环，给进攻方反应窗），true=已成型（实线环）
     pub fields: Vec<FieldSnapshot>,
+    /// 水域矩形投影（D-009 可视铁律：水域必须可视）。每拍全量（恒有字段，
+    /// 空数组=无水世界，前端零可选分支）；颜色=密度映射是前端装饰非世界事实
+    /// （玩家造 ρ=0.8 的"蓝油"世界不拦不判）
+    pub liquids: Vec<LiquidSnapshot>,
+}
+
+/// 单个水域矩形投影（D-009：液体造物格对齐 AABB 转矩形 + 密度）
+#[derive(Debug, Serialize)]
+pub(crate) struct LiquidSnapshot {
+    /// 矩形左下角 x（格对齐 AABB min.x）
+    pub x: f64,
+    /// 矩形左下角 y
+    pub y: f64,
+    /// 矩形宽（max.x − min.x）
+    pub w: f64,
+    /// 矩形高（max.y − min.y）
+    pub h: f64,
+    /// 液体密度 ρ（无量纲，水=1.0 参照系；前端查表插值画色）
+    pub density: f64,
 }
 
 /// 单个力场投影（D-012：场源坐标+半径+成型态）
@@ -282,6 +301,34 @@ pub(crate) fn build_snapshot(
         })
         .collect();
     fields.sort_by_key(|f| f.id);
+    // 水域矩形投影（D-009 可视铁律）：每拍全量（空数组恒有）；液体造物格对齐
+    // AABB 转矩形+密度随投影（颜色=密度映射是前端装饰非世界事实）。定序纪律
+    // 照 fields 同款：按 id 升序，快照逐帧 diff 依赖帧序稳定
+    let mut liquids: Vec<LiquidSnapshot> = world
+        .entities
+        .values()
+        .filter(|e| e.is_alive() && e.liquid_density() > 0.0)
+        .map(|e| {
+            let (min, max) = codeworld_core::collision::creation_aabb(e.pos());
+            LiquidSnapshot {
+                x: min.0,
+                y: min.1,
+                w: max.0 - min.0,
+                h: max.1 - min.1,
+                density: e.liquid_density(),
+            }
+        })
+        .collect();
+    // 定序纪律照 fields 同款（帧序稳定）：投影无 id 字段，用几何键（x,y,density,
+    // w,h）全序——同格多水域也有确定帧序
+    liquids.sort_by(|a, b| {
+        a.x
+            .total_cmp(&b.x)
+            .then(a.y.total_cmp(&b.y))
+            .then(a.density.total_cmp(&b.density))
+            .then(a.w.total_cmp(&b.w))
+            .then(a.h.total_cmp(&b.h))
+    });
     WorldSnapshot {
         tick: world.tick(),
         caption: caption.to_string(),
@@ -295,6 +342,7 @@ pub(crate) fn build_snapshot(
         attacks,
         terrain,
         fields,
+        liquids,
     }
 }
 
@@ -1888,6 +1936,45 @@ mod tests {
         for e in json["entities"].as_array().unwrap() {
             assert!(e.get("disposition").is_none(), "非 player 实体无 disposition");
         }
+    }
+
+    // === D-009 水域投影（前端密度映射画色的数据源）===
+
+    #[test]
+    fn snapshot_carries_liquid_rectangles_with_density() {
+        // 契约（D-009）：液体造物的格对齐 AABB 投影为矩形 {x,y,w,h,density}——
+        // 颜色=密度映射是前端装饰非世界事实；死水/非液体实体不入投影
+        let mut world = WorldState::new();
+        let (id, _) = put_entity(&mut world, "creation", "W", "blue", (10.5, 0.0));
+        world
+            .entities
+            .get_mut(&id)
+            .unwrap()
+            .set_liquid_density(1.0);
+        world.entities.get_mut(&id).unwrap().set_liquid_drag(0.35);
+        let dir = PlayerDirectory::disabled();
+        let json = build(&world, &dir, None);
+        let liqs = json["liquids"].as_array().expect("liquids 数组恒有");
+        assert_eq!(liqs.len(), 1, "一个液体造物=一个矩形投影");
+        assert_eq!(liqs[0]["x"], 10.0, "矩形 x=格对齐左下角（floor）");
+        assert_eq!(liqs[0]["y"], 0.0);
+        assert_eq!(liqs[0]["w"], 1.0, "1×1 AABB 宽");
+        assert_eq!(liqs[0]["h"], 1.0);
+        assert_eq!(liqs[0]["density"], 1.0, "密度随投影（前端查表画色）");
+    }
+
+    #[test]
+    fn snapshot_liquids_empty_array_always_present() {
+        // 契约：无水世界 liquids=[] 恒有字段（前端零可选分支，attacks/fields 先例）
+        let mut world = WorldState::new();
+        put_entity(&mut world, "creation", "T", "cyan", (10.0, 0.0)); // 非液体
+        let dir = PlayerDirectory::disabled();
+        let json = build(&world, &dir, None);
+        assert_eq!(
+            json["liquids"].as_array().map(Vec::len),
+            Some(0),
+            "liquids 空数组恒有"
+        );
     }
 
     #[tokio::test]

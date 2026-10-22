@@ -14,6 +14,7 @@ use codeworld_core::world::WorldState;
 use std::collections::{HashMap, HashSet};
 
 use crate::fields::{effective_gravity_drag, FieldEffect};
+use crate::liquid::{LiquidDomain, liquid_effect};
 
 /// 接触对（两个身体相触的实体，detect_touching 产出）
 #[derive(Debug, Clone, PartialEq)]
@@ -219,6 +220,23 @@ impl DefaultPhysicsEngine {
         shooters: &HashMap<EntityId, EntityId>,
         fields: &[FieldEffect],
     ) -> Vec<ProjectileEvent> {
+        // 无液体委托：空清单=世界默认，弹丸行为与 D-009 前逐位一致（零回归锚）
+        self.step_projectiles_with_liquids(world, current_tick, shooters, fields, &[])
+    }
+
+    /// 弹丸步进（带液体域，D-009）：域内弹丸按液体物理被结算——浮力托缓下坠
+    /// （g_final）、水中阻尼（k_eff，替代重力入速度步）、附加质量（m_eff 进阻力
+    /// 分母）。浸入判定用弹丸圆心+半径（f 竖径夹逼近似）；ρ物=m/πr²（标准弹
+    /// r=0.15/m=1 → ρ物≈14 很稠，任何液体都缓沉不浮，物理诚实）。空清单=
+    /// 无液体世界，行为与 D-009 前逐位一致（零回归锚）。
+    pub fn step_projectiles_with_liquids(
+        &self,
+        world: &mut WorldState,
+        current_tick: u64,
+        shooters: &HashMap<EntityId, EntityId>,
+        fields: &[FieldEffect],
+        liquids: &[LiquidDomain],
+    ) -> Vec<ProjectileEvent> {
         let mut events = Vec::new();
         let mut ids: Vec<EntityId> = world
             .entities
@@ -245,10 +263,31 @@ impl DefaultPhysicsEngine {
                 continue;
             }
             // 2. 重力（吃满，无 aloft 豁免；D-012 力场域内用生效重力）
+            //    D-009 水中：阻尼+净加速度一步完成（v ← v×k_eff + g_final，
+            //    替代重力入速度步——MC 三步乘法加法同构），附加质量进阻力分母
             // 3. 阻力定律（质量为分母；域内用生效阻力——护弹道场第一消费者）
             let (eff_gravity, eff_drag) = effective_gravity_drag(before, &self.params, fields);
-            vel.1 += eff_gravity;
-            vel = apply_drag(vel, mass, eff_drag);
+            if liquids.is_empty() {
+                vel.1 += eff_gravity;
+                vel = apply_drag(vel, mass, eff_drag);
+            } else {
+                let le = liquid_effect(before, radius, mass, vel, (eff_gravity, eff_drag), liquids);
+                if le.f > 0.0 {
+                    tracing::debug!(
+                        projectile = %pid.0,
+                        f = le.f,
+                        g_final = le.g_final,
+                        k_eff = le.k_eff,
+                        m_eff = le.m_eff,
+                        "[projectile] 弹丸在水中（浮力托缓+阻尼+附加质量）"
+                    );
+                    vel = (vel.0 * le.k_eff, vel.1 * le.k_eff + le.g_final);
+                    vel = apply_drag(vel, le.m_eff, eff_drag);
+                } else {
+                    vel.1 += eff_gravity;
+                    vel = apply_drag(vel, mass, eff_drag);
+                }
+            }
             // 3.5 世界极速钳制（#034 修订一，双审 P1-A 修复）：积分后（重力+阻力）、
             // 位移前归一化压回——重力累积从此封顶，弹丸一拍位移不超过极速。
             // 视觉可读性常数：攻击永远看得见飞过来（发射端钳制见 arena shoot import，
@@ -465,6 +504,31 @@ impl DefaultPhysicsEngine {
         aloft: &HashSet<EntityId>,
         fields: &[FieldEffect],
     ) -> Vec<PhysicsChange> {
+        // 无液体委托：空清单=世界默认，行为与 D-009 前逐位一致（零回归锚——
+        // 现有全部物理测试经此路径照绿）
+        self.step_with_liquids(world, aloft, fields, &[])
+    }
+
+    /// 执行完整默认物理步骤（带液体域，D-009：浮力改写+水中阻尼+附加质量+
+    /// 零速入水速度制路由）
+    ///
+    /// - `liquids`：本拍液体域清单（main 每拍收集，登记制刷场）——域内实体
+    ///   （生物+dynamic 造物）按液体物理被结算：先力场 effective_gravity_drag、
+    ///   再浮力改写（正交改写代数叠加）、水中阻尼、附加质量进阻力项；空清单=
+    ///   无液体世界，行为与 D-009 前逐位一致（零回归锚）。
+    /// - 路由裁决（测试锚定 step_zero_velocity_entity_in_water_uses_velocity_regime）：
+    ///   f>0 的实体一律走冲量积分路径（速度制），即使速度为零——阻尼定律
+    ///   v×k 需要速度状态才成立；零速走位置制则每拍位移=全额 g_final，水面
+    ///   附近会疯狂弹跳，"典型物体半沉"永远看不到。水面平衡=逐拍结算自然收敛。
+    /// - static 造物/液体造物自己：不受液体影响（static 不吃物理现状照旧，
+    ///   水不会动）。aloft 优先级高于浮力（短路在液体结算之前，与力场同款）。
+    pub fn step_with_liquids(
+        &self,
+        world: &mut WorldState,
+        aloft: &HashSet<EntityId>,
+        fields: &[FieldEffect],
+        liquids: &[LiquidDomain],
+    ) -> Vec<PhysicsChange> {
         let mut changes = Vec::new();
         // 实体 id 升序（裁决确定序）
         let mut ids: Vec<EntityId> = world.entities.keys().copied().collect();
@@ -502,8 +566,31 @@ impl DefaultPhysicsEngine {
             // D-012 力场：本实体所处位置的生效重力/阻力（叠加 v2；空清单快速路径
             // 逐位返回默认值——无场世界行为与力场刀前一致）
             let (eff_gravity, eff_drag) = effective_gravity_drag(before, &self.params, fields);
+            // D-009 液体结算（次序定死：①先力场 ②再浮力改写 ③水中阻尼 ④附加
+            // 质量进阻力项——正交改写代数叠加）。static 造物不走液体结算（不吃
+            // 物理现状照旧；液体造物自己=static 布景）；aloft 已在上面短路
+            //（悬停免重力免浮力免阻尼，优先级高于浮力）
+            let wet = if liquids.is_empty() || (is_creation && !is_dyn_creation) {
+                None
+            } else {
+                let le = liquid_effect(before, me_r, me_mass, me_vel, (eff_gravity, eff_drag), liquids);
+                (le.f > 0.0).then_some(le)
+            };
+            if let Some(le) = &wet {
+                // 实体入水 INFO（带 f 值，任务书数据流两端日志；登记制无缓存
+                // 故"出水"无独立边沿日志——本行缺席即出水信号，前端高亮判定同源）
+                tracing::info!(
+                    entity_id = %id.0,
+                    f = le.f,
+                    g_final = le.g_final,
+                    k_eff = le.k_eff,
+                    m_eff = le.m_eff,
+                    "[liquid] 实体在水中（浮沉结算：入水=本行出现，出水=本行缺席）"
+                );
+            }
             // 分支选择（顺序固定，测试锚定）：static 造物→直落地面；带速度实体
-            //（生物+dynamic 造物）→ D-010a 冲量路径（速度积分）；零速→落点制（现状）。
+            //（生物+dynamic 造物）或水中实体（f>0，即使零速——速度制路由裁决）
+            // → D-010a 冲量路径（速度积分）；零速域外→落点制（现状）。
             // 产物：new_pos（本拍新坐标）+ ballistic_vel（Some=冲量路径要写回的速度）
             let (new_pos, ballistic_vel) = if is_creation && !is_dyn_creation {
                 // static 造物：直落地面（D-016：地面=terrain.height(x)，格对齐 AABB
@@ -530,7 +617,7 @@ impl DefaultPhysicsEngine {
                 } else {
                     (target, None)
                 }
-            } else if me_vel != (0.0, 0.0) {
+            } else if wet.is_some() || me_vel != (0.0, 0.0) {
                 // D-010a 冲量路径（带速度生物/dynamic 造物速度积分，一拍一步）。
                 // 【#021 切割声明】一次性冲量非持续推挤：已退役的"推挤"（持续重叠
                 // 互相挤开→连体 bug）是每拍重复施加的位置推力；本路径是冲量入速度
@@ -543,10 +630,20 @@ impl DefaultPhysicsEngine {
                 // 被落地解析当场吃掉跳不起来；中点法拍 1 位移 2.85，落在"跳 ≤3 格高"
                 // 锚点内（thrust_ballistic_jump_peak_within_three_grid_anchor 锚定）。
                 let mut vel = me_vel;
-                vel.1 += eff_gravity; // 生效重力入速度（空中累积；落地清零见下）
+                // 重力入速度（空中累积；落地清零见下）。D-009 水中：阻尼+净加速
+                // 一步完成（v ← v×k_eff + g_final，替代重力入速度步——MC 三步
+                // 乘法加法同构，结算次序定死：①力场 ②浮力 ③水中阻尼 ④附加质量）
+                if let Some(le) = &wet {
+                    vel = (vel.0 * le.k_eff, vel.1 * le.k_eff + le.g_final);
+                } else {
+                    vel.1 += eff_gravity;
+                }
                 // 阻力定律（#045 通用化口径：一切有速度实体，质量为分母；域内用
-                // 生效阻力——护弹道场在生物/dynamic 造物上的直接作用点）
-                vel = apply_drag(vel, me_mass, eff_drag);
+                // 生效阻力——护弹道场在生物/dynamic 造物上的直接作用点）。
+                // D-009 附加质量独门立法：水中阻力分母=m_eff（排开流体质量）——
+                // "水下加速钝"从阻力响应涌现；ρ物 计算用真实 m 不用 m_eff（防递归）
+                let drag_mass = wet.as_ref().map_or(me_mass, |le| le.m_eff);
+                vel = apply_drag(vel, drag_mass, eff_drag);
                 // 世界极速钳制（与弹丸/dynamic 造物同款：积分后归一化压回，方向不变）
                 let speed2 = vel.0 * vel.0 + vel.1 * vel.1;
                 let max_speed = self.params.max_speed;
@@ -2227,5 +2324,301 @@ mod tests {
             (vy_out + 9.8 * 0.95).abs() < 1e-12,
             "域外弹丸照常吃重力（阻力后 -9.8×0.95），实际 {vy_out}"
         );
+    }
+
+    // === D-009 水体：物理步液体接入（浮力改写/水中阻尼/附加质量/速度制路由）===
+
+    use crate::liquid::{LiquidDomain, liquid_effect};
+
+    /// 深水液体域（y ∈ [-100, 100] 全覆盖，圆心 y<100 全浸没）
+    fn deep_water(id_u: u128, density: f64, drag_k: f64) -> LiquidDomain {
+        LiquidDomain {
+            domain_id: EntityId(Uuid::from_u128(id_u)),
+            min: (0.0, -100.0),
+            max: (100.0, 100.0),
+            density,
+            drag_k,
+        }
+    }
+
+    #[test]
+    fn step_water_damping_drops_sixty_five_percent_first_tick() {
+        // 水中阻尼锚（D-009 定案观感锚）：入水一拍速度掉 65%——v=(-0, -10)
+        // 的实体进入 k=0.35 等密度水（g_final=0：m=π×r² 使 ρ物=ρ液=1.0）：
+        // 水中一步 v ← v×0.35（-3.5）→ 再吃 apply_drag（m_eff=1+π×0.25≈1.7854，
+        // 衰 2.8%）→ ≈-3.402。对照组：空气中同实体吃重力入速度 (-10-9.8)×0.95
+        // = -18.81。（y=30 起跳：一拍位移 ~-6.7 够不着湖底，落地清零不干扰速度断言）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut wet = make_entity(1, 5.0, 30.0, 0);
+        wet.set_mass(std::f64::consts::PI * 0.25); // ρ物=1.0 等密度
+        wet.set_velocity((0.0, -10.0));
+        let mut dry = make_entity(2, 150.0, 30.0, 0); // 水域 x≤100 域外（对照组）
+        dry.set_velocity((0.0, -10.0));
+        let id_wet = wet.id;
+        let id_dry = dry.id;
+        world.entities.insert(id_wet, wet);
+        world.entities.insert(id_dry, dry);
+        let liquids = [deep_water(9, 1.0, 0.35)];
+        engine.step_with_liquids(&mut world, &HashSet::new(), &[], &liquids);
+        let vy_wet = world.entities.get(&id_wet).unwrap().velocity().1;
+        // m=π/4 等密度下 m_eff = m + ρ液·π·r²·f = π/4 × 2 = π/2
+        let m_eff = std::f64::consts::PI * 0.5;
+        let expect = (-10.0 * 0.35) * (1.0 - 0.05 / m_eff);
+        assert!(
+            (vy_wet - expect).abs() < 1e-9,
+            "入水一拍应 v×0.35 再吃附加质量阻力（≈{expect}，掉 65%），实际 {vy_wet}"
+        );
+        let vy_dry = world.entities.get(&id_dry).unwrap().velocity().1;
+        assert!(
+            (vy_dry - (-10.0 - 9.8) * 0.95).abs() < 1e-9,
+            "空气中对照组照常重力入速度（-18.81），实际 {vy_dry}"
+        );
+    }
+
+    #[test]
+    fn step_water_added_mass_sluggish_drag_response() {
+        // 附加质量锚（独门立法）：水下阻力响应更钝——同 v=(10,0) 实体在水
+        //（m_eff=1+π×0.25≈1.7854）阻力衰 2.8%（→9.7200），在空气（m=1）衰 5%
+        //（→9.5）——"水下加速钝"从阻力响应涌现，零新参数。
+        //（水配 k=1.0=速度完全保留的无阻尼档——隔离附加质量单变量，k 阻尼另测；
+        // 注：k 保留系数语义下 k=0=每拍速度清零最粘档，非"无阻尼"）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut wet = make_entity(1, 5.0, 30.0, 0);
+        wet.set_velocity((10.0, 0.0));
+        let mut dry = make_entity(2, 150.0, 30.0, 0); // 水域 x≤100 域外（对照组）
+        dry.set_velocity((10.0, 0.0));
+        let id_wet = wet.id;
+        let id_dry = dry.id;
+        world.entities.insert(id_wet, wet);
+        world.entities.insert(id_dry, dry);
+        let liquids = [deep_water(9, 1.0, 1.0)];
+        engine.step_with_liquids(&mut world, &HashSet::new(), &[], &liquids);
+        let vx_wet = world.entities.get(&id_wet).unwrap().velocity().0;
+        let vx_dry = world.entities.get(&id_dry).unwrap().velocity().0;
+        let expect_wet = 10.0 * (1.0 - 0.05 / (1.0 + std::f64::consts::PI * 0.25));
+        assert!(
+            (vx_wet - expect_wet).abs() < 1e-9,
+            "水下 vx 应=m_eff 阻力响应 9.72，实际 {vx_wet}"
+        );
+        assert!(
+            vx_wet > vx_dry,
+            "水下阻力响应应更钝（{vx_wet} > 空气 {vx_dry}）"
+        );
+    }
+
+    #[test]
+    fn step_zero_velocity_entity_in_water_uses_velocity_regime() {
+        // 物理步路由裁决锚：f>0 的零速实体一律走冲量积分路径（速度制）——
+        // 铁球全浸一拍位移=|g_final|/2 的小步进（速度从 0 涨起），而域外零速
+        // 实体走落点制一拍摔 9.8 格。零速走位置制则每拍位移=全额 g_final，
+        // 水面附近会疯狂弹跳，"典型物体半沉"永远看不到。
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let iron = make_entity(1, 5.0, 50.0, 0); // r=0.5 m=1 → ρ物≈1.27>1 沉
+        let id = iron.id;
+        world.entities.insert(id, iron);
+        let liquids = [deep_water(9, 1.0, 0.35)];
+        engine.step_with_liquids(&mut world, &HashSet::new(), &[], &liquids);
+        let e = world.entities.get(&id).unwrap();
+        let drop = 50.0 - e.pos().1;
+        assert!(
+            drop > 0.5 && drop < 9.8,
+            "零速入水应走速度制小步下沉（|g_final|/2 量级），实际下坠 {drop}"
+        );
+        assert!(
+            e.velocity().1 < 0.0,
+            "水中速度制应写回速度（下拍继续累积），实际 {:?}",
+            e.velocity()
+        );
+    }
+
+    #[test]
+    fn step_half_submerged_neutral_body_stays_put() {
+        // 半沉平衡锚（"典型物体半沉"涌现）：m=0.5×π×r² → ρ物=0.5、圆心在
+        // 液面 f=0.5、ρ液=1.0=2ρ物 → g_final=0，零速实体位置逐拍不动
+        //（阻尼 k<1 的线性系统自然收敛，不写平衡点求解器）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut body = make_entity(1, 5.0, 100.0, 0);
+        body.set_mass(0.5 * std::f64::consts::PI * 0.25); // ρ物=0.5
+        let id = body.id;
+        world.entities.insert(id, body);
+        // 水面在 y=100（域 max.1）
+        let liquids = [deep_water(9, 1.0, 0.35)];
+        for _ in 0..5 {
+            engine.step_with_liquids(&mut world, &HashSet::new(), &[], &liquids);
+        }
+        let y = world.entities.get(&id).unwrap().pos().1;
+        assert!(
+            (y - 100.0).abs() < 1e-9,
+            "半沉平衡体应原地悬浮（g_final=0），实际 y={y}"
+        );
+    }
+
+    #[test]
+    fn step_multi_liquid_heaviest_domain_floats_faster() {
+        // 多域最高密度集成锚：木球同时泡在轻液（ρ=1）与重液（ρ=2.5）里，
+        // 取 ρ 最高者结算——重液上浮推力更大，一拍上浮位移更大
+        let engine = DefaultPhysicsEngine::new();
+        let run = |densities: [f64; 2]| -> f64 {
+            let mut world = WorldState::new();
+            let mut wood = make_entity(1, 5.0, 50.0, 0);
+            wood.set_mass(0.4); // ρ物≈0.51<1 木
+            let id = wood.id;
+            world.entities.insert(id, wood);
+            let liquids = [
+                deep_water(9, densities[0], 0.35),
+                deep_water(8, densities[1], 0.35),
+            ];
+            engine.step_with_liquids(&mut world, &HashSet::new(), &[], &liquids);
+            world.entities.get(&id).unwrap().pos().1 - 50.0
+        };
+        let rise_light = run([0.0, 1.0]);
+        let rise_heavy = run([1.0, 2.5]);
+        assert!(rise_light > 0.0, "轻液中木球应上浮，实际 {rise_light}");
+        assert!(
+            rise_heavy > rise_light,
+            "重液上浮推力更大（ρ比 4.9 vs 1.96），实际 {rise_heavy} vs {rise_light}"
+        );
+    }
+
+    #[test]
+    fn step_entity_far_from_liquid_matches_no_liquid_baseline() {
+        // 域外零回归锚：远处水域不影响域外实体——与无液体基线逐位一致
+        //（位置+速度双双对照，无液体世界全测试照绿的显式形态）
+        let engine = DefaultPhysicsEngine::new();
+        let mut base = WorldState::new();
+        let mut plain = make_entity(1, 5.0, 10.0, 0);
+        plain.set_velocity((1.0, 0.0));
+        let id_p = plain.id;
+        base.entities.insert(id_p, plain);
+        engine.step(&mut base, &HashSet::new(), &[]);
+        let mut wet_world = WorldState::new();
+        let mut shadow = make_entity(1, 5.0, 10.0, 0);
+        shadow.set_velocity((1.0, 0.0));
+        let id_s = shadow.id;
+        wet_world.entities.insert(id_s, shadow);
+        // 水域在 (60..61, 0..1)，实体在 (5,10)——域外
+        let liquids = [LiquidDomain {
+            domain_id: EntityId(Uuid::from_u128(9)),
+            min: (60.0, 0.0),
+            max: (61.0, 1.0),
+            density: 1.0,
+            drag_k: 0.35,
+        }];
+        engine.step_with_liquids(&mut wet_world, &HashSet::new(), &[], &liquids);
+        assert_eq!(
+            base.entities.get(&id_p).unwrap().pos(),
+            wet_world.entities.get(&id_s).unwrap().pos(),
+            "域外实体位置应与无液体基线逐位一致"
+        );
+        assert_eq!(
+            base.entities.get(&id_p).unwrap().velocity(),
+            wet_world.entities.get(&id_s).unwrap().velocity(),
+            "域外实体速度应与无液体基线逐位一致"
+        );
+    }
+
+    #[test]
+    fn step_aloft_entity_in_water_ignores_buoyancy() {
+        // aloft 优先级高于浮力锚（与力场同款）：悬停声明本拍免重力免浮力免
+        // 阻尼——悬停在水中的实体坐标分毫不动
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut hover = make_entity(1, 5.0, 50.0, 0);
+        hover.set_velocity((0.0, -10.0)); // 即使带速度
+        let id = hover.id;
+        world.entities.insert(id, hover);
+        let mut aloft = HashSet::new();
+        aloft.insert(id);
+        let liquids = [deep_water(9, 1.0, 0.35)];
+        engine.step_with_liquids(&mut world, &aloft, &[], &liquids);
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (5.0, 50.0),
+            "悬停实体在水中也应分毫不动（aloft 短路在液体结算之前）"
+        );
+        assert_eq!(
+            world.entities.get(&id).unwrap().velocity(),
+            (0.0, -10.0),
+            "悬停实体速度不被水中阻尼触碰"
+        );
+    }
+
+    #[test]
+    fn step_static_creation_ignores_liquids() {
+        // static 造物（含液体造物自己）不吃液体物理锚：static 不吃物理现状
+        // 照旧——直落地面分支，落点/速度字段都不被液体改写（水不会动）
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut water_block = make_creation(1, 5.0, 5.0);
+        water_block.set_liquid_density(1.0); // 液体造物=static 布景
+        water_block.set_liquid_drag(0.35);
+        let id = water_block.id;
+        world.entities.insert(id, water_block);
+        let liquids = [deep_water(9, 1.0, 0.35)];
+        engine.step_with_liquids(&mut world, &HashSet::new(), &[], &liquids);
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (5.0, 0.0),
+            "static 造物照旧直落地面（液体域不改写 static 分支）"
+        );
+    }
+
+    #[test]
+    fn step_projectile_in_water_slows_and_softens_fall() {
+        // 弹丸入水改弹道锚（本刀可见效果之一）：标准弹（r=0.15/m=1 →
+        // ρ物≈14.1 很稠）入水（ρ=1, k=0.5）——水平速度被阻尼减半后吃更钝
+        // 阻力、下坠被浮力托缓（|g_final|<9.8）：弹道变短变缓
+        let engine = DefaultPhysicsEngine::new();
+        let mut world = WorldState::new();
+        let mut wet = make_entity(1, 50.0, 50.0, 0);
+        wet.set_velocity((3.0, 0.0));
+        wet.set_radius(codeworld_core::collision::PROJECTILE_RADIUS);
+        wet.code_hash = codeworld_core::collision::PROJECTILE_CODE.to_string();
+        let mut dry = make_entity(2, 150.0, 50.0, 0); // 水域 x≤100 域外（对照组）
+        dry.set_velocity((3.0, 0.0));
+        dry.set_radius(codeworld_core::collision::PROJECTILE_RADIUS);
+        dry.code_hash = codeworld_core::collision::PROJECTILE_CODE.to_string();
+        let id_wet = wet.id;
+        let id_dry = dry.id;
+        world.entities.insert(id_wet, wet);
+        world.entities.insert(id_dry, dry);
+        let liquids = [deep_water(9, 1.0, 0.5)];
+        let events = engine.step_projectiles_with_liquids(&mut world, 1, &HashMap::new(), &[], &liquids);
+        assert!(events.is_empty(), "两弹都还在飞，实际 {events:?}");
+        let w = world.entities.get(&id_wet).unwrap();
+        let d = world.entities.get(&id_dry).unwrap();
+        assert!(
+            w.velocity().0 < d.velocity().0,
+            "弹丸水中水平速度应低于空气对照（阻尼减半=弹道显著变缓），实际 {} vs {}",
+            w.velocity().0,
+            d.velocity().0
+        );
+        let m_eff_proj = 1.0 + std::f64::consts::PI * 0.15 * 0.15; // 全浸 f=1
+        let expect_vx = 3.0 * 0.5 * (1.0 - 0.05 / m_eff_proj);
+        assert!(
+            (w.velocity().0 - expect_vx).abs() < 1e-9,
+            "水中 vx 应=v×k=1.5 再吃 m_eff 阻力（≈{expect_vx}），实际 {}",
+            w.velocity().0
+        );
+        assert!(
+            w.velocity().1 > d.velocity().1,
+            "水中下坠应被浮力托缓（g_final 钳后仍小于空气重力），实际 {} vs {}",
+            w.velocity().1,
+            d.velocity().1
+        );
+    }
+
+    #[test]
+    fn liquid_effect_is_pure_helper_importable() {
+        // 依赖接线锚：default.rs 经 crate::liquid::liquid_effect 结算（单一实现），
+        // 全浸悬浮输入给出 g_final=0（防物理步里手抄公式分叉）
+        let liquids = [deep_water(9, 1.0, 0.35)];
+        let m = std::f64::consts::PI * 0.25; // ρ物=1.0
+        let e = liquid_effect((5.0, 3.0), 0.5, m, (0.0, 0.0), (-9.8, 0.05), &liquids);
+        assert!((e.g_final - 0.0).abs() < 1e-12, "等密度全浸应悬浮");
     }
 }

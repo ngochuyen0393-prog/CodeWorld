@@ -2,6 +2,11 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
+## 现在（2026-10-22 D-009 水体系统 收工更新）
+- 在做：D-009 收工——液体造物声明家族（spawn 第 18/19 参 liquid_density/liquid_drag，域 [0,5] 钳制）+ 浮沉公式涌现（g_final=g×(1−ρ液/ρ物×f) 钳 [-98,+98]、浸入比竖径夹逼、附加质量 m_eff 进阻力分母、多域取最高密度、aloft 优先）+ 零速入水速度制路由 + 弹丸入水改弹道 + 快照 liquids 矩形投影 + 前端密度映射画色 + examples/liquid-demo.wat（守卫测试同源）+ 文档五件（api.md 19 参+「液体（D-009）」节/decisions #053/dev-plan ✅/game-menu 浮力✅+1.7 常数/progress）。decisions.md #053。
+- 待土豆人工验收（两分钟级）：起世界→liquid-demo 放 players/ 看 15 块蓝色水域拼成 5×3→丢轻球（低 mass spawn）看上浮半沉→丢重球（高 mass）看沉底→射弹入水看弹道变缓变短。
+- 技术注记：wasmtime 25 func_wrap 参数上限 17（Caller+17），spawn 19 参改 func_new 动态注册（校验体逐行保留，行为不变）；"我在水里"零新事件（scan+坐标比对），import 计数 16 不变。
+
 ## 现在（2026-10-22 D-001 外接算力桥+凭证保险库 卡终验）
 - 在做：D-001 主体收口——外桥管道+凭证保险库 MVP 已落地并双审（施工 D-001b：ef133ec+双审收尾 d4d7597），本卡终验全过：workspace 1069 绿+2 ignored（HEAD=b7bb8fe 复跑）/ ignored 桥 e2e `bridge_e2e_reply_changes_behavior_across_ticks` 绿 / `tools/bridge-e2e.bat --ci` ALL PASS（26 封信 seq 单调、grow 页偏移递增、marker=6 连走）/ clippy --workspace 0 警告。三铁律 MVP 验收：①凭证不进沙箱（沙箱只见 port 号，URL/鉴权头世界侧解析代签——bridges.rs 证实）②吊销（port 热重载消失→信作废+inflight 结算，main.rs L641+测试锚 collect_bridge_sends_revoked_port_discards；账号级绑定吊销按 dev-plan 既定排期"随多人系统前"）③保险库=账号级资产随账号永生（MVP 单账号=世界所有者天然成立）。e2e 产物（bridges.json/fake-bridge.log/battle-clean.log）已清，无进程残留；static/index.html 在途改动属兄弟卡 D-004b WIP 未动。
 - 卡在：无。残项已拆 D-001c（见 dev-plan）：design-bridge §4.2 活弹待遇参数（fuel 扣减继承/出厂下限 1000/PROJECTILE_FUEL_CAP 50_000/活弹在途 1 条）未做，且分档判据成新问题（#045 退役 code_hash=projectile 品类，"活弹 vs 常驻造物"按什么分档待土豆拍板：A 出生声明参数/B 不分档/C 并入 D-018）。首接知情提示归 D-014 批（decisions #043 附则落点明文）。

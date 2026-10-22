@@ -1809,6 +1809,15 @@ fn tick_with_intents(
         tracing::info!(tick = current_tick, count = fields.len(), "[field] 本拍场清单收集");
     }
 
+    //   a1.42 液体域清单收集（D-009 登记制刷场，照 fields 先例）：每拍全量重算
+    //       覆盖关系（无 enter/exit 缓存），alive+liquid_density>0 的格对齐 AABB
+    //       即水域。产物喂物理两步（弹道步+位置重力步）——数据流两端日志此为
+    //       收集端，结算端在 physics step 内（实体在水中 INFO 带 f 值）。
+    let liquids = codeworld_physics::liquid::collect_liquid_domains(world);
+    if !liquids.is_empty() {
+        tracing::info!(tick = current_tick, count = liquids.len(), "[liquid] 本拍液体域清单收集");
+    }
+
     //   a1.45 力场脉冲应用（D-012 交付物 8：分离式发射器）：排在弹道步之前——
     //       本拍被推的弹丸照常参与 step_projectiles 积分（推膛内炮弹→当拍出膛）
     let field_pulses = collect_field_pulses(sandbox_map);
@@ -1830,7 +1839,7 @@ fn tick_with_intents(
             .iter()
             .map(|(p, meta)| (*p, meta.shooter))
             .collect();
-        physics.step_projectiles(world, current_tick, &shooters, &fields)
+        physics.step_projectiles_with_liquids(world, current_tick, &shooters, &fields, &liquids)
     };
 
     //   a2. 处理攻击（架构 4.2 两阶段模型：阶段一 on_tick 调 env.attack_at 排队的请求在此统一执行）
@@ -1857,8 +1866,10 @@ fn tick_with_intents(
     enforce_binding_deaths(world, sandbox_map);
 
     //   c. 物理规则（#030 半径物理：重力落点解析 + 悬停免重力，架构 4.1 b 步；
-    //      D-012：域内实体按改后参数被结算，aloft 优先级高于场）
-    let changes = physics.step(world, &aloft, &fields);
+    //      D-012：域内实体按改后参数被结算，aloft 优先级高于场；
+    //      D-009：域内实体按液体物理被结算——浮力/水中阻尼/附加质量，aloft
+    //      优先级高于浮力）
+    let changes = physics.step_with_liquids(world, &aloft, &fields, &liquids);
     if !changes.is_empty() {
         tracing::debug!(tick = current_tick, change_count = changes.len(), "物理变更");
     }
@@ -2483,14 +2494,31 @@ fn process_spawn_requests(
             );
             continue;
         };
+        // D-009 液体造物裁决（先于出生预检——身体判据随 static 分流）：ρ>0 =
+        // 纯布景无沙箱（液体是物理域不是居民——"有沙箱=居民"判据）+无视 motion
+        // 声明强制 static（水不会动——"不做守恒水体"的实现面）。照常占世界实体
+        // 名额（防刷水弹幕）；scan/probe 照常可探测（布景与规则分层，WC3 先例）
+        let is_liquid = req.liquid_density > 0.0;
+        let motion = if is_liquid {
+            tracing::info!(
+                creator = %req.creator.0,
+                liquid_density = req.liquid_density,
+                liquid_drag = req.liquid_drag,
+                declared_motion = req.motion,
+                "[process_spawns] 液体造物：无沙箱布景（无视 motion 声明强制 static，水不会动）"
+            );
+            codeworld_core::entity::MOTION_STATIC
+        } else {
+            req.motion
+        };
         let entity_id = EntityId::new();
         // #030 出生预检（Factorio 放置检查，半径版）：造物身体与任何存活身体重叠
         // → 该次 spawn 失败。放在编译之后、建沙箱之前（防沙箱泄漏）；不诞生、
         // 不占世界名额，下拍可重试。D-003：dynamic 造物身体=声明 radius 的圆，
-        // static 造物身体=出生格对齐 1×1 AABB（现状不变）。
+        // static 造物身体=出生格对齐 1×1 AABB（现状不变；D-009 液体造物恒 static）。
         {
             use codeworld_core::collision::{body_of, body_overlap, creation_aabb, Body};
-            let body = if codeworld_core::collision::is_dynamic_creation_candidate(req.motion) {
+            let body = if codeworld_core::collision::is_dynamic_creation_candidate(motion) {
                 Body::Circle {
                     center: req.pos,
                     radius: req.radius,
@@ -2534,35 +2562,46 @@ fn process_spawn_requests(
         entity.set_binding(req.binding);
         entity.set_bound_to(Some(req.creator));
         // D-003 spawn 第 10 参 motion：运动身份写进造物数据（import 层已钳制，
-        // 此处直存）——dynamic 造物即刻受完整物理（身体=声明 radius 的圆）
-        entity.set_motion(req.motion);
+        // 此处直存；D-009 液体造物已被上面强制 static）——dynamic 造物即刻受
+        // 完整物理（身体=声明 radius 的圆）
+        entity.set_motion(motion);
         // D-012 spawn 第 15/16/17 参力场三参：场声明写进造物数据（import 层已
         // 钳制，此处直存）——0/1.0/0=无场现状语义零回归；成型期满后物理步按
         // 叠加 v2 结算，前端按快照 fields 画环
         entity.set_field_radius(req.field_radius);
         entity.set_field_gravity_scale(req.field_gravity_scale);
         entity.set_field_drag_delta(req.field_drag_delta);
+        // D-009 spawn 第 18/19 参液体两参：声明写进造物数据（import 层已钳制，
+        // 此处直存）——ρ>0 的身体区域（格对齐 AABB）即水域，物理步按液体物理
+        // 结算，前端按快照 liquids 画矩形
+        entity.set_liquid_density(req.liquid_density);
+        entity.set_liquid_drag(req.liquid_drag);
         // 出生初速（spawn 第 11/12 参，D-018 一体式发射提前落地）：import 层已校验
         // （有限+模长 ≤ 世界极速），此处写进造物 velocity 字段。位置积分（造物被
         // 初速带着飞）不做——那是 D-018「通用有速度实体物理」的活；velocity 字段
         // 所有实体都有，static 造物钉死不吃速度物理（初速仅对 dynamic 造物有
         // 物理意义，api.md 载明）
         entity.set_velocity((req.vx, req.vy));
-        // 沙箱创建成功才插入世界（失败则实体不落世界，不留无沙箱活体）
-        if let Err(e) = sandbox_map.create(entity_id, &wasm_bytes, req.fuel_limit) {
-            tracing::warn!(
-                creator = %req.creator.0,
-                error = %e,
-                "[process_spawns] 造物沙箱创建失败，该次 spawn 作废"
-            );
-            continue;
-        }
-        // 出生数据包交付（spawn 第 13/14 参读取侧）：写进造物沙箱 SandboxData，
-        // 造物代码经 env.birth_blob 随时读回（世界不解释内容，通道归世界内容归
-        // 玩家）；随沙箱存活不持久化，跨重启不保留（api.md 载明）
+        // 沙箱创建成功才插入世界（失败则实体不落世界，不留无沙箱活体）。
+        // D-009 液体造物跳过 create_sandbox（纯布景无沙箱——液体是物理域不是
+        // 居民；编译步照常跑=spawn 合法性校验的一部分）
         let blob_len = req.blob.len();
-        if let Some(handle) = sandbox_map.sandboxes.get_mut(&entity_id) {
-            handle.store.data_mut().birth_blob = req.blob;
+        if !is_liquid {
+            if let Err(e) = sandbox_map.create(entity_id, &wasm_bytes, req.fuel_limit) {
+                tracing::warn!(
+                    creator = %req.creator.0,
+                    error = %e,
+                    "[process_spawns] 造物沙箱创建失败，该次 spawn 作废"
+                );
+                continue;
+            }
+            // 出生数据包交付（spawn 第 13/14 参读取侧）：写进造物沙箱 SandboxData，
+            // 造物代码经 env.birth_blob 随时读回（世界不解释内容，通道归世界内容归
+            // 玩家）；随沙箱存活不持久化，跨重启不保留（api.md 载明）。
+            // 液体造物无沙箱，无 birth_blob 通道可交付（布景不需要家书）
+            if let Some(handle) = sandbox_map.sandboxes.get_mut(&entity_id) {
+                handle.store.data_mut().birth_blob = req.blob;
+            }
         }
         world.entities.insert(entity_id, entity);
         tracing::info!(
@@ -2571,12 +2610,15 @@ fn process_spawn_requests(
             owner = %owner.0,
             pos = ?req.pos,
             glyph = %req.glyph,
-            motion = req.motion,
+            motion,
             vx = req.vx,
             vy = req.vy,
             blob_len,
-            "造物诞生：玩家造物进场（门二，产权链归属创造者 owner；D-003 motion={}）",
-            if req.motion == codeworld_core::entity::MOTION_DYNAMIC { "dynamic 全活" } else { "static 钉死" }
+            liquid_density = req.liquid_density,
+            liquid_drag = req.liquid_drag,
+            sandboxed = !is_liquid,
+            "造物诞生：玩家造物进场（门二，产权链归属创造者 owner；D-003 motion={}；D-009 液体造物=无沙箱布景）",
+            if motion == codeworld_core::entity::MOTION_DYNAMIC { "dynamic 全活" } else { "static 钉死" }
         );
     }
 }
@@ -4748,6 +4790,146 @@ mod tests {
             "tick 后落点 ({x},{y}) 不穿地（ground={}）",
             world.terrain.height(x)
         );
+    }
+
+    // === D-009 水体：19 参端到端 + 木浮铁沉长跑 ===
+
+    /// 带液体两参的造物方 WAT（D-009 spawn 第 18/19 参，19 参签名；motion 恒
+    /// 声明 1=dynamic——液体造物应被强制 static，本生成器专为验证强制）
+    fn birth_liquid_spawner_wat(code: &str, x: &str, y: &str, density: &str, drag: &str) -> String {
+        let escaped = wat_escape(code);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "W\00")
+  (data (i32.const 8256) "blue\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const {x} f64.const {y}
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1.0
+    i32.const 0
+    i32.const 1
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
+    f64.const {density}
+    f64.const {drag}
+    call $spawn drop)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = code.len(),
+            x = x,
+            y = y,
+            density = density,
+            drag = drag,
+        )
+    }
+
+    #[test]
+    fn process_spawns_births_liquid_creation_no_sandbox_static_forced() {
+        // 19 参端到端：liquid_density>0 的造物出生——落库+液体两参写进造物数据
+        // +照常占世界名额（防刷水弹幕）+跳过 create_sandbox（液体是物理域不是
+        // 居民——"有沙箱=居民"判据）+无视 motion 声明强制 static（水不会动，
+        // 身体=格对齐 AABB=水域）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(1));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(1, 50, (10.0, 0.0)));
+        let mut map = test_sandbox_map();
+        let spawner = birth_liquid_spawner_wat(CREATION_LOG_WAT, "18.0", "0.0", "1.0", "0.35");
+        map.create(creator, &wasm(&spawner), 1_000_000).unwrap();
+        map.run_player_code(&world, &unbounded_bb());
+        process_spawns(&mut world, &mut map, 7);
+        assert_eq!(world.entities.len(), 2, "液体造物照常占世界实体名额");
+        let liquid = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .unwrap_or_else(|| panic!("应有 code_hash=creation 的液体造物"));
+        let liquid_id = liquid.id;
+        assert_eq!(liquid.liquid_density(), 1.0, "第 18 参液体密度应落库");
+        assert_eq!(liquid.liquid_drag(), 0.35, "第 19 参水中阻尼应落库");
+        assert_eq!(
+            liquid.motion(),
+            codeworld_core::entity::MOTION_STATIC,
+            "液体造物应无视 motion 声明强制 static（水不会动，身体=格对齐 AABB）"
+        );
+        assert!(
+            !map.sandboxes.contains_key(&liquid_id),
+            "液体造物应跳过 create_sandbox（纯布景无沙箱）"
+        );
+        assert!(liquid.is_alive(), "液体造物出生即存活（世界实体，可被 scan 探测）");
+    }
+
+    #[test]
+    fn d009_wood_floats_iron_sinks_long_run() {
+        // 木浮铁沉长跑锚（≥10 拍）：1 格深水坑（水域造物 [30,31]×[0,1]，
+        // ρ=1.0 k=0.35）内插入木球（m=0.4，ρ物≈0.51 浮）与铁球（m=10，
+        // ρ物≈12.7 沉）——12 拍后木球上浮到水面线（≈1.5=surface+r），铁球
+        // 沉到湖底（0.5=terrain+r）速度清零；全公式涌现零特例无浮沉清单
+        let mut world = WorldState::new();
+        let physics = DefaultPhysicsEngine::new();
+        // 水域造物：static 布景（直接插世界=测试布景，等价出生后的状态）
+        let mut pond = make_entity_of_owner(9, 88, (30.0, 0.0));
+        pond.code_hash = "creation".to_string();
+        pond.set_liquid_density(1.0);
+        pond.set_liquid_drag(0.35);
+        world.entities.insert(pond.id, pond);
+        // 木球与铁球：域内测试插入（r=0.5 生物身体）
+        let mut wood = make_entity_of_owner(1, 88, (30.5, 0.5));
+        wood.set_mass(0.4); // ρ物≈0.51 < 1 浮
+        let wood_id = wood.id;
+        world.entities.insert(wood_id, wood);
+        let mut iron = make_entity_of_owner(2, 88, (30.5, 0.9));
+        iron.set_mass(10.0); // ρ物≈12.7 > 1 沉
+        let iron_id = iron.id;
+        world.entities.insert(iron_id, iron);
+        let mut aloft = std::collections::HashSet::new();
+        let mut wood_peak = 0.0f64;
+        let mut late_wood_peak = 0.0f64; // 末段相位鲁棒观测（振荡收敛中的浮体不在固定位相）
+        for t in 0..20 {
+            let liquids = codeworld_physics::liquid::collect_liquid_domains(&world);
+            assert_eq!(liquids.len(), 1, "水域造物应每拍入液体域清单");
+            assert_eq!(
+                (liquids[0].min, liquids[0].max),
+                ((30.0, 0.0), (31.0, 1.0)),
+                "水域=AABB（格对齐 1×1）"
+            );
+            physics.step_with_liquids(&mut world, &aloft, &[], &liquids);
+            let wy = world.entities.get(&wood_id).unwrap().pos().1;
+            wood_peak = wood_peak.max(wy);
+            if t >= 10 {
+                late_wood_peak = late_wood_peak.max(wy);
+            }
+        }
+        let wood_y = world.entities.get(&wood_id).unwrap().pos().1;
+        let iron = world.entities.get(&iron_id).unwrap();
+        assert!(
+            wood_peak > 1.3,
+            "木球长跑中应上浮触及水面线（>1.3），峰值 {wood_peak}"
+        );
+        assert!(
+            late_wood_peak > 1.0,
+            "末段木球仍应周期性浮到水面附近（>1.0=浮体特征；沉体只会 ≤0.5），实际 {late_wood_peak}"
+        );
+        assert!(
+            (iron.pos().1 - 0.5).abs() < 1e-9,
+            "铁球应沉到湖底（0.5=terrain+半径），实际 {}",
+            iron.pos().1
+        );
+        assert_eq!(iron.velocity(), (0.0, 0.0), "铁球触底速度清零（落地规则照旧）");
+        // 沉浮分明由上两断言共同证明：木球末段仍周期性浮上水面（late_wood_peak>1.0），
+        // 铁球 20 拍全程钉死湖底 0.5——终态同格只可能是浮体振荡相位，非同命运
+        let _ = wood_y; // 终态 y 仅相位快照，断言走峰值口径（相位鲁棒）
     }
 
     #[test]
@@ -10451,7 +10633,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -10470,6 +10652,8 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
     f64.const 0.0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -10665,6 +10849,8 @@ mod tests {
                 field_radius: 0.0,
                 field_gravity_scale: 1.0,
                 field_drag_delta: 0.0,
+                liquid_density: 0.0,
+                liquid_drag: 0.0,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 7);
@@ -10704,7 +10890,7 @@ mod tests {
         let escaped = wat_escape(creation_code);
         let spawner = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -10722,6 +10908,8 @@ mod tests {
     i32.const 8500 i32.const 5
     f64.const 0.0
     f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
     f64.const 0.0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -10923,6 +11111,8 @@ mod tests {
                 field_radius: 0.0,
                 field_gravity_scale: 1.0,
                 field_drag_delta: 0.0,
+                liquid_density: 0.0,
+                liquid_drag: 0.0,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -11020,6 +11210,10 @@ mod tests {
     /// 场参数改了守卫测试立刻红
     const FIELD_DEMO_WAT: &str = include_str!("../../../examples/field-demo.wat");
 
+    /// 挖池人示例（D-009）：examples/ 目录真文件，示例即文档——语法坏了/
+    /// 液体参数改了守卫测试立刻红
+    const LIQUID_DEMO_WAT: &str = include_str!("../../../examples/liquid-demo.wat");
+
     #[test]
     fn field_demo_example_compiles_and_declares_field() {
         // 示例守卫：field-demo.wat 是自包含玩家模块（第一拍立场塔，17 参带场
@@ -11055,6 +11249,66 @@ mod tests {
                 .unwrap(),
             Some(0),
             "示例 on_field 应答 0=维持出生声明（笨场）"
+        );
+    }
+
+    #[test]
+    fn liquid_demo_example_compiles_and_pools_water() {
+        // 示例守卫（D-009）：liquid-demo.wat 是自包含玩家模块（15 拍挖 5×3
+        // 水坑，19 参带液体声明）——全文作为玩家代码走真实管线：语法坏/参数
+        // 改/19 参签名漂移都会在此红（示例即文档，FIELD_DEMO_WAT 同款哲学）。
+        // 快进 15 拍逐拍 tick：15 块水全落库=液体造物（ρ=1.0/k=0.35、无沙箱、
+        // static 格对齐）
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(43));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(43, 64, (10.0, 0.0)));
+        let mut map = test_sandbox_map();
+        map.create(creator, &wasm(LIQUID_DEMO_WAT), 1_000_000).unwrap();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        for t in 1..=16 {
+            tick(
+                &mut world,
+                &mut time,
+                &physics,
+                &mut renderer,
+                &mut storage,
+                &mut pending,
+                &mut map,
+            );
+            let _ = t;
+        }
+        let waters: Vec<_> = world
+            .entities
+            .values()
+            .filter(|e| e.liquid_density() > 0.0)
+            .collect();
+        assert_eq!(waters.len(), 15, "15 拍应立 15 块水（每拍 1 个限流）");
+        for w in &waters {
+            assert!(
+                (w.liquid_density() - 1.0).abs() < 1e-9 && (w.liquid_drag() - 0.35).abs() < 1e-9,
+                "示例声明的 ρ=1.0/k=0.35 应原样落库"
+            );
+            assert_eq!(
+                w.motion(),
+                codeworld_core::entity::MOTION_STATIC,
+                "液体造物应强制 static（水不会动）"
+            );
+            assert!(
+                !map.sandboxes.contains_key(&w.id),
+                "液体造物应无沙箱（纯布景）"
+            );
+        }
+        // 水域范围：坑在 +5..+9、y=0..2（部分上行块悬停在下层块顶）
+        let xs: Vec<f64> = waters.iter().map(|w| w.pos().0).collect();
+        assert!(
+            xs.iter().cloned().fold(f64::MAX, f64::min) >= 15.0,
+            "水坑应在 +5 格以东"
         );
     }
 
@@ -11098,7 +11352,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -11124,6 +11378,8 @@ mod tests {
         (i32.const 0)
         (f64.const 0.0)
         (f64.const 1.0)
+        (f64.const 0.0)
+        (f64.const 0.0)
         (f64.const 0.0)
         (call $spawn)
         (drop))))
@@ -11221,7 +11477,7 @@ mod tests {
         let escaped = wat_escape(relic_code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "R\00")
@@ -11241,6 +11497,8 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
     f64.const 0.0
     call $spawn drop))"#,
             escaped = escaped,
@@ -11631,7 +11889,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "F\00")
@@ -11651,6 +11909,8 @@ mod tests {
     f64.const {fr}
     f64.const {fgs}
     f64.const {fdd}
+    f64.const 0.0
+    f64.const 0.0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,

@@ -124,6 +124,11 @@ pub struct PendingSpawn {
     /// 场阻力改写量（D-012 spawn 第 17 参；加法式 delta，import 层已钳制
     /// [-1.0, +25.0]，0.0=中性）
     pub field_drag_delta: f64,
+    /// 液体密度（D-009 spawn 第 18 参；import 层已钳制 [0.0, 5.0]，0=非液体默认）
+    pub liquid_density: f64,
+    /// 水中阻尼（D-009 spawn 第 19 参；import 层已钳制 [0.0, 5.0]，0=无阻尼；
+    /// 结算时有效保留系数另钳 [0,1]）
+    pub liquid_drag: f64,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
 }
@@ -1052,30 +1057,110 @@ impl SandboxManager {
         //   - 力场第 15/16/17 参（D-012）：field_radius 钳 [0,25]（0=无场）、
         //     field_gravity_scale 钳 [0,10]（非有限钳 1.0）、field_drag_delta 钳
         //     [-1,+25]（非有限钳 0）——出生声明家族哲学：超界钳回+警告非拒绝
+        //   - 液体第 18/19 参（D-009）：liquid_density 钳 [0,5]（0=非液体默认）、
+        //     liquid_drag 钳 [0,5]（0=无阻尼；结算时有效保留系数另钳 [0,1]）
         // 产权链 owner 继承、世界实体上限、WAT 编译都在阶段二判（返回 1=已排队，
         // 阶段二拒绝以日志为准，api.md 载明）。
-        linker.func_wrap(
+        // D-009：spawn 已 19 参——wasmtime 25 的 IntoFunc 宏上限 17 参
+        //（Caller+17，func.rs for_each_function_signature 最后一档），func_wrap
+        // 装不下 20 个闭包参数，改走 func_new 动态注册（任意元数）。参数经
+        // Val::I32/F64 匹配抽取（import 签名已声明类型，运行期只会是声明类型；
+        // 防御性回退 0/NAN，落在既有校验拒绝路径上，不崩世界）。
+        linker.func_new(
             "env",
             "spawn",
+            wasmtime::FuncType::new(
+                engine,
+                [
+                    wasmtime::ValType::I32, wasmtime::ValType::I32, // code_ptr/len
+                    wasmtime::ValType::F64, wasmtime::ValType::F64, // x, y
+                    wasmtime::ValType::I32, wasmtime::ValType::I32, // glyph/color ptr
+                    wasmtime::ValType::F64, wasmtime::ValType::F64, // radius, mass
+                    wasmtime::ValType::I32, wasmtime::ValType::I32, // binding, motion
+                    wasmtime::ValType::F64, wasmtime::ValType::F64, // vx, vy
+                    wasmtime::ValType::I32, wasmtime::ValType::I32, // blob ptr/len
+                    wasmtime::ValType::F64, wasmtime::ValType::F64, wasmtime::ValType::F64, // field 三参（D-012）
+                    wasmtime::ValType::F64, wasmtime::ValType::F64, // liquid 两参（D-009 第 18/19 参）
+                ],
+                [wasmtime::ValType::I32],
+            ),
             move |mut caller: Caller<SandboxData>,
-                  code_ptr: i32,
-                  code_len: i32,
-                  x: f64,
-                  y: f64,
-                  glyph_ptr: i32,
-                  color_ptr: i32,
-                  radius: f64,
-                  mass: f64,
-                  binding: i32,
-                  motion: i32,
-                  vx: f64,
-                  vy: f64,
-                  blob_ptr: i32,
-                  blob_len: i32,
-                  field_radius: f64,
-                  field_gravity_scale: f64,
-                  field_drag_delta: f64|
-                  -> i32 {
+                  params: &[wasmtime::Val],
+                  results: &mut [wasmtime::Val]|
+             -> Result<()> {
+                // 类型抽取（防御性回退：I32→0 / F64→NAN——NAN 会落在既有的
+                // 非有限拒绝路径上，warn 带变体名）
+                let val_kind = |v: Option<&wasmtime::Val>| -> &'static str {
+                    match v {
+                        Some(wasmtime::Val::I32(_)) => "i32",
+                        Some(wasmtime::Val::I64(_)) => "i64",
+                        Some(wasmtime::Val::F32(_)) => "f32",
+                        Some(wasmtime::Val::F64(_)) => "f64",
+                        Some(_) => "other",
+                        None => "missing",
+                    }
+                };
+                let i32_at = |i: usize| -> i32 {
+                    match params.get(i) {
+                        Some(wasmtime::Val::I32(v)) => *v,
+                        other => {
+                            tracing::warn!(idx = i, got = val_kind(other), "[spawn] 参数类型异常，按 0 处理");
+                            0
+                        }
+                    }
+                };
+                let f64_at = |i: usize| -> f64 {
+                    match params.get(i) {
+                        // wasmtime 25 的 Val::F64 存裸 IEEE-754 位（u64），from_bits 还原
+                        Some(wasmtime::Val::F64(v)) => f64::from_bits(*v),
+                        other => {
+                            tracing::warn!(idx = i, got = val_kind(other), "[spawn] 参数类型异常，按 NAN 处理");
+                            f64::NAN
+                        }
+                    }
+                };
+                let code_ptr = i32_at(0);
+                let code_len = i32_at(1);
+                let x = f64_at(2);
+                let y = f64_at(3);
+                let glyph_ptr = i32_at(4);
+                let color_ptr = i32_at(5);
+                let radius = f64_at(6);
+                let mass = f64_at(7);
+                let binding = i32_at(8);
+                let motion = i32_at(9);
+                let vx = f64_at(10);
+                let vy = f64_at(11);
+                let blob_ptr = i32_at(12);
+                let blob_len = i32_at(13);
+                let field_radius = f64_at(14);
+                let field_gravity_scale = f64_at(15);
+                let field_drag_delta = f64_at(16);
+                let liquid_density = f64_at(17);
+                let liquid_drag = f64_at(18);
+                // 校验体（19 参签名，与 func_wrap 时代闭包体逐行同代码）
+                #[allow(clippy::too_many_arguments)]
+                let spawn_call = |caller: &mut Caller<SandboxData>,
+                                  code_ptr: i32,
+                                  code_len: i32,
+                                  x: f64,
+                                  y: f64,
+                                  glyph_ptr: i32,
+                                  color_ptr: i32,
+                                  radius: f64,
+                                  mass: f64,
+                                  binding: i32,
+                                  motion: i32,
+                                  vx: f64,
+                                  vy: f64,
+                                  blob_ptr: i32,
+                                  blob_len: i32,
+                                  field_radius: f64,
+                                  field_gravity_scale: f64,
+                                  field_drag_delta: f64,
+                                  liquid_density: f64,
+                                  liquid_drag: f64|
+                 -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
                 // 限流：每实体每 tick 最多 1 个造物请求
@@ -1096,7 +1181,7 @@ impl SandboxManager {
                     );
                     return 0;
                 }
-                let code_bytes = read_payload_from_caller(&mut caller, code_ptr, code_len);
+                let code_bytes = read_payload_from_caller(caller, code_ptr, code_len);
                 let Ok(code) = String::from_utf8(code_bytes) else {
                     tracing::warn!(
                         entity_id = %creator.0,
@@ -1133,7 +1218,7 @@ impl SandboxManager {
                     return 0;
                 }
                 // 外观校验：glyph 恰 1 字符、color 非空（NUL 结尾字符串从 memory 读）
-                let Some(glyph) = read_cstring_from_caller(&mut caller, glyph_ptr, MAX_META_LEN)
+                let Some(glyph) = read_cstring_from_caller(caller, glyph_ptr, MAX_META_LEN)
                 else {
                     tracing::warn!(
                         entity_id = %creator.0,
@@ -1150,7 +1235,7 @@ impl SandboxManager {
                     );
                     return 0;
                 }
-                let Some(color) = read_cstring_from_caller(&mut caller, color_ptr, MAX_META_LEN)
+                let Some(color) = read_cstring_from_caller(caller, color_ptr, MAX_META_LEN)
                 else {
                     tracing::warn!(
                         entity_id = %creator.0,
@@ -1200,7 +1285,7 @@ impl SandboxManager {
                 let blob = if blob_len <= 0 {
                     Vec::new()
                 } else {
-                    read_payload_from_caller(&mut caller, blob_ptr, blob_len)
+                    read_payload_from_caller(caller, blob_ptr, blob_len)
                 };
                 // fuel 配额继承创造者（造物与创造者同算力档）
                 let fuel_limit = caller.data().fuel_limit;
@@ -1219,6 +1304,10 @@ impl SandboxManager {
                     codeworld_core::entity::clamp_field_gravity_scale(field_gravity_scale);
                 let field_drag_delta =
                     codeworld_core::entity::clamp_field_drag_delta(field_drag_delta);
+                // D-009 第 18/19 参液体两参校验钳制（超界钳回+warn 非拒绝：
+                // 0=非液体默认 / 0=无阻尼；k>1 声明合法、结算时另钳 [0,1]）
+                let liquid_density = codeworld_core::entity::clamp_liquid_density(liquid_density);
+                let liquid_drag = codeworld_core::entity::clamp_liquid_drag(liquid_drag);
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
@@ -1235,6 +1324,8 @@ impl SandboxManager {
                     field_radius,
                     field_gravity_scale,
                     field_drag_delta,
+                    liquid_density,
+                    liquid_drag,
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
                 caller
@@ -1256,9 +1347,36 @@ impl SandboxManager {
                         field_radius,
                         field_gravity_scale,
                         field_drag_delta,
+                        liquid_density,
+                        liquid_drag,
                         fuel_limit,
                     });
                 1
+                };
+                let ret = spawn_call(
+                    &mut caller,
+                    code_ptr,
+                    code_len,
+                    x,
+                    y,
+                    glyph_ptr,
+                    color_ptr,
+                    radius,
+                    mass,
+                    binding,
+                    motion,
+                    vx,
+                    vy,
+                    blob_ptr,
+                    blob_len,
+                    field_radius,
+                    field_gravity_scale,
+                    field_drag_delta,
+                    liquid_density,
+                    liquid_drag,
+                );
+                results[0] = wasmtime::Val::I32(ret);
+                Ok(())
             },
         )?;
         // env.birth_blob(ptr: i32, cap: i32) -> i32：读回自己的出生数据包（第 13 个玩家
@@ -3722,7 +3840,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -3741,6 +3859,8 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
     f64.const 0.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
@@ -3761,7 +3881,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
@@ -3783,6 +3903,8 @@ mod tests {
     f64.const 0.0
     f64.const 1.0
     f64.const 0.0
+    f64.const 0.0
+    f64.const 0.0
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
@@ -3798,6 +3920,8 @@ mod tests {
     f64.const 0.0
     f64.const 1.0
     f64.const 0.0
+    f64.const 0.0
+    f64.const 0.0
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
@@ -3809,7 +3933,7 @@ mod tests {
 
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
@@ -3829,6 +3953,8 @@ mod tests {
     f64.const 0.0
     f64.const 1.0
     f64.const 0.0
+    f64.const 0.0
+    f64.const 0.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -3838,7 +3964,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -3858,6 +3984,8 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
     f64.const 0.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
@@ -3908,7 +4036,7 @@ mod tests {
         // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
         let wat_text = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -3927,6 +4055,8 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
     f64.const 0.0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -3951,7 +4081,7 @@ mod tests {
         let escaped = wat_escape(SPAWNED_CODE);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -3971,6 +4101,8 @@ mod tests {
     f64.const {radius}
     f64.const {scale}
     f64.const {delta}
+    f64.const 0.0
+    f64.const 0.0
     call $spawn global.set $ret)
   (global $ret (mut i32) (i32.const -1))
   (func (export "get_ret") (result i32) global.get $ret)
@@ -4027,6 +4159,101 @@ mod tests {
         mgr.call_on_tick(&mut handle).unwrap();
         let spawns = &handle.store.data().pending_spawns;
         assert_eq!(spawns[0].field_gravity_scale, 10.0, "超上限重力缩放应钳 10.0");
+    }
+
+    // === D-009 液体出生声明（spawn 第 18/19 参）===
+
+    /// 指定液体两参的造物方 WAT（D-009 spawn 第 18/19 参，19 参签名）：
+    /// liquid 两参压栈序 = density / drag
+    fn liquid_spawner_wat(density: &str, drag: &str) -> String {
+        let escaped = wat_escape(SPAWNED_CODE);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "W\00")
+  (data (i32.const 8256) "blue\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const 1.0 f64.const 1.0
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
+    f64.const {density}
+    f64.const {drag}
+    call $spawn drop)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = SPAWNED_CODE.len(),
+            density = density,
+            drag = drag,
+        )
+    }
+
+    #[test]
+    fn spawn_import_queues_liquid_params() {
+        // env.spawn 第 18/19 参透传：合法域内值原样进 PendingSpawn（import 层
+        // 钳制后存档，阶段二 set_liquid_* 直存落库）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = liquid_spawner_wat("1.0", "0.35");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(821))
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns.len(), 1, "合法液体请求应排队");
+        assert_eq!(spawns[0].liquid_density, 1.0, "第 18 参液体密度应透传");
+        assert_eq!(spawns[0].liquid_drag, 0.35, "第 19 参水中阻尼应透传");
+    }
+
+    #[test]
+    fn spawn_import_clamps_liquid_density_out_of_domain() {
+        // 第 18 参液体密度护栏：50 超上限钳 5.0（出生声明家族哲学：超界钳回+
+        // 警告非拒绝）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = liquid_spawner_wat("50.0", "0.0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(822))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].liquid_density, 5.0, "超上限液体密度应钳 5.0");
+    }
+
+    #[test]
+    fn spawn_import_clamps_liquid_drag_negative_and_non_finite() {
+        // 第 19 参水中阻尼护栏：负值钳 0（无阻尼最保守回退）；非有限值钳 0
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = liquid_spawner_wat("1.0", "-1.0");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(823))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns[0].liquid_drag, 0.0, "负值阻尼应钳 0.0");
+        // 非有限值（canonical NaN）：钳 0
+        let wat_text = liquid_spawner_wat("1.0", "nan");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(824))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns[0].liquid_drag, 0.0, "非有限阻尼应钳 0.0");
     }
 
     #[test]
@@ -4477,7 +4704,7 @@ mod tests {
         let blob_escaped: String = blob_data.iter().map(|b| format!("\\{b:02x}")).collect();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -4497,6 +4724,8 @@ mod tests {
     {blob_ptr} {blob_len}
     f64.const 0.0
     f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
     f64.const 0.0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)

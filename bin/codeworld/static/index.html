@@ -1011,6 +1011,42 @@
     return null;
   }
 
+  // 水域颜色=密度映射（D-009；查表+线性插值，纯函数）。锚点：0.75 淡黄（油）/
+  // 1.0 蓝（水）/ 1.4 琥珀（蜂蜜）/ 2.5 橙红（岩浆）；两端延伸：≤0.75 白蓝、
+  // ≥2.5 深红。返回 rgba 字符串（alpha 固定 0.45 半透明——纯装饰非世界事实，
+  // 社区预设名只是记忆锚，世界只认数字）
+  function liquidColor(density) {
+    var STOPS = [
+      [0.75, [235, 226, 140]],  // 淡黄（油）
+      [1.0,  [64, 132, 204]],   // 蓝（水）
+      [1.4,  [224, 160, 64]],   // 琥珀（蜂蜜）
+      [2.5,  [226, 92, 48]],    // 橙红（岩浆）
+      [5.0,  [148, 28, 28]]     // 深红（上限延伸）
+    ];
+    var d = isFinite(density) ? density : 1.0;
+    if (d <= STOPS[0][0]) {
+      // 下延伸段：白蓝 → 淡黄 线性插值（白蓝锚 0.1，域外同色）
+      var t = Math.max(0, (d - 0.1) / (STOPS[0][0] - 0.1));
+      var c0 = [210, 230, 250], c1 = STOPS[0][1];
+      var r0 = Math.round(c0[0] + (c1[0] - c0[0]) * t);
+      var g0 = Math.round(c0[1] + (c1[1] - c0[1]) * t);
+      var b0 = Math.round(c0[2] + (c1[2] - c0[2]) * t);
+      return 'rgba(' + r0 + ',' + g0 + ',' + b0 + ',0.45)';
+    }
+    for (var i = 0; i < STOPS.length - 1; i++) {
+      if (d <= STOPS[i + 1][0]) {
+        var tt = (d - STOPS[i][0]) / (STOPS[i + 1][0] - STOPS[i][0]);
+        var a = STOPS[i][1], b = STOPS[i + 1][1];
+        var rr = Math.round(a[0] + (b[0] - a[0]) * tt);
+        var gg = Math.round(a[1] + (b[1] - a[1]) * tt);
+        var bb = Math.round(a[2] + (b[2] - a[2]) * tt);
+        return 'rgba(' + rr + ',' + gg + ',' + bb + ',0.45)';
+      }
+    }
+    var e = STOPS[STOPS.length - 1][1]; // 超上限钳深红
+    return 'rgba(' + e[0] + ',' + e[1] + ',' + e[2] + ',0.45)';
+  }
+
   // ==== [PURE-END] ====
 
   // ---- 坐标换算（net-protocol.md §4；世界 y 向上、屏幕 y 向下须翻转，负数域直接可用）----

@@ -150,6 +150,20 @@ pub struct Entity {
     #[serde(default = "default_field_drag_delta")]
     field_drag_delta: f64,
 
+    // 液体出生声明家族（D-009 水体：spawn 第 18/19 参——与 radius/mass/binding/
+    // motion/field 并列，世界只认数字不认名字：油 0.75/水 1.0/蜂蜜 1.4 是玩家
+    // 黑话，decisions.md #053）。liquid_density > 0 = 声明"我的身体区域（格对齐
+    // AABB）是液体"——域内实体按液体物理被结算（浮沉/阻尼/附加质量全公式涌现，
+    // 无浮沉清单）；0=非液体（默认=现状语义零回归）。
+    /// serde default：旧快照无此字段时回退 0.0=非液体（存储向后兼容）
+    #[serde(default)]
+    liquid_density: f64,
+    // 水中阻尼 k（每拍速度保留系数的 MC 语义：v ← v×k_eff + g_final；k>1 的
+    // 声明合法但结算按 1 钳——不许凭空加速）。
+    /// serde default：旧快照无此字段时回退 0.0=无阻尼（存储向后兼容）
+    #[serde(default)]
+    liquid_drag: f64,
+
     // 外观与动作状态
     /// 渲染数据
     pub appearance: Appearance,
@@ -208,6 +222,51 @@ fn default_field_gravity_scale() -> f64 {
 /// 场阻力改写量默认值（D-012：新实体与旧快照回退共用 0.0=中性——加 0 不改写）
 fn default_field_drag_delta() -> f64 {
     0.0
+}
+
+/// 液体密度合法上限（D-009：域 [0.0, 5.0]——0=非液体默认，5=岩浆级上限。
+/// 参照系=水 1.0 无量纲，油 0.75/蜂蜜 1.4/岩浆 2.5 都是玩家黑话非内置清单）
+pub const LIQUID_DENSITY_MAX: f64 = 5.0;
+
+/// 水中阻尼声明合法上限（D-009：域 [0.0, 5.0]——声明域宽松、结算域收紧：
+/// k>1 的声明合法但有效保留系数按 1 结算，不许凭空加速）
+pub const LIQUID_DRAG_MAX: f64 = 5.0;
+
+/// 液体密度校验钳制（spawn 第 18 参口径）：域 [0.0, 5.0]，负值/非有限钳 0
+/// （非液体最保守回退）并 warn，超上限钳 5.0——出生声明家族哲学：超界钳回+
+/// 警告非拒绝
+pub fn clamp_liquid_density(v: f64) -> f64 {
+    if !v.is_finite() {
+        tracing::warn!(value = v, clamped = 0.0, "[liquid] 液体密度非有限值，钳 0（非液体）");
+        return 0.0;
+    }
+    if v < 0.0 {
+        tracing::warn!(value = v, clamped = 0.0, "[liquid] 液体密度为负，钳 0（非液体）");
+        return 0.0;
+    }
+    if v > LIQUID_DENSITY_MAX {
+        tracing::warn!(value = v, clamped = LIQUID_DENSITY_MAX, "[liquid] 液体密度超上限，钳制");
+        return LIQUID_DENSITY_MAX;
+    }
+    v
+}
+
+/// 水中阻尼校验钳制（spawn 第 19 参口径）：域 [0.0, 5.0]，负值/非有限钳 0
+/// （无阻尼）并 warn，超上限钳 5.0（结算时有效保留系数另钳 [0,1]）
+pub fn clamp_liquid_drag(v: f64) -> f64 {
+    if !v.is_finite() {
+        tracing::warn!(value = v, clamped = 0.0, "[liquid] 水中阻尼非有限值，钳 0（无阻尼）");
+        return 0.0;
+    }
+    if v < 0.0 {
+        tracing::warn!(value = v, clamped = 0.0, "[liquid] 水中阻尼为负，钳 0（无阻尼）");
+        return 0.0;
+    }
+    if v > LIQUID_DRAG_MAX {
+        tracing::warn!(value = v, clamped = LIQUID_DRAG_MAX, "[liquid] 水中阻尼超上限，钳制");
+        return LIQUID_DRAG_MAX;
+    }
+    v
 }
 
 /// 运动身份档位（D-003 motion 出生声明，dev-plan 拍板 2026-10-17；kinematic 剧本档缓立）
@@ -352,6 +411,8 @@ impl Entity {
             field_radius: default_field_radius(),
             field_gravity_scale: default_field_gravity_scale(),
             field_drag_delta: default_field_drag_delta(),
+            liquid_density: 0.0,
+            liquid_drag: 0.0,
             appearance,
             action_state: ActionState::Idle,
             instruction_guard: InstructionGuard::new(per_tick_instruction_limit),
@@ -474,6 +535,26 @@ impl Entity {
     /// 设置场阻力改写量（import 层已 clamp_field_drag_delta，此处直存）
     pub fn set_field_drag_delta(&mut self, field_drag_delta: f64) {
         self.field_drag_delta = field_drag_delta;
+    }
+
+    /// 液体密度（D-009：0.0=非液体）
+    pub fn liquid_density(&self) -> f64 {
+        self.liquid_density
+    }
+
+    /// 设置液体密度（import 层已 clamp_liquid_density，此处直存）
+    pub fn set_liquid_density(&mut self, liquid_density: f64) {
+        self.liquid_density = liquid_density;
+    }
+
+    /// 水中阻尼（D-009：每拍速度保留系数的 MC 语义声明值）
+    pub fn liquid_drag(&self) -> f64 {
+        self.liquid_drag
+    }
+
+    /// 设置水中阻尼（import 层已 clamp_liquid_drag，此处直存）
+    pub fn set_liquid_drag(&mut self, liquid_drag: f64) {
+        self.liquid_drag = liquid_drag;
     }
 
     /// 设置坐标（物理规则校验与变换管线由 space/physics 模块负责，此处只存）
@@ -1025,5 +1106,101 @@ mod tests {
         // 只挂字段；玩家进场/弹丸恒无皮）
         let e = sample_entity();
         assert!(e.assets.is_empty(), "新实体装戴清单应为空");
+    }
+
+    // === 液体出生声明家族（D-009 水体：liquid_density/liquid_drag 与
+    // === radius/mass/binding/motion/field 并列，世界只认数字不认名字）===
+
+    #[test]
+    fn clamp_liquid_density_boundary_and_valid() {
+        // 校验：边界值原样通过（0.0=非液体默认 / 5.0=上限），域内值原样保留
+        assert_eq!(clamp_liquid_density(0.0), 0.0);
+        assert_eq!(clamp_liquid_density(5.0), 5.0);
+        assert_eq!(clamp_liquid_density(1.0), 1.0);
+        assert_eq!(clamp_liquid_density(0.1), 0.1);
+    }
+
+    #[test]
+    fn clamp_liquid_density_rejects_negative_and_overflow() {
+        // 校验：负值钳 0（非液体最保守回退），超上限钳 5.0（出生声明家族哲学：
+        // 超界钳回+警告非拒绝）
+        assert_eq!(clamp_liquid_density(-0.8), 0.0);
+        assert_eq!(clamp_liquid_density(50.0), 5.0);
+    }
+
+    #[test]
+    fn clamp_liquid_density_non_finite_to_zero() {
+        // 校验：非有限值（NaN/±inf）钳 0=非液体（最保守回退）
+        assert_eq!(clamp_liquid_density(f64::NAN), 0.0);
+        assert_eq!(clamp_liquid_density(f64::INFINITY), 0.0);
+        assert_eq!(clamp_liquid_density(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn clamp_liquid_drag_boundary_and_valid() {
+        // 校验：边界值原样通过（0.0=无阻尼理想液体 / 5.0=上限），域内值保留
+        //（k=0 配 ρ>0 合法：无阻尼理想液体）
+        assert_eq!(clamp_liquid_drag(0.0), 0.0);
+        assert_eq!(clamp_liquid_drag(5.0), 5.0);
+        assert_eq!(clamp_liquid_drag(0.35), 0.35);
+    }
+
+    #[test]
+    fn clamp_liquid_drag_rejects_negative_and_overflow() {
+        // 校验：负值钳 0，超上限钳 5.0
+        assert_eq!(clamp_liquid_drag(-1.0), 0.0);
+        assert_eq!(clamp_liquid_drag(99.0), 5.0);
+    }
+
+    #[test]
+    fn clamp_liquid_drag_non_finite_to_zero() {
+        // 校验：非有限值钳 0=无阻尼（与 serde default 同语义）
+        assert_eq!(clamp_liquid_drag(f64::NAN), 0.0);
+        assert_eq!(clamp_liquid_drag(f64::INFINITY), 0.0);
+        assert_eq!(clamp_liquid_drag(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn entity_liquid_defaults_are_not_liquid() {
+        // 创建：新实体默认非液体（density=0/drag=0）——现状语义零回归
+        let e = sample_entity();
+        assert_eq!(e.liquid_density(), 0.0);
+        assert_eq!(e.liquid_drag(), 0.0);
+    }
+
+    #[test]
+    fn entity_liquid_setters_direct_store() {
+        // 修改：两个 setter 直存（import 层已钳制，照 set_field_radius 直存模式）
+        let mut e = sample_entity();
+        e.set_liquid_density(1.0);
+        e.set_liquid_drag(0.35);
+        assert_eq!(e.liquid_density(), 1.0);
+        assert_eq!(e.liquid_drag(), 0.35);
+    }
+
+    #[test]
+    fn entity_liquid_survives_serialize_roundtrip() {
+        // 读写：液体声明序列化往返保留（快照存档不断档）
+        let mut e = sample_entity();
+        e.set_liquid_density(2.5);
+        e.set_liquid_drag(0.35);
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.liquid_density(), 2.5);
+        assert_eq!(back.liquid_drag(), 0.35);
+    }
+
+    #[test]
+    fn entity_liquid_serde_backcompat_old_snapshot() {
+        // 边界：旧快照（无 liquid 两字段）反序列化回退非液体语义（density=0/
+        // drag=0——serde default 与非液体语义严格一致，旧存量造物零行为变化，
+        // 存储向后兼容 radius/mass/binding/motion/field 同款先例）
+        let mut obj: serde_json::Value = serde_json::to_value(sample_entity()).unwrap();
+        obj.as_object_mut().unwrap().remove("liquid_density");
+        obj.as_object_mut().unwrap().remove("liquid_drag");
+        let json = serde_json::to_string(&obj).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.liquid_density(), 0.0, "旧快照应回退非液体");
+        assert_eq!(back.liquid_drag(), 0.0);
     }
 }
