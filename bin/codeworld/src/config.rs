@@ -272,9 +272,17 @@ impl Config {
                 cfg.asset_quota = n;
             }
         }
-        // D-005 决斗单窗预算（模式照抄 CODEWORLD_CONTACT_FUEL：解析失败保留默认值）
+        // D-005 决斗单窗预算（模式照抄 CODEWORLD_CONTACT_FUEL：解析失败保留默认值；
+        // 钳制 ≥1——0 会让每个会话首拍即油尽驱逐，配置错误误报成游魂崩溃，
+        // 坏值不进世界（同 BRIDGE_TIMEOUT_S=0 防御惯例））
         if let Some(f) = env_u64("CODEWORLD_DUEL_STEP_FUEL") {
-            cfg.duel_step_fuel = f;
+            if f == 0 {
+                tracing::warn!(
+                    value = f,
+                    "[config] CODEWORLD_DUEL_STEP_FUEL=0 无效（0 预算=会话油尽驱逐），钳制为 1"
+                );
+            }
+            cfg.duel_step_fuel = f.max(1);
         }
         // D-001b 外桥（CODEWORLD_BRIDGE 家族）：默认禁用；非 0 数值=启用（"1" 是
         // bat 脚本惯用值）；护栏四项数值类容错（解析失败回退默认，同其他数值项）
@@ -705,6 +713,17 @@ mod tests {
         let c = Config::load();
         std::env::remove_var("CODEWORLD_DUEL_STEP_FUEL");
         assert_eq!(c.duel_step_fuel, 123_456, "环境变量应覆盖决斗单窗预算");
+    }
+
+    #[test]
+    fn duel_step_fuel_env_zero_clamped_to_one() {
+        // D-005-R1：env=0 非法（0 预算=每会话首拍即油尽驱逐，配置错误会误报成
+        // 游魂崩溃），装配侧钳制 ≥1（max(1)），坏值不进世界
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_DUEL_STEP_FUEL", "0");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_DUEL_STEP_FUEL");
+        assert_eq!(c.duel_step_fuel, 1, "env=0 应钳制为 1（≥1 口径）");
     }
 
     #[test]

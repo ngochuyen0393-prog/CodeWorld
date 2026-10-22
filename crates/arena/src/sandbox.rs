@@ -1521,10 +1521,17 @@ impl SandboxManager {
                 // SAFETY：窗口契约（见 DuelGhostData.defender 文档）——指针仅在
                 // call_duel_step 函数体存活期内非空且指向存活守方沙箱
                 let defender = unsafe { &mut *bridge };
-                // 守方 fuel 守卫（#046 账本铁律）：host 侧 memory.read 会被 wasmtime
-                // 计量进守方油箱（每步约 4 步）——决斗通道的字节搬运必须烧攻方赌注，
-                // 操作前后快照/恢复，守方 fuel 分毫不动（账户跟人不跟房子）
-                let prev_fuel = defender.store.get_fuel().unwrap_or(0);
+                // 守方 fuel 守卫（#046 账本铁律）：防御性快照恢复——当前 wasmtime
+                // 版本 host 侧 Memory::read/write 是裸 slice 拷贝、不计量 fuel，
+                // 保留守卫防未来计量策略变化。快照失败=操作不执行返回 -1（反向
+                // 抹零会伤守方油箱），与 call_on_field 家族 Err 传播口径一致
+                let prev_fuel = match defender.store.get_fuel() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "[duel] 守方 fuel 快照失败，读作废返回 -1（不动守方油箱）");
+                        return -1;
+                    }
+                };
                 let read = duel_read_bytes(defender, ptr as u32, len as u32);
                 let _ = defender.store.set_fuel(prev_fuel);
                 match read {
@@ -1575,7 +1582,15 @@ impl SandboxManager {
                 };
                 // SAFETY：同 duel_read 窗口契约
                 let defender = unsafe { &mut *bridge };
-                let prev_fuel = defender.store.get_fuel().unwrap_or(0);
+                // 守方 fuel 守卫（同 duel_read：防御性快照恢复，host 读写当前
+                // 不计量 fuel；快照失败=操作不执行返回 -1，不动守方油箱）
+                let prev_fuel = match defender.store.get_fuel() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "[duel] 守方 fuel 快照失败，写作废返回 -1（不动守方油箱）");
+                        return -1;
+                    }
+                };
                 let write = duel_write_bytes(defender, ptr as u32, &payload);
                 let _ = defender.store.set_fuel(prev_fuel);
                 match write {
@@ -2021,6 +2036,9 @@ impl SandboxManager {
     /// 崩溃三路全走 Err（调用方按崩溃死关闭会话，世界只看见崩溃）：
     /// 模块编译失败 / 实例化失败（含走私多余 import）/ on_duel 导出缺失 / trap。
     /// budget=0 拒绝开窗（Windows 下 wasm 零 fuel 执行是进程 abort，.cc-bugs #5）。
+    /// 红线：窗口内烧穿 budget 的 out-of-fuel trap 在 Windows 下同样是进程 abort
+    /// 非 Err（.cc-bugs #5 既有环境限制，暴露面与玩家 on_tick 死循环等价，非新增）——
+    /// 预算由 bin 侧油尽驱逐先行兜底（fuel_stake < duel_step_fuel 不开窗）。
     pub fn call_duel_step(
         &self,
         attacker_module: &[u8],
