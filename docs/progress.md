@@ -4,7 +4,7 @@
 
 ## 现在（2026-10-22 D-018 弹丸退役工程 落地）
 - 在做：D-018 收口——shoot import/弹丸专属管线/痕迹机制/三常数全退役（decisions #045 执行刀）；弹道物理通用化为一切有速度实体（step 冲量路径+CCD 扫掠截断，积分器双轨注记入码：中点位移保留=跳跃锚、半隐式轨随弹丸退役）；H 搅局者/操控射击/遗嘱烟花全迁造物弹（spawn 第 11/12 参初速+on_contact 接触代码攻）；弹头延迟 2 拍消亡（结算需攻击者在册）；CCD 停点 1cm 推进修接触浮点缝隙；投掷器教学 docs/newbie-first-thrower.md。Gate：workspace 1034 绿/0 failed（基线 1069-删 37 个 shoot 专属测试+新增通用锚，删测授权见任务书⑥）/本刀 hunks clippy 零警告/4 条 clippy 新 lint 警告属 HEAD 既有代码（mask/avatars/net/bridge 区，非本刀 hunks）。
-- 卡在：无。注意：worktree 施工（.cc-wt-d018，HEAD=1a69d51 干净基线），主树有 D-009 液体刀 WIP 在途（spawn 19 参方向）——D-009 落地后需把 hunter_wat/shooter_once_wat/dying_will_firework_wat 的 spawn 调用与 ctrl_shell_spawns 构造补 2 个液体参（交接注记入 cc-report-d018.md）。
+- 卡在：无。**已 rebase 落回 master（9cee29b，基于 D-009 162fd82）**：液体物理迁入 step 冲量路径（D-009 液体测试全绿）、三 WAT 生成器与 PendingSpawn 构造同步 19 参、CCD 接近性判据修正（重叠分离中放行——D-009 浮沉实测暴露）、液体造物不作 CCD 目标、木浮铁沉布景适配。详见 .cc-scratch/cc-report-d018.md §八。
 - 下一步：① D-001c 活弹待遇参数判据拍板（土豆）② D-011 链路已解锁可派 ③ 待土豆人工验收：watch 日志观察 H 投掷弹道手感（每 8 拍一发、两拍回弧）/浏览器操控射击（点敌人出定装弹）/遗嘱烟花（spawn 造物带初速）④ 弹幕躺尸堆积极限=实体上限 64 认账（#045），寿命管理第二课候选。
 >>>>>>> a1804fc (feat(core,physics,arena,bin,docs): D-018 弹丸退役工程——shoot 移除/弹道通用化/痕迹退役/三常数划线/D-H 迁移造物弹/投掷器模板第一课)
 
