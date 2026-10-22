@@ -1,0 +1,812 @@
+diff --git a/bin/codeworld/src/main.rs b/bin/codeworld/src/main.rs
+index 1886777..3aba44c 100644
+--- a/bin/codeworld/src/main.rs
++++ b/bin/codeworld/src/main.rs
+@@ -11,6 +11,7 @@
+ //!    a. physics.step(world)    b. 死亡清理    c. renderer.render(world)    d. 每100tick存快照
+ //! 4. sleep 到下一个 tick
+ 
++mod bridges;
+ mod config;
+ mod dispose;
+ mod input;
+@@ -146,6 +147,14 @@ struct EntitySandboxMap {
+     /// 单沙箱资产配额（#051：引擎+魂+皮合计封顶）。main() 从 config.asset_quota
+     /// 装配（CODEWORLD_ASSET_QUOTA 覆盖）；测试基线取 arena 常数默认
+     asset_quota: usize,
++    /// 外桥出站信箱（D-001b）。None=世界未开桥（fill 复位快照、收发步骤零开销
++    /// no-op——禁用测试环境零回归）。main() 按 CODEWORLD_BRIDGE 装配。
++    bridge: Option<bridges::BridgeOutbox>,
++    /// 桥 payload 单信上限（D-001b 护栏装配值；拍首填进每沙箱快照，
++    /// 回信投递侧截断同口径——别与 bin 侧硬编码两套）
++    bridge_payload_max: usize,
++    /// 每沙箱桥在途上限（D-001b 护栏装配值；拍首填进每沙箱快照）
++    bridge_inflight_max: u32,
+ }
+ 
+ impl EntitySandboxMap {
+@@ -201,6 +210,9 @@ impl EntitySandboxMap {
+             traces: Vec::new(),
+             asset_mirror: mirror::AssetMirror::new(),
+             asset_quota: codeworld_arena::assets::SANDBOX_ASSET_QUOTA_BYTES,
++            bridge: None,
++            bridge_payload_max: 8192,
++            bridge_inflight_max: 4,
+         })
+     }
+ 
+@@ -257,6 +269,38 @@ impl EntitySandboxMap {
+         tracing::debug!(count = visible.len(), "[visible_snapshot] 可见实体快照已填充");
+     }
+ 
++    /// 桥拍首填充（D-001b）：热重载检查 + 每沙箱桥快照（enabled/ports/上限）
++    ///
++    /// bridge=None（世界未开桥/禁用环境）：统一复位 enabled=false——世界中途关桥
++    /// 要复位，测试基线零开销（一个 bool 写循环，沙箱表空=零循环）。
++    /// mtime 热重载（design-bridge 3.1）：每拍 stat 一次，变更重载+INFO。
++    fn fill_bridge_snapshots(&mut self) {
++        let Some(outbox) = &self.bridge else {
++            for handle in self.sandboxes.values_mut() {
++                handle.store.data_mut().bridge_enabled = false;
++            }
++            return;
++        };
++        {
++            let mut vault = outbox.vault().write().unwrap_or_else(|e| e.into_inner());
++            vault.reload_if_changed();
++        }
++        let ports = outbox
++            .vault()
++            .read()
++            .unwrap_or_else(|e| e.into_inner())
++            .ports();
++        let (payload_max, inflight_max) = (self.bridge_payload_max, self.bridge_inflight_max);
++        for handle in self.sandboxes.values_mut() {
++            let d = handle.store.data_mut();
++            d.bridge_enabled = true;
++            d.bridge_ports = ports.clone();
++            d.bridge_payload_max = payload_max;
++            d.bridge_inflight_max = inflight_max;
++        }
++        tracing::debug!(ports = ?ports, "[bridge] 桥快照已填充");
++    }
++
+     /// 为实体创建沙箱
+     fn create(&mut self, entity_id: EntityId, wasm_bytes: &[u8], fuel: u64) -> Result<()> {
+         let handle = self.manager.create_sandbox(wasm_bytes, fuel, entity_id)?;
+@@ -493,6 +537,173 @@ impl EntitySandboxMap {
+         std::mem::take(&mut self.field_delta_overrides)
+     }
+ 
++    /// 回信投递（D-001b 阶段二 a-1 前半）：drain 回信通道，逐封投递
++    ///
++    /// - 实体已死/沙箱已销毁 -> 回信无人认领，丢弃+INFO（design-bridge 2.3 死亡
++    ///   竞态：你死前发的信照发，回信你收不到）
++    /// - 回信超 payload_max -> 截断投递（诚实交付前缀；坏服务器的超大回信不涨
++    ///   沙箱内存配额外账——grow 页数也随截断缩）
++    /// - 预算复用 probe_fuel（同族外部回调；on_contact/on_field 同档小预算）
++    /// - 缺省导出 bridge_on_reply -> Ok(None) 零副作用，**inflight 照结算**——
++    ///   信的生命周期已终结，世界记账不泄漏（沙箱零副作用与结算互不冲突）
++    fn deliver_bridge_replies(&mut self, world: &WorldState) {
++        let Some(outbox) = self.bridge.as_mut() else {
++            return;
++        };
++        while let Some(event) = outbox.try_recv_reply() {
++            match event {
++                bridges::ReplyEvent::Reply { entity, port, seq, body } => {
++                    let capped = if body.len() > self.bridge_payload_max {
++                        tracing::warn!(
++                            entity = %entity.0,
++                            seq,
++                            len = body.len(),
++                            cap = self.bridge_payload_max,
++                            "[bridge] 回信超上限，截断投递"
++                        );
++                        body[..self.bridge_payload_max].to_vec()
++                    } else {
++                        body
++                    };
++                    let Some(handle) = self.sandboxes.get_mut(&entity) else {
++                        tracing::info!(
++                            entity = %entity.0,
++                            port,
++                            seq,
++                            bytes = capped.len(),
++                            "[bridge] 回信无人认领（实体已死），丢弃"
++                        );
++                        continue;
++                    };
++                    let alive = world
++                        .entities
++                        .get(&entity)
++                        .map(|e| e.is_alive())
++                        .unwrap_or(false);
++                    if !alive {
++                        tracing::info!(
++                            entity = %entity.0,
++                            port,
++                            seq,
++                            "[bridge] 回信无人认领（实体已死），丢弃"
++                        );
++                        let d = handle.store.data_mut();
++                        d.bridge_inflight = d.bridge_inflight.saturating_sub(1);
++                        continue;
++                    }
++                    match self
++                        .manager
++                        .call_on_bridge_reply(handle, port, &capped, self.probe_fuel)
++                    {
++                        Ok(_) => {
++                            tracing::info!(
++                                entity = %entity.0,
++                                port,
++                                seq,
++                                bytes = capped.len(),
++                                "[bridge] 回信投递"
++                            );
++                            let d = handle.store.data_mut();
++                            d.bridge_inflight = d.bridge_inflight.saturating_sub(1);
++                        }
++                        Err(e) => {
++                            tracing::warn!(
++                                entity = %entity.0,
++                                seq,
++                                error = %e,
++                                "[bridge] 回信投递失败（调用异常，丢弃）"
++                            );
++                            let d = handle.store.data_mut();
++                            d.bridge_inflight = d.bridge_inflight.saturating_sub(1);
++                        }
++                    }
++                }
++                bridges::ReplyEvent::Timeout { entity, seq } => {
++                    // 出站超时/连接失败/非 2xx：不投递（代码自管），只结算在途
++                    tracing::info!(
++                        entity = %entity.0,
++                        seq,
++                        "[bridge] 出站超时（不投递，代码自管）"
++                    );
++                    if let Some(handle) = self.sandboxes.get_mut(&entity) {
++                        let d = handle.store.data_mut();
++                        d.bridge_inflight = d.bridge_inflight.saturating_sub(1);
++                    }
++                }
++            }
++        }
++    }
++
++    /// 出站收集（D-001b 阶段二 a-1 后半）：collect 各沙箱排队信件，出站
++    ///
++    /// - collect 即清 sent_this_tick（下一拍可再发——每拍 1 发限流以拍为单位）
++    /// - 死实体信件丢弃+INFO+inflight 结算（死者信不送）
++    /// - port 热重载后消失 -> 作废+INFO+inflight 结算（design-bridge 吊销语义）
++    /// - 正常信：取单调 seq -> vault 解析端点 -> INFO 出站一条 -> 推出站通道
++    ///   （信封由工作线程组装；内容永不入日志，日志只记 entity/port/seq/字节数）
++    fn collect_bridge_sends(&mut self, world: &WorldState) {
++        let Some(outbox) = self.bridge.as_mut() else {
++            return;
++        };
++        for (id, handle) in self.sandboxes.iter_mut() {
++            handle.store.data_mut().bridge_sent_this_tick = false;
++            let pending = std::mem::take(&mut handle.store.data_mut().bridge_pending);
++            if pending.is_empty() {
++                continue;
++            }
++            let alive = world
++                .entities
++                .get(id)
++                .map(|e| e.is_alive())
++                .unwrap_or(false);
++            if !alive {
++                tracing::info!(
++                    entity = %id.0,
++                    count = pending.len(),
++                    "[bridge] 死实体信件丢弃（死者信不送）"
++                );
++                let d = handle.store.data_mut();
++                d.bridge_inflight = d.bridge_inflight.saturating_sub(pending.len() as u32);
++                continue;
++            }
++            for letter in pending {
++                let endpoint = {
++                    let vault = outbox.vault().read().unwrap_or_else(|e| e.into_inner());
++                    vault.resolve(letter.port).cloned()
++                };
++                let Some(endpoint) = endpoint else {
++                    tracing::info!(
++                        entity = %id.0,
++                        port = letter.port,
++                        bytes = letter.payload.len(),
++                        "[bridge] 端点热重载后消失，信件作废"
++                    );
++                    let d = handle.store.data_mut();
++                    d.bridge_inflight = d.bridge_inflight.saturating_sub(1);
++                    continue;
++                };
++                let d = handle.store.data_mut();
++                d.bridge_seq += 1;
++                let seq = d.bridge_seq;
++                tracing::info!(
++                    entity = %id.0,
++                    port = letter.port,
++                    seq,
++                    bytes = letter.payload.len(),
++                    url = %endpoint.url,
++                    "[bridge] 出站"
++                );
++                outbox.send_letter(bridges::Letter {
++                    entity: *id,
++                    port: letter.port,
++                    seq,
++                    payload: letter.payload,
++                    endpoint,
++                });
++            }
++        }
++    }
++
+     /// 收集本 tick 所有沙箱排队的移动请求（env.move_by 推入，阶段二并入 pending 队列）
+     ///
+     /// drain 各沙箱 pending_moves 后清空，保证不跨 tick 残留。在 tick 阶段二 a 步
+@@ -649,7 +860,9 @@ impl EntitySandboxMap {
+         // #051 皮入沙箱·换血配额门（拒绝换血，资产不丢）：新模块字节+随行资产
+         // 合计超配额 → 拒绝（夺取方装不下自己的 payload 那是夺取失败）。校验在
+         // remove 之前——旧沙箱从未离开映射表，资产天然不丢。资产大小按指纹查
+-        // 镜像仓实大小（不信任玩家自报）；查不到按 0 记 warn（容错不炸换血）
++        // 镜像仓实大小（不信任玩家自报）；任一随行 id 查不到 → fail-closed 拒绝
++        //（R1 P1：世界核实不了就不记账，诚实性优先于可用性——按 0 记=静默刷
++        // 配额洞；装戴刀接"上传→镜像仓 insert"后正常路径永不触发）
+         let module_bytes = if payload.is_empty() {
+             DEFAULT_KILL_WASM.len()
+         } else {
+@@ -659,23 +872,19 @@ impl EntitySandboxMap {
+             let Some(handle) = self.sandboxes.get(target_id) else {
+                 anyhow::bail!("目标 {:?} 无沙箱，无法换血", target_id);
+             };
+-            handle
+-                .store
+-                .data()
+-                .assets
+-                .iter()
+-                .map(|id| {
+-                    let size = self.asset_mirror.size_of(id).unwrap_or_else(|| {
+-                        tracing::warn!(
+-                            entity_id = %target_id.0,
+-                            asset_id = %id,
+-                            "[skin] 资产不在镜像仓，配额按 0 记（容错）"
+-                        );
+-                        0
+-                    });
+-                    (id.clone(), size)
+-                })
+-                .collect()
++            let mut sized = Vec::with_capacity(handle.store.data().assets.len());
++            for id in &handle.store.data().assets {
++                let Some(size) = self.asset_mirror.size_of(id) else {
++                    tracing::warn!(
++                        entity_id = %target_id.0,
++                        asset_id = %id,
++                        "[skin] 换血拒绝：资产 id 不在镜像仓，配额无法核实（fail-closed）"
++                    );
++                    anyhow::bail!("换血失败：资产 id 不在镜像仓，配额无法核实（fail-closed）");
++                };
++                sized.push((id.clone(), size));
++            }
++            sized
+         };
+         // 无皮/有皮同一扇门：配额语义=引擎+皮合计（空清单=纯模块校验）
+         let quota = codeworld_arena::assets::SandboxAssetQuota::with_limit(self.asset_quota);
+@@ -986,6 +1195,37 @@ fn main() -> Result<()> {
+     // 世界实体上限装配（门二 spawn 配套，decisions.md #020）
+     sandbox_map.max_entities = config.max_entities;
+ 
++    // D-001b 外桥装配：CODEWORLD_BRIDGE=1 启用（保险库加载 + 出站工作线程）。
++    // 未启用 INFO 一条明示（bridge_send 恒返 4，禁用=默认零回归）。
++    // 保险库路径即 config.bridge_config（默认 bridges.json，与 codeworld.db 同级
++    // ——两者默认都落世界工作目录）
++    sandbox_map.bridge_payload_max = config.bridge_payload_max;
++    sandbox_map.bridge_inflight_max = config.bridge_inflight;
++    sandbox_map.bridge = if config.bridge_enabled {
++        match bridges::BridgeOutbox::new(
++            std::path::Path::new(&config.bridge_config),
++            config.bridge_timeout_s,
++        ) {
++            Ok(outbox) => {
++                tracing::info!(
++                    vault = %config.bridge_config,
++                    timeout_s = config.bridge_timeout_s,
++                    inflight_max = config.bridge_inflight,
++                    payload_max = config.bridge_payload_max,
++                    "[bridge] 外桥已启用"
++                );
++                Some(outbox)
++            }
++            Err(e) => {
++                tracing::warn!(error = %e, "[bridge] 外桥启用失败（工作线程构造异常），按禁用运行");
++                None
++            }
++        }
++    } else {
++        tracing::info!("[bridge] CODEWORLD_BRIDGE 未启用——bridge_send 恒返 4");
++        None
++    };
++
+     // 新世界或恢复后无实体：放测试实体（含 WASM 沙箱）让 MVP 有东西渲染、能跑玩家代码
+     if world.entities.is_empty() {
+         spawn_test_entities(&mut world, &mut sandbox_map, config.d_shield, config.h_enabled, config.s_enabled);
+@@ -1173,6 +1413,8 @@ fn tick_with_intents(
+         BoundingBox::new(min_x, min_y, max_x, max_y)
+     };
+     sandbox_map.fill_visible_snapshots(world, &bounds);
++    // 桥拍首填充（D-001b）：热重载检查 + 每沙箱桥快照（None=复位，零开销）
++    sandbox_map.fill_bridge_snapshots();
+ 
+     // ②5 操控路由（#022 双层模型：操控优先于自主，代码层回落挂机AI）
+     //    - 操控目标 = me 声明（CODEWORLD_ME 优先，其次 players/me.txt）且在线的玩家
+@@ -1492,6 +1734,12 @@ fn tick_with_intents(
+     //    前移到阶段一需同步调整，否则将死的实体会多跑一个 tick 的 on_tick。
+ 
+     // ③ 阶段二：状态更新（串行）
++    //   a-1 桥收发（D-001b）：回信投递（drain 回信通道 -> bridge_on_reply，拍边界
++    //       确定性锚——回信到达时刻在拍中任意点，调用固定在拍边界，设计 2.3）+
++    //       出站收集（collect 信件 -> 出站通道 -> 工作线程发 HTTP，早发早到）。
++    //       排在 pending 应用之前：桥不改世界状态，只读 alive 与投递，与管线正交。
++    sandbox_map.deliver_bridge_replies(world);
++    sandbox_map.collect_bridge_sends(world);
+     //   a. 应用 PendingChanges（spawn/destroy/set_pos/set_velocity，架构 4.1 a 步）
+     //      先并入阶段一排队的移动请求（env.move_by），随本步统一应用（与攻击排队同模式）；
+     //      再并入产权校验通过的销毁请求（env.destroy，门二）一起应用
+@@ -6110,6 +6358,7 @@ mod tests {
+     #[test]
+     fn replace_code_transfers_assets_to_new_sandbox() {
+         // 正面（换血随行端到端）：replace_code 成功后新沙箱读得到完整资产清单
++        //（fail-closed 契约：随行 id 须在镜像仓可核实——两 id 先播种）
+         let mut map = test_sandbox_map();
+         let target_id = EntityId(Uuid::from_u128(22));
+         map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
+@@ -6122,6 +6371,8 @@ mod tests {
+             "av_0123456789abcdef".to_string(),
+             "av_fedcba9876543210".to_string(),
+         ];
++        seed_mirror_asset(&mut map, "av_0123456789abcdef", 100);
++        seed_mirror_asset(&mut map, "av_fedcba9876543210", 100);
+         let killed = map
+             .replace_code(&target_id, &wasm(TARGET_WAT))
+             .expect("默认配额下合法 payload 应换血成功");
+@@ -6156,6 +6407,35 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn replace_code_rejects_when_asset_id_missing_from_mirror() {
++        // 负面（R1 P1 fail-closed）：随行 id 不在镜像仓 → 配额无法核实 → 拒绝换血
++        //（世界核实不了就不记账——诚实性优先于可用性；镜像仓启动建仓后不更新，
++        // 启动后上传的资产 id 全走此路，按 0 记=静默刷配额洞）。配额留默认 1MB
++        //（模块本身装得下），拒绝的唯一原因=fail-closed，与超限拒绝同路径：
++        // 旧沙箱原样保留、资产清单不变
++        let mut map = test_sandbox_map();
++        let target_id = EntityId(Uuid::from_u128(24));
++        map.create(target_id, &wasm(TARGET_WAT), 1_000_000).unwrap();
++        map.sandboxes
++            .get_mut(&target_id)
++            .unwrap()
++            .store
++            .data_mut()
++            .assets = vec!["av_ffffffffffffffff".to_string()]; // 镜像仓故意不播种
++        let payload = wasm(TARGET_WAT);
++        assert!(
++            map.replace_code(&target_id, &payload).is_err(),
++            "随行 id 不在镜像仓应拒绝换血（fail-closed）"
++        );
++        assert!(map.sandboxes.contains_key(&target_id), "拒绝后旧沙箱应保留");
++        assert_eq!(
++            map.sandboxes[&target_id].store.data().assets,
++            vec!["av_ffffffffffffffff".to_string()],
++            "拒绝后资产清单应原样（不丢）"
++        );
++    }
++
+     #[test]
+     fn replace_code_uses_remaining_fuel_not_limit() {
+         // P1（验收#4）+ 审查 P1-2：换血继承旧沙箱【当 tick 剩余量】（防吃刀回满刷配额），
+@@ -7438,6 +7718,400 @@ mod tests {
+         );
+     }
+ 
++    // === D-001b 外桥编排（拍首填充 + 阶段二 a-1 回信投递/出站收集）===
++
++    /// 发信生物 WAT：on_tick 调 bridge_send(1, 0, 6)，"WHERE?" data 段（与 arena
++    /// 测试同款形状；bin 侧测编排链路，返回码细节归 arena）
++    const BRIDGE_MESSENGER_WAT: &str = r#"(module
++  (import "env" "bridge_send" (func $bridge_send (param i32 i32 i32) (result i32)))
++  (memory (export "memory") 1)
++  (data (i32.const 0) "WHERE?")
++  (func (export "on_tick")
++    i32.const 1 i32.const 0 i32.const 6 call $bridge_send drop)
++  (func (export "life") (result i32) i32.const 1))"#;
++
++    /// 写临时保险库文件（port=1 -> 动态空闲端口；返回路径）
++    fn write_bridge_vault() -> std::path::PathBuf {
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let port = listener.local_addr().unwrap().port();
++        drop(listener);
++        let path = std::env::temp_dir().join(format!(
++            "cw-bridge-main-{}-{}.json",
++            std::process::id(),
++            Uuid::new_v4().simple()
++        ));
++        std::fs::write(
++            &path,
++            serde_json::to_string(&serde_json::json!([{
++                "port": 1,
++                "url": format!("http://127.0.0.1:{port}/hook"),
++            }]))
++            .unwrap(),
++        )
++        .unwrap();
++        path
++    }
++
++    fn bridge_stage(id_u: u128) -> (WorldState, EntitySandboxMap, EntityId) {
++        let mut world = WorldState::new();
++        let id = EntityId(Uuid::from_u128(id_u));
++        world.entities.insert(id, make_entity(id_u, (0.0, 0.0)));
++        let mut map = test_sandbox_map();
++        map.create(id, &wasm(BRIDGE_MESSENGER_WAT), 1_000_000).unwrap();
++        (world, map, id)
++    }
++
++    #[test]
++    fn fill_bridge_snapshots_none_resets_all() {
++        // bridge=None（世界未开桥/中途关桥）：拍首填充统一复位 enabled=false
++        //——模拟"上一拍开着"的预置状态必须被打掉
++        let (_world, mut map, id) = bridge_stage(50);
++        map.sandboxes
++            .get_mut(&id)
++            .unwrap()
++            .store
++            .data_mut()
++            .bridge_enabled = true;
++        map.fill_bridge_snapshots();
++        assert!(
++            !map.sandboxes[&id].store.data().bridge_enabled,
++            "无桥世界拍首应复位快照开关"
++        );
++    }
++
++    #[test]
++    fn fill_bridge_snapshots_outbox_fills_ports_and_limits() {
++        // 挂 outbox：拍首热重载检查 + 每沙箱 enabled/ports/上限装配
++        let vault_path = write_bridge_vault();
++        let (_world, mut map, id) = bridge_stage(51);
++        map.bridge = Some(
++            bridges::BridgeOutbox::without_worker(&vault_path, 5).unwrap(),
++        );
++        map.bridge_payload_max = 4096;
++        map.bridge_inflight_max = 2;
++        map.fill_bridge_snapshots();
++        let d = map.sandboxes[&id].store.data();
++        assert!(d.bridge_enabled, "有桥世界拍首应启用快照");
++        assert_eq!(d.bridge_ports, vec![1], "端口快照应来自保险库");
++        assert_eq!(d.bridge_payload_max, 4096, "payload 上限应装配");
++        assert_eq!(d.bridge_inflight_max, 2, "在途上限应装配");
++        let _ = std::fs::remove_file(&vault_path);
++    }
++
++    #[test]
++    fn collect_bridge_sends_drains_letters_with_monotonic_seq() {
++        // 出站收集：两拍各发一封 -> 信进 outbox、seq 单调 1,2、pending/sent 清空、
++        // 信封端点解析自保险库
++        let vault_path = write_bridge_vault();
++        let (world, mut map, id) = bridge_stage(52);
++        map.bridge = Some(
++            bridges::BridgeOutbox::without_worker(&vault_path, 5).unwrap(),
++        );
++        map.fill_bridge_snapshots();
++        // 第一拍：沙箱发信（run_player_code 走 on_tick -> bridge_send 排队）
++        map.run_player_code(&world, &unbounded_bb());
++        map.collect_bridge_sends(&world);
++        let l1 = map.bridge.as_mut().unwrap().try_recv_letter().expect("第一封应出站");
++        assert_eq!(l1.entity, id);
++        assert_eq!(l1.seq, 1, "首封序号应为 1");
++        assert_eq!(l1.port, 1);
++        assert_eq!(l1.payload, b"WHERE?");
++        assert_eq!(l1.endpoint.path, "/hook", "端点应解析自保险库");
++        assert!(
++            map.bridge.as_mut().unwrap().try_recv_letter().is_none(),
++            "本拍只发一封"
++        );
++        let d = map.sandboxes[&id].store.data();
++        assert!(!d.bridge_sent_this_tick, "collect 后 sent 标记应清");
++        assert!(d.bridge_pending.is_empty(), "collect 后 pending 应清空");
++        assert_eq!(d.bridge_inflight, 1, "在途 +1");
++        // 第二拍：sent 复位后沙箱可再发，seq 单调递增
++        map.fill_bridge_snapshots();
++        map.run_player_code(&world, &unbounded_bb());
++        map.collect_bridge_sends(&world);
++        let l2 = map.bridge.as_mut().unwrap().try_recv_letter().expect("第二封应出站");
++        assert_eq!(l2.seq, 2, "序号应单调递增");
++        let _ = std::fs::remove_file(&vault_path);
++    }
++
++    #[test]
++    fn collect_bridge_sends_dead_entity_drops_letter() {
++        // 死实体信件：kill 后 collect 不出站 + inflight 减回（诚实世界：死者信不送）
++        let vault_path = write_bridge_vault();
++        let (mut world, mut map, id) = bridge_stage(53);
++        map.bridge = Some(
++            bridges::BridgeOutbox::without_worker(&vault_path, 5).unwrap(),
++        );
++        map.fill_bridge_snapshots();
++        map.run_player_code(&world, &unbounded_bb());
++        world.entities.get_mut(&id).unwrap().kill(); // 沙箱还在（d 步未跑）
++        map.collect_bridge_sends(&world);
++        assert!(
++            map.bridge.as_mut().unwrap().try_recv_letter().is_none(),
++            "死实体信件不应出站"
++        );
++        assert_eq!(
++            map.sandboxes[&id].store.data().bridge_inflight,
++            0,
++            "死实体信件应结算在途计数"
++        );
++        let _ = std::fs::remove_file(&vault_path);
++    }
++
++    #[test]
++    fn collect_bridge_sends_revoked_port_discards() {
++        // 端点热重载后消失：信件作废 + inflight-1 + 不出站（INFO 日志人工核对）
++        let vault_path = write_bridge_vault();
++        let (world, mut map, id) = bridge_stage(54);
++        map.bridge = Some(
++            bridges::BridgeOutbox::without_worker(&vault_path, 5).unwrap(),
++        );
++        map.fill_bridge_snapshots();
++        map.run_player_code(&world, &unbounded_bb());
++        // 热重载把保险库换成空表（文件改写 -> mtime 变化 -> fill 拉新）
++        std::thread::sleep(std::time::Duration::from_millis(50));
++        std::fs::write(&vault_path, "[]").unwrap();
++        map.fill_bridge_snapshots();
++        map.collect_bridge_sends(&world);
++        assert!(
++            map.bridge.as_mut().unwrap().try_recv_letter().is_none(),
++            "端点消失后信件不应出站"
++        );
++        assert_eq!(
++            map.sandboxes[&id].store.data().bridge_inflight,
++            0,
++            "作废信件应结算在途计数"
++        );
++        let _ = std::fs::remove_file(&vault_path);
++    }
++
++    #[test]
++    fn deliver_bridge_replies_unclaimed_when_entity_gone() {
++        // 回信到达但沙箱已 remove（实体死透）：无人认领丢弃，不 panic、无 inflight 可结算
++        let (world, mut map, _id) = bridge_stage(55);
++        map.bridge = Some(bridges::BridgeOutbox::without_worker(
++            std::path::Path::new("this-file-does-not-matter.json"),
++            5,
++        )
++        .unwrap());
++        map.bridge.as_mut().unwrap().push_reply_for_test(
++            bridges::ReplyEvent::Reply {
++                entity: EntityId(Uuid::from_u128(999)),
++                port: 1,
++                seq: 1,
++                body: b"{\"dx\":3}".to_vec(),
++            },
++        );
++        map.deliver_bridge_replies(&world); // 不 panic 即为过（INFO 人工核对）
++    }
++
++    #[test]
++    fn deliver_bridge_replies_default_export_still_settles_inflight() {
++        // 活实体缺省导出 bridge_on_reply：Ok(None) 零副作用（不 grow 不调用），
++        // 但世界记账 inflight 照减（记账不泄漏——信的生命周期已终结）
++        let (world, mut map, id) = bridge_stage(56);
++        map.create(id, &wasm(BRIDGE_MESSENGER_WAT), 1_000_000).unwrap(); // 无 bridge_on_reply 导出
++        map.sandboxes.get_mut(&id).unwrap().store.data_mut().bridge_inflight = 2;
++        map.bridge = Some(bridges::BridgeOutbox::without_worker(
++            std::path::Path::new("this-file-does-not-matter.json"),
++            5,
++        )
++        .unwrap());
++        map.bridge.as_mut().unwrap().push_reply_for_test(
++            bridges::ReplyEvent::Reply {
++                entity: id,
++                port: 1,
++                seq: 1,
++                body: b"{\"dx\":3}".to_vec(),
++            },
++        );
++        map.deliver_bridge_replies(&world);
++        assert_eq!(
++            map.sandboxes[&id].store.data().bridge_inflight,
++            1,
++            "缺省导出回信应结算在途计数（2-1=1）"
++        );
++    }
++
++    #[test]
++    fn deliver_bridge_replies_timeout_settles_inflight() {
++        // 出站超时事件：不投递 bridge_on_reply（代码自管），inflight 结算
++        let (world, mut map, id) = bridge_stage(57);
++        map.sandboxes
++            .get_mut(&id)
++            .unwrap()
++            .store
++            .data_mut()
++            .bridge_inflight = 3;
++        map.bridge = Some(bridges::BridgeOutbox::without_worker(
++            std::path::Path::new("this-file-does-not-matter.json"),
++            5,
++        )
++        .unwrap());
++        map.bridge.as_mut().unwrap().push_reply_for_test(
++            bridges::ReplyEvent::Timeout { entity: id, seq: 7 },
++        );
++        map.deliver_bridge_replies(&world);
++        assert_eq!(
++            map.sandboxes[&id].store.data().bridge_inflight,
++            2,
++            "超时应结算在途计数（3-1=2）"
++        );
++    }
++
++    /// e2e 生物 WAT：on_tick 每拍发信 "WHERE?"；bridge_on_reply 扫回信数字存
++    /// $cmd——假服务器回 {"dx":3} 含数字 3，$cmd 从 0 变 3 = 行为改变的断言锚
++    ///（与 players/bridge-demo.wat 同款解析逻辑的测试缩小版）
++    const BRIDGE_E2E_WAT: &str = r#"(module
++  (import "env" "bridge_send" (func $bridge_send (param i32 i32 i32) (result i32)))
++  (global $cmd (mut i32) (i32.const 0))
++  (memory (export "memory") 1)
++  (data (i32.const 0) "WHERE?")
++  (func $scan_digit (param $ptr i32) (param $len i32) (result i32)
++    (local $i i32) (local $c i32)
++    (block $done
++      (loop $loop
++        (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
++        (local.set $c (i32.load8_u (i32.add (local.get $ptr) (local.get $i))))
++        (if (i32.and (i32.ge_u (local.get $c) (i32.const 48)) (i32.le_u (local.get $c) (i32.const 57)))
++          (then (return (i32.sub (local.get $c) (i32.const 48)))))
++        (local.set $i (i32.add (local.get $i) (i32.const 1)))
++        (br $loop)))
++    i32.const 0)
++  (func (export "on_tick")
++    i32.const 1 i32.const 0 i32.const 6 call $bridge_send drop)
++  (func (export "bridge_on_reply") (param $port i32) (param $ptr i32) (param $len i32)
++    (global.set $cmd (call $scan_digit (local.get $ptr) (local.get $len))))
++  (func (export "life") (result i32) i32.const 1)
++  (func (export "get_cmd") (result i32) (global.get $cmd)))"#;
++
++    /// 迷你桥服务器：accept 两次（两拍各一封），每请求回 200 {"dx":3}，
++    /// 收到的请求体经通道交回主线程断言
++    #[test]
++    #[ignore = "bridge-e2e: 需本地回环网络"]
++    fn bridge_e2e_reply_changes_behavior_across_ticks() {
++        use std::io::{Read as _, Write as _};
++        // 全链路（D-001b 五步链，进程内）：拍1 bridge_send 排队 -> a-1 出站 ->
++        // worker 手搓 HTTP -> 迷你服务器收信回 {"dx":3} -> 拍2 a-1 回信投递
++        // bridge_on_reply -> 造物全局 $cmd=3（行为改变的肉眼证据等价物）
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let port = listener.local_addr().unwrap().port();
++        let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<u8>>();
++        let server = std::thread::spawn(move || {
++            for _ in 0..2 {
++                let (mut stream, _) = match listener.accept() {
++                    Ok(s) => s,
++                    Err(_) => return,
++                };
++                stream
++                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
++                    .ok();
++                let mut req = Vec::new();
++                let mut buf = [0u8; 4096];
++                loop {
++                    match stream.read(&mut buf) {
++                        Ok(0) => break,
++                        Ok(n) => {
++                            req.extend_from_slice(&buf[..n]);
++                            let has_body = req
++                                .windows(4)
++                                .position(|w| w == b"\r\n\r\n")
++                                .map(|pos| {
++                                    let cl = req[..pos]
++                                        .split(|b| *b == b'\n')
++                                        .find_map(|line| {
++                                            let s = std::str::from_utf8(line).ok()?;
++                                            s.to_ascii_lowercase()
++                                                .strip_prefix("content-length:")
++                                                .map(|v| v.trim().parse::<usize>().ok())?
++                                        })
++                                        .unwrap_or(0);
++                                    req.len() >= pos + 4 + cl
++                                })
++                                .unwrap_or(false);
++                            if has_body {
++                                break;
++                            }
++                        }
++                        Err(_) => break,
++                    }
++                }
++                let _ = req_tx.send(req);
++                let _ = stream.write_all(
++                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 9\r\nConnection: close\r\n\r\n{\"dx\":3}",
++                );
++                let _ = stream.flush();
++            }
++        });
++        // 保险库指向迷你服务器
++        let vault_path = std::env::temp_dir().join(format!(
++            "cw-bridge-e2e-{}-{}.json",
++            std::process::id(),
++            Uuid::new_v4().simple()
++        ));
++        std::fs::write(
++            &vault_path,
++            serde_json::to_string(&serde_json::json!([{
++                "port": 1,
++                "url": format!("http://127.0.0.1:{port}/hook"),
++            }]))
++            .unwrap(),
++        )
++        .unwrap();
++        // 战场脚手架：单实体挂 e2e 生物 + 带 worker 桥
++        let mut world = WorldState::new();
++        let id = EntityId(Uuid::from_u128(88));
++        world.entities.insert(id, make_entity(88, (0.0, 0.0)));
++        let mut time = TimeEngine::new();
++        let physics = DefaultPhysicsEngine::new();
++        let mut renderer = test_renderer();
++        let mut storage = StorageEngine::open_in_memory().unwrap();
++        let mut pending: Vec<PendingChange> = Vec::new();
++        let mut map = test_sandbox_map();
++        map.create(id, &wasm(BRIDGE_E2E_WAT), 1_000_000).unwrap();
++        map.bridge = Some(bridges::BridgeOutbox::new(&vault_path, 5).unwrap());
++        // 拍1：发信出站（worker 异步 HTTP）
++        tick(
++            &mut world,
++            &mut time,
++            &physics,
++            &mut renderer,
++            &mut storage,
++            &mut pending,
++            &mut map,
++        );
++        // 等 worker 往返（本机毫秒级；200ms 富余）+ 服务器收到第一封
++        let first = req_rx
++            .recv_timeout(std::time::Duration::from_secs(5))
++            .expect("服务器应收到第一封信");
++        let req_text = String::from_utf8_lossy(&first);
++        assert!(req_text.starts_with("POST /hook HTTP/1.1"), "信应发往登记路径");
++        assert!(req_text.contains("\"payload\":[87,72,69,82,69,63]"), "信封应内嵌 WHERE? 字节");
++        std::thread::sleep(std::time::Duration::from_millis(200));
++        // 拍2：回信投递 bridge_on_reply（拍边界锚），同时拍2 出站第二封
++        tick(
++            &mut world,
++            &mut time,
++            &physics,
++            &mut renderer,
++            &mut storage,
++            &mut pending,
++            &mut map,
++        );
++        // 造物行为改变：$cmd 从 0 变 3（回信 {"dx":3} 的数字被造物读到）
++        let handle = map.sandboxes.get_mut(&id).unwrap();
++        let func = handle
++            .instance
++            .get_typed_func::<(), i32>(&mut handle.store, "get_cmd")
++            .unwrap();
++        let cmd = func.call(&mut handle.store, ()).unwrap();
++        assert_eq!(cmd, 3, "回信数字 3 应写进造物全局（行为改变）");
++        // 第二封信照常出站（每拍 1 发节律的跨拍连续性）
++        let _second = req_rx.recv_timeout(std::time::Duration::from_secs(5));
++        server.join().unwrap();
++        let _ = std::fs::remove_file(&vault_path);
++    }
++
+     // === 两只真性格生物（攻击者 A / 防御者 D）：行为与胜负演进 ===
+ 
+     /// 构造自定义外观实体（生物测试用：A 红 / D 青，glyph 各自设定）

@@ -1,0 +1,16 @@
+   Compiling codeworld v0.1.0 (D:\projects\CodeWorld\.cc-wt-d018\bin\codeworld)
+error[E0277]: `std::option::Option<bool>` doesn't implement `std::fmt::Display`
+    --> bin\codeworld\src\main.rs:9218:17
+     |
+9215 |                 "DBG t={} shells={} victim_alive={} victim_pos={:?} touching={:?}",
+     |                                                  -- required by this formatting parameter
+...
+9218 |                 world.entities.get(&victim).map(|e| e.is_alive()),
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `std::option::Option<bool>` cannot be formatted with the default formatter
+     |
+     = help: the trait `std::fmt::Display` is not implemented for `std::option::Option<bool>`
+     = note: in format strings you may be able to use `{:?}` (or `{:#?}` for pretty-print) instead
+     = note: this error originates in the macro `$crate::format_args_nl` which comes from the expansion of the macro `eprintln` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `codeworld` (bin "codeworld" test) due to 1 previous error

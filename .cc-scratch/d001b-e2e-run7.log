@@ -1,0 +1,62 @@
+[e2e] note: killed leftover codeworld.exe
+[e2e] ---- five-step chain assertions ----
+[e2e] step1 bridge_send queued marker=0: FAIL
+[e2e] step1b outbound line bytes=6: FAIL
+[e2e] step2 fake server received: PASS
+[e2e] step3 call bridge_on_reply: PASS
+[e2e] step4 creature got command marker=5: FAIL
+[e2e] step5 creature walked east marker=6: FAIL
+[e2e] ---- excerpt: outbound ----
+[e2e] ---- excerpt: fake server ----
+[fake-bridge] listening on 127.0.0.1:18080
+[fake-bridge] POST received bytes=119 -> replied
+[fake-bridge] POST received bytes=119 -> replied
+[fake-bridge] POST received bytes=119 -> replied
+[fake-bridge] POST received bytes=119 -> replied
+[fake-bridge] POST received bytes=119 -> replied
+[fake-bridge] POST received bytes=119 -> replied
+[fake-bridge] POST received bytes=119 -> replied
+[fake-bridge] POST received bytes=119 -> replied
+[fake-bridge] POST received bytes=119 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[fake-bridge] POST received bytes=120 -> replied
+[e2e] ---- excerpt: reply delivery ----
+[2m2026-10-21T19:07:42.501853Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m65536 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:43.503893Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m131072 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:44.506837Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m196608 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:45.508738Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m262144 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:46.511174Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m327680 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:47.512953Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m393216 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:48.514690Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m458752 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:49.520926Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m524288 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:50.524038Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m589824 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:51.528091Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m655360 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:52.530827Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m720896 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:53.534552Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m786432 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:54.537474Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m851968 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:55.541206Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m917504 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:56.544049Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m983040 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:57.547622Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m1048576 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:58.550698Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m1114112 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:07:59.553899Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m1179648 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:08:00.557435Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m1245184 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:08:01.560503Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m1310720 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:08:02.563818Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m1376256 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:08:03.566844Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m1441792 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:08:04.570804Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m1507328 [3mfuel_used[0m[2m=[0m187
+[2m2026-10-21T19:08:05.574295Z[0m [32m INFO[0m [2mcodeworld_arena::sandbox[0m[2m:[0m call bridge_on_reply [3mentity_id[0m[2m=[0mb97f577c-904f-4ed7-a180-91e01531800d [3mport[0m[2m=[0m1 [3mlen[0m[2m=[0m9 [3moffset[0m[2m=[0m1572864 [3mfuel_used[0m[2m=[0m187
+[e2e] RESULT: FAILED - see battle.log / fake-bridge.log

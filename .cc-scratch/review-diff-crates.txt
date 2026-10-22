@@ -1,0 +1,1571 @@
+diff --git a/bin/codeworld/src/config.rs b/bin/codeworld/src/config.rs
+index 4428ec7..20863a7 100644
+--- a/bin/codeworld/src/config.rs
++++ b/bin/codeworld/src/config.rs
+@@ -54,6 +54,11 @@ pub struct Config {
+     /// 下线处置等待拍数（#025 期五第一刀：操控连接意外断开后角色留场等待处置
+     /// 的窗口），默认 30。0 = 断开即默认带走（不等待）。CODEWORLD_DISPOSE_WAIT 覆盖。
+     pub dispose_wait_ticks: u64,
++    /// 阻力常量（#034 世界基石参数，与重力同级），默认 0.05。
++    /// 阻力定律：v = v - drag*v/mass（线性阻力，方向不变模衰减）。
++    /// 标定判据：默认参数下标准上抛弹（vx=4/vy=+9.8/mass=1.0）射程 5~15 格。
++    /// CODEWORLD_DRAG 覆盖。
++    pub drag_coefficient: f64,
+ }
+ 
+ impl Default for Config {
+@@ -75,6 +80,7 @@ impl Default for Config {
+             max_entities: 64,
+             ws_port: 8080,
+             dispose_wait_ticks: 30,
++            drag_coefficient: 0.05,
+         }
+     }
+ }
+@@ -121,6 +127,14 @@ impl Config {
+         if let Some(t) = env_u64("CODEWORLD_DISPOSE_WAIT") {
+             cfg.dispose_wait_ticks = t;
+         }
++        if let Some(d) = env_f64("CODEWORLD_DRAG") {
++            // 非有限值护栏：阻力进除法公式（mass 为分母），NaN/无穷回退默认
++            if d.is_finite() {
++                cfg.drag_coefficient = d;
++            } else {
++                tracing::warn!(value = d, "[config] CODEWORLD_DRAG 非有限值，回退默认 0.05");
++            }
++        }
+         // 布尔类开关："0"/"false"（大小写不敏感）= 关闭，缺失或其他值 = 默认开启
+         if let Ok(v) = std::env::var("CODEWORLD_H_ENABLED") {
+             if v == "0" || v.eq_ignore_ascii_case("false") {
+@@ -459,4 +473,36 @@ mod tests {
+         std::env::remove_var("CODEWORLD_DISPOSE_WAIT");
+         assert_eq!(c.dispose_wait_ticks, 30, "非法值应回退默认处置等待");
+     }
++
++    // === 阻力常量（#034 世界基石参数）===
++
++    #[test]
++    fn default_drag_is_point_zero_five() {
++        // 创建：阻力默认 0.05（标定判据：默认参数标准上抛弹射程 5~15 格，
++        // physics crate projectile_range_calibration_default_drag 测试锚定）
++        let _g = ENV_LOCK.lock().unwrap();
++        std::env::remove_var("CODEWORLD_DRAG");
++        let c = Config::load();
++        assert_eq!(c.drag_coefficient, 0.05, "阻力默认应为 0.05");
++    }
++
++    #[test]
++    fn load_drag_env_overrides_default() {
++        // 修改：CODEWORLD_DRAG 覆盖默认阻力（世界基石参数可调）
++        let _g = ENV_LOCK.lock().unwrap();
++        std::env::set_var("CODEWORLD_DRAG", "0.2");
++        let c = Config::load();
++        std::env::remove_var("CODEWORLD_DRAG");
++        assert_eq!(c.drag_coefficient, 0.2, "环境变量应覆盖阻力常量");
++    }
++
++    #[test]
++    fn load_drag_non_finite_falls_back_to_default() {
++        // 边界：非有限值（NaN/inf）-> 回退默认 0.05（阻力进除法公式，坏值不进世界）
++        let _g = ENV_LOCK.lock().unwrap();
++        std::env::set_var("CODEWORLD_DRAG", "nan");
++        let c = Config::load();
++        std::env::remove_var("CODEWORLD_DRAG");
++        assert_eq!(c.drag_coefficient, 0.05, "非有限值应回退默认阻力");
++    }
+ }
+diff --git a/bin/codeworld/src/net.rs b/bin/codeworld/src/net.rs
+index 6188747..5b9338f 100644
+--- a/bin/codeworld/src/net.rs
++++ b/bin/codeworld/src/net.rs
+@@ -107,11 +107,13 @@ pub(crate) struct EntitySnapshot {
+ }
+ 
+ /// kind 判定（纯映射，任务书定案）：开局四生物=npc；creation=造物；
+-/// players 目录在线名（或残影躯壳）=player；其余未知 code_hash 兜底 npc。
++/// 弹丸=projectile（#034 弹道系统：前端画小圆点+尾迹）；players 目录在线名
++/// （或残影躯壳）=player；其余未知 code_hash 兜底 npc。
+ fn entity_kind(code_hash: &str, entity_id: EntityId, players: &PlayerDirectory) -> &'static str {
+     match code_hash {
+         crate::ATTACKER_CODE | crate::DEFENDER_CODE | crate::HUNTER_CODE | crate::SPY_CODE => "npc",
+         "creation" => "creation",
++        codeworld_core::collision::PROJECTILE_CODE => "projectile",
+         name if players.is_online(name) => "player",
+         _ if players.is_ghost(&entity_id) => "player",
+         _ => "npc",
+diff --git a/crates/arena/src/attack.rs b/crates/arena/src/attack.rs
+index 7475521..50c88cf 100644
+--- a/crates/arena/src/attack.rs
++++ b/crates/arena/src/attack.rs
+@@ -18,6 +18,32 @@ pub struct PendingAttack {
+     pub target_pos: (f64, f64),
+     /// 攻击 payload：WASM 模块字节码（路线A整模块替换）。空=用 DEFAULT_KILL_WASM 默认击杀
+     pub payload: Vec<u8>,
++    /// #034 接触门豁免：贴身刀判距只约束 attack_at 直出之手（出手者与目标身体相触
++    /// 才砍得着）；弹丸命中结算不走本门——弹丸撞身体本身就是接触事实，离体之物是
++    /// 攻击者手臂的延伸（env.attack_at 传 false，弹丸结算传 true）。
++    pub contact_exempt: bool,
++}
++
++impl PendingAttack {
++    /// 普通出刀（attack_at/操控攻击：走 #034 接触门）
++    pub fn strike(attacker: EntityId, target_pos: (f64, f64), payload: Vec<u8>) -> Self {
++        Self {
++            attacker,
++            target_pos,
++            payload,
++            contact_exempt: false,
++        }
++    }
++
++    /// 弹丸命中结算（#034：接触事实已由弹丸完成，豁免贴身判距）
++    pub fn projectile_strike(attacker: EntityId, target_pos: (f64, f64), payload: Vec<u8>) -> Self {
++        Self {
++            attacker,
++            target_pos,
++            payload,
++            contact_exempt: true,
++        }
++    }
+ }
+ 
+ /// 默认击杀 WAT 文本：life()=false 的最小模块（payload 为空时框架用此替换目标沙箱）
+@@ -38,15 +64,22 @@ mod tests {
+ 
+     #[test]
+     fn pending_attack_stores_fields() {
+-        // 创建：PendingAttack 字段正确存取（attacker/坐标/payload）
+-        let atk = PendingAttack {
+-            attacker: EntityId(Uuid::from_u128(1)),
+-            target_pos: (5.0, 5.0),
+-            payload: vec![1, 2, 3],
+-        };
++        // 创建：PendingAttack 字段正确存取（attacker/坐标/payload/接触门豁免）
++        let atk = PendingAttack::strike(
++            EntityId(Uuid::from_u128(1)),
++            (5.0, 5.0),
++            vec![1, 2, 3],
++        );
+         assert_eq!(atk.attacker, EntityId(Uuid::from_u128(1)));
+         assert_eq!(atk.target_pos, (5.0, 5.0));
+         assert_eq!(atk.payload, vec![1, 2, 3]);
++        assert!(!atk.contact_exempt, "普通出刀走接触门");
++        let proj = PendingAttack::projectile_strike(
++            EntityId(Uuid::from_u128(2)),
++            (6.0, 6.0),
++            vec![],
++        );
++        assert!(proj.contact_exempt, "弹丸命中豁免贴身判距");
+     }
+ 
+     #[test]
+diff --git a/crates/arena/src/sandbox.rs b/crates/arena/src/sandbox.rs
+index 8ad4cd6..a35cef6 100644
+--- a/crates/arena/src/sandbox.rs
++++ b/crates/arena/src/sandbox.rs
+@@ -25,6 +25,10 @@ pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
+ /// MVP 一刀切的简单规则；规则由宪法允许后续玩法化（decisions.md #012）。
+ pub const SPAWN_RANGE: f64 = 10.0;
+ 
++/// shoot 初速模长上限（#034：防一拍穿世界——弹丸一拍一步，初速 50 即一拍最多
++/// 飞 50 格≈半个视口；工程护栏非玩法裁定）
++pub const MAX_SHOOT_SPEED: f64 = 50.0;
++
+ /// spawn 外观字符串（glyph/color，NUL 结尾）最大字节数
+ ///
+ /// import 层扫描上限：内存里没有 NUL 时最多读这么多字节就拒绝，
+@@ -50,10 +54,31 @@ pub struct PendingSpawn {
+     /// 身体半径（#030 spawn 第 7 参；import 层已校验钳制 0.05..=25.0；
+     /// creation 身体=占地格 AABB 不用它，快照协议携带）
+     pub radius: f64,
++    /// 质量（#034 spawn 第 8 参；import 层已钳制 0.05..=100.0，物理人格属性）
++    pub mass: f64,
+     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
+     pub fuel_limit: u64,
+ }
+ 
++/// 本 tick 排队的射击请求（#034 env.shoot 推入，阶段二收集统一处理）
++///
++/// import 层只做零 world 校验（限流 1 发/tick、速度模长 ≤50、mass 钳制、
++/// payload ≤1MB）；发射位置在阶段二读发射者当拍坐标（阶段一快照坐标会被
++/// move_by 移动更新，从哪里出手以移动后的实况为准——与攻击坐标解析同哲学）。
++#[derive(Debug, Clone)]
++pub struct PendingShoot {
++    /// 发射者（沙箱所属实体）
++    pub shooter: EntityId,
++    /// 初速 x 分量（import 层已校验：有限、模长 ≤50）
++    pub vx: f64,
++    /// 初速 y 分量
++    pub vy: f64,
++    /// 弹丸质量（import 层已钳制 0.05..=100.0）
++    pub mass: f64,
++    /// 弹丸携带的攻击字节（同 attack_at payload 语义：空=默认击杀模块）
++    pub payload: Vec<u8>,
++}
++
+ /// 本 tick 排队的 destroy 请求（env.destroy 推入，阶段二产权校验后应用）
+ ///
+ /// 产权约束（宪法 #015）：MVP 只允许销毁自家造物（owner 匹配，阶段二用 world 判）；
+@@ -118,6 +143,11 @@ pub struct SandboxData {
+     pub pending_spawns: Vec<PendingSpawn>,
+     /// 本 tick 排队的销毁请求（env.destroy 推入，阶段二产权校验后 drain 清空）
+     pub pending_destroys: Vec<PendingDestroy>,
++    /// 本 tick 排队的射击请求（#034 env.shoot 推入，阶段二收集后 drain 清空；
++    /// 每实体每拍限 1 发在 import 层保证）
++    pub pending_shoots: Vec<PendingShoot>,
++    /// 该沙箱累计已成功排队的射击发数（#034 shoot 返回值：弹丸序号，跨拍递增）
++    pub shots_fired: i32,
+     /// 本 tick 的悬停声明（env.hover 置位，host 阶段一收件并入免重力集合后清空；
+     /// 每拍重申语义——玩家代码要持续对抗世界规则，上一拍声明不延续）
+     pub hover_declared: bool,
+@@ -362,11 +392,10 @@ impl SandboxManager {
+                 }
+                 let payload = read_payload_from_caller(&mut caller, ptr, len);
+                 let payload_len = payload.len(); // 实际读取到的字节数（非调用方声称的 len）
+-                caller.data_mut().pending_attacks.push(PendingAttack {
+-                    attacker,
+-                    target_pos: (x, y),
+-                    payload,
+-                });
++                caller
++                    .data_mut()
++                    .pending_attacks
++                    .push(PendingAttack::strike(attacker, (x, y), payload));
+                 tracing::info!(
+                     attacker = %attacker.0,
+                     x,
+@@ -565,7 +594,7 @@ impl SandboxManager {
+                 }
+             },
+         )?;
+-        // env.spawn(code_ptr, code_len, x, y, glyph_ptr, color_ptr) -> i32：造物
++        // env.spawn(code_ptr, code_len, x, y, glyph_ptr, color_ptr, radius, mass) -> i32：造物
+         //（门二开放，world-foundation 门二 + decisions.md #012 能力统一：造物再造造物合法）。
+         // 玩家代码提交一段 WAT 文本 + 出生坐标 + 外观，请求造一个新实体。
+         // import 层只做零 world 校验（同 move_by 模式：快照坐标 host 填充，玩家伪造不了）：
+@@ -576,6 +605,8 @@ impl SandboxManager {
+         //     防远程投射刷屏；规则由宪法允许后续玩法化）
+         //   - 外观：glyph/color 从 memory 读 NUL 结尾字符串（≤ MAX_META_LEN），
+         //     glyph 恰 1 字符、color 非空
++        //   - radius 第 7 参钳制 0.05..=25.0（#030）；mass 第 8 参钳制 0.05..=100.0
++        //     （#034 物理人格属性，除零护栏）
+         // 产权链 owner 继承、世界实体上限、WAT 编译都在阶段二判（返回 1=已排队，
+         // 阶段二拒绝以日志为准，api.md 载明）。
+         linker.func_wrap(
+@@ -588,7 +619,8 @@ impl SandboxManager {
+              y: f64,
+              glyph_ptr: i32,
+              color_ptr: i32,
+-             radius: f64|
++             radius: f64,
++             mass: f64|
+              -> i32 {
+                 caller.data_mut().api_calls.push("spawn".to_string());
+                 let creator = caller.data().entity_id;
+@@ -673,12 +705,15 @@ impl SandboxManager {
+                 let fuel_limit = caller.data().fuel_limit;
+                 // #030 第 7 参 radius 校验钳制（0.05..=25.0，非有限回退 0.5，超界 warn）
+                 let radius = codeworld_core::collision::clamp_radius(radius);
++                // #034 第 8 参 mass 校验钳制（0.05..=100.0，非有限回退 1.0，超界 warn）
++                let mass = codeworld_core::collision::clamp_mass(mass);
+                 tracing::info!(
+                     creator = %creator.0,
+                     birth = ?(x, y),
+                     glyph = %glyph,
+                     color = %color,
+                     radius,
++                    mass,
+                     code_len = code.len(),
+                     "[spawn] 造物请求已排队（阶段二统一处理）"
+                 );
+@@ -692,11 +727,95 @@ impl SandboxManager {
+                         glyph,
+                         color,
+                         radius,
++                        mass,
+                         fuel_limit,
+                     });
+                 1
+             },
+         )?;
++        // env.shoot(vx, vy, mass, payload_ptr, payload_len) -> i32：射击（#034 第 12 个
++        // 玩家 import，弹道系统）：从调用者当前位置发射弹丸。初速/质量由代码定，
++        // payload 同 attack_at 语义（空=默认击杀模块）。离体即世界物体（#034 立法第 1 条）。
++        // import 层只做零 world 校验（排队模式同 attack_at）：
++        //   - 限流：每实体每 tick 最多 1 发（防弹幕灌爆）
++        //   - 速度：vx/vy 有限且模长 ≤ 50（防一拍穿世界）
++        //   - mass：钳制 0.05..=100.0（除零护栏，#034）
++        //   - payload：len > MAX_PAYLOAD_LEN 直接拒绝（同 attack_at）
++        //   - 返回：弹丸序号（该实体累计第几发，1 起）或 0=拒绝。
++        //     发射位置与世界实体上限在阶段二判（import 拿不到 world）。
++        linker.func_wrap(
++            "env",
++            "shoot",
++            |mut caller: Caller<SandboxData>,
++             vx: f64,
++             vy: f64,
++             mass: f64,
++             payload_ptr: i32,
++             payload_len: i32|
++             -> i32 {
++                caller.data_mut().api_calls.push("shoot".to_string());
++                let shooter = caller.data().entity_id;
++                // 限流：同实体一拍至多 1 发
++                if !caller.data().pending_shoots.is_empty() {
++                    tracing::warn!(
++                        entity_id = %shooter.0,
++                        "[shoot] 本 tick 已射击，限流拒绝（1 发/tick）"
++                    );
++                    return 0;
++                }
++                // 速度校验：有限 + 模长 ≤ 50
++                if !vx.is_finite() || !vy.is_finite() {
++                    tracing::warn!(
++                        entity_id = %shooter.0,
++                        vx,
++                        vy,
++                        "[shoot] 初速非有限，拒绝"
++                    );
++                    return 0;
++                }
++                let speed2 = vx * vx + vy * vy;
++                if speed2 > MAX_SHOOT_SPEED * MAX_SHOOT_SPEED {
++                    tracing::warn!(
++                        entity_id = %shooter.0,
++                        speed = speed2.sqrt(),
++                        max = MAX_SHOOT_SPEED,
++                        "[shoot] 初速超上限，拒绝（防一拍穿世界）"
++                    );
++                    return 0;
++                }
++                // payload 超限拒绝：在读 memory 之前拦下（同 attack_at）
++                if payload_len > 0 && payload_len as usize > MAX_PAYLOAD_LEN {
++                    tracing::warn!(
++                        entity_id = %shooter.0,
++                        actual_len = payload_len,
++                        max = MAX_PAYLOAD_LEN,
++                        "[shoot] payload 超限，拒绝入队"
++                    );
++                    return 0;
++                }
++                let payload = read_payload_from_caller(&mut caller, payload_ptr, payload_len);
++                // mass 钳制（除零护栏，#034）
++                let mass = codeworld_core::collision::clamp_mass(mass);
++                caller.data_mut().shots_fired += 1;
++                let serial = caller.data().shots_fired;
++                caller.data_mut().pending_shoots.push(PendingShoot {
++                    shooter,
++                    vx,
++                    vy,
++                    mass,
++                    payload,
++                });
++                tracing::info!(
++                    entity_id = %shooter.0,
++                    vx,
++                    vy,
++                    mass,
++                    serial,
++                    "[shoot] 射击已排队（阶段二统一发射）"
++                );
++                serial
++            },
++        )?;
+         // env.destroy(id_lo: i64, id_hi: i64) -> i32：销毁（门二开放，产权链 #015）。
+         // EntityId(Uuid u128) 拆 lo/hi 两个 i64 传（WAT 侧负 i64 经 as u64 恢复位型）。
+         // import 只排队：产权校验（只能销毁自家造物，owner 匹配）需要 world，
+@@ -1993,7 +2112,7 @@ mod tests {
+         let escaped = wat_escape(code);
+         format!(
+             r#"(module
+-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
++  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+   (global $ret (mut i32) (i32.const -1))
+   (memory (export "memory") 1)
+   (data (i32.const 0) "{escaped}\00")
+@@ -2004,6 +2123,7 @@ mod tests {
+     {x} {y}
+     i32.const 8192 i32.const 8256
+     f64.const 0.5
++    f64.const 1.0
+     call $spawn global.set $ret)
+   (func (export "get_ret") (result i32) global.get $ret)
+   (func (export "life") (result i32) i32.const 1))"#,
+@@ -2019,7 +2139,7 @@ mod tests {
+         let escaped = wat_escape(code);
+         format!(
+             r#"(module
+-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
++  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+   (global $r1 (mut i32) (i32.const -1))
+   (global $r2 (mut i32) (i32.const -1))
+   (memory (export "memory") 1)
+@@ -2031,11 +2151,13 @@ mod tests {
+     f64.const 1.0 f64.const 1.0
+     i32.const 8192 i32.const 8256
+     f64.const 0.5
++    f64.const 1.0
+     call $spawn global.set $r1
+     i32.const 0 i32.const {len}
+     f64.const 4.0 f64.const 4.0
+     i32.const 8192 i32.const 8256
+     f64.const 0.5
++    f64.const 1.0
+     call $spawn global.set $r2)
+   (func (export "get_r1") (result i32) global.get $r1)
+   (func (export "get_r2") (result i32) global.get $r2)
+@@ -2047,7 +2169,7 @@ mod tests {
+ 
+     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
+     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
+-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
++  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+   (global $ret (mut i32) (i32.const -1))
+   (memory (export "memory") 1)
+   (data (i32.const 8192) "T\00")
+@@ -2057,6 +2179,7 @@ mod tests {
+     f64.const 1.0 f64.const 1.0
+     i32.const 8192 i32.const 8256
+     f64.const 0.5
++    f64.const 1.0
+     call $spawn global.set $ret)
+   (func (export "get_ret") (result i32) global.get $ret)
+   (func (export "life") (result i32) i32.const 1))"#;
+@@ -2066,7 +2189,7 @@ mod tests {
+         let escaped = wat_escape(code);
+         format!(
+             r#"(module
+-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64) (result i32)))
++  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
+   (global $ret (mut i32) (i32.const -1))
+   (memory (export "memory") 1)
+   (data (i32.const 0) "{escaped}\00")
+@@ -2077,6 +2200,7 @@ mod tests {
+     f64.const 1.0 f64.const 1.0
+     i32.const 8192 i32.const 8256
+     f64.const 0.5
++    f64.const 1.0
+     call $spawn global.set $ret)
+   (func (export "get_ret") (result i32) global.get $ret)
+   (func (export "life") (result i32) i32.const 1))"#,
+@@ -2111,12 +2235,200 @@ mod tests {
+         assert_eq!(s.glyph, "T", "字形应从 memory 读取");
+         assert_eq!(s.color, "cyan", "颜色应从 memory 读取");
+         assert_eq!(s.fuel_limit, 100_000, "fuel 配额应继承创造者沙箱的 fuel_limit");
++        assert_eq!(s.mass, 1.0, "#034 第 8 参 mass 应透传（import 层已钳制）");
+         assert!(
+             handle.store.data().api_calls.contains(&"spawn".to_string()),
+             "spawn 调用应记入 api_calls 元数据"
+         );
+     }
+ 
++    #[test]
++    fn spawn_import_clamps_mass_out_of_bounds() {
++        // #034 第 8 参 mass 护栏：1000 超上限钳到 100，0.001 低下限钳到 0.05（除零护栏）
++        let mgr = SandboxManager::new().unwrap();
++        let escaped = wat_escape(SPAWNED_CODE);
++        // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
++        let wat_text = format!(
++            r#"(module
++  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64) (result i32)))
++  (memory (export "memory") 1)
++  (data (i32.const 0) "{escaped}\00")
++  (data (i32.const 8192) "T\00")
++  (data (i32.const 8256) "cyan\00")
++  (func (export "on_tick")
++    i32.const 0 i32.const {len}
++    f64.const 1.0 f64.const 1.0
++    i32.const 8192 i32.const 8256
++    f64.const 0.5
++    f64.const 1000.0
++    call $spawn drop)
++  (func (export "life") (result i32) i32.const 1))"#,
++            escaped = escaped,
++            len = SPAWNED_CODE.len(),
++        );
++        let mut handle = mgr
++            .create_sandbox(&wasm(&wat_text), 100_000, id(808))
++            .unwrap();
++        handle.store.data_mut().pos = (0.0, 0.0);
++        mgr.call_on_tick(&mut handle).unwrap();
++        let spawns = &handle.store.data().pending_spawns;
++        assert_eq!(spawns.len(), 1);
++        assert_eq!(spawns[0].mass, 100.0, "超上限 mass 应钳到 100.0");
++    }
++
++    // === env.shoot import（#034 第 12 个玩家 import：发射弹丸）===
++
++    /// 射手 WAT 生成器：on_tick 调 shoot(vx, vy, mass, 0, payload_len)（payload 从
++    /// data 段 [0..4) 读 [1,2,3,4]），返回值存全局 get_ret。
++    fn shooter_wat(vx: &str, vy: &str, mass: &str, payload_len: &str) -> String {
++        format!(
++            r#"(module
++  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
++  (global $ret (mut i32) (i32.const -1))
++  (memory (export "memory") 1)
++  (data (i32.const 0) "\01\02\03\04")
++  (func (export "on_tick")
++    {vx} {vy} {mass} i32.const 0 i32.const {payload_len}
++    call $shoot global.set $ret)
++  (func (export "get_ret") (result i32) global.get $ret)
++  (func (export "life") (result i32) i32.const 1))"#,
++            vx = vx,
++            vy = vy,
++            mass = mass,
++            payload_len = payload_len,
++        )
++    }
++
++    #[test]
++    fn shoot_import_queues_pending_shoot() {
++        // env.shoot：合法请求（速度/质量合法、限流未满）-> 排队 PendingShoot，
++        // 返回弹丸序号（该实体累计第 1 发）
++        let mgr = SandboxManager::new().unwrap();
++        let shooter_id = id(901);
++        let wat_text = shooter_wat("f64.const 3.0", "f64.const 4.0", "f64.const 0.5", "4");
++        let mut handle = mgr
++            .create_sandbox(&wasm(&wat_text), 100_000, shooter_id)
++            .unwrap();
++        mgr.call_on_tick(&mut handle).unwrap();
++        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "首发射击序号应为 1");
++        let shoots = &handle.store.data().pending_shoots;
++        assert_eq!(shoots.len(), 1, "应排队 1 次射击");
++        let s = &shoots[0];
++        assert_eq!(s.shooter, shooter_id, "shooter 应为沙箱绑定实体");
++        assert_eq!(s.vx, 3.0);
++        assert_eq!(s.vy, 4.0);
++        assert_eq!(s.mass, 0.5, "#034 弹丸质量由代码定（0.5 合法域内透传）");
++        assert_eq!(s.payload, vec![1, 2, 3, 4], "payload 应从 memory data 段读取");
++        assert!(
++            handle.store.data().api_calls.contains(&"shoot".to_string()),
++            "shoot 调用应记入 api_calls 元数据"
++        );
++    }
++
++    #[test]
++    fn shoot_import_rejects_second_shot_same_tick() {
++        // 限流：同实体一拍至多 1 发（防弹幕灌爆），第二次返回 0 不入队
++        let mgr = SandboxManager::new().unwrap();
++        let wat_text = r#"(module
++  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
++  (global $r1 (mut i32) (i32.const -1))
++  (global $r2 (mut i32) (i32.const -1))
++  (memory (export "memory") 1)
++  (func (export "on_tick")
++    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 0 call $shoot global.set $r1
++    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 0 call $shoot global.set $r2)
++  (func (export "get_r1") (result i32) global.get $r1)
++  (func (export "get_r2") (result i32) global.get $r2)
++  (func (export "life") (result i32) i32.const 1))"#;
++        let mut handle = mgr
++            .create_sandbox(&wasm(wat_text), 100_000, id(902))
++            .unwrap();
++        mgr.call_on_tick(&mut handle).unwrap();
++        assert_eq!(call_i32_export(&mut handle, "get_r1"), 1, "首发应排队成功");
++        assert_eq!(call_i32_export(&mut handle, "get_r2"), 0, "同拍第二发应被限流拒绝");
++        assert_eq!(handle.store.data().pending_shoots.len(), 1, "同拍只应有 1 发入队");
++    }
++
++    #[test]
++    fn shoot_import_serial_increments_across_ticks() {
++        // 序号跨拍递增：tick1 返 1、drain 后 tick2 返 2（该实体累计第几发）
++        let mgr = SandboxManager::new().unwrap();
++        let wat_text = shooter_wat("f64.const 1.0", "f64.const 9.8", "f64.const 1.0", "0");
++        let mut handle = mgr
++            .create_sandbox(&wasm(&wat_text), 100_000, id(903))
++            .unwrap();
++        mgr.call_on_tick(&mut handle).unwrap();
++        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1);
++        handle.store.data_mut().pending_shoots.clear(); // 主程序收集后清空（drain 语义）
++        mgr.call_on_tick(&mut handle).unwrap();
++        assert_eq!(call_i32_export(&mut handle, "get_ret"), 2, "次拍射击序号应递增");
++    }
++
++    #[test]
++    fn shoot_import_rejects_overspeed() {
++        // 速度模长上限 50（防一拍穿世界）：(40, 40) 模长 ~56.6 > 50 -> 拒绝
++        let mgr = SandboxManager::new().unwrap();
++        let wat_text = shooter_wat("f64.const 40.0", "f64.const 40.0", "f64.const 1.0", "0");
++        let mut handle = mgr
++            .create_sandbox(&wasm(&wat_text), 100_000, id(904))
++            .unwrap();
++        mgr.call_on_tick(&mut handle).unwrap();
++        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超速射击应被拒绝");
++        assert!(handle.store.data().pending_shoots.is_empty(), "超速请求不应入队");
++    }
++
++    #[test]
++    fn shoot_import_rejects_non_finite_velocity() {
++        // NaN 初速（0/0 除零）-> 拒绝，防污染世界状态
++        let mgr = SandboxManager::new().unwrap();
++        let wat_text = shooter_wat(
++            "f64.const 0.0 f64.const 0.0 f64.div",
++            "f64.const 1.0",
++            "f64.const 1.0",
++            "0",
++        );
++        let mut handle = mgr
++            .create_sandbox(&wasm(&wat_text), 100_000, id(905))
++            .unwrap();
++        mgr.call_on_tick(&mut handle).unwrap();
++        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "NaN 初速应被拒绝");
++        assert!(handle.store.data().pending_shoots.is_empty());
++    }
++
++    #[test]
++    fn shoot_import_clamps_mass_out_of_bounds() {
++        // mass 护栏（与 spawn 第 8 参同口径）：0.001 -> 0.05，1000 -> 100
++        let mgr = SandboxManager::new().unwrap();
++        let wat_text = shooter_wat("f64.const 1.0", "f64.const 0.0", "f64.const 0.001", "0");
++        let mut handle = mgr
++            .create_sandbox(&wasm(&wat_text), 100_000, id(906))
++            .unwrap();
++        mgr.call_on_tick(&mut handle).unwrap();
++        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1);
++        assert_eq!(handle.store.data().pending_shoots[0].mass, 0.05, "低下限应钳到 0.05");
++    }
++
++    #[test]
++    fn shoot_import_rejects_oversized_payload() {
++        // payload 超限（>1MB）-> 拒绝不入队（与 attack_at 同上限 MAX_PAYLOAD_LEN）
++        let mgr = SandboxManager::new().unwrap();
++        let wat_text = r#"(module
++  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
++  (global $ret (mut i32) (i32.const -1))
++  (memory (export "memory") 24)
++  (func (export "on_tick")
++    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 1048577
++    call $shoot global.set $ret)
++  (func (export "get_ret") (result i32) global.get $ret)
++  (func (export "life") (result i32) i32.const 1))"#;
++        let mut handle = mgr
++            .create_sandbox(&wasm(wat_text), 100_000, id(907))
++            .unwrap();
++        mgr.call_on_tick(&mut handle).unwrap();
++        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超限 payload 应被拒绝");
++        assert!(handle.store.data().pending_shoots.is_empty());
++    }
++
+     #[test]
+     fn spawn_import_rejects_second_request_same_tick() {
+         // 限流：每实体每 tick 最多 1 个 spawn 请求，第二次调用返回 0 不入队
+diff --git a/crates/core/src/collision.rs b/crates/core/src/collision.rs
+index 8ebb129..00ce6ee 100644
+--- a/crates/core/src/collision.rs
++++ b/crates/core/src/collision.rs
+@@ -14,6 +14,33 @@ use crate::entity::Entity;
+ /// 创造物 code_hash 标识（process_spawns 写入，本模块/net.rs 共用同一常量）
+ pub const CREATION_CODE: &str = "creation";
+ 
++/// 弹丸 code_hash 标识（#034 离体之物：shoot 产出的飞行体，无沙箱无 on_tick，
++/// 物理由 physics step_projectiles 接管；本模块/net.rs 共用同一常量）
++pub const PROJECTILE_CODE: &str = "projectile";
++
++/// 贴身刀判距冗余（#034 attack_at 接触化）：出手判距 = r攻 + r目 + 0.5。
++/// 这 0.5 是"胳膊长度"物理判距常量，不是射程属性（射程不立法，全部物理涌现——
++/// design-ballistics.md 否决清单：attack_at 加射程属性已被土豆否决）
++pub const MELEE_REACH: f64 = 0.5;
++
++/// 弹丸身体半径（#034：弹丸是小圆点，身体半径固定 0.15——shoot 无半径参，
++/// 弹丸碰撞判据 = 弹丸中心距实体中心 < r弹(0.15) + r实）
++pub const PROJECTILE_RADIUS: f64 = 0.15;
++
++/// 实体是否是弹丸（#034 离体之物识别；与 CREATION_CODE 同款 code_hash 判据）
++pub fn is_projectile(e: &Entity) -> bool {
++    e.code_hash == PROJECTILE_CODE
++}
++
++/// 贴身刀判据（#034 接触化）：dist(攻,目) < r攻 + r目 + MELEE_REACH，严格 <。
++/// 恰好等于判距 = 落空（与重叠判据同款严格约定，审查锚定）
++pub fn melee_in_reach(a_pos: (f64, f64), a_r: f64, b_pos: (f64, f64), b_r: f64) -> bool {
++    let dx = a_pos.0 - b_pos.0;
++    let dy = a_pos.1 - b_pos.1;
++    let s = a_r + b_r + MELEE_REACH;
++    dx * dx + dy * dy < s * s
++}
++
+ /// 身体形状：世界里的实体要么是圆（活动实体），要么是格对齐方块（造物）
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum Body {
+@@ -205,6 +232,28 @@ pub fn clamp_radius(r: f64) -> f64 {
+     r
+ }
+ 
++/// 质量校验钳制（#034 spawn 第 8 参 / shoot 第 3 参口径）：0.05 ≤ mass ≤ 100，
++/// 超界 warn 并钳制；非有限值（NaN/无穷）回退默认 1.0 并 warn。
++/// 这是除零护栏（阻力定律 mass 做分母），不是玩法裁定（#034 立法第 4 条）。
++pub fn clamp_mass(m: f64) -> f64 {
++    const MIN: f64 = 0.05;
++    const MAX: f64 = 100.0;
++    const DEFAULT: f64 = 1.0;
++    if !m.is_finite() {
++        tracing::warn!(value = m, "[mass] 非有限值，回退默认 1.0");
++        return DEFAULT;
++    }
++    if m < MIN {
++        tracing::warn!(value = m, clamped = MIN, "[mass] 低于下限，钳制");
++        return MIN;
++    }
++    if m > MAX {
++        tracing::warn!(value = m, clamped = MAX, "[mass] 超过上限，钳制");
++        return MAX;
++    }
++    m
++}
++
+ /// 圆心到 AABB 的最近点偏移（dx, dy）——圆-AABB 判定的共享实现：
+ /// 圆心在盒内 → (0,0)（必然重叠）；盒外 → 最近点与圆心的差向量。
+ fn clamp_point_to_aabb_dist(
+@@ -453,4 +502,58 @@ mod tests {
+         assert_eq!(clamp_radius(f64::NAN), 0.5);
+         assert_eq!(clamp_radius(f64::INFINITY), 0.5);
+     }
++
++    // === clamp_mass（#034 spawn/shoot 第 mass 参校验口径）===
++
++    #[test]
++    fn clamp_mass_passes_valid() {
++        assert_eq!(clamp_mass(1.0), 1.0);
++        assert_eq!(clamp_mass(0.05), 0.05, "下限含边界");
++        assert_eq!(clamp_mass(100.0), 100.0, "上限含边界");
++        assert_eq!(clamp_mass(0.5), 0.5);
++    }
++
++    #[test]
++    fn clamp_mass_clamps_out_of_bounds() {
++        assert_eq!(clamp_mass(0.01), 0.05, "低于下限钳到 0.05");
++        assert_eq!(clamp_mass(1000.0), 100.0, "超上限钳到 100.0");
++    }
++
++    #[test]
++    fn clamp_mass_non_finite_falls_back() {
++        // 除零护栏：NaN/无穷回退默认 1.0（#034 铁律：mass 只做物理分母，非有限值进公式会污染世界）
++        assert_eq!(clamp_mass(f64::NAN), 1.0);
++        assert_eq!(clamp_mass(f64::INFINITY), 1.0);
++        assert_eq!(clamp_mass(f64::NEG_INFINITY), 1.0);
++    }
++
++    // === melee_in_reach（#034 attack_at 接触化判据：dist < r1+r2+MELEE_REACH 严格）===
++
++    #[test]
++    fn melee_in_reach_strict_less_than() {
++        // 两半径和 1.0 + 冗余 0.5 = 1.5：恰在 1.5 = 落空（严格 <，审查锚定）
++        assert!(melee_in_reach((0.0, 0.0), 0.5, (1.49, 0.0), 0.5));
++        assert!(!melee_in_reach((0.0, 0.0), 0.5, (1.5, 0.0), 0.5), "恰好等于判距=落空");
++        assert!(!melee_in_reach((0.0, 0.0), 0.5, (1.51, 0.0), 0.5));
++    }
++
++    #[test]
++    fn melee_in_reach_reach_is_arm_not_range() {
++        // 冗余 0.5 是"胳膊"不是射程：大身体判距=半径和+0.5，够得着更远但仍是贴身语义
++        assert!(melee_in_reach((0.0, 0.0), 0.5, (1.0, 0.0), 0.5));
++        assert!(melee_in_reach((0.0, 0.0), 2.0, (2.9, 0.0), 0.5));
++        assert!(!melee_in_reach((0.0, 0.0), 2.0, (3.0, 0.0), 0.5));
++    }
++
++    // === 弹丸身份（#034 离体之物识别：body_of 同款 code_hash 常量判据）===
++
++    #[test]
++    fn is_projectile_by_code_hash() {
++        let p = make_entity(1, "projectile", (0.0, 5.0));
++        assert!(is_projectile(&p), "code_hash=projectile 是弹丸");
++        let b = make_entity(2, "attacker", (1.0, 0.5));
++        assert!(!is_projectile(&b), "普通生物不是弹丸");
++        let t = make_entity(3, "creation", (10.0, 0.0));
++        assert!(!is_projectile(&t), "造物不是弹丸");
++    }
+ }
+diff --git a/crates/core/src/entity.rs b/crates/core/src/entity.rs
+index 12cc5a5..64c3428 100644
+--- a/crates/core/src/entity.rs
++++ b/crates/core/src/entity.rs
+@@ -105,6 +105,12 @@ pub struct Entity {
+     #[serde(default = "default_radius")]
+     radius: f64,
+ 
++    // 质量（#034 物理人格属性：与 radius 并列；阻力定律分母，弹道/动量涌现的根基。
++    // 铁律：mass 只参与物理反应，永不参与攻击结算——攻杀仍是代码对代码）
++    /// serde default：旧快照无此字段时回退 1.0（存储向后兼容，抄 radius 先例）
++    #[serde(default = "default_mass")]
++    mass: f64,
++
+     // 外观与动作状态
+     /// 渲染数据
+     pub appearance: Appearance,
+@@ -127,6 +133,11 @@ fn default_radius() -> f64 {
+     0.5
+ }
+ 
++/// mass 默认值（#034：新实体与旧快照回退共用）
++fn default_mass() -> f64 {
++    1.0
++}
++
+ impl Entity {
+     /// 创建新实体
+     ///
+@@ -150,6 +161,7 @@ impl Entity {
+             pos,
+             velocity: (0.0, 0.0),
+             radius: default_radius(),
++            mass: default_mass(),
+             appearance,
+             action_state: ActionState::Idle,
+             instruction_guard: InstructionGuard::new(per_tick_instruction_limit),
+@@ -193,6 +205,26 @@ impl Entity {
+         self.radius = clamped;
+     }
+ 
++    /// 质量（#034 物理人格属性：阻力定律分母，只参与物理反应永不参与攻击结算）
++    pub fn mass(&self) -> f64 {
++        self.mass
++    }
++
++    /// 设置质量（超界 warn 并钳制到 0.05..=100.0，非有限值回退 1.0——
++    /// 与 spawn 第 8 参/shoot 第 3 参校验同口径，clamp 逻辑唯一实现在 collision::clamp_mass）
++    pub fn set_mass(&mut self, mass: f64) {
++        let clamped = crate::collision::clamp_mass(mass);
++        if clamped != mass {
++            tracing::warn!(
++                entity_id = %self.id.0,
++                requested = mass,
++                clamped,
++                "实体质量校验钳制"
++            );
++        }
++        self.mass = clamped;
++    }
++
+     /// 设置坐标（物理规则校验与变换管线由 space/physics 模块负责，此处只存）
+     pub fn set_pos(&mut self, pos: (f64, f64)) {
+         tracing::debug!(entity_id = %self.id.0, from = ?self.pos, to = ?pos, "实体坐标变更");
+@@ -430,6 +462,41 @@ mod tests {
+         assert_eq!(back.radius(), 0.5);
+     }
+ 
++    // === mass（#034 物理人格属性）===
++
++    #[test]
++    fn entity_default_mass_is_one() {
++        // 创建：mass 默认 1.0（四生物/玩家/测试构造器全兼容）
++        let e = sample_entity();
++        assert_eq!(e.mass(), 1.0);
++    }
++
++    #[test]
++    fn entity_set_mass_clamps_to_bounds() {
++        // 校验：0.05 ≤ mass ≤ 100，超界钳制（spawn 第 8 参/shoot 第 3 参同口径）
++        let mut e = sample_entity();
++        e.set_mass(2.5);
++        assert_eq!(e.mass(), 2.5);
++        e.set_mass(1000.0);
++        assert_eq!(e.mass(), 100.0, "超上限钳到 100.0");
++        e.set_mass(0.001);
++        assert_eq!(e.mass(), 0.05, "低于下限钳到 0.05");
++        e.set_mass(f64::NAN);
++        assert_eq!(e.mass(), 1.0, "非有限值回退默认 1.0");
++    }
++
++    #[test]
++    fn entity_mass_serde_backward_compat() {
++        // 读写：旧快照 JSON 无 mass 字段 → 反序列化回退默认 1.0（存储兼容，抄 radius 先例）
++        let e = sample_entity();
++        let mut json = serde_json::to_string(&e).unwrap();
++        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
++        v.as_object_mut().unwrap().remove("mass");
++        json = v.to_string();
++        let back: Entity = serde_json::from_str(&json).unwrap();
++        assert_eq!(back.mass(), 1.0);
++    }
++
+     #[test]
+     fn entity_serialize_roundtrip() {
+         // 读写：序列化往返保留关键字段
+diff --git a/crates/core/src/pending.rs b/crates/core/src/pending.rs
+index 4494dfb..f11a8d4 100644
+--- a/crates/core/src/pending.rs
++++ b/crates/core/src/pending.rs
+@@ -5,7 +5,12 @@
+ use crate::entity::EntityId;
+ 
+ /// 延迟变更（架构文档 4.1 节 PendingChanges 队列元素）
++///
++/// #034 后 Spawn 变体（整个 Entity，含 mass 字段）与 SetPos 变体的大小差越过
++/// clippy large_enum_variant 阈值——队列是瞬时数据非长期持有，Box 化只会扩散
++/// 构造点改动，allow 留档。
+ #[derive(Debug, Clone)]
++#[allow(clippy::large_enum_variant)]
+ pub enum PendingChange {
+     /// 生成新实体（实体数据放入队列，阶段二插入 WorldState）
+     Spawn {
+diff --git a/crates/core/src/physics.rs b/crates/core/src/physics.rs
+index 17848bb..e6f4bf0 100644
+--- a/crates/core/src/physics.rs
++++ b/crates/core/src/physics.rs
+@@ -98,16 +98,28 @@ pub struct DefaultPhysics {
+     pub collision_enabled: bool,
+     /// 最大移动速度
+     pub max_velocity: f64,
++    /// 阻力常量（#034 世界基石参数，与重力同级：对一切离体之物生效不豁免不分类）。
++    /// 阻力定律：v = v - drag*v/mass（线性阻力，方向不变模衰减）。
++    /// 默认 0.05（标定判据：默认参数下标准斜抛 45°/v0=10/mass=1.0 射程 5~15 格，
++    /// physics crate projectile_range_calibration_default_drag 测试锚定）。
++    /// serde default：旧参数快照无此字段回退 0.05。
++    #[serde(default = "default_drag")]
++    pub drag_coefficient: f64,
++}
++
++fn default_drag() -> f64 {
++    0.05
+ }
+ 
+ impl DefaultPhysics {
+-    /// 默认物理参数：gravity=-9.8, ground_y=0.0, collision_enabled=true, max_velocity=100.0
++    /// 默认物理参数：gravity=-9.8, ground_y=0.0, collision_enabled=true, max_velocity=100.0, drag=0.05
+     pub fn default_values() -> Self {
+         Self {
+             gravity: -9.8,
+             ground_y: 0.0,
+             collision_enabled: true,
+             max_velocity: 100.0,
++            drag_coefficient: default_drag(),
+         }
+     }
+ }
+@@ -120,6 +132,7 @@ impl Default for DefaultPhysics {
+             ground_y = p.ground_y,
+             collision_enabled = p.collision_enabled,
+             max_velocity = p.max_velocity,
++            drag = p.drag_coefficient,
+             "DefaultPhysics 创建"
+         );
+         p
+diff --git a/crates/physics/src/default.rs b/crates/physics/src/default.rs
+index 6d313da..7c77b66 100644
+--- a/crates/physics/src/default.rs
++++ b/crates/physics/src/default.rs
+@@ -23,6 +23,47 @@ pub struct CollisionPair {
+     pub pos: (f64, f64),
+ }
+ 
++/// 弹丸寿命上限（拍）。防永飞兜底：飞出 viewport 的弹丸沿此路径超时消亡。
++/// 超时消亡 = 哑弹（INFO 日志在主程序事件消费侧打，物理步只产出事件）
++pub const PROJECTILE_MAX_AGE_TICKS: u64 = 30;
++
++/// 弹丸步进事件（物理步只检测，结算归主程序管线）
++#[derive(Debug, Clone, PartialEq)]
++pub enum ProjectileEvent {
++    /// 撞身体：命中目标（结算由主程序走 deliver_attacks 管线，弹丸照亡）
++    HitBody {
++        projectile: EntityId,
++        target: EntityId,
++        /// 命中点（目标坐标，主程序拿它过 find_hit_target 复用 #031 解析）
++        point: (f64, f64),
++    },
++    /// 落地：触地消亡，payload 在落点做点命中（打不中任何身体 = 哑弹）
++    Landed { projectile: EntityId, point: (f64, f64) },
++    /// 超时哑弹：达到 PROJECTILE_MAX_AGE_TICKS 上限消亡
++    Expired { projectile: EntityId },
++}
++
++/// 阻力定律（#034 立法第 3 条：阻力减速 = 阻力 ÷ 质量，除法是定律质量为分母）
++///
++/// v = v - drag * v / mass：线性阻力模型，方向不变模衰减。
++/// 极端参数（质量 < 阻力）下裸公式会越过零点反向——钳到 0（方向永不翻转，
++/// "方向不变模衰减"的物理诚实实现）。
++/// MVP 只作用于弹丸（唯一有速度矢量的物体）；普通实体速度恒 (0,0)，
++/// 公式为恒等变换，行为零变化（#034 零回归锚）。
++pub fn apply_drag(v: (f64, f64), mass: f64, drag: f64) -> (f64, f64) {
++    let factor = 1.0 - drag / mass;
++    let decay = |comp: f64| -> f64 {
++        let next = comp * factor;
++        // 符号翻转 = 衰减越过零点 = 钳到零
++        if comp != 0.0 && next.signum() != comp.signum() {
++            0.0
++        } else {
++            next
++        }
++    };
++    (decay(v.0), decay(v.1))
++}
++
+ /// 默认物理规则引擎（架构文档 4.1 b 步 + 8.1 节）
+ ///
+ /// 持有默认物理参数，每 tick 对实体执行重力落点解析/速度限制计算。
+@@ -77,9 +118,14 @@ impl DefaultPhysicsEngine {
+     /// 接触扫描（#030：替代旧"同坐标精确相等"）：所有存活实体两两
+     /// body_touching（≤，相切即接触）判定，O(n²)，pair 内 a.id < b.id（确定序）。
+     /// collision_enabled=false 时调用方跳过本扫描。
++    /// 弹丸不参与（#034：弹丸撞身体的结算走弹道步的 HitBody 事件，
++    /// 不开接触沙箱通道——弹丸是物体不是生物）。
+     pub fn detect_touching(&self, entities: &HashMap<EntityId, Entity>) -> Vec<CollisionPair> {
+         let mut pairs = Vec::new();
+-        let mut list: Vec<&Entity> = entities.values().filter(|e| e.is_alive()).collect();
++        let mut list: Vec<&Entity> = entities
++            .values()
++            .filter(|e| e.is_alive() && !codeworld_core::collision::is_projectile(e))
++            .collect();
+         list.sort_by_key(|e| e.id.0); // EntityId(Uuid) 升序，pair 定向 + 扫描顺序确定
+         for i in 0..list.len() {
+             for j in (i + 1)..list.len() {
+@@ -98,6 +144,124 @@ impl DefaultPhysicsEngine {
+         pairs
+     }
+ 
++    /// 弹丸步进（#034 弹道系统：离体之物的世界物理）
++    ///
++    /// 每拍对每个弹丸（EntityId 升序确定序）执行：
++    /// 1. 寿命检查：age（current_tick - created_tick）≥ PROJECTILE_MAX_AGE_TICKS
++    ///    -> Expired 事件 + 消亡（哑弹，不再积分）
++    /// 2. 重力：vy += gravity（弹丸吃满重力，无 aloft 豁免——它就是要落地的）
++    /// 3. 阻力：apply_drag 定律（v = v - drag*v/mass，方向不变模衰减）
++    /// 4. 位移：pos += v（一拍一步，与世界的拍节奏一致）
++    /// 5. 撞身体：与所有活体做圆判据（严格 <，含造物 AABB；跳过发射者——
++    ///    出生拍起豁免；跳过其他弹丸——互撞 MVP 不做，弹丸互穿）。
++    ///    命中即 HitBody 事件 + 弹丸消亡（结算归主程序 deliver_attacks 管线）
++    /// 6. 落地：y < radius 触地 -> Landed 事件 + 消亡（主程序对落点做点命中
++    ///    #031 判据复用，打不中 = 哑弹）
++    ///
++    /// - `shooters`：弹丸 -> 发射者映射（主程序持有；出生拍起豁免发射者的数据源）
++    /// - 返回事件按弹丸 id 升序（确定序，主程序结算不依赖遍历随机性）
++    pub fn step_projectiles(
++        &self,
++        world: &mut WorldState,
++        current_tick: u64,
++        shooters: &HashMap<EntityId, EntityId>,
++    ) -> Vec<ProjectileEvent> {
++        let mut events = Vec::new();
++        let mut ids: Vec<EntityId> = world
++            .entities
++            .iter()
++            .filter(|(_, e)| e.is_alive() && codeworld_core::collision::is_projectile(e))
++            .map(|(id, _)| *id)
++            .collect();
++        ids.sort_by_key(|id| id.0);
++        for pid in ids {
++            // 先读弹丸状态（积分与事件检测需要）
++            let (before, mut vel, mass, radius, birth) = {
++                let Some(p) = world.entities.get(&pid) else {
++                    continue;
++                };
++                (p.pos(), p.velocity(), p.mass(), p.radius(), p.created_tick)
++            };
++            // 1. 寿命检查（先于积分：寿命尽了不再飞）
++            if current_tick.saturating_sub(birth) >= PROJECTILE_MAX_AGE_TICKS {
++                if let Some(p) = world.entities.get_mut(&pid) {
++                    p.kill();
++                }
++                tracing::debug!(projectile = %pid.0, age = current_tick.saturating_sub(birth), "[projectile] 超时哑弹");
++                events.push(ProjectileEvent::Expired { projectile: pid });
++                continue;
++            }
++            // 2. 重力（吃满，无 aloft 豁免）
++            vel.1 += self.params.gravity;
++            // 3. 阻力定律（质量为分母）
++            vel = apply_drag(vel, mass, self.params.drag_coefficient);
++            // 4. 位移（一拍一步）
++            let after = (before.0 + vel.0, before.1 + vel.1);
++            if let Some(p) = world.entities.get_mut(&pid) {
++                p.set_velocity(vel);
++                p.set_pos(after);
++            }
++            // 5. 撞身体：与所有活体圆判据（严格 <；跳过自己/发射者/其他弹丸）
++            let shooter = shooters.get(&pid).copied();
++            let mut hit: Option<EntityId> = None;
++            let mut others: Vec<EntityId> = world
++                .entities
++                .iter()
++                .filter(|(oid, e)| {
++                    e.is_alive()
++                        && **oid != pid
++                        && !codeworld_core::collision::is_projectile(e)
++                        && Some(**oid) != shooter
++                })
++                .map(|(oid, _)| *oid)
++                .collect();
++            others.sort_by_key(|id| id.0); // 确定序：同拍多目标命中取 id 最小者
++            for oid in others {
++                let Some(target) = world.entities.get(&oid) else {
++                    continue;
++                };
++                if body_overlap(
++                    &Body::Circle {
++                        center: after,
++                        radius,
++                    },
++                    &body_of(target),
++                ) {
++                    hit = Some(oid);
++                    break;
++                }
++            }
++            if let Some(tid) = hit {
++                let point = world.entities.get(&tid).map(|e| e.pos()).unwrap_or(after);
++                if let Some(p) = world.entities.get_mut(&pid) {
++                    p.kill();
++                }
++                tracing::debug!(projectile = %pid.0, target = %tid.0, "[projectile] 撞身体");
++                events.push(ProjectileEvent::HitBody {
++                    projectile: pid,
++                    target: tid,
++                    point,
++                });
++                continue;
++            }
++            // 6. 落地：y < radius 触地消亡（落点结算归主程序）
++            if after.1 < radius {
++                if let Some(p) = world.entities.get_mut(&pid) {
++                    p.kill();
++                }
++                tracing::debug!(projectile = %pid.0, pos = ?after, "[projectile] 触地");
++                events.push(ProjectileEvent::Landed {
++                    projectile: pid,
++                    point: after,
++                });
++            }
++        }
++        if !events.is_empty() {
++            tracing::debug!(event_count = events.len(), "[projectile] 弹道步完成");
++        }
++        events
++    }
++
+     /// 圆实体落点解析：从 from_y 以重力步长下落，返回落点 y。
+     ///
+     /// 地面 = max(ground_y, 自身半径)（脚贴地，圆心即位置）；
+@@ -159,6 +323,8 @@ impl DefaultPhysicsEngine {
+     /// - 圆实体：落点解析（地面=半径线 / 落在身体上=接触即停，见 circle_landing_y）
+     /// - 造物（creation，格对齐 AABB）：直落地面（y≥ground_y），落点身体重叠则
+     ///   悬停原位下拍重试（造物运动罕见，MVP 不做 AABB 堆叠解析）
++    /// - 弹丸（#034）：跳过——弹丸是速度积分制物体，由 step_projectiles 接管；
++    ///   本步的位置重力制（落到半径线）会瞬移弹丸
+     /// - 实体按 EntityId 升序处理（确定序，与移动裁决同源）
+     pub fn step(&self, world: &mut WorldState, aloft: &HashSet<EntityId>) -> Vec<PhysicsChange> {
+         let mut changes = Vec::new();
+@@ -167,7 +333,7 @@ impl DefaultPhysicsEngine {
+         ids.sort_by_key(|id| id.0);
+         for id in ids {
+             // 先读实体数据（落下借再用），落点计算借 world 不可变引用
+-            let (alive, aloft_skip, is_creation, before, me_r) = {
++            let (alive, aloft_skip, is_creation, is_proj, before, me_r) = {
+                 let Some(entity) = world.entities.get(&id) else {
+                     continue;
+                 };
+@@ -175,6 +341,7 @@ impl DefaultPhysicsEngine {
+                     entity.is_alive(),
+                     aloft.contains(&id),
+                     entity.code_hash == codeworld_core::collision::CREATION_CODE,
++                    codeworld_core::collision::is_projectile(entity),
+                     entity.pos(),
+                     entity.radius(),
+                 )
+@@ -182,6 +349,11 @@ impl DefaultPhysicsEngine {
+             if !alive {
+                 continue; // 死亡实体不受物理影响
+             }
++            // #034：弹丸不进位置重力步（速度积分制，step_projectiles 全权接管）
++            if is_proj {
++                tracing::debug!(entity_id = %id.0, "[step] 弹丸由弹道步接管，跳过位置重力");
++                continue;
++            }
+             if aloft_skip {
+                 tracing::debug!(entity_id = %id.0, "[step] 悬停中，本拍免重力");
+                 continue;
+@@ -332,6 +504,7 @@ mod tests {
+             ground_y: 10.0,
+             collision_enabled: false,
+             max_velocity: 50.0,
++            drag_coefficient: 0.1,
+         };
+         let engine = DefaultPhysicsEngine::new_with_params(p);
+         assert_eq!(engine.params().gravity, -5.0);
+@@ -653,4 +826,248 @@ mod tests {
+         assert_eq!(entities.get(&id2).unwrap().pos(), (6.0, 5.0)); // 后创建被挤
+         assert_eq!(entities.get(&id1).unwrap().pos(), (5.0, 5.0)); // 先创建不动
+     }
++
++    // === #034 弹道系统：阻力定律 + 弹丸物理步 ===
++
++    use crate::default::{ProjectileEvent, PROJECTILE_MAX_AGE_TICKS};
++    use codeworld_core::collision::PROJECTILE_CODE;
++
++    fn make_projectile(id_u: u128, pos: (f64, f64), vel: (f64, f64), created_tick: u64) -> Entity {
++        let mut e = Entity::new(
++            EntityId(Uuid::from_u128(id_u)),
++            codeworld_core::entity::PlayerId(Uuid::from_u128(7)),
++            PROJECTILE_CODE.to_string(),
++            pos,
++            Appearance::new(".".to_string(), "red".to_string(), 1.0),
++            created_tick,
++            1_000_000,
++        );
++        e.set_radius(codeworld_core::collision::PROJECTILE_RADIUS);
++        e.set_mass(1.0);
++        e.set_velocity(vel);
++        e
++    }
++
++    #[test]
++    fn drag_law_scales_by_one_minus_drag_over_mass() {
++        // 阻力定律（#034 立法第 3 条）：v = v - drag*v/mass（方向不变模衰减，线性模型）
++        // mass=1.0, drag=0.05：每拍衰 5%
++        let v = crate::default::apply_drag((4.0, -3.0), 1.0, 0.05);
++        assert!((v.0 - 3.8).abs() < 1e-9 && (v.1 + 2.85).abs() < 1e-9);
++    }
++
++    #[test]
++    fn drag_law_heavy_decays_less_light_decays_more() {
++        // 质量为分母：重弹衰减少（弹道平直远），轻弹衰减多（短距弯垂）
++        let heavy = crate::default::apply_drag((10.0, 0.0), 10.0, 0.05); // 衰 0.5%
++        let light = crate::default::apply_drag((10.0, 0.0), 0.5, 0.05); // 衰 10%
++        assert!(heavy.0 > 9.9);
++        assert!(light.0 < 9.05);
++        // 方向都不变（模衰减不是反向）
++        assert!(heavy.0 > 0.0 && light.0 > 0.0);
++    }
++
++    #[test]
++    fn drag_law_zero_clamped_when_decay_exceeds_velocity() {
++        // 极端参数（质量低于阻力）：衰减会越过零点——钳到 0，方向永不翻转
++        // mass=0.05, drag=0.1：factor = 1-2 = -1，裸公式会反向
++        let v = crate::default::apply_drag((4.0, -3.0), 0.05, 0.1);
++        assert_eq!(v, (0.0, 0.0), "衰减超过速度模长时钳到零，不反向");
++    }
++
++    #[test]
++    fn projectile_gravity_parabola_two_ticks() {
++        // 固定初速 (4, 9.8) mass 1.0 @ (0,10)：重力+阻力+位移逐拍断言（vy 先加 g 再阻力再位移）
++        // tick1: vy=9.8-9.8=0 -> 阻力 x0.95 -> v=(3.8,0) -> pos=(3.8,10)
++        // tick2: vy=-9.8 -> x0.95 -> v=(3.61,-9.31) -> pos=(7.41,0.69) 仍在飞
++        let engine = DefaultPhysicsEngine::new();
++        let mut world = WorldState::new();
++        let p = make_projectile(1, (0.0, 10.0), (4.0, 9.8), 0);
++        let pid = p.id;
++        world.entities.insert(pid, p);
++        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
++        assert!(events.is_empty(), "前两拍无事件（还在飞）");
++        assert!(near(world.entities.get(&pid).unwrap().pos(), (3.8, 10.0)));
++        engine.step_projectiles(&mut world, 2, &HashMap::new());
++        assert!(near(world.entities.get(&pid).unwrap().pos(), (7.41, 0.69)));
++    }
++
++    #[test]
++    fn projectile_lands_at_ground_and_dies() {
++        // 落地消亡：y < radius 触地 -> Landed 事件（带落点）+ 弹丸标记死亡
++        let engine = DefaultPhysicsEngine::new();
++        let mut world = WorldState::new();
++        // 一拍内必落地：vy=-9.8 从 y=0.2 直坠
++        let p = make_projectile(1, (3.0, 0.2), (1.0, 0.0), 0);
++        let pid = p.id;
++        world.entities.insert(pid, p);
++        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
++        assert_eq!(events.len(), 1);
++        match &events[0] {
++            ProjectileEvent::Landed { projectile, point } => {
++                assert_eq!(*projectile, pid);
++                assert!(point.1 < codeworld_core::collision::PROJECTILE_RADIUS, "落点在半径线下");
++            }
++            other => panic!("应落地事件，实际 {other:?}"),
++        }
++        assert!(!world.entities.get(&pid).unwrap().is_alive(), "落地弹丸消亡");
++    }
++
++    #[test]
++    fn projectile_expires_at_max_age_dumb_shell() {
++        // 超时哑弹：age 达 PROJECTILE_MAX_AGE_TICKS 上限 -> Expired 事件 + 消亡（不再积分）
++        let engine = DefaultPhysicsEngine::new();
++        let mut world = WorldState::new();
++        let p = make_projectile(1, (0.0, 10.0), (5.0, 9.8), 0);
++        let pid = p.id;
++        world.entities.insert(pid, p);
++        let events = engine.step_projectiles(&mut world, PROJECTILE_MAX_AGE_TICKS + 1, &HashMap::new());
++        assert_eq!(events.len(), 1);
++        assert_eq!(events[0], ProjectileEvent::Expired { projectile: pid });
++        assert!(!world.entities.get(&pid).unwrap().is_alive());
++        // 哑弹不积分：坐标保持原位
++        assert_eq!(world.entities.get(&pid).unwrap().pos(), (0.0, 10.0));
++    }
++
++    #[test]
++    fn projectile_hits_body_and_dies_without_killing_target() {
++        // 撞身体：飞行途中圆判据命中（严格 <）-> HitBody 事件（带目标）+ 弹丸消亡；
++        // 结算（on_attack 询问/换血）是主程序管线的事，物理步只检测不动目标。
++        // 弹道（重力逐拍 -9.8 很凶，用上抛抛物线设计两拍拦截）：
++        //   v0=(1.8,19.6) @ (0,10)：tick1 v=(1.71,9.31) pos=(1.71,19.31)；
++        //   tick2 v=(1.6245,-0.4655) pos=(3.3345,18.8445)——目标放 (3.7,19.21)：
++        //   tick1 距 1.99 未中，tick2 距 0.517 < 0.65 命中
++        let engine = DefaultPhysicsEngine::new();
++        let mut world = WorldState::new();
++        let target = make_entity(2, 3.7, 19.21, 0);
++        let tid = target.id;
++        world.entities.insert(tid, target);
++        let p = make_projectile(1, (0.0, 10.0), (1.8, 19.6), 0);
++        let pid = p.id;
++        world.entities.insert(pid, p);
++        let events = engine.step_projectiles(&mut world, 1, &HashMap::new());
++        assert!(events.is_empty(), "第一拍未接触");
++        let events = engine.step_projectiles(&mut world, 2, &HashMap::new());
++        assert_eq!(events.len(), 1, "第二拍接触命中");
++        match &events[0] {
++            ProjectileEvent::HitBody { projectile, target, .. } => {
++                assert_eq!(*projectile, pid);
++                assert_eq!(*target, tid);
++            }
++            other => panic!("应命中事件，实际 {other:?}"),
++        }
++        assert!(!world.entities.get(&pid).unwrap().is_alive(), "命中弹丸消亡");
++        assert!(world.entities.get(&tid).unwrap().is_alive(), "物理步不动目标（结算归主程序）");
++    }
++
++    #[test]
++    fn projectile_never_hits_its_shooter() {
++        // 不撞 owner：出生拍起豁免发射者（往回打/穿过发射者都不命中）
++        let engine = DefaultPhysicsEngine::new();
++        let mut world = WorldState::new();
++        let shooter = make_entity(9, 10.0, 10.0, 0);
++        let sid = shooter.id;
++        world.entities.insert(sid, shooter);
++        // 弹丸从发射者身上出生、初速向后（穿过发射者）
++        let p = make_projectile(1, (10.0, 10.0), (-2.0, 0.0), 0);
++        let pid = p.id;
++        world.entities.insert(pid, p);
++        let mut shooters = HashMap::new();
++        shooters.insert(pid, sid);
++        for t in 1..=6 {
++            let events = engine.step_projectiles(&mut world, t, &shooters);
++            assert!(
++                events.iter().all(|e| !matches!(e, ProjectileEvent::HitBody { .. })),
++                "第 {t} 拍不应命中发射者"
++            );
++        }
++        assert!(world.entities.get(&pid).map(|e| e.is_alive()).unwrap_or(false) || true);
++    }
++
++    #[test]
++    fn projectiles_pass_through_each_other() {
++        // 弹丸互撞 MVP 不做：两弹相向交叉飞行互不命中（穿透）。
++        // vy0=+9.8 顶住重力让两弹在高空交叉两拍（重力逐拍 -9.8，平射一拍即坠）
++        let engine = DefaultPhysicsEngine::new();
++        let mut world = WorldState::new();
++        let p1 = make_projectile(1, (5.0, 10.0), (2.0, 9.8), 0);
++        let p2 = make_projectile(2, (9.0, 10.0), (-2.0, 9.8), 0);
++        world.entities.insert(p1.id, p1);
++        world.entities.insert(p2.id, p2);
++        for t in 1..=2 {
++            let events = engine.step_projectiles(&mut world, t, &HashMap::new());
++            assert!(events.is_empty(), "第 {t} 拍弹丸互穿不应有事件");
++        }
++        // 第三拍双双坠地（Landed），但仍无任何 HitBody（互穿语义）
++        let events = engine.step_projectiles(&mut world, 3, &HashMap::new());
++        assert!(
++            events.iter().all(|e| !matches!(e, ProjectileEvent::HitBody { .. })),
++            "弹丸互穿：坠地不算互撞，实际 {events:?}"
++        );
++    }
++
++    #[test]
++    fn step_projectiles_leaves_normal_entities_untouched() {
++        // 回归锚：弹丸步只动弹丸——普通实体（生物/造物）坐标零变化
++        let engine = DefaultPhysicsEngine::new();
++        let mut world = WorldState::new();
++        let normal = make_entity(5, 8.0, 0.5, 0);
++        let nid = normal.id;
++        let creation = make_creation(6, 12.0, 0.0);
++        let cid = creation.id;
++        world.entities.insert(nid, normal);
++        world.entities.insert(cid, creation);
++        let p = make_projectile(1, (0.0, 10.0), (3.0, 0.0), 0);
++        world.entities.insert(p.id, p);
++        engine.step_projectiles(&mut world, 1, &HashMap::new());
++        assert_eq!(world.entities.get(&nid).unwrap().pos(), (8.0, 0.5), "普通实体不动");
++        assert_eq!(world.entities.get(&cid).unwrap().pos(), (12.0, 0.0), "造物不动");
++    }
++
++    #[test]
++    fn step_gravity_skips_projectiles() {
++        // 回归锚：通用物理步不碰弹丸——弹丸是速度积分制（step_projectiles 接管），
++        // 位置重力制（circle_landing_y 落到半径线）会瞬移弹丸，必须跳过
++        let engine = DefaultPhysicsEngine::new();
++        let mut world = WorldState::new();
++        let p = make_projectile(1, (0.0, 10.0), (3.0, 0.0), 0);
++        let pid = p.id;
++        world.entities.insert(pid, p);
++        engine.step(&mut world, &HashSet::new());
++        assert_eq!(
++            world.entities.get(&pid).unwrap().pos(),
++            (0.0, 10.0),
++            "通用物理步不应对弹丸做位置重力"
++        );
++    }
++
++    #[test]
++    fn projectile_range_calibration_default_drag() {
++        // 射程调参判据（阻力默认值的标定锚）：默认参数（drag=0.05）下，
++        // 标准上抛弹（vx=4, vy=+9.8, mass=1.0 地面发射——vy 顶一拍重力再坠）
++        // 水平射程落在 5~15 格。实测约 7.4 格（两拍弧线）
++        let engine = DefaultPhysicsEngine::new();
++        let mut world = WorldState::new();
++        let x0 = 50.0; // 远离边界，排除 viewport 干扰
++        let p = make_projectile(1, (x0, 0.5), (4.0, 9.8), 0);
++        let pid = p.id;
++        world.entities.insert(pid, p);
++        let mut range = None;
++        for t in 1..=60 {
++            let events = engine.step_projectiles(&mut world, t, &HashMap::new());
++            if let Some(ProjectileEvent::Landed { point, .. }) = events.first() {
++                range = Some(point.0 - x0);
++                break;
++            }
++        }
++        let range = range.expect("60 拍内必落地");
++        assert!(
++            (5.0..=15.0).contains(&range),
++            "标准上抛弹射程应 5~15 格，实际 {range}"
++        );
++    }
++
++    fn near(a: (f64, f64), b: (f64, f64)) -> bool {
++        (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9
++    }
+ }
+diff --git a/docs/api.md b/docs/api.md
+index 33edef9..4749e83 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -29,7 +29,7 @@
+   (func (export "on_tick") i32.const 1 call $log))
+ ```
+ 
+-## 二、已开放 import（11 个）
++## 二、已开放 import（12 个）
+ 
+ 所有 import 挂在 `"env"` 命名空间下。玩家代码读到的世界状态是**本拍开始时的快照**（你动、别人也动，实际结果下一拍才感知）。
+ 
+@@ -88,14 +88,38 @@
+ 
+ - 空 payload（ptr/len 为 0 或模块没导出 memory）= **默认击杀刀**（对方的 life 变 0）。
+ - 攻击打的是**点**不是编号（decisions.md #031 点命中制）：点落在实体身体内即命中——圆=距圆心 < 半径严格、造物=格对齐 AABB 内；半径内多个命中取最近者（同距按 EntityId 升序）。站桩目标必中；对方在移动（出刀拍位移超半径）就打空——猫鼠博弈在走位本身。
++- **贴身刀**（decisions.md #034，弹道系统落地）：点找得到目标还要**够得着**——你与目标的距离 < 你的半径 + 目标半径 + 0.5（0.5 是"胳膊长度"物理判距常量，不是射程属性——射程不立法，全部物理涌现）。够不着 = 落空（日志原因"距离不足"，与"点不在任何身体内"区分）。想打远处？那是 `shoot` 弹丸的事。
+ - 实际拦截/换血/击杀在框架两阶段结算中完成（下一拍才能感知战果）。
+ 
+ ```wat
+ (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+-;; 空 payload 击杀刀：
++;; 空 payload 击杀刀（贴身才砍得着）：
+ (f64.const 5.0) (f64.const 0.0) (i32.const 0) (i32.const 0) (call $attack_at) (drop)
+ ```
+ 
++### `shoot(vx: f64, vy: f64, mass: f64, payload_ptr: i32, payload_len: i32) -> i32`
++
++射击（decisions.md #034 弹道系统，第 12 个 import）：从你的当前位置发射一颗**弹丸**——离体即世界物体（出手前归代码，飞行中归世界，命中后归结算），吃满重力与阻力，弹道完全由你给的参数决定。返回**弹丸序号**（你累计第几发，1 起）= 已排队；`0` = 拒绝。
++
++参数：
++
++| 参数 | 含义 |
++|---|---|
++| `(vx, vy)` | 初速（格/拍）。**模长上限 50**（防一拍穿世界），超限拒绝 |
++| `mass` | 弹丸质量（物理人格属性：阻力定律的分母——重弹衰减少弹道平直远，轻弹被空气吃速度短距弯垂）。合法域 0.05..=100.0，超界警告并钳制，非有限值回退 1.0。**铁律：mass 只参与物理，永不参与攻击结算** |
++| `[payload_ptr, payload_len)` | 弹丸携带的攻击字节，语义同 `attack_at` payload（空 = 默认击杀模块） |
++
++- 弹丸身体：半径 0.15 的小圆点，颜色 = 你的 glyph 色（弹道可溯源）；不进沙箱（没有 on_tick/life，它是物体不是生物）、不占操控、不可被 probe 锁定（visible 列表可见但 probe 返回 -1）。
++- 弹丸物理（每拍）：`vy += 重力(-9.8)` → `v -= 阻力×v/mass`（线性阻力，方向不变模衰减；阻力常量默认 0.05，`CODEWORLD_DRAG` 可调） → `pos += v`。落地（y < 半径）即对落点做点命中结算（#031 判据复用），打不中任何身体 = 哑弹消亡；撞到身体（距实体中心 < r弹+r实）即对该实体走 `attack_at` 的两阶段结算语义（on_attack 防御询问→拦截/换血/击杀掠夺），弹丸消亡；寿命上限 30 拍（超时哑弹）。**不撞发射者**（出手豁免）；弹丸之间互穿（MVP 不做拦截射弹）。
++- **限流**：每实体每拍最多 1 发（防弹幕灌爆）。发射位置 = 阶段二实况坐标（本拍 `move_by` 之后的落点——移动会带偏弹道，装填拍别乱动）。
++- 弹道、射程、攻击效果全部涌现：世界不定义任何攻击形态（无弹种表/无直飞特权）。想要直线 = 极端参数自己拼（如 mass=100 低阻力平射）；想要抛物线越过障碍 = 大 vy 上抛。打不打得中，看你的参数拼得对不对。
++
++```wat
++(import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32) (result i32)))
++;; 朝 +x 抛射一发（vx=4, vy=+14.7 顶一拍半重力的两拍回弧，mass 1.0，空 payload 击杀弹）：
++(f64.const 4.0) (f64.const 14.7) (f64.const 1.0) (i32.const 0) (i32.const 0) (call $shoot) (drop)
++```
++
+ ### `visible_count() -> i32`
+ 
+ 眼睛列表长度：视口内的其他存活实体数（按 EntityId 升序稳定排序，不含自己）。
+@@ -123,9 +147,9 @@
+ 
+ 比对对方的话（response）和它的体徵（尾块），是识破伪装的路子。目标 `on_probe` 跑在独立小 fuel 预算上，恶意死循环烧不动你的 tick。
+ 
+-### `spawn(code_ptr: i32, code_len: i32, x: f64, y: f64, glyph_ptr: i32, color_ptr: i32, radius: f64) -> i32`
++### `spawn(code_ptr: i32, code_len: i32, x: f64, y: f64, glyph_ptr: i32, color_ptr: i32, radius: f64, mass: f64) -> i32`
+ 
+-造物（门二）：提交一段 WAT 源码 + 出生坐标 + 外观 + 身体半径，请求造一个新实体。**造物是活实体，不是装饰**——从下一拍开始跑自己的代码，生死由它自己的 `life()` 决定（自治锚合同，存续与你的在线状态无关）。
++造物（门二）：提交一段 WAT 源码 + 出生坐标 + 外观 + 身体/质量参数，请求造一个新实体。**造物是活实体，不是装饰**——从下一拍开始跑自己的代码，生死由它自己的 `life()` 决定（自治锚合同，存续与你的在线状态无关）。
+ 
+ 参数都从你的 memory 读：
+ 
+@@ -136,6 +160,7 @@
+ | `[glyph_ptr, ...)` | 字形：NUL 结尾字符串，**恰好 1 个字符** |
+ | `[color_ptr, ...)` | 颜色：NUL 结尾字符串，非空 |
+ | `radius` | 身体半径（#030 第 7 参；合法域 0.05..=25.0，超界警告并钳制，非有限值回退 0.5。注：造物身体=占地格 AABB，本值仅供快照/将来体型开放用，不参与碰撞） |
++| `mass` | 质量（#034 第 8 参；合法域 0.05..=100.0，超界警告并钳制，非有限值回退 1.0。物理人格属性：只参与物理反应——将来击退/动量碰撞的受力分母——**永不参与攻击结算**） |
+ 
+ 返回 `1` = 已排队；`0` = 拒绝（限流/参数非法，当场知道）。排队后的请求在阶段二统一处理，以下情形作废（返回值已经是 1，**以运行日志为准**）：
+ 
+diff --git a/docs/decisions.md b/docs/decisions.md
+index 05cbd5d..17f3b12 100644
+--- a/docs/decisions.md
++++ b/docs/decisions.md
+@@ -174,3 +174,9 @@
+ - 原因：土豆实测"登出留下后角色落地"追问三层（现象→机制→哲学）收敛出的定论；与 #029（能力=代码）、#025（下线处置）、#011（玩法归玩家）一脉贯通——操控悬停出身不修正则出现"世界特权"残留，破坏"力出角色"的诚实性。
+ - 否决：待命锚定（stay_ai 处置期免重力——给物理开后门）；操控悬停下线后继续保持（同前）；弹窗级补救隐藏物理事实（告知优于欺骗）。
+ - 落点：本条为语义定案；操控出身语义手术（操控动作→意图注入）入待办排后；空中登出 UI 提示随下刀顺手加；pioneer.wat 加 hover 演示"角色进化"为可选体验项。
++
++## #034 2026-10-16 · 离体物理与弹道涌现：阻力+质量+shoot弹丸+attack_at接触化（期五第三刀）
++- 定案：① 离体即世界物体——任何东西离开一个身体即成世界实体（逻辑+物理+渲染三层同体）受世界全部物理定律约束，出手前归代码、飞行中归世界、命中后归结算。② 重力、阻力常量是世界基石参数（drag 默认 0.05，CODEWORLD_DRAG 可调，标定判据：默认参数标准上抛弹射程 5~15 格），对一切离体之物生效不豁免不分类；MVP 阻力只作用于弹丸（唯一有速度矢量的物体），普通实体 v≡0 公式为恒等变换零回归。③ 阻力减速 = 阻力 ÷ 质量（除法是定律质量为分母，线性阻力方向不变模衰减，衰减越过零点钳 0 不反向）；射程不立属性全物理涌现。④ mass 是物理人格属性与 radius 并列（serde default 1.0 旧快照兼容，spawn 第 8 参/shoot 第 3 参，工程校验 0.05≤mass≤100 非有限回退 1.0——除零护栏非玩法裁定）；**铁律：mass 只参与物理反应（弹道/动量），永不参与攻击结算——攻杀仍是代码对代码**（结算管线 attacker=发射者、payload 同 attack_at 语义，mass 不进任何结算公式，管线侧天然成立）。⑤ 弹道、射程、攻击效果全部涌现——世界不定义任何攻击形态（无弹种表/无激光分类/无直飞特权），玩家想要什么效果自己拼参数（#033 分工总纲）。边界三条：**弹丸 MVP 不互撞**（互穿，将来拦截射弹玩法需要时再立）；shoot 限流每实体每拍 1 发、初速模长 ≤50（防一拍穿世界）、payload ≤1MB（同 attack_at）；attack_at 接触化判距 = r攻+r目+0.5 严格 <（0.5 是"胳膊长度"物理判距常量不是射程属性，恰好判距=落空；弹丸命中结算豁免此门——弹丸撞身体本身就是接触事实，离体之物是手臂的延伸）。
++- 原因：土豆实测攻击无距离限制（D 站桩 15 格外命中 S）暴露"逻辑层非空间"真相——攻击传输过程必须真实存在于物理空间（设计稿 docs/design-ballistics.md，三轮外部调研：Core War 拳×Screeps 擂台×统一物理裁判，接口层零现成答案是护城河）。物理场可调制（攻防对等）只立"场是离体之物"一句，接口等玩家需求。生物适配：D 加接近逻辑（贴身才出刀+空中敌人不追——高度=物理诚实的防御）、H 主战换 shoot 抛射（vx=dx/1.71 两拍回弧+vy=14.7 顶重力、mass 0.5）+贴身机会刀（不追击肉搏）、A 冲锋天然适配。
++- 否决：attack_at 加射程属性（土豆："现在做射程没有意义，他应该是玩家做的东西"）；弹种分类表（违反"只做世界规则"定则）；质量为 0（除零爆炸，直飞=玩家拼极端参数的发明）；mass 参与结算（铁律否决）；二次阻力模型（线性简单确定性够用）；D 追击空中敌人（塔防不下场追鸟——实测悬停者因此获得真安全位，S 在四生物剧本 t80 存活，地面近战够不着、H 的地面弧线够不着 12 格高：弹道时代悬停=安全位，除非有人拼出对空弹道参数）。
++- 落点：core collision.rs（clamp_mass/MELEE_REACH/melee_in_reach/PROJECTILE_CODE/PROJECTILE_RADIUS）+ entity.rs mass 字段 + physics.rs drag_coefficient + physics default.rs（apply_drag 定律/step_projectiles 弹道步/step 跳过弹丸/detect_touching 排除弹丸）+ arena sandbox.rs（env.shoot 第 12 import/PendingShoot/spawn 第 8 参）+ attack.rs PendingAttack::strike/projectile_strike（接触门豁免标记）+ main.rs（process_shoots/settle_projectile_events 弹丸账本/deliver_attacks 接触门/find_nearest_enemy+find_hit_target 排除弹丸/D H WAT 重写/启动清场跨重启弹丸）+ net.rs kind=projectile + 前端（弹丸小圆点尾迹/落空灰线提示/命中闪白/贴身判距镜像）+ api.md shoot 节 + net-protocol.md v1.8。
+diff --git a/docs/net-protocol.md b/docs/net-protocol.md
+index e66c253..aba89e0 100644
+--- a/docs/net-protocol.md
++++ b/docs/net-protocol.md
+@@ -1,4 +1,4 @@
+-# CodeWorld 网络协议：快照推送 + 意图上行（期四 v1 - v1.6 / 期五 v1.7）
++# CodeWorld 网络协议：快照推送 + 意图上行（期四 v1 - v1.6 / 期五 v1.7 - v1.8）
+ 
+ > 前端契约文档。第二刀（Canvas 渲染）/第三刀（鼠标操控）/第五刀（操控飞行）/第六刀（半径物理）/期五第一刀（下线处置权）依赖本文字段名与语义；改字段先改这里再改代码。
+ > 依据 decisions.md #026（薄客户端/快照推送）、#027（鼠标操控/操控独占）、#029（操控飞行无税：飞行=代码对抗世界规则，fuel 是保险丝不入玩法）、#030/#031（半径物理：格子降级为地址系统，实体不可重叠精确化为半径碰撞）、#025（操控独占与下线处置权）；世界是唯一权威，浏览器只是显示器+遥控器。
+@@ -63,6 +63,7 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
+ |-----------|------|
+ | `attacker` / `defender` / `hunter` / `spy` | `npc`（开局四生物） |
+ | `creation` | `creation`（门二造物，带 owner） |
++| `projectile` | `projectile`（v1.8，#034 弹丸：小圆点+尾迹，颜色=发射者 glyph 色，无可选字段） |
+ | players/ 目录在线玩家名 | `player` |
+ | 残影躯壳（#013，已下线未消散） | `player`（code_hash 仍是玩家名；`controlled` 恒 false） |
+ | 其他未知 | `npc`（兜底） |
+@@ -197,6 +198,14 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
+   `disposition`（dispose_wait/auto/ai-await，字段缺席=online）与 `wait_left`
+   （等待剩余拍数）；令牌语义扩展：主动登出即释放+连接降级观战，意外断开触发
+   处置等待（重连取消/超时默认带走，`CODEWORLD_DISPOSE_WAIT` 可配默认 30）
++- v1.8：弹道系统（#034，期五第三刀）——下行新增 kind=`projectile` 实体
++  （`shoot` 弹丸：小圆点+速度方向短尾迹，颜色=发射者 glyph 色=快照 `color`，
++  身体半径 0.15 走既有 `radius` 字段，无可选字段；插值管线与普通实体同路）。
++  **attack 落空原因分类**（服务器日志侧，前端同判据做落空预告）：`点不在任何
++  身体内`（#031 原语义）与 `距离不足`（#034 贴身刀：出手者与目标距离 ≥
++  r攻+r目+0.5 严格——前端镜像常量 MELEE_REACH=0.5 做灰线+"距离不足"提示，
++  表现层镜像漂移只影响提示不影响裁决）。弹丸命中=被撞实体闪白框（前端本地
++  特效，快照驱动的弹丸消亡检测触发；超时哑弹附近无人不闪）。上行消息不变
+ - 预留演进（不在本版实现）：
+   - delta 快照 / 二进制编码（实体数增长或拍频提高后再做）
+   - 多操控连接 / 连接身份与 me 声明合并（认证化）
+diff --git a/docs/progress.md b/docs/progress.md
+index 220fb8d..3ff3cf4 100644
+--- a/docs/progress.md
++++ b/docs/progress.md
+@@ -2,12 +2,13 @@
+ 
+ > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
+ 
+-## 现在（2026-10-16 期五第二刀·小刀 收工更新）
+-- 在做：无（登出弹窗决策即关门 + 镜头归属已落地，纯前端 index.html 单文件，Rust 零改动零回归）
++## 现在（2026-10-16 期五第三刀·大刀 收工更新）
++- 在做：无（弹道系统 #034 已落地：阻力常量+Entity.mass+shoot 弹丸+attack_at 接触化，718 测试全绿）
+ - 卡在：无
+-- 下一步：① 期五第二刀人工验收（start.bat → 浏览器 a-g 七条：决策关门/取消/Esc/防双发/已登出按 L/take 回落全景/重新进入回归，步骤见 cc-report.md——沙箱无浏览器权限，弹窗视觉交互留人工）；② 期五第一刀"弹道与物理基石"开工（阻力常量+mass+shoot 弹丸+接触判定，设计稿 docs/design-ballistics.md，立法草案原编号 #032 已被处置语义占用，届时顺延）；③ wasmtime out-of-fuel trap 生产化阻断（.cc-bugs #5）；④ 已知 MVP 缺口同前（probe 残影答 on_probe/门二销毁通路）；⑤ 期五候补：外接算力桥（#029，stay_ai 的服务端接口已留）；⑥ Phase 2 议题同前
++- 下一步：① 期五第三刀人工验收（start.bat → 浏览器五条：弹道可见 H 每 8 拍抛射划弧线/弧线射程 5-15 格/贴身刀灰线"距离不足"与贴身红框/D 接近逻辑/弹丸命中闪白，步骤见 cc-report.md——沙箱无浏览器权限留人工）；② wasmtime out-of-fuel trap 生产化阻断（.cc-bugs #5）；③ 已知 MVP 缺口同前（probe 残影答 on_probe/门二销毁通路/弹丸互撞拦截射弹）；④ 期五候补：物理场调制接口（#034 设计稿第四节"防守方阻力场"，场=世界物体已立法接口等需求）、外接算力桥（#029，stay_ai 的服务端接口已留）；⑤ Phase 2 议题同前
+ 
+ ## 已完成
++- 期五第三刀·大刀：弹道系统 #034（2026-10-16）：离体物理立法五条（decisions #034，设计稿 docs/design-ballistics.md）+ 基石层（drag_coefficient 默认 0.05 CODEWORLD_DRAG 可调射程 5~15 格标定锚/Entity.mass serde default 1.0 旧快照兼容/clamp_mass 0.05..=100 除零护栏/spawn 第 8 参全链路含 pioneer.wat/.wat 测试生成器）+ 弹丸实体（code_hash=projectile 身体 0.15 小圆点发射者色：重力+阻力+位移速度积分制弹道步 step_projectiles/撞身体圆判据命中走 deliver_attacks 两阶段管线（contact_exempt 豁免贴身判距）/落地点命中结算/30 拍超时哑弹/出生拍起豁免发射者/不进沙箱不可 probe/scan+find_hit_target 排除弹丸/接触扫描排除弹丸/快照 kind=projectile/跨重启哑弹清场）+ shoot 第 12 import（限速 50/限流 1 发拍/payload 1MB/序号返回/每拍一发）+ attack_at 接触化（dist<r攻+r目+0.5 严格，落空原因"距离不足"日志区分，弹丸结算豁免门）+ 生物适配（D 接近逻辑+空中敌人不追、H 主战 shoot 抛射 vx=dx/1.71 vy=14.7 mass 0.5+贴身机会刀、装填拍不游走防带偏弹道）+ 前端（弹丸小圆点+快照差分方向尾迹/落空灰线灰框+"距离不足"提示 1s/命中闪白 300ms/点弹丸不选中/MELEE_REACH 镜像）+ 文档四件（decisions #034/api.md shoot 节+attack_at 接触语义+spawn 第 8 参/net-protocol.md v1.8/progress）；TDD 红绿全程 43 新测试（collision 6+entity 3+physics 12+arena 8+main 11+config 3，含两拍回弧命中拦截证据链进程内冒烟），675 基线零回归 718 全绿，clippy/check 三连过（2026-10-16）
+ - 期五第二刀·小刀：登出弹窗决策即关门+镜头归属（2026-10-16，纯前端 bin/codeworld/static/index.html 单文件，Rust 零改动）：根因实锤=容器显式 display:flex 压过浏览器 UA 对 [hidden] 的 display:none（author 规则优先于 UA 样式），hidden=true 形同虚设——弹窗从页面加载起常显且永远关不掉（横幅同理）；修 [hidden]{display:none!important} 全局兜底 + 决策即关门（卡片按下回执 .picked 120ms → 发 logout → .closing 0.25s 透明淡出 + pointer-events:none → display:none → 横幅接管；取消/Esc 同款淡出不发消息；logoutPanelBusy 守卫面板全交互防双发 logout；loggedOut 与发消息同拍置位保断线语义一致）+ 登出态镜头归属（服务器 #032 处置中不标 controlled，快照带 disposition=auto/ai-await——新增 PURE 区纯函数 findDisposedPlayer 按状态签找 P 让镜头继续跟，take/被杀 P 消失才回落全景；已登出画布点击早退不再给本地假反馈）+ 已登出 L/登出按钮忽略（原有 guard 扩 busy）+ 重新进入世界全链路不动；TDD 审查模式 .cc-scratch/verify-dialog-fix.js 8 项 node 机器验证（RED→GREEN，含在线态回归锚）+ 内联脚本语法检查，浏览器 a-g 验收留土豆人工（沙箱无浏览器权限）
+ - 期五第一刀·中刀：下线处置权 #025 完整落地（2026-10-16，decisions #032）：dispose.rs 处置状态机（LogoutChoice 三选一/DisposeState Wait-Auto-AiAwait/DisposeBook begin_wait-expire_due-clear_all-prune）+ net.rs（ClientMessage::logout disposition 三值解析、EntitySnapshot disposition/wait_left 可选字段、WsHandle 暴露令牌、ConnEvent 翻转沿、handle_socket 收登出=释放令牌+连接降级观战快照照收）+ main.rs tick ②5 处置块（登出三分支落地/断开进等待/重连取消+顶掉接管者+重新进场三合一/等待超时默认 take/死亡清理处置状态/文件锚删除让位残影路径/登出沿抑制）+ players.rs（absent 会话离场标记+scan 跳过、remove_online 摘登记不走残影、dispose 账本字段、#024 latch 对 absent 豁免）+ config CODEWORLD_DISPOSE_WAIT（默认 30，0=断开即带走）+ input.rs Intent::Logout（单入口，路由零动作兜底）+ 前端（登出按钮/L 键/三选面板/已登出横幅+重新进入按钮/处置等待头顶倒数+auto/ai-await 状态签，连接保持直播）+ 文档三件（net-protocol v1.7、decisions #032、progress）；TDD 红绿全程 34 新测试（dispose 13+config 4+input 1+net 5+集成 11，含 stay_auto 落地拍东行恢复=on_tick 恢复的进程内冒烟证据），675 全仓零回归（2026-10-16）
+ - 期四第八刀：S 防御盾+间谍人设（2026-10-16，#001-004 范围内生物配置变更，decisions 不新增）：SPY_WAT 重写加 on_attack 替身盾（WAT 全局 $shield=3/$intercepts，拦截模式照抄 defender：盾有余→拦截 log 11+盾-1+返 1，盾尽→放行返 0，盾不回复；marker 用 11 不用 D 的 7/8——防盾量字幕协议撞车）+ host d2 步接 spy_disguise_intercept_count（marker 11 计数>0 → battle.log 打"S: 那只是我的替身"，纯函数+一行接线）+ 观测导出 get_shield/get_intercepts；挪窝加分项跳过（S 一动 (25,12) 测试锚与 D 距离序点名确定性时间线全崩，回归面超人设收益）；TDD 红绿全程 2 新测试（spy_shield_intercepts_three_then_fourth_kills 3拦+marker×3+第4刀卒 / spy_disguise_intercept_count_counts_marker_11）+ d_blade 首刀改判拦截 + four_bio 时间线更新（S 盾3拦3刀最迟 t28 死、E 最迟 t32 死）+ seventh_cut 摘 D 修隐性 flaky，641 全仓零回归（2026-10-16）

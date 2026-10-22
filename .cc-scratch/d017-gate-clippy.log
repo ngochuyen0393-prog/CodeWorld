@@ -1,0 +1,20 @@
+    Checking codeworld-core v0.1.0 (D:\projects\CodeWorld\crates\core)
+    Checking spike-route-a v0.1.0 (D:\projects\CodeWorld\spike\route_a)
+    Checking spike-route-c v0.1.0 (D:\projects\CodeWorld\spike\route_c)
+    Checking spike-route-b v0.1.0 (D:\projects\CodeWorld\spike\route_b)
+error: the loop variable `i` is used to index `comp`
+   --> crates\core\src\mask.rs:238:14
+    |
+238 |     for i in 0..n {
+    |              ^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_range_loop
+    = note: `-D clippy::needless-range-loop` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_range_loop)]`
+help: consider using an iterator and enumerate()
+    |
+238 -     for i in 0..n {
+238 +     for (i, <item>) in comp.iter().enumerate().take(n) {
+    |
+
+error: could not compile `codeworld-core` (lib) due to 1 previous error

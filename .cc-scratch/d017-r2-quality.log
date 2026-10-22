@@ -1,0 +1,12 @@
+Permission allow rule (C:\Users\Administrator\.claude\settings.json): Write(**/*.html) is not matched by file permission checks — only Edit(path) rules are. Use Edit(**/*.html) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Administrator\.claude\settings.json): Write(**/*.axml) is not matched by file permission checks — only Edit(path) rules are. Use Edit(**/*.axml) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Administrator\.claude\settings.json): Write(**/*.acss) is not matched by file permission checks — only Edit(path) rules are. Use Edit(**/*.acss) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Administrator\.claude\settings.json): Write(**/*.sjs) is not matched by file permission checks — only Edit(path) rules are. Use Edit(**/*.sjs) instead (Edit rules cover all file-editing tools).
+`53a2c4a` 不存在（git show 落空，fallback 显示最近提交，最新为 fe4f3f3）。四点核对：
+
+1. **① CONFIRMED** — `is_canonical_asset_id` 定义于 avatars.rs:343（`av_`+16 hex），load() 第 138 行实际调用，违规 id 跳过。
+2. **② CONFIRMED** — seen HashSet 第 116 行建，第 131 行 `seen.insert` 查重，重复 asset_id 只收先到者。
+3. **③ CONFIRMED** — store_upload 第 253 行 `name.is_empty() || len > 64` 拒绝为 bad_json；第 284 行 json 落盘失败调 `cleanup_partial_write` 删孤儿 png。
+4. **④ CONFIRMED** — `MaskError::BadDims` 于 mask.rs:79 定义，validate_and_prune 第 190-191 行入口检查非 128 表即返回 BadDims。
+
+四处全部在位。

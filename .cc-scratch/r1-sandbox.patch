@@ -1,0 +1,11 @@
+diff --git a/crates/arena/src/sandbox.rs b/crates/arena/src/sandbox.rs
+index 9a0dd5a..25aba74 100644
+--- a/crates/arena/src/sandbox.rs
++++ b/crates/arena/src/sandbox.rs
+@@ -265,3 +278,3 @@ pub struct SandboxData {
+-    /// 不烧 fuel、不参与编译实例化；配额由 crate::assets::SandboxAssetQuota
+-    /// 引擎侧记账（不信任玩家自报）。装戴时由 host 写入，与 birth_blob 同生命
+-    /// 周期（随沙箱存活，不持久化，换血时随行转移——replace_sandbox_assets）。
++    /// 不烧 fuel、不参与编译实例化；换血配额门按镜像仓实大小核实（不信任玩家
++    /// 自报，查不到 fail-closed 拒绝换血）。装戴时由 host 写入，与 birth_blob 同
++    /// 生命周期（随沙箱存活，不持久化，换血时随行转移——replace_sandbox_assets）。

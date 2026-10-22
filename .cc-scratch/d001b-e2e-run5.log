@@ -1,0 +1,15 @@
+另一个程序正在使用此文件，进程无法访问。
+[e2e] note: killed leftover codeworld.exe
+[e2e] ---- five-step chain assertions ----
+[e2e] step1 bridge_send queued marker=0: FAIL
+[e2e] step1b outbound line bytes=6: FAIL
+[e2e] step2 fake server received: FAIL
+[e2e] step3 call bridge_on_reply: FAIL
+[e2e] step4 creature got command marker=5: FAIL
+[e2e] step5 creature walked east marker=6: FAIL
+[e2e] ---- excerpt: outbound ----
+[e2e] ---- excerpt: fake server ----
+[fake-bridge] listening on 127.0.0.1:18080
+[fake-bridge] lifetime over, exiting
+[e2e] ---- excerpt: reply delivery ----
+[e2e] RESULT: FAILED - see battle.log / fake-bridge.log

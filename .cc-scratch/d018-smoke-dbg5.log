@@ -1,0 +1,27 @@
+   Compiling codeworld v0.1.0 (D:\projects\CodeWorld\.cc-wt-d018\bin\codeworld)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.06s
+     Running unittests src\main.rs (.cc-wt-d018\target\debug\deps\codeworld-b795209925f53e36.exe)
+
+running 1 test
+[1;1H[33mt[1;2H[33mi[1;3H[33mc[1;4H[33mk[1;5H[33m=[1;6H[33m1[1;7H[33m [1;8H[33m|[1;9H[33m [1;10H[33mA[1;11H[33m:[1;12H[33m阵[1;13H[33m亡[1;14H[33m [1;15H[33m|[1;16H[33m [1;17H[33mD[1;18H[33m [1;19H[33ms[1;20H[33mh[1;21H[33mi[1;22H[33me[1;23H[33ml[1;24H[33md[1;25H[33m=[1;26H[33m?[1;27H[33m [1;28H[33m|[1;29H[33m [1;30H[33ma[16;17H[31m@[16;19H[31m@[17;18H[31m.TICKAGE alive=true age=0 fired=0
+SMOKE after t1: shell=Some(((9.3474575, 5.136749999999999), (3.505215, -0.2565000000000013), true)) target_alive=Some(true)
+[1;6H[33m2[16;19H[31m.[17;18H[0m TICKAGE alive=true age=0 fired=0
+SMOKE after t2: shell=Some(((12.160026489740506, 1.100011043034515), (0.0, 0.0), true)) target_alive=Some(true)
+[1;6H[33m3TICKAGE alive=true age=0 fired=1
+[1;6H[33m4TICKAGE alive=true age=1 fired=1
+SMOKE after t4: shell=Some(((12.160026489740506, 1.1000110367056148), (0.0, 0.0), true)) target_alive=Some(true) shield=2
+SMOKE diag age=1 fired=1
+
+thread 'tests::smoke_ballistics_launch_to_intercept_evidence_chain' (37720) panicked at bin\codeworld\src\main.rs:8636:9:
+证据链3：命中后造物弹应消亡（$fired→life=0）
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::smoke_ballistics_launch_to_intercept_evidence_chain ... FAILED
+
+failures:
+
+failures:
+    tests::smoke_ballistics_launch_to_intercept_evidence_chain
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 442 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p codeworld --bin codeworld`

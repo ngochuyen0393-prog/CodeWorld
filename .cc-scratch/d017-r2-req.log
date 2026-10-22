@@ -1,0 +1,49 @@
+Permission allow rule (C:\Users\Administrator\.claude\settings.json): Write(**/*.html) is not matched by file permission checks — only Edit(path) rules are. Use Edit(**/*.html) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Administrator\.claude\settings.json): Write(**/*.axml) is not matched by file permission checks — only Edit(path) rules are. Use Edit(**/*.axml) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Administrator\.claude\settings.json): Write(**/*.acss) is not matched by file permission checks — only Edit(path) rules are. Use Edit(**/*.acss) instead (Edit rules cover all file-editing tools).
+Permission allow rule (C:\Users\Administrator\.claude\settings.json): Write(**/*.sjs) is not matched by file permission checks — only Edit(path) rules are. Use Edit(**/*.sjs) instead (Edit rules cover all file-editing tools).
+R2 需求确认审查完毕。Gate 实跑：clippy -D warnings 零告警；cargo test --workspace **952 通过 / 0 失败**（bin 401 + arena 111 + core 207 + physics 73 + render 72 + space 30 + storage 26 + time 16 + spike 16）。
+
+---
+
+# D-017 R2 需求确认报告
+
+## 一、修复准确性核对 —— 全部 CONFIRMED
+
+| # | 简报项 | 核对结论 |
+|---|--------|---------|
+| ① | name 非空+≤64 字节 | ✅ `store_upload` 落在解码**之前**（拒绝零成本）；`str::len()`=UTF-8 字节数，与文档「≤64 字节、中文名合法」逐字吻合；空串/65 字节拒绝、恰 64 字节/中文名放行均有测试锚。顺带闭合了 net.rs:458 `unwrap_or_default` 静默空名的洞（net.rs 本体未动，diff 更小——正确的修法选择） |
+| ② | net-protocol bad_json 补磁盘 IO 降级注记 | ✅ 与代码两处 IO 失败（png 写/json 写→BadJson+error 日志）精确对应，无夸大无遗漏 |
+| ③ | store_upload 注释改准+半途清理 | ✅ `cleanup_partial_write` 挂在 json 写失败分支，先写 png 后写 json 的顺序下只此一处会产生孤儿；NotFound 静默幂等；「清理失败=无害垃圾」的措辞核实为真（load 只扫 .json，孤儿 png 永不加载）。有测试 |
+| ④ | MaskError::BadDims 非 128 防御 | ✅ 守卫放在 `validate_and_prune` 入口、16KB clone **之前**（fail-fast）；生产调用点仅 avatars.rs:187/:261 两处、均喂 decode_png_to_mask 产物（恒 128）→ 纯防御零行为变化；`From→DecodeFailed` 有注释；thiserror `{MASK_SIZE}` 常量插值经模块作用域捕获成立（clippy 过=编译证） |
+
+## 二、简报未列但工作区实际存在的修复 —— 溯源合法，非越界
+
+| 项 | 定性 |
+|----|------|
+| **load() asset_id 查重**（HashSet 先到者优先）+ 测试 | ✅ R1 质量审 P1-1 的修法原文就含「同时顺手去重」——53a2c4f 做了格式校验半边，工作区补查重半边，测试注释自标「P1-1 残留子项」。**简报四条清单漏列此项，但它有 R1 出处、有测试、内容正确** |
+| 三处函数头「日志豁免：trivial helper」注记 | ✅ R1 质量审 P2-6 给出的补救选项原文（「可在函数头注释标明豁免理由」），纯注释 |
+
+## 三、越界核对 —— 零触碰成立
+
+- 53a2c4f 只动 avatars.rs；工作区代码面 = avatars.rs + mask.rs + docs/net-protocol.md，共 3 个文件。
+- entity.rs / net.rs / sandbox.rs / physics / index.html：零改动。ClientMessage 五型、EntitySnapshot、碰撞、spawn 14 参全未动。✅
+- 工作区 .cc-bugs/.cc-context/.cc-progress 的 diff 是并行 D-016 R84 会话的记录（新增条目 #17-22 全是地形 CCD 话题），**不属于 D-017 修复内容**，按「他人改动不回退不提交」纪律处置正确——不构成越界，但验收时别把它算进本卡账。
+
+## 四、需求七条复检 —— 仍然全过
+
+① 上传链路（2MB/1024px/name 校验齐）✅ ② 阈值化+降采样（守卫未改主逻辑）✅ ③ 4-连通校验（未动）✅ ④ avatar_assets 下发（net.rs 未动）✅ ⑤ 前端面板（index.html 未动）✅ ⑥ 禁区零触碰 ✅ ⑦ net-protocol v2.2 §9 两行同步 + menu 1.7 五常数在案（100-104 行，N 标待拍板）+ .gitignore:12 ✅
+
+## 五、对账说明
+
+- 简报「实跑 948/0」vs 本次实跑 **952/0**：差 4 = 恰好是本修复轮新增的 4 个测试（查重/name/cleanup/BadDims），账目闭合，R1 需求审 P2-1「测试计数对不上」就此作废。
+- curl/WS/浏览器三类运行时验收不在本沙箱权限内（环境边界），此前实测证据继续有效——name 校验只收紧了空名路径，验收用例用的是合法名，不受影响。
+
+## 六、P3 观察记录（不阻断，记入案底即可）
+
+1. **纯空白 name（如 `"   "`）可通过**——「非空」字面=非空串，文档与实现一致故非缺陷；R1 P2-5 原建议含 trim，修复未做 trim 但文档已同步实现口径，文实自洽。
+2. **查重裁决依赖 read_dir 顺序**——两份同 id json 且先者 png 缺失的极端手工篡改场景下，后到合法份会被连带跳过（保守拒绝+日志，仅盘上篡改可触发，上传端 id 自产唯一）。
+
+## 结论
+
+**NEW-ISSUE：无。** 简报四条修复全部准确落地且有测试锚；额外两项修复（load 查重、日志豁免注记）有 R1 出处、内容正确，非越界；禁区零触碰复核成立；七条需求复检全过；硬 Gate 亲跑 952/0 + clippy 干净。**D-017 通过 R2 需求确认，可收工。**

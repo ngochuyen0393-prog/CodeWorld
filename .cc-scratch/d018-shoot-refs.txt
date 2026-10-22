@@ -1,0 +1,199 @@
+53:    trace_id: EntityId,
+57:    shooter: EntityId,
+136:    /// 操控射击排队（#036：WsShoot 意图产的定装弹请求；route 后入队，阶段二
+137:    /// a1.5 与 sandbox pending_shoots 同一 process_shoots 出口统一发射。
+138:    /// 同拍至多 1 发由 route 单行动折叠保证——操控路径与 shoot import 限流同语义）
+139:    ctrl_shoots: Vec<codeworld_arena::sandbox::PendingShoot>,
+179:    /// 创建映射表（指定世界极速 + 够不着判定阻力，D-007 收尾 P1-3）：shoot 够
+207:            ctrl_shoots: Vec::new(),
+257:            .map(|t| (t.trace_id, t.pos))
+353:        let bridge_traces: Vec<codeworld_arena::sandbox::TraceProbe> = self
+356:            .map(|t| codeworld_arena::sandbox::TraceProbe {
+357:                trace_id: t.trace_id,
+358:                shooter: t.shooter,
+816:    /// 收集本 tick 所有沙箱排队的射击请求（#034 env.shoot 推入，弹道系统）
+818:    /// drain 各沙箱 pending_shoots 后清空，保证不跨拍残留。在 tick 阶段二
+819:    /// process_shoots 调用。
+820:    fn collect_pending_shoots(&mut self) -> Vec<codeworld_arena::sandbox::PendingShoot> {
+823:            all.append(&mut handle.store.data_mut().pending_shoots);
+826:        all.append(&mut self.ctrl_shoots);
+828:            tracing::info!(count = all.len(), "[collect_pending_shoots] 收集射击请求");
+1655:            input::ControlledAction::Shoot { tx, ty } => {
+1667:                                .ctrl_shoots
+1668:                                .push(codeworld_arena::sandbox::PendingShoot {
+1669:                                    shooter: *id,
+1687:                tracing::info!("[input] 操控意图 Shoot target=({tx},{ty}) player={name}（炮塔解算：基准{CTRL_SHOOT_SPEED}×阻力补偿，上限{CTRL_SHOOT_MAX_EFF_SPEED}）");
+1700:        Some((id, input::ControlledAction::Shoot { .. })) => world
+1769:        Some((_, input::ControlledAction::Attack(_))) | Some((_, input::ControlledAction::Shoot { .. }))
+1820:    //       ① 发射落地：env.shoot 排队请求 -> 弹丸实体（离体即世界物体，出手前归代码）
+1823:    process_shoots(world, sandbox_map, current_tick);
+1824:    // 发射痕迹清算（#034 修订三）：寿命尽的痕迹消亡（排在 process_shoots 之后——
+1828:        let shooters: HashMap<EntityId, EntityId> = sandbox_map
+1831:            .map(|(p, meta)| (*p, meta.shooter))
+1833:        physics.step_projectiles(world, current_tick, &shooters, &fields)
+1917:    //      遗嘱排队的 spawn/shoot 当拍喂回既有管线（先后顺序与 a1/a1.5 同：先造物
+1919:    let (will_shoots, will_spawns) = run_death_wills(sandbox_map, &dead_ids);
+1925:    if !will_shoots.is_empty() {
+1927:        let shooters: Vec<EntityId> = will_shoots.iter().map(|s| s.shooter).collect();
+1928:        process_shoot_requests(world, sandbox_map, will_shoots, current_tick, &shooters);
+2585:/// 钳制必过。操控层是"驾驶"：基准档不由玩家调，自定义弹道走玩家代码 env.shoot。
+2761:/// 发射处理（#034 弹道系统：env.shoot 排队请求 -> 弹丸实体落地成世界物体）
+2771:fn process_shoots(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, current_tick: u64) {
+2772:    let requests = sandbox_map.collect_pending_shoots();
+2773:    process_shoot_requests(world, sandbox_map, requests, current_tick, &[]);
+2776:/// 射击请求落地（process_shoots 主体；will_shooters = 遗嘱放行名单，D-007 ③）
+2778:/// 发射者已死分支的例外：遗嘱钩子当拍排队的 shoot 放行（死者最后一发照常出膛
+2781:fn process_shoot_requests(
+2784:    requests: Vec<codeworld_arena::sandbox::PendingShoot>,
+2786:    will_shooters: &[EntityId],
+2790:        let will_pass = will_shooters.contains(&req.shooter);
+2791:        let Some(shooter) = world
+2793:            .get(&req.shooter)
+2797:                shooter = %req.shooter.0,
+2798:                "[process_shoots] 发射者已死，射击请求作废"
+2804:                shooter = %req.shooter.0,
+2807:                "[process_shoots] 达世界实体上限，射击请求作废"
+2813:        let (birth_pos, owner, color) = (shooter.pos(), shooter.owner, shooter.appearance.color.clone());
+2829:        projectile.set_bound_to(Some(req.shooter));
+2833:                shooter: req.shooter,
+2845:            trace_id: EntityId::new(),
+2847:            shooter: req.shooter,
+2854:            shooter = %req.shooter.0,
+2861:            "[shoot] 弹丸发射+痕迹留下（离体即世界物体：出手前归代码，飞行中归世界）"
+2898:                    meta.shooter,
+2917:                    meta.shooter,
+3000:                .get(&meta.shooter)
+3004:        .map(|(pid, meta)| (*pid, meta.shooter))
+3006:    for (pid, shooter) in dead_shells {
+3013:            shooter = %shooter.0,
+3057:    shooter: EntityId,
+3117:///   远程打击归 shoot 弹丸，attack_at 是黑神话棍法语义的贴身近战）。
+3194:                "[deliver_attacks] 攻击落空（距离不足：非贴身够不着，远程打击请用 shoot 弹丸）"
+3487:/// - pending_shoots / pending_spawns 收集返回，由调用方当拍喂回既有管线
+3500:) -> (Vec<codeworld_arena::sandbox::PendingShoot>, Vec<PendingSpawn>) {
+3501:    let mut will_shoots = Vec::new();
+3534:        // 遗嘱产物抢救（沙箱销毁前）：shoot/spawn 当拍放行，attack 丢弃
+3536:        will_shoots.append(&mut data.pending_shoots);
+3558:    (will_shoots, will_spawns)
+3871:/// 策略（on_tick 每 tick 执行；#034 弹道系统生物适配：主战手段换 shoot 抛射，
+3889:  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+3927:        (drop (call $shoot
+8603:    // === #034 弹道系统：shoot 弹丸 + attack_at 接触化 ===
+8626:    /// 一次性射手 WAT：首拍向固定方向 shoot（vx=4, vy=+14.7 两拍回弧, mass 1.0），
+8629:  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+8638:        (drop (call $shoot (f64.const 4.0) (f64.const 14.7)
+8661:        // 证据链四事件走状态取证（battle.log 对应行：[shoot] 射击已排队 / [弹丸诞生] /
+8663:        // 发射=射手沙箱 api_calls 含 shoot；飞行=弹丸实体离手位移；命中拦截=弹丸消亡
+8668:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), SHOOTER_ONCE_WAT);
+8677:        // 证据链1 发射：射手沙箱调过 shoot（api_calls 元数据）
+8680:                .get(&shooter)
+8685:                .contains(&"shoot".to_string()),
+8686:            "证据链1：射手应调过 shoot"
+8724:        assert!(world.entities.get(&shooter).unwrap().is_alive());
+8766:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (0.0, 0.5), PLAYER_WAT);
+8768:        let attacks = vec![PendingAttack::projectile_strike(shooter, (5.0, 0.5), vec![], false)];
+8775:            world.entities.get(&shooter).unwrap().survival.points(),
+8781:    // === #036 期五第五刀：操控定装弹（WS 远程射击；驾驶档，玩家代码 shoot 才是自定义弹道）===
+8972:    fn ws_shoot_intent_spawns_projectile_with_fixed_loadout() {
+8973:        // 端到端：WsShoot 意图 -> 操控目标发射弹丸（解算初速/mass 1.0/
+8977:        let intents = vec![input::Intent::WsShoot { x: 45.0, y: 0.5 }];
+8988:        assert_eq!(count_projectiles(&world), 1, "WsShoot 诞生恰好 1 发弹丸");
+9009:        assert_eq!(meta.shooter, pid, "发射者=操控目标");
+9014:    fn ws_shoot_intent_unreachable_target_spawns_no_projectile() {
+9018:        let intents = vec![input::Intent::WsShoot { x: 90.0, y: 0.5 }];
+9033:    fn ws_shoot_rate_limited_to_one_per_tick() {
+9034:        // 同拍限流沿用（shoot import 1 发/拍在操控路径同样生效）：一批两次点击射
+9039:            input::Intent::WsShoot { x: 45.0, y: 0.5 },
+9040:            input::Intent::WsShoot { x: 20.0, y: 0.5 },
+9056:    fn ws_shoot_and_move_coexist_across_ticks() {
+9062:            input::Intent::WsShoot { x: 45.0, y: 0.5 },
+9136:    fn process_shoots_spawns_projectile_entity_with_meta() {
+9137:        // 发射落地：PendingShoot -> 弹丸实体（code_hash=projectile/半径 0.15/速度/质量/
+9141:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9142:        world.entities.get_mut(&shooter).unwrap().appearance.color = "purple".to_string();
+9144:            .get_mut(&shooter)
+9148:            .pending_shoots
+9149:            .push(codeworld_arena::sandbox::PendingShoot {
+9150:                shooter,
+9157:        process_shoots(&mut world, &mut map, 7);
+9172:        assert_eq!(meta.shooter, shooter, "账本记发射者");
+9179:    fn push_shoot(map: &mut EntitySandboxMap, shooter: EntityId, vx: f64, vy: f64, mass: f64) {
+9181:            .get_mut(&shooter)
+9185:            .pending_shoots
+9186:            .push(codeworld_arena::sandbox::PendingShoot {
+9187:                shooter,
+9197:    fn shoot_leaves_one_tick_trace_for_weak_shell() {
+9201:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9202:        push_shoot(&mut map, shooter, 3.0, 4.0, 1.0);
+9203:        process_shoots(&mut world, &mut map, 7);
+9207:        assert_eq!(t.shooter, shooter, "痕迹记发射者");
+9214:            .all(|e| e.id != t.trace_id), "痕迹实体不进 world");
+9218:    fn shoot_leaves_three_tick_trace_for_high_kinetic_shell() {
+9222:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9223:        push_shoot(&mut map, shooter, 20.0, 0.0, 10.0);
+9224:        process_shoots(&mut world, &mut map, 7);
+9233:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9234:        push_shoot(&mut map, shooter, 3.0, 4.0, 1.0);
+9235:        process_shoots(&mut world, &mut map, 7);
+9248:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9249:        push_shoot(&mut map, shooter, 3.0, 4.0, 1.0);
+9250:        process_shoots(&mut world, &mut map, 7);
+9253:        let vis = map.sandboxes[&shooter].store.data().visible.clone();
+9264:    fn push_binding_shoot(
+9266:        shooter: EntityId,
+9273:            .get_mut(&shooter)
+9277:            .pending_shoots
+9278:            .push(codeworld_arena::sandbox::PendingShoot {
+9279:                shooter,
+9294:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9295:        push_binding_shoot(&mut map, shooter, 3.0, 0.0, 1.0, codeworld_core::entity::BINDING_FADE_ON_DEATH);
+9296:        process_shoots(&mut world, &mut map, 3);
+9299:        world.entities.get_mut(&shooter).unwrap().kill();
+9323:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9324:        push_binding_shoot(&mut map, shooter, 3.0, 0.0, 1.0, codeworld_core::entity::BINDING_UNBOUND);
+9325:        process_shoots(&mut world, &mut map, 3);
+9326:        world.entities.get_mut(&shooter).unwrap().kill();
+9383:    fn grace_owner_landing_does_not_settle_shooter() {
+9388:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9390:            attacker: shooter,
+9398:        assert!(world.entities.get(&shooter).unwrap().is_alive());
+9402:    fn unbound_landing_still_settles_shooter() {
+9406:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9408:            attacker: shooter,
+9416:        assert_eq!(strikes[0].target, shooter, "目标就是发射者自己");
+9424:  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+9431:        (drop (call $shoot (f64.const 0.0) (f64.const 14.7)
+9436:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), GRACE_UPWARD_WAT);
+9437:        let points_before = world.entities.get(&shooter).unwrap().survival.points();
+9453:        let me = world.entities.get(&shooter).expect("发射者存活未清理");
+9464:    fn process_shoots_dead_shooter_and_cap_void_requests() {
+9468:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9470:            .get_mut(&shooter)
+9474:            .pending_shoots
+9475:            .push(codeworld_arena::sandbox::PendingShoot {
+9476:                shooter,
+9483:        world.entities.get_mut(&shooter).unwrap().kill();
+9484:        process_shoots(&mut world, &mut map, 1);
+9490:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
+9492:            .get_mut(&shooter)
+9496:            .pending_shoots
+9497:            .push(codeworld_arena::sandbox::PendingShoot {
+9498:                shooter,
+9505:        process_shoots(&mut world, &mut map, 1);
+9510:    fn projectile_flies_on_after_shooter_death_and_strike_voided() {
+9515:        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), SHOOTER_ONCE_WAT);
+9524:        world.entities.get_mut(&shooter).unwrap().kill();
+9537:        assert!(!world.entities.contains_key(&shooter), "死者被清理");
+9569:    fn hunter_shoots_projectile_at_eighth_tick_and_hits_static_victim() {
+11264:    /// 遗嘱射击模块：life=0 + on_death 排队 shoot（烟花：遗嘱排队的弹当拍发射）
+11266:  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+11271:    call $shoot drop))"#;
+11292:    fn shoot_reach_sim_ticks_mirror_physics() {
+11437:    fn will_shoot_fires_same_tick() {
+11438:        // 验收：遗嘱排队的 shoot 当拍发射（烟花）——弹丸实体+账本当拍出现
+11570:        let (will_shoots, will_spawns) = run_death_wills(&mut map, &[]);
+11571:        assert!(will_shoots.is_empty(), "无死者应无遗嘱产物（shoot）");
+11583:        let shooter_wat = r#"(module
+11584:  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+11589:    call $shoot global.set $ret)
+11595:            map.create(sid, &wasm(shooter_wat), 100_000).unwrap();
