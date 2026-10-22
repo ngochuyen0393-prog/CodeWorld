@@ -13,10 +13,10 @@
 //! 数据非执行（#051 工程三点）：资产段不烧 fuel、不参与编译实例化，只占
 //! 沙箱内存边界——配额是唯一约束面。
 
-/// 单沙箱资产配额（字节）。Screeps 5MB 思路，默认 1MB（bin 侧 CODEWORLD_ASSET_QUOTA
+/// 单沙箱资产配额（字节）。Screeps 5MB 思路，默认 8MB（土豆 1022 拍板 B：一步到位，3D 皮时代免再改）（bin 侧 CODEWORLD_ASSET_QUOTA
 /// 覆盖，config 可调），与 64MB 内存上限的比例≈1/64（资产=富余量非主粮）。
 /// 常数入 game-menu 1.7 总账。
-pub const SANDBOX_ASSET_QUOTA_BYTES: usize = 1024 * 1024;
+pub const SANDBOX_ASSET_QUOTA_BYTES: usize = 8 * 1024 * 1024;
 
 /// 单沙箱资产配额校验器（无状态：每次按实况校验，不落账）。
 ///
@@ -113,10 +113,10 @@ mod tests {
 
     #[test]
     fn default_limit_is_one_megabyte() {
-        // 创建：默认上限=SANDBOX_ASSET_QUOTA_BYTES=1MB（game-menu 1.7 总账锚）
+        // 创建：默认上限=SANDBOX_ASSET_QUOTA_BYTES=8MB（game-menu 1.7 总账锚）
         let q = SandboxAssetQuota::new();
         assert_eq!(q.limit(), SANDBOX_ASSET_QUOTA_BYTES);
-        assert_eq!(q.limit(), 1024 * 1024);
+        assert_eq!(q.limit(), 8 * 1024 * 1024);
         assert_eq!(
             SandboxAssetQuota::default().limit(),
             SANDBOX_ASSET_QUOTA_BYTES
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn admit_under_limit_ok() {
-        // 装戴：模块 100B + 资产 300B ≤ 1MB → Ok（无状态校验器：按实况判定不落账）
+        // 装戴：模块 100B + 资产 300B ≤ 8MB → Ok（无状态校验器：按实况判定不落账）
         let q = SandboxAssetQuota::new();
         assert!(q.admit(100, &sized(&[("av_aabbccddeeff0011", 300)])).is_ok());
     }
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn admit_swap_under_limit_ok() {
-        // 换血（正面）：新模块 500B + 随行资产 400B ≤ 1MB → Ok（换血可成）
+        // 换血（正面）：新模块 500B + 随行资产 400B ≤ 8MB → Ok（换血可成）
         let q = SandboxAssetQuota::new();
         assert!(q
             .admit_swap(500, &sized(&[("av_aabbccddeeff0011", 400)]))

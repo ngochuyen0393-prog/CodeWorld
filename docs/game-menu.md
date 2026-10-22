@@ -106,7 +106,7 @@
 | 力场参数域 | 出生声明家族护栏（防数值病） | field_radius [0,25]（0=无场）/ field_gravity_scale [0,10]（1=中性）/ field_drag_delta [-1,+25]（0=中性，加法式）；生效值域钳制：重力 [-98,0]、阻力 [0,25]（堆场买不到定律外胜利） | ✅ D-012 代码在跑 |
 | 力场脉冲域 | 分离式发射器护栏（D-018 初速来源） | radius [0.1,25] 钳制；冲量模长 ≤ 极速 25（恰等放行）；中心 ±10 格；1 次/拍/实体 | ✅ D-012 代码在跑 |
 | 外桥护栏全家 | 工程保险丝（防灌爆/防卡世界，与 fuel 同性质非玩法数值；design-bridge §2.5） | payload 8KB/信（CODEWORLD_BRIDGE_PAYLOAD_MAX）/ 出站超时 5s（CODEWORLD_BRIDGE_TIMEOUT_S）/ 每沙箱在途 4 条（CODEWORLD_BRIDGE_INFLIGHT）/ 每沙箱每拍 1 发（代码在跑，与接触容差同账本）/ 回信读保险丝 1MB（REPLY_READ_CAP，const 非 config——worker 防坏服务器灌爆读上限） | ✅ D-001b 代码在跑 |
-| 单沙箱资产配额 | 皮入沙箱的盒子容量（引擎+皮入配额账；魂走 64MB 内存上限独立账，两账并行。超限拒绝装戴/换血，资产不丢） | 1MB（SANDBOX_ASSET_QUOTA_BYTES，CODEWORLD_ASSET_QUOTA 覆盖） | ⚠️ **待土豆拍板**（临时默认 1MB≈64MB 内存上限的 1/64，资产=富余量非主粮，Screeps 5MB 同款思路） |
+| 单沙箱资产配额 | 皮入沙箱的盒子容量（引擎+皮入配额账；魂走 64MB 内存上限独立账，两账并行。超限拒绝装戴/换血，资产不丢） | 8MB（SANDBOX_ASSET_QUOTA_BYTES，CODEWORLD_ASSET_QUOTA 覆盖） | ✅ 定案（土豆 2026-10-22 拍板 B 一步到位——3D 皮时代 glTF 模型 5~15MB 免再改；≈64MB 内存上限的 1/8，资产=富余量非主粮，Screeps 5MB/VRChat 10MB 同档思路） |
 
 3. **量测口径变更要重标锚**：CCD 上线时射程锚 7.4→3.9（旧口径把穿地距离算进去）——锚不变，值跟着重解。换测量方式时盘点所有依赖旧口径的锚。
 4. **常数修改"跟随但明着跟"**：拍速升级时重力/阻力/极速一批重标+入宪法修订+公告——不悄悄自动换算（世界暗改玩家可感知的东西=不诚实）。现值进 config（CODEWORLD_MAX_SPEED 等可调），改动走立法流程。
