@@ -164,6 +164,22 @@ pub struct Entity {
     #[serde(default)]
     liquid_drag: f64,
 
+    // 链账本（D-011 世界内链路段：link=binding 家族新成员，decisions.md #038
+    // 通道公理世界内段）。活链造物指向母体——与 bound_to 同款形态（Option<EntityId>
+    // 实体字段）、同款快照待遇。链管通信（契约管生死，两轴正交自由组合）：
+    // None=无链放生（默认=现状语义零回归）；Some=活链（母体 command 可达、
+    // 自己 report 沿链上行）。断链=母体死时世界清算清 None（孤儿按 binding 活）。
+    /// serde default：旧快照无此字段时回退 None=无链（存储向后兼容）
+    #[serde(default)]
+    link_to: Option<EntityId>,
+
+    // 公开存储块（D-011 存储件：造物=移动硬盘的"盘面"——storage_write 全量
+    // 覆盖自己的公开块，对方贴身 storage_read 拉读）。数据在世界侧非沙箱内存：
+    // 不烧燃料、不占沙箱内存，随实体入快照（重启不丢=比沙箱内存耐用）。
+    /// serde default：旧快照无此字段时回退空块（存储向后兼容）
+    #[serde(default)]
+    storage: Vec<u8>,
+
     // 外观与动作状态
     /// 渲染数据
     pub appearance: Appearance,
@@ -382,6 +398,25 @@ pub fn clamp_binding(v: i32) -> i32 {
     }
 }
 
+/// 链声明档位（D-011：spawn 第 20 参 link，binding 家族新成员——契约管生死、
+/// 链管通信，两轴正交自由组合）
+/// - 无链（默认）：放生——现状语义零回归（离体之物独立存在不可遥控）
+/// - 活链：可控+可传——母体 command 下行广播可达、造物 report 沿链上行
+pub const LINK_UNLINKED: i32 = 0;
+pub const LINK_ACTIVE: i32 = 1;
+
+/// 链声明校验钳制（spawn 第 20 参口径，与 clamp_binding 同款）：非法值钳无链
+/// 并 warn——坏声明不进世界，回退最保守的放生现状语义
+pub fn clamp_link(v: i32) -> i32 {
+    match v {
+        LINK_UNLINKED | LINK_ACTIVE => v,
+        other => {
+            tracing::warn!(value = other, clamped = LINK_UNLINKED, "[link] 非法链声明值，钳无链");
+            LINK_UNLINKED
+        }
+    }
+}
+
 impl Entity {
     /// 创建新实体
     ///
@@ -414,6 +449,8 @@ impl Entity {
             field_drag_delta: default_field_drag_delta(),
             liquid_density: 0.0,
             liquid_drag: 0.0,
+            link_to: None,
+            storage: Vec::new(),
             appearance,
             action_state: ActionState::Idle,
             instruction_guard: InstructionGuard::new(per_tick_instruction_limit),
@@ -556,6 +593,32 @@ impl Entity {
     /// 设置水中阻尼（import 层已 clamp_liquid_drag，此处直存）
     pub fn set_liquid_drag(&mut self, liquid_drag: f64) {
         self.liquid_drag = liquid_drag;
+    }
+
+    /// 活链母体（D-011：None=无链放生，Some=活链可控+可传）
+    pub fn link_to(&self) -> Option<EntityId> {
+        self.link_to
+    }
+
+    /// 设置活链母体（import 层已 clamp_link，此处直存；断链清算也走此口清 None）
+    pub fn set_link_to(&mut self, parent: Option<EntityId>) {
+        tracing::debug!(
+            entity_id = %self.id.0,
+            parent = ?parent.map(|p| p.0.to_string()),
+            "[link] 链账本变更"
+        );
+        self.link_to = parent;
+    }
+
+    /// 公开存储块（D-011 存储件：世界侧公开信箱，随实体入快照）
+    pub fn storage(&self) -> &[u8] {
+        &self.storage
+    }
+
+    /// 全量覆盖公开存储块（storage_write 语义：整块替换非追加）
+    pub fn set_storage(&mut self, storage: Vec<u8>) {
+        tracing::debug!(entity_id = %self.id.0, len = storage.len(), "[storage] 公开块覆盖");
+        self.storage = storage;
     }
 
     /// 设置坐标（物理规则校验与变换管线由 space/physics 模块负责，此处只存）
@@ -1203,5 +1266,85 @@ mod tests {
         let back: Entity = serde_json::from_str(&json).unwrap();
         assert_eq!(back.liquid_density(), 0.0, "旧快照应回退非液体");
         assert_eq!(back.liquid_drag(), 0.0);
+    }
+
+    // === 链账本 + 公开存储块（D-011 世界内链路段：link=binding 家族新成员，
+    // === storage=造物公开信箱；decisions.md #038 通道公理世界内段）===
+
+    #[test]
+    fn entity_link_defaults_to_unlinked() {
+        // 创建：新实体默认无链（现状语义零回归——放生是链的默认态）
+        let e = sample_entity();
+        assert_eq!(e.link_to(), None);
+    }
+
+    #[test]
+    fn entity_link_survives_serialize_roundtrip() {
+        // 读写：活链序列化往返保留（快照存档不断档——链账本落在实体字段，
+        // 与 bound_to 同款形态同款快照待遇）
+        let mut e = sample_entity();
+        e.set_link_to(Some(crate::entity::EntityId(uuid::Uuid::from_u128(42))));
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.link_to(),
+            Some(crate::entity::EntityId(uuid::Uuid::from_u128(42))),
+            "活链应随实体序列化往返"
+        );
+    }
+
+    #[test]
+    fn entity_link_serde_backcompat_old_snapshot() {
+        // 边界：旧快照（无 link_to 字段）反序列化回退 None（存储向后兼容，
+        // bound_to/binding 同款先例——旧存量造物全部保持放生现状）
+        let mut obj: serde_json::Value = serde_json::to_value(sample_entity()).unwrap();
+        obj.as_object_mut().unwrap().remove("link_to");
+        let json = serde_json::to_string(&obj).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.link_to(), None, "旧快照应回退无链");
+    }
+
+    #[test]
+    fn clamp_link_passes_valid_values() {
+        // 校验：两档合法值原样通过（0=无链放生 / 1=活链可控+可传）
+        assert_eq!(clamp_link(LINK_UNLINKED), LINK_UNLINKED);
+        assert_eq!(clamp_link(LINK_ACTIVE), LINK_ACTIVE);
+    }
+
+    #[test]
+    fn clamp_link_rejects_invalid_to_unlinked() {
+        // 校验：非法值钳 0（出生声明家族哲学：坏声明不进世界，回退最保守现状语义）
+        assert_eq!(clamp_link(2), LINK_UNLINKED);
+        assert_eq!(clamp_link(-1), LINK_UNLINKED);
+        assert_eq!(clamp_link(i32::MAX), LINK_UNLINKED);
+    }
+
+    #[test]
+    fn entity_storage_defaults_empty() {
+        // 创建：新实体公开存储块默认空（对方读它返回"无存储"，与空字节区分）
+        let e = sample_entity();
+        assert!(e.storage().is_empty());
+    }
+
+    #[test]
+    fn entity_storage_survives_serialize_roundtrip() {
+        // 读写：存储块随实体入快照（重启不丢=存储块比沙箱内存耐用，
+        // design-link 五节）；全量覆盖语义下往返必须保真
+        let mut e = sample_entity();
+        e.set_storage(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.storage(), &[0xDE, 0xAD, 0xBE, 0xEF], "存储块应往返保真");
+    }
+
+    #[test]
+    fn entity_storage_serde_backcompat_old_snapshot() {
+        // 边界：旧快照（无 storage 字段）反序列化回退空块（serde default，
+        // 存储向后兼容 link_to/bound_to 同款先例）
+        let mut obj: serde_json::Value = serde_json::to_value(sample_entity()).unwrap();
+        obj.as_object_mut().unwrap().remove("storage");
+        let json = serde_json::to_string(&obj).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert!(back.storage().is_empty(), "旧快照应回退空存储块");
     }
 }

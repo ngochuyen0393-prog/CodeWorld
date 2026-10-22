@@ -17,6 +17,9 @@
 | `on_contact` | `(f64, f64) -> ()` | 可缺省 | 新进入物理接触时（双方各一次，边沿触发） |
 | `on_death` | `() -> ()` | 可缺省 | 死亡清理前（遗嘱窗口，世界托管执行） |
 | `on_field` | `(i32, i32, i32) -> i32` | 可缺省 | 声明了力场（field_radius>0）且已成型时，世界每拍询问一次 |
+| `on_command` | `(i32, i32) -> ()` | 可缺省 | 母体 command 广播到达时（下一拍 a-1 投递） |
+| `on_report` | `(i64, i32, i32) -> ()` | 可缺省 | 活链孩子 report 到达时（from=发送造物 id 低 64 位） |
+| `on_message` | `(i64, i32, i32) -> ()` | 可缺省 | 其他实体 send 到达时（from=发送方 id 低 64 位） |
 
 - **`life()` 返回 1 = 继续存在；返回 0 = 主动自尽。** 缺 `life` 导出或调用失败，第一拍就会被框架判定死亡——没有 `life` 的模块活不过一拍。
 - `on_tick` 是你的主逻辑入口（找敌人、移动、出刀都在这里）。
@@ -65,7 +68,7 @@
 - **失败诚实**：on_field 抛错/签名不匹配/未导出 → 本拍按出生声明结算（世界不用坏数据）。操控接管/处置等待**不豁免**询问（场是出生声明的每拍核实，与 life 同级的存在合同）。
 - **窗口注意**：on_field 执行窗口内 probe 不可用（probe 桥只挂 on_tick 窗口）；get_pos/scan/visible 照常。
 
-## 二、已开放 import（16 个）
+## 二、已开放 import（21 个）
 
 所有 import 挂在 `"env"` 命名空间下。玩家代码读到的世界状态是**本拍开始时的快照**（你动、别人也动，实际结果下一拍才感知）。
 
@@ -186,7 +189,7 @@
 
 比对对方的话（response）和它的体徵（尾块），是识破伪装的路子。目标 `on_probe` 跑在独立小 fuel 预算上，恶意死循环烧不动你的 tick。
 
-### `spawn(code_ptr: i32, code_len: i32, x: f64, y: f64, glyph_ptr: i32, color_ptr: i32, radius: f64, mass: f64, binding: i32, motion: i32, vx: f64, vy: f64, blob_ptr: i32, blob_len: i32, field_radius: f64, field_gravity_scale: f64, field_drag_delta: f64, liquid_density: f64, liquid_drag: f64) -> i32`
+### `spawn(code_ptr: i32, code_len: i32, x: f64, y: f64, glyph_ptr: i32, color_ptr: i32, radius: f64, mass: f64, binding: i32, motion: i32, vx: f64, vy: f64, blob_ptr: i32, blob_len: i32, field_radius: f64, field_gravity_scale: f64, field_drag_delta: f64, liquid_density: f64, liquid_drag: f64, link: i32) -> i32`
 
 造物（门二）：提交一段 WAT 源码 + 出生坐标 + 外观 + 身体/质量参数 + **绑定契约** + **运动身份** + **出生初速** + **出生数据包**，请求造一个新实体。**造物是活实体，不是装饰**——从下一拍开始跑自己的代码，生死由它自己的 `life()` 决定（自治锚合同，存续与你的在线状态无关——除非你声明了契约）。
 
@@ -209,6 +212,7 @@
 | `field_drag_delta` | **场阻力改写量**（D-012 第 17 参，**加法式**不是缩放）：生效阻力 = 世界阻力 + delta。域 [-1.0, +25.0]，0=不改写（默认）；非有限值警告并钳 0，超域钳边界。正负互吃（叠加 v2 代数抵消），详见「力场（D-012）」节 |
 | `liquid_density` | **液体密度 ρ**（D-009 第 18 参，液体出生声明家族）：域 [0.0, 5.0]，0=非液体（默认=普通造物零回归）；>0 即声明"我的身体区域（格对齐 AABB）是水域"。参照系=水 1.0 无量纲，世界只认数字不认名字（"油 0.75/蜂蜜 1.4/岩浆 2.5"是社区预设非内置清单）。非有限/负值警告并钳 0，超上限钳 5.0。详见「液体（D-009）」节 |
 | `liquid_drag` | **水中阻尼 k**（D-009 第 19 参）：每拍速度保留系数的 MC 语义——水中一步 `v ← v×k_eff + 浮力改写重力`，`k_eff = clamp(k, 0, 1)`（声明域 [0,5] 宽松、结算域 [0,1] 收紧，不许凭空加速）。域 [0.0, 5.0]，0=无阻尼声明合法；非有限/负值警告并钳 0，超上限钳 5.0。k=0.35 → 入水一拍速度掉 65% |
+| `link` | **链声明**（D-011 第 20 参，binding 家族新成员——契约管生死、链管通信，两轴正交自由组合）：`0`=无链（默认=放生，现状零回归）；`1`=活链（母体 `command` 下行广播可达、自己 `report` 沿链上行）。非法值警告并按 0 处理。断链唯一事件=母体实体死（当拍 link_to 清 None，INFO 一条汇总）；断链不杀造物——电话挂了人活着。**夺剑注意**：链是实体字段，造物被决斗攻陷后链仍连原母体——新主照收原母体的剑诀广播、可用 report 伪装上行（"放风筝的人自己也在被钓"，#038 原文零新立法）。详见「世界内链路段（D-011）」节 |
 
 返回 `1` = 已排队；`0` = 拒绝（限流/参数非法，当场知道）。排队后的请求在阶段二统一处理，以下情形作废（返回值已经是 1，**以运行日志为准**）：
 
@@ -222,7 +226,7 @@
 造物属性（框架定，改不了）：owner 继承你的 owner（**产权链**，见 `destroy`）；fuel 配额继承你；出生即存活。
 
 ```wat
-(import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+(import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
 (import "env" "get_pos" (func $get_pos (result f64 f64)))
 (memory (export "memory") 1)
 ;; [0..56) 造物 WAT 源码 + NUL；[8192] 字形 + NUL；[8256] 颜色 + NUL
@@ -251,6 +255,7 @@
       (f64.const 0.0)                       ;; field_drag_delta（第 17 参，0=不改写阻力）
       (f64.const 0.0)                       ;; liquid_density（D-009 第 18 参，0=非液体默认）
       (f64.const 0.0)                       ;; liquid_drag（第 19 参，0=无阻尼声明）
+      (i32.const 0)                         ;; link（D-011 第 20 参，0=无链放生；1=活链）
       (call $spawn) (drop))))
 ```
 
@@ -353,6 +358,100 @@
   ;; 例：数字 3 = 连走 3 拍向东（外脑回 {"dx":3}）
   ...)
 ```
+
+## 二点四、世界内链路段（D-011）——链是活电话，契约是遗嘱，存储是公开信箱
+
+**法律事实**（#038 通道公理世界内段）：链/消息/存储三件套全部落在**信息通道**层——世界只送信不拆信，全部零内容解释。外桥=对世界外出线（`bridge_send`）；本节=世界内管道。两个管道、同一法条。直接访问仍然只有物理接触→决斗会话一条路——本节接口全部**不触碰对方沙箱内存**：send 送的信对方自愿收（开门=导出回调），storage 读的是世界侧公开块非沙箱内存。
+
+**链三态**：无链（放生，spawn 默认）/ 活链（可控+可传）/ 断链（孤儿按 binding 契约活）。`link` 与 `binding` 正交自由组合：链管通信、契约管生死——可自由组合（link=1+binding=0：母体死后造物活着但链断了；link=1+binding=1：母体死当拍同生+链断无感）。**广播制寻址**：command=向名下全部活链造物广播，不做"第 N 个孩子"编号寻址——沙箱不持久化记不住编号，谁响应哪条指令是玩家代码的事（指令内容带标记孩子自己过滤，世界零预设）。
+
+### `command(ptr: i32, len: i32) -> i32`
+
+下行广播（母体剑诀控万剑——飞剑剑诀本来就是万人一面）：把 payload 从你的 memory `[ptr, ptr+len)` 读取，排队投给**名下全部活链造物**（link_to==你 且 存活），对方经 `on_command(offset, len)` 收到。
+
+- **返回码**：正数=入队链数（本拍开始时名下活链孩子数）；`0`=无活链或参数坏（len 超上限/本拍已广播）。多重违规按超限→限流→无链判序。
+- **每拍 1 次**；**无视口限制**（链=声明关系，风筝线可放出屏幕——风筝流成立前提）。
+- **两拍节律**（与外桥回信一致）：拍 N 你 command，拍 N+1 阶段二投递（孩子 on_command 被调），孩子主代码拍 N+2 on_tick 感知。孩子当拍死了=丢弃+INFO（无人认领）。
+- **fuel**：调用本身烧你的 tick 燃料；孩子的 on_command 烧**孩子的**独立防守预算（probe 同档 10_000，不占它主配额——围殴经济学：发信烧自己，收信有独立上限兜底）。
+
+```wat
+(import "env" "command" (func $command (param i32 i32) (result i32)))
+(memory (export "memory") 1)
+(data (i32.const 0) "TURN+2")   ;; 剑诀内容自己定义——世界不解释，孩子自己过滤
+;; 广播给全部活链造物；返回 3 = 名下三个活链孩子已入队
+(i32.const 0) (i32.const 6) (call $command)
+```
+
+### `report(ptr: i32, len: i32) -> i32`
+
+上行沿链（侦察弹报坐标）：你是活链造物时（link_to 有值），payload 沿链投给母体，母体经 `on_report(from, offset, len)` 收到。**无需寻址**——链连着呢，世界查账本找母体。
+
+- **返回码**：`1`=入队；`0`=参数坏（len 超上限/本拍已上报）；`2`=无链或断链。
+- **`from` 参数**=发送造物 EntityId 低 64 位（8 字节小端，i64 直传）——母体多孩子区分靠它；孩子自己的状态写进消息内容。
+- **每拍 1 次**；无视口限制。母体当拍死了=信丢弃+INFO（濒死回传天然成立：消息发出≠载体存活——反过来，载体死了信照送）。
+- 同族回调 `on_message` 同签名同预算（见 `send`）。
+
+```wat
+(import "env" "report" (func $report (param i32 i32) (result i32)))
+(import "env" "get_pos" (func $get_pos (result f64 f64)))
+(memory (export "memory") 1)
+;; 每拍把自己的坐标上报给母体（16 字节 = x/y 两个 f64）
+(func (export "on_tick") (local $x f64) (local $y f64)
+  (call $get_pos) (local.set $y) (local.set $x)
+  (f64.store (i32.const 0) (local.get $x))    ;; x 写 [0..8)——f64.store 先地址后值
+  (f64.store (i32.const 8) (local.get $y))    ;; y 写 [8..16)
+  (i32.const 0) (i32.const 16) (call $report) (drop))
+```
+
+### `send(x: f64, y: f64, ptr: i32, len: i32) -> i32`
+
+横向数据通道（坐标寻址，与 probe/attack_at 同哲学——点寻址，所见即所发）：把 payload 投给坐标 `(x, y)` 处的视口内实体，对方经 `on_message(from, offset, len)` 收到。
+
+- **视口门槛**：目标必须在你的**视口内**（visible 列表成员——"屏幕内无欺骗"的发送版：看不见的发不到，想发先 scan/visible_at 拿坐标）。坐标精确匹配（visible_at 给出什么就发什么）。
+- **返回码**：`1`=入队；`0`=参数坏（坐标非有限/len 超上限/本拍已发）；`-1`=坐标无实体或不视口内。
+- **每拍 1 次**。对方聋（无 on_message 导出）=入队成功但投递作废+INFO（**通信自由=发信自由；开门=收信自由**，注入无门落地）。
+- **不做**（接口面最小化）：送达回执（消息发出≠送达，代码自理）；广播 send（广播=自己循环坐标发）；视口外投递（跨视口走链或外桥——横向中继=自己拼信鸽，storage 块就是给这个的）。
+
+```wat
+(import "env" "send" (func $send (param f64 f64 i32 i32) (result i32)))
+(import "env" "visible_at" (func $visible_at (param i32 i32 i32) (result i32)))
+(memory (export "memory") 1)
+(data (i32.const 0) "HELLO")
+;; 拿 0 号可见实体的坐标发信（先 visible_at 取坐标，再按坐标投）
+(i32.const 0) (i32.const 100) (i32.const 108) (call $visible_at) (drop)
+(f64.load (i32.const 100)) (f64.load (i32.const 108))
+(i32.const 0) (i32.const 5) (call $send) (drop)
+```
+
+### `storage_write(ptr: i32, len: i32) -> i32` / `storage_read(x: f64, y: f64, ptr: i32, cap: i32) -> i32`
+
+公开存储块（造物=移动硬盘）：`storage_write` 全量覆盖**自己的**公开块；`storage_read` **贴身**读对方的公开块（距离 < 你的半径 + 对方半径 + 0.5 严格小于——读硬盘=物理凑过去读，与 melee 判距同款）。**数据在世界侧**：不烧沙箱燃料、不占沙箱内存、**随实体入快照（重启不丢=比沙箱内存耐用）**。信鸽中继玩法：前线造物写盘 → 飞越战场 → 后方母体贴身读走。
+
+- **storage_write 返回码**：`N`=写入字节数（全量覆盖，写 0 字节=清盘）；`-1`=超容拒绝（**不截断**——硬盘写一半=坏盘，诚实拒绝；上限 4096B，`CODEWORLD_STORAGE_CAP`）；`0`=参数坏（负长度/本拍已写盘）。
+- **storage_read 返回码**：`N`=读到字节数（写入你的 memory `[ptr, ptr+N)`，原子）；`0`=cap 不足或指针坏；`-1`=坐标无实体；`-2`=够不着（贴身判据外）；`-3`=对方无存储（**空块返回 0**——"-3 没硬盘"与"0 空硬盘"区分）。读自己：storage_read 自己坐标（get_pos），距离 0 天然成立，读自己的盘（同拍写后读可见新值）。
+- **每拍各 1 次**（写与读各一，写读同拍可并用）。失败路径不占限流（下一拍可重试）。
+- **与"接触传导"挂起项的区分**：storage_read=主动 import 拉读世界侧公开块（信息通道层），不触碰对方沙箱内存——飞剑回鞘（接触自动连通沙箱内存）是另一层另议。
+- 完整立法（否决编号寻址/链上写盘/送达回执/视口外投递/世界侧持久化）见 decisions.md；演示对见 `players/link-demo.wat`（风筝演示：母体广播转向+侦察弹回报坐标）。
+
+```wat
+(import "env" "storage_write" (func $storage_write (param i32 i32) (result i32)))
+(import "env" "storage_read" (func $storage_read (param f64 f64 i32 i32) (result i32)))
+(memory (export "memory") 1)
+;; 前线造物写情报（全量覆盖）
+(i32.const 0) (i32.const 6) (call $storage_write) (drop)
+;; 后方母体贴身读对方硬盘（cap 512 的缓冲；返回 N=读到 N 字节，-2=凑近点再来）
+(f64.const 7.0) (f64.const 8.0) (i32.const 2048) (i32.const 512) (call $storage_read)
+```
+
+### `on_command(offset: i32, len: i32)`（可缺省导出）
+
+造物收母体剑诀：母体 command 的信字节已由世界 **grow 新页**写进你的线性内存（`ptr`=新页偏移，`len`=信长，新增零页永不覆盖你的数据）。不带 from 参——链连着呢，你知道信是谁的（谁响应哪条指令是你的代码写的）。缺省导出=收不到信（世界零副作用丢弃+日志）。
+
+### `on_report(from: i64, offset: i32, len: i32)` / `on_message(from: i64, offset: i32, len: i32)`（可缺省导出）
+
+母体收孩子回传 / 任意沙箱收横向信。`from`=发送方 EntityId 低 64 位（母体多孩子区分靠它）。投递时点=拍边界（下一拍阶段二，确定性锚）；独立小预算包裹（默认 10_000 指令同 probe 档）——收信不占你的 tick 配额，恶意来信烧不动你的主算力。缺省导出=聋（合法，通信自由是双向的）。
+
+**快照注意**：链消息不进快照——在途消息=当拍生命周期，重启即清（持久化归存储块：要留的字段自己 storage_write 落盘）。
 
 ## 二点五、力场（D-012）——场是出生声明，不是特殊品类
 

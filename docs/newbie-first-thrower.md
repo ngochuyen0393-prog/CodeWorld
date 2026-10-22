@@ -18,7 +18,7 @@
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
   (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
   (import "env" "spawn" (func $spawn
-    (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64)
+    (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32)
     (result i32)))
   (memory (export "memory") 1)
   ;; ↓↓↓ 改这里 1：子弹代码（data 段 [4096..)，别与 scan 缓冲 [0..16) 重叠）
@@ -70,7 +70,8 @@
           (f64.const 1.0)           ;; 16 field_gravity_scale（1.0=不改写重力）
           (f64.const 0.0)           ;; 17 field_drag_delta（0=不改写阻力）
           (f64.const 0.0)           ;; 18 liquid_density（0=非液体默认）
-          (f64.const 0.0)))         ;; 19 liquid_drag（0=无水中阻尼）
+          (f64.const 0.0)           ;; 19 liquid_drag（0=无水中阻尼）
+          (i32.const 0)))           ;; 20 link（D-011，0=无链放生；1=活链可控+可传）
         (return)))
     ;; 贴身机会刀（投掷器也能近战）
     (if (f64.le (local.get $dist) (f64.const 1.0))

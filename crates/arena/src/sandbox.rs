@@ -123,9 +123,56 @@ pub struct PendingSpawn {
     /// 水中阻尼（D-009 spawn 第 19 参；import 层已钳制 [0.0, 5.0]，0=无阻尼；
     /// 结算时有效保留系数另钳 [0,1]）
     pub liquid_drag: f64,
+    /// 链声明（D-011 spawn 第 20 参；import 层已钳制非法值为无链：
+    /// 0=放生默认 / 1=活链可控+可传，binding 家族新成员）
+    pub link: i32,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
 }
+
+/// 链消息出站方向（D-011：import 层只认方向，扇出/沿链寻址在世界侧阶段二做
+/// ——import 闭包是 'static 拿不到 world）
+#[derive(Debug, Clone)]
+pub enum LinkOutKind {
+    /// 下行广播给名下全部活链造物（to 由阶段二按 link_to 账本扇出）
+    Command,
+    /// 上行沿链投母体（to=拍首快照的 link_parent）
+    Report { to: EntityId },
+    /// 横向坐标寻址（to=坐标命中的视口内实体）
+    Send { to: EntityId },
+    /// 全量覆盖自己的公开存储块（世界侧落账，当拍闭环不进投递信箱）
+    StorageWrite,
+}
+
+/// 本 tick 排队的链路出站请求（五 import 的 command/report/send/storage_write
+/// 共用管道；storage_read 是同步读不走此队列）
+#[derive(Debug, Clone)]
+pub struct PendingLinkOut {
+    /// 发送方（沙箱所属实体）
+    pub from: EntityId,
+    /// 出站方向
+    pub kind: LinkOutKind,
+    /// 信体（import 层已读出并过上限校验）
+    pub payload: Vec<u8>,
+}
+
+/// 贴身可读实体快照（D-011 storage_read/send 的数据通路）：host 拍首按视口
+/// 过滤存活实体填充（与 visible 同批同源口径，EntityId 升序稳定排序、排除自己）
+#[derive(Debug, Clone)]
+pub struct LinkPeer {
+    /// 实体 id（send 坐标命中后的投递目标）
+    pub id: EntityId,
+    /// 坐标快照（精确匹配寻址——visible_at 给出什么就发什么，所见即所发）
+    pub pos: (f64, f64),
+    /// 身体半径快照（贴身判据 r_self + r_peer + 0.5 用）
+    pub radius: f64,
+    /// 公开存储块快照（storage_read 拉读的数据源）
+    pub storage: Vec<u8>,
+}
+
+/// storage_read 贴身判距冗余（与 melee 同款 0.5——读硬盘=物理凑过去读，
+/// design-link 五节；引用 core 单一实现防两套口径）
+pub const STORAGE_READ_REACH: f64 = codeworld_core::collision::MELEE_REACH;
 
 /// 本 tick 排队的 destroy 请求（env.destroy 推入，阶段二产权校验后应用）
 ///
@@ -274,6 +321,39 @@ pub struct SandboxData {
     pub bridge_payload_max: usize,
     /// 在途上限（host 从 config 装配传入；import 判"在途满"返 3 的依据）
     pub bridge_inflight_max: u32,
+    // === 世界内链路段快照/排队段（D-011：host 拍首填充 + import 排队 + 阶段二
+    // === 收集，与 bridge 管道分记账分管道——桥管出世界，链管世界内）===
+
+    /// 名下活链造物数快照（host 拍首按 link_to==自己 且 存活 计数填充；
+    /// command 返回值=入队链数的依据，实际扇出在世界侧阶段二）
+    pub link_children: u32,
+    /// 活链母体快照（host 拍首读实体 link_to 填充；None=无链——report 恒返 2）
+    pub link_parent: Option<EntityId>,
+    /// 自己身体半径快照（host 拍首填充；storage_read 贴身判据 r_self 侧）
+    pub link_radius: f64,
+    /// 视口内实体快照（host 拍首按 viewport 过滤存活实体填充，EntityId 升序、
+    /// 排除自己——send 坐标寻址与 storage_read 贴身判据的数据源）
+    pub link_peers: Vec<LinkPeer>,
+    /// 自己公开存储块镜像（host 拍首读实体 storage 填充；storage_write 同时
+    /// 更新镜像——同拍读自己可见新值，真源在世界侧实体字段）
+    pub link_storage_own: Vec<u8>,
+    /// 本拍 command 已成功标记（每沙箱每拍 1 次；host collect 后清——限流以拍为单位）
+    pub link_command_sent: bool,
+    /// 本拍 report 已成功标记（同上）
+    pub link_report_sent: bool,
+    /// 本拍 send 已成功标记（同上）
+    pub link_send_sent: bool,
+    /// 本拍 storage_write 已成功标记（同上）
+    pub link_sw_sent: bool,
+    /// 本拍 storage_read 已成功标记（读也限 1 次/拍——五 import 同节律）
+    pub link_sr_sent: bool,
+    /// 本拍排队的链路出站请求（command/report/send/storage_write 共用管道，
+    /// 与 bridge_pending 分记账；host 阶段二收集后 drain 清空）
+    pub link_pending: Vec<PendingLinkOut>,
+    /// 链消息 payload 单信上限字节数（host 从 config 装配传入）
+    pub link_payload_max: usize,
+    /// 公开存储块容量上限字节数（host 从 config 装配传入；超容拒绝不截断）
+    pub storage_cap: usize,
     /// 地形快照指针（D-016：move_by/spawn 的钻地判据从 y<0 改 y<ground(x)）。
     /// 与 probe_bridge 同款窗口契约：仅主循环阶段一执行玩家代码的窗口内非空
     ///（host 挂载 -> call -> 置空同一循环体作用域），窗口外恒 null——
@@ -907,9 +987,10 @@ impl SandboxManager {
         //     [-1,+25]（非有限钳 0）——出生声明家族哲学：超界钳回+警告非拒绝
         //   - 液体第 18/19 参（D-009）：liquid_density 钳 [0,5]（0=非液体默认）、
         //     liquid_drag 钳 [0,5]（0=无阻尼；结算时有效保留系数另钳 [0,1]）
+        //   - 链第 20 参（D-011）：link 钳非法值回无链（0=放生默认/1=活链）
         // 产权链 owner 继承、世界实体上限、WAT 编译都在阶段二判（返回 1=已排队，
         // 阶段二拒绝以日志为准，api.md 载明）。
-        // D-009：spawn 已 19 参——wasmtime 25 的 IntoFunc 宏上限 17 参
+        // D-009：spawn 超 17 参——wasmtime 25 的 IntoFunc 宏上限 17 参
         //（Caller+17，func.rs for_each_function_signature 最后一档），func_wrap
         // 装不下 20 个闭包参数，改走 func_new 动态注册（任意元数）。参数经
         // Val::I32/F64 匹配抽取（import 签名已声明类型，运行期只会是声明类型；
@@ -929,6 +1010,7 @@ impl SandboxManager {
                     wasmtime::ValType::I32, wasmtime::ValType::I32, // blob ptr/len
                     wasmtime::ValType::F64, wasmtime::ValType::F64, wasmtime::ValType::F64, // field 三参（D-012）
                     wasmtime::ValType::F64, wasmtime::ValType::F64, // liquid 两参（D-009 第 18/19 参）
+                    wasmtime::ValType::I32, // link（D-011 第 20 参）
                 ],
                 [wasmtime::ValType::I32],
             ),
@@ -986,7 +1068,8 @@ impl SandboxManager {
                 let field_drag_delta = f64_at(16);
                 let liquid_density = f64_at(17);
                 let liquid_drag = f64_at(18);
-                // 校验体（19 参签名，与 func_wrap 时代闭包体逐行同代码）
+                let link = i32_at(19);
+                // 校验体（20 参签名，与 func_wrap 时代闭包体逐行同代码）
                 #[allow(clippy::too_many_arguments)]
                 let spawn_call = |caller: &mut Caller<SandboxData>,
                                   code_ptr: i32,
@@ -1007,7 +1090,8 @@ impl SandboxManager {
                                   field_gravity_scale: f64,
                                   field_drag_delta: f64,
                                   liquid_density: f64,
-                                  liquid_drag: f64|
+                                  liquid_drag: f64,
+                                  link: i32|
                  -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
@@ -1156,6 +1240,8 @@ impl SandboxManager {
                 // 0=非液体默认 / 0=无阻尼；k>1 声明合法、结算时另钳 [0,1]）
                 let liquid_density = codeworld_core::entity::clamp_liquid_density(liquid_density);
                 let liquid_drag = codeworld_core::entity::clamp_liquid_drag(liquid_drag);
+                // D-011 第 20 参链声明校验钳制（非法值钳无链，warn）
+                let link = codeworld_core::entity::clamp_link(link);
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
@@ -1174,6 +1260,7 @@ impl SandboxManager {
                     field_drag_delta,
                     liquid_density,
                     liquid_drag,
+                    link,
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
                 caller
@@ -1197,6 +1284,7 @@ impl SandboxManager {
                         field_drag_delta,
                         liquid_density,
                         liquid_drag,
+                        link,
                         fuel_limit,
                     });
                 1
@@ -1222,6 +1310,7 @@ impl SandboxManager {
                     field_drag_delta,
                     liquid_density,
                     liquid_drag,
+                    link,
                 );
                 results[0] = wasmtime::Val::I32(ret);
                 Ok(())
@@ -1490,6 +1579,345 @@ impl SandboxManager {
                     "[bridge_send] 信件已排队（阶段二统一出站）"
                 );
                 0
+            },
+        )?;
+        // === D-011 世界内链路段五 import（command/report/send/storage_write/
+        // === storage_read，第 17-21 个玩家 import）——全部照 bridge_send 闭包
+        // === 风格：api_calls 计数 + 返回码 + 限流 flag + INFO 日志。与 bridge
+        // === 管道分记账分管道（bridge_pending 管出世界，link_pending 管世界内）。
+        // === import 闭包是 'static 拿不到 world：扇出/沿链/落账全在世界侧阶段
+        // === 二，这里只做零 world 校验 + 快照判定 + 入队 ===
+        // env.command(ptr: i32, len: i32) -> i32：下行广播（母体剑诀控万剑）。
+        // 返回：正数=入队链数（拍首快照 link_children，实际扇出阶段二）/ 0=无活链
+        // 或参数坏或限流。每拍 1 次；无视口限制（风筝线可放出屏幕）。
+        linker.func_wrap(
+            "env",
+            "command",
+            |mut caller: Caller<SandboxData>, ptr: i32, len: i32| -> i32 {
+                caller.data_mut().api_calls.push("command".to_string());
+                let entity = caller.data().entity_id;
+                // payload 超限在读内存前拦下（同 attack_at/bridge_send 护栏哲学）
+                if len > 0 && len as usize > caller.data().link_payload_max {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        actual_len = len,
+                        max = caller.data().link_payload_max,
+                        "[command] payload 超限，拒绝入队"
+                    );
+                    return 0;
+                }
+                // 每拍 1 次限流（同 bridge_send 节律）
+                if caller.data().link_command_sent {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        "[command] 本拍已广播，限流拒绝（1 次/tick）"
+                    );
+                    return 0;
+                }
+                let children = caller.data().link_children;
+                if children == 0 {
+                    // 放生（无链）或断链（母体名下已无活链孩子）：无收信人
+                    tracing::debug!(
+                        entity_id = %entity.0,
+                        "[command] 名下无活链造物，返回 0"
+                    );
+                    return 0;
+                }
+                let payload = read_payload_from_caller(&mut caller, ptr, len);
+                caller.data_mut().link_pending.push(PendingLinkOut {
+                    from: entity,
+                    kind: LinkOutKind::Command,
+                    payload: payload.clone(),
+                });
+                caller.data_mut().link_command_sent = true;
+                tracing::info!(
+                    entity_id = %entity.0,
+                    children,
+                    payload_len = payload.len(),
+                    "[command] 下行广播已排队（阶段二按链账本扇出）"
+                );
+                children as i32
+            },
+        )?;
+        // env.report(ptr: i32, len: i32) -> i32：上行沿链（侦察弹报坐标）。
+        // 返回：1=入队 / 0=参数坏 / 2=无链或断链。每拍 1 次；无视口限制。
+        linker.func_wrap(
+            "env",
+            "report",
+            |mut caller: Caller<SandboxData>, ptr: i32, len: i32| -> i32 {
+                caller.data_mut().api_calls.push("report".to_string());
+                let entity = caller.data().entity_id;
+                if len > 0 && len as usize > caller.data().link_payload_max {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        actual_len = len,
+                        max = caller.data().link_payload_max,
+                        "[report] payload 超限，拒绝入队"
+                    );
+                    return 0;
+                }
+                if caller.data().link_report_sent {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        "[report] 本拍已上报，限流拒绝（1 次/tick）"
+                    );
+                    return 0;
+                }
+                // 无链或断链（拍首快照 link_parent=None）：链没连着，投无可投
+                let Some(parent) = caller.data().link_parent else {
+                    tracing::debug!(
+                        entity_id = %entity.0,
+                        "[report] 无链或断链，返回 2"
+                    );
+                    return 2;
+                };
+                let payload = read_payload_from_caller(&mut caller, ptr, len);
+                caller.data_mut().link_pending.push(PendingLinkOut {
+                    from: entity,
+                    kind: LinkOutKind::Report { to: parent },
+                    payload: payload.clone(),
+                });
+                caller.data_mut().link_report_sent = true;
+                tracing::info!(
+                    entity_id = %entity.0,
+                    parent = %parent.0,
+                    payload_len = payload.len(),
+                    "[report] 上行已排队（阶段二沿链投母体）"
+                );
+                1
+            },
+        )?;
+        // env.send(x: f64, y: f64, ptr: i32, len: i32) -> i32：横向坐标寻址
+        //（点寻址所见即所发，与 probe/attack_at 同哲学）。门槛=目标在发送方
+        // 视口内（link_peers 快照=发送方 visible 列表成员——屏幕内无欺骗的
+        // 发送版：看不见的发不到，想发先 scan）。返回：1=入队 / 0=参数坏
+        //（坐标非有限/超限/限流）/ -1=坐标无实体或不视口内。每拍 1 次。
+        linker.func_wrap(
+            "env",
+            "send",
+            |mut caller: Caller<SandboxData>, x: f64, y: f64, ptr: i32, len: i32| -> i32 {
+                caller.data_mut().api_calls.push("send".to_string());
+                let entity = caller.data().entity_id;
+                // 参数坏三连（先于视口判定——数据尺寸/有限性优先于路由有效性，
+                // 同 bridge_send 判序哲学）
+                if !x.is_finite() || !y.is_finite() {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        x,
+                        y,
+                        "[send] 坐标非有限，拒绝入队"
+                    );
+                    return 0;
+                }
+                if len > 0 && len as usize > caller.data().link_payload_max {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        actual_len = len,
+                        max = caller.data().link_payload_max,
+                        "[send] payload 超限，拒绝入队"
+                    );
+                    return 0;
+                }
+                if caller.data().link_send_sent {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        "[send] 本拍已发，限流拒绝（1 次/tick）"
+                    );
+                    return 0;
+                }
+                // 坐标寻址：视口内实体快照精确匹配（visible_at 给出什么就发什么，
+                // bit 相等）；列表 EntityId 升序，同坐标多实体取 id 最小者（确定序）
+                let Some(target) = caller
+                    .data()
+                    .link_peers
+                    .iter()
+                    .find(|p| p.pos == (x, y))
+                    .map(|p| p.id)
+                else {
+                    tracing::info!(
+                        entity_id = %entity.0,
+                        x,
+                        y,
+                        "[send] 坐标无实体或不视口内，返回 -1"
+                    );
+                    return -1;
+                };
+                let payload = read_payload_from_caller(&mut caller, ptr, len);
+                caller.data_mut().link_pending.push(PendingLinkOut {
+                    from: entity,
+                    kind: LinkOutKind::Send { to: target },
+                    payload: payload.clone(),
+                });
+                caller.data_mut().link_send_sent = true;
+                tracing::info!(
+                    entity_id = %entity.0,
+                    target = %target.0,
+                    payload_len = payload.len(),
+                    "[send] 横向信已排队（阶段二投递）"
+                );
+                1
+            },
+        )?;
+        // env.storage_write(ptr: i32, len: i32) -> i32：全量覆盖自己的公开块
+        //（移动硬盘写盘）。返回：N=写入字节 / -1=超容拒绝（不截断——硬盘写一半
+        // =坏盘，诚实拒绝）/ 0=参数坏。每拍 1 次。写入双落：镜像同步（同拍读
+        // 自己可见）+ 排队（阶段二落世界侧实体字段=真源，随实体入快照）。
+        linker.func_wrap(
+            "env",
+            "storage_write",
+            |mut caller: Caller<SandboxData>, ptr: i32, len: i32| -> i32 {
+                caller.data_mut().api_calls.push("storage_write".to_string());
+                let entity = caller.data().entity_id;
+                // 负长度=参数坏（0=合法清空，全量覆盖语义下写 0 字节=清盘）
+                if len < 0 {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        len,
+                        "[storage_write] 负长度参数坏，拒绝"
+                    );
+                    return 0;
+                }
+                // 超容拒绝在读内存前拦下（防大拷贝；不截断=不偷改玩家数据）
+                if len as usize > caller.data().storage_cap {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        actual_len = len,
+                        cap = caller.data().storage_cap,
+                        "[storage_write] 超容拒绝（不截断）"
+                    );
+                    return -1;
+                }
+                if caller.data().link_sw_sent {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        "[storage_write] 本拍已写盘，限流拒绝（1 次/tick）"
+                    );
+                    return 0;
+                }
+                let payload = read_payload_from_caller(&mut caller, ptr, len);
+                let n = payload.len();
+                caller.data_mut().link_storage_own = payload.clone();
+                caller.data_mut().link_pending.push(PendingLinkOut {
+                    from: entity,
+                    kind: LinkOutKind::StorageWrite,
+                    payload,
+                });
+                caller.data_mut().link_sw_sent = true;
+                tracing::info!(
+                    entity_id = %entity.0,
+                    len = n,
+                    "[storage_write] 公开块覆盖已排队（阶段二落世界侧账）"
+                );
+                n as i32
+            },
+        )?;
+        // env.storage_read(x: f64, y: f64, ptr: i32, cap: i32) -> i32：贴身读
+        // 对方公开块（读硬盘=物理凑过去读）。返回：N=读到字节（写入 memory
+        // [ptr..ptr+N)）/ 0=cap 不足或指针坏 / -1=坐标无实体 / -2=够不着
+        //（贴身判据 dist < r_self + r_target + 0.5 严格小于，melee 同款）/
+        // -3=对方无存储（空块返回 0 字节=有硬盘没内容，与 -3 区分）。每拍 1 次。
+        linker.func_wrap(
+            "env",
+            "storage_read",
+            |mut caller: Caller<SandboxData>,
+             x: f64,
+             y: f64,
+             ptr: i32,
+             cap: i32|
+             -> i32 {
+                caller.data_mut().api_calls.push("storage_read".to_string());
+                let entity = caller.data().entity_id;
+                // 参数坏：非有限坐标 / 负 cap（i32 负值转 usize 回绕，先判符号）
+                if !x.is_finite() || !y.is_finite() || cap < 0 {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        x,
+                        y,
+                        cap,
+                        "[storage_read] 参数坏（非有限坐标/负 cap）"
+                    );
+                    return 0;
+                }
+                if caller.data().link_sr_sent {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        "[storage_read] 本拍已读盘，限流拒绝（1 次/tick）"
+                    );
+                    return 0;
+                }
+                // 读自己：坐标=自己快照 pos，距离 0 天然成立，读镜像（storage_write
+                // 已同步——同拍写后读可见新值）
+                let (sx, sy) = caller.data().pos;
+                let block: Vec<u8> = if x == sx && y == sy {
+                    caller.data().link_storage_own.clone()
+                } else {
+                    // 坐标寻址：视口内实体快照精确匹配（同 send 口径）
+                    let Some(peer) = caller
+                        .data()
+                        .link_peers
+                        .iter()
+                        .find(|p| p.pos == (x, y))
+                    else {
+                        tracing::info!(
+                            entity_id = %entity.0,
+                            x,
+                            y,
+                            "[storage_read] 坐标无实体，返回 -1"
+                        );
+                        return -1;
+                    };
+                    // 贴身判据：dist < r_self + r_peer + 0.5 严格小于（melee 同款，
+                    // 恰好等于判距=够不着）；读自己走上面的镜像分支不经过此判
+                    let (px, py) = peer.pos;
+                    let dx = px - sx;
+                    let dy = py - sy;
+                    let reach = caller.data().link_radius + peer.radius + STORAGE_READ_REACH;
+                    if dx * dx + dy * dy >= reach * reach {
+                        tracing::info!(
+                            entity_id = %entity.0,
+                            peer = %peer.id.0,
+                            reach,
+                            "[storage_read] 够不着（贴身判据外），返回 -2"
+                        );
+                        return -2;
+                    }
+                    peer.storage.clone()
+                };
+                // 空块=对方无存储（"没硬盘"）；cap 不足不写（原子语义）
+                if block.is_empty() {
+                    tracing::info!(
+                        entity_id = %entity.0,
+                        "[storage_read] 对方无存储（空块），返回 -3"
+                    );
+                    return -3;
+                }
+                let n = block.len();
+                if (cap as usize) < n {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        need = n,
+                        cap,
+                        "[storage_read] cap 不足，未写任何字节"
+                    );
+                    return 0;
+                }
+                let written = write_bytes_to_caller(&mut caller, ptr, &block, n);
+                if written != n {
+                    tracing::warn!(
+                        entity_id = %entity.0,
+                        ptr,
+                        need = n,
+                        "[storage_read] 写入指针非法，未写任何字节"
+                    );
+                    return 0;
+                }
+                caller.data_mut().link_sr_sent = true;
+                tracing::info!(
+                    entity_id = %entity.0,
+                    len = n,
+                    "[storage_read] 贴身读取完成"
+                );
+                n as i32
             },
         )?;
         Ok(linker)
@@ -2003,6 +2431,127 @@ impl SandboxManager {
             offset,
             fuel_used = used,
             "call bridge_on_reply"
+        );
+        Ok(Some(used))
+    }
+
+    /// 链消息通用投递器（D-011：on_command/on_report/on_message 三回调的全套
+    /// 先例复刻，call_on_bridge_reply 同款六步）——签名核验先于 grow+写（P2-A：
+    /// 坏签名导出不留"字节已落内存但回调没跑"的半副作用，也先于预算包裹）、
+    /// grow 分配 offset=旧末尾（新增零页永不覆盖玩家数据）、probe_fuel 预算
+    /// 包裹调（接收方为收信付费的上限是防守预算，不占主配额）、缺省导出
+    /// Ok(None) 零副作用（信塞进无人收件箱，世界记账照结算不泄漏）。
+    ///
+    /// `with_from=false` 时回调签名 `(i32, i32)`（on_command——造物收母体剑诀，
+    /// 无需知道是哪个母体：链连着呢）；`true` 时 `(i64, i32, i32)`（on_report/
+    /// on_message，`from`=源 EntityId 低 64 位——母体多孩子区分靠它，field
+    /// 信箱同款先例）。
+    pub fn deliver_message(
+        &self,
+        handle: &mut SandboxHandle,
+        export: &str,
+        from: u64,
+        with_from: bool,
+        payload: &[u8],
+        budget: u64,
+    ) -> Result<Option<u64>> {
+        if !self.has_export(handle, export)? {
+            tracing::debug!(
+                export,
+                entity = %handle.store.data().entity_id.0,
+                "[link] 缺省导出，消息零副作用丢弃"
+            );
+            return Ok(None);
+        }
+        let Some(memory) = handle.instance.get_memory(&mut handle.store, "memory") else {
+            tracing::warn!(
+                export,
+                entity = %handle.store.data().entity_id.0,
+                "[link] 未导出 memory，消息无处落笔，投递作废"
+            );
+            return Ok(None);
+        };
+        // 双签名核验（先于 grow+写+预算包裹——签名不匹配 Err 时原剩余量与内存
+        // 分毫不动）
+        let call_result = if with_from {
+            let func = handle
+                .instance
+                .get_typed_func::<(i64, i32, i32), ()>(&mut handle.store, export)?;
+            // grow 分配：offset = 调 grow 前的内存字节数（同 call_on_bridge_reply）
+            let old_bytes = memory.data_size(&handle.store);
+            let delta_pages = payload.len().div_ceil(65536) as u64;
+            if delta_pages > 0 {
+                if let Err(e) = memory.grow(&mut handle.store, delta_pages) {
+                    tracing::warn!(
+                        entity_id = %handle.store.data().entity_id.0,
+                        error = %e,
+                        delta_pages,
+                        "[link] 内存 grow 失败，消息投递作废"
+                    );
+                    return Ok(None);
+                }
+            }
+            if let Err(e) = memory.write(&mut handle.store, old_bytes, payload) {
+                tracing::warn!(error = %e, offset = old_bytes, "[link] 消息写入失败，投递作废");
+                return Ok(None);
+            }
+            let limit = handle.store.data().fuel_limit;
+            let prev_fuel = handle.store.get_fuel()?;
+            if let Err(e) = handle.store.set_fuel(budget) {
+                anyhow::bail!("[link] 预算设置失败: {e}");
+            }
+            let r = func.call(&mut handle.store, (from as i64, old_bytes as i32, payload.len() as i32));
+            let fuel_left = handle.store.get_fuel().unwrap_or(budget);
+            let used = budget.saturating_sub(fuel_left);
+            if let Err(e) = handle.store.set_fuel(prev_fuel) {
+                tracing::warn!(error = %e, "[link] fuel 恢复失败");
+            }
+            handle.store.data_mut().fuel_consumed = limit.saturating_sub(prev_fuel);
+            r.map(|_| used)
+        } else {
+            let func = handle
+                .instance
+                .get_typed_func::<(i32, i32), ()>(&mut handle.store, export)?;
+            let old_bytes = memory.data_size(&handle.store);
+            let delta_pages = payload.len().div_ceil(65536) as u64;
+            if delta_pages > 0 {
+                if let Err(e) = memory.grow(&mut handle.store, delta_pages) {
+                    tracing::warn!(
+                        entity_id = %handle.store.data().entity_id.0,
+                        error = %e,
+                        delta_pages,
+                        "[link] 内存 grow 失败，消息投递作废"
+                    );
+                    return Ok(None);
+                }
+            }
+            if let Err(e) = memory.write(&mut handle.store, old_bytes, payload) {
+                tracing::warn!(error = %e, offset = old_bytes, "[link] 消息写入失败，投递作废");
+                return Ok(None);
+            }
+            let limit = handle.store.data().fuel_limit;
+            let prev_fuel = handle.store.get_fuel()?;
+            if let Err(e) = handle.store.set_fuel(budget) {
+                anyhow::bail!("[link] 预算设置失败: {e}");
+            }
+            let r = func.call(&mut handle.store, (old_bytes as i32, payload.len() as i32));
+            let fuel_left = handle.store.get_fuel().unwrap_or(budget);
+            let used = budget.saturating_sub(fuel_left);
+            if let Err(e) = handle.store.set_fuel(prev_fuel) {
+                tracing::warn!(error = %e, "[link] fuel 恢复失败");
+            }
+            handle.store.data_mut().fuel_consumed = limit.saturating_sub(prev_fuel);
+            r.map(|_| used)
+        };
+        let used = call_result?;
+        tracing::info!(
+            entity_id = %handle.store.data().entity_id.0,
+            export,
+            from,
+            len = payload.len(),
+            offset_hint = "grow 末尾",
+            fuel_used = used,
+            "call 链消息投递"
         );
         Ok(Some(used))
     }
@@ -3759,7 +4308,8 @@ mod tests {
     }
 
     /// 带出生初速的造物方 WAT（spawn 第 11/12 参 vx/vy；14 参生成器最全档：
-    /// blob 恒无包 i32.const 0/0——blob 用例走 spawner_blob_wat）
+    /// blob 恒无包 i32.const 0/0——blob 用例走 spawner_blob_wat；D-011 起补
+    /// 第 20 参 link，默认无链 i32.const 0）
     fn spawner_velocity_wat(
         code: &str,
         x: &str,
@@ -3772,7 +4322,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -3794,6 +4344,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -3813,7 +4364,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
@@ -3837,6 +4388,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
@@ -3854,6 +4406,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
@@ -3865,7 +4418,7 @@ mod tests {
 
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
@@ -3887,6 +4440,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -3896,7 +4450,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -3919,6 +4473,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -3968,7 +4523,7 @@ mod tests {
         // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
         let wat_text = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -3990,6 +4545,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -4013,7 +4569,7 @@ mod tests {
         let escaped = wat_escape(SPAWNED_CODE);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -4035,6 +4591,7 @@ mod tests {
     f64.const {delta}
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn global.set $ret)
   (global $ret (mut i32) (i32.const -1))
   (func (export "get_ret") (result i32) global.get $ret)
@@ -4101,7 +4658,7 @@ mod tests {
         let escaped = wat_escape(SPAWNED_CODE);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "W\00")
@@ -4123,6 +4680,7 @@ mod tests {
     f64.const 0.0
     f64.const {density}
     f64.const {drag}
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -4636,7 +5194,7 @@ mod tests {
         let blob_escaped: String = blob_data.iter().map(|b| format!("\\{b:02x}")).collect();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -4659,6 +5217,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -5374,5 +5933,572 @@ mod tests {
         let after = defender.store.get_fuel().unwrap();
         assert_eq!(before, after, "守方 fuel 不应因决斗窗口变化（账户跟人不跟房子）");
         assert!(outcome.fuel_used > 0, "游魂自己烧自己的预算");
+    }
+
+    // === D-011 世界内链路段：spawn 第 20 参 link + 五 import + 三回调投递 ===
+
+    /// 带链声明的造物方 WAT（D-011 spawn 第 20 参）：link 表达式直传
+    fn spawner_link_wat(code: &str, link: &str) -> String {
+        let escaped = wat_escape(code);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "K\00")
+  (data (i32.const 8256) "lime\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const 1.0 f64.const 1.0
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
+    f64.const 0.0
+    {link}
+    call $spawn global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = code.len(),
+            link = link,
+        )
+    }
+
+    /// command 广播方 WAT：on_tick 调 command(0, 6)（data 段 "TURN+2" 6 字节）
+    const COMMANDER_WAT: &str = r#"(module
+  (import "env" "command" (func $command (param i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "TURN+2")
+  (func (export "on_tick")
+    i32.const 0 i32.const 6 call $command global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// report 上行方 WAT：on_tick 调 report(0, 6)（data 段 "STATUS" 6 字节）
+    const REPORTER_WAT: &str = r#"(module
+  (import "env" "report" (func $report (param i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "STATUS")
+  (func (export "on_tick")
+    i32.const 0 i32.const 6 call $report global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// send 横向信 WAT：on_tick 调 send(7.0, 8.0, 0, 5)（data 段 "HELLO" 5 字节）
+    const SENDER_WAT: &str = r#"(module
+  (import "env" "send" (func $send (param f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "HELLO")
+  (func (export "on_tick")
+    f64.const 7.0 f64.const 8.0 i32.const 0 i32.const 5 call $send global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// storage_write 方 WAT：on_tick 调 storage_write(0, 6)（data 段 "INTEL1" 6 字节）
+    const STORAGE_WRITER_WAT: &str = r#"(module
+  (import "env" "storage_write" (func $storage_write (param i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "INTEL1")
+  (func (export "on_tick")
+    i32.const 0 i32.const 6 call $storage_write global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// storage_read 方 WAT：on_tick 调 storage_read(7.0, 8.0, 100, 64)，返回值存
+    /// 全局；哨兵字节 @[2048]（"未写任何字节"断言锚）
+    fn storage_reader_wat(tx: &str, ty: &str) -> String {
+        format!(
+            r#"(module
+  (import "env" "storage_read" (func $storage_read (param f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 2048) "\77")
+  (func (export "on_tick")
+    f64.const {tx} f64.const {ty} i32.const 100 i32.const 64
+    call $storage_read global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "get_first") (result i32) (i32.load8_u (i32.const 100)))
+  (func (export "life") (result i32) i32.const 1))"#,
+            tx = tx,
+            ty = ty,
+        )
+    }
+
+    /// 链快照预置 helper：模拟 host 拍首填充（children/parent/radius/peers/own/
+    /// 上限装配——import 闭包是 'static 拿不到 world，一切经 SandboxData 快照）
+    fn fill_link_snapshot(
+        handle: &mut SandboxHandle,
+        children: u32,
+        parent: Option<EntityId>,
+        own: &[u8],
+        peers: Vec<LinkPeer>,
+        payload_max: usize,
+        cap: usize,
+    ) {
+        let d = handle.store.data_mut();
+        d.link_children = children;
+        d.link_parent = parent;
+        d.link_radius = 0.5;
+        d.link_storage_own = own.to_vec();
+        d.link_peers = peers;
+        d.link_payload_max = payload_max;
+        d.storage_cap = cap;
+    }
+
+    fn link_peer(id_u: u128, pos: (f64, f64), storage: &[u8]) -> LinkPeer {
+        LinkPeer {
+            id: id(id_u),
+            pos,
+            radius: 0.5,
+            storage: storage.to_vec(),
+        }
+    }
+
+    #[test]
+    fn spawn_import_passes_link_through_and_clamps_invalid() {
+        // spawn 第 20 参 link：1=活链透传；非法值（7/2/-1）钳无链——坏声明不进
+        // 世界，回退放生现状（与 binding/motion 同款口径）
+        let mgr = SandboxManager::new().unwrap();
+        let creator = id(880);
+        let wat_text = spawner_link_wat(SPAWNED_CODE, "i32.const 1");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, creator)
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(
+            handle.store.data().pending_spawns[0].link,
+            codeworld_core::entity::LINK_ACTIVE,
+            "合法值 1 应透传活链"
+        );
+        for bad in ["i32.const 7", "i32.const 2", "i32.const -1"] {
+            handle.store.data_mut().pending_spawns.clear();
+            let bad_text = spawner_link_wat(SPAWNED_CODE, bad);
+            let mut h = mgr
+                .create_sandbox(&wasm(&bad_text), 100_000, id(881))
+                .unwrap();
+            h.store.data_mut().pos = (10.0, 10.0);
+            mgr.call_on_tick(&mut h).unwrap();
+            assert_eq!(
+                h.store.data().pending_spawns[0].link,
+                codeworld_core::entity::LINK_UNLINKED,
+                "非法 link（{bad}）应钳无链"
+            );
+        }
+    }
+
+    #[test]
+    fn command_import_without_children_returns_zero() {
+        // 链三态·放生：无活链孩子（快照 children=0）-> command 返回 0 不入队
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(COMMANDER_WAT), 10_000, id(882)).unwrap();
+        fill_link_snapshot(&mut handle, 0, None, &[], Vec::new(), 8192, 4096);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "无活链应返回 0");
+        assert!(handle.store.data().link_pending.is_empty(), "拒绝不入队");
+    }
+
+    #[test]
+    fn command_import_queues_broadcast_with_children_count() {
+        // 链三态·活链：快照 children=3 -> 返回 3（入队链数=拍首快照），payload
+        // 原样入队（扇出在世界侧阶段二做——import 拿不到 world）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(COMMANDER_WAT), 10_000, id(883)).unwrap();
+        fill_link_snapshot(&mut handle, 3, None, &[], Vec::new(), 8192, 4096);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 3, "活链应返回孩子数 3");
+        let pending = &handle.store.data().link_pending;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].from, id(883));
+        assert!(matches!(pending[0].kind, LinkOutKind::Command));
+        assert_eq!(pending[0].payload, b"TURN+2".to_vec(), "信体应从 memory 读出");
+    }
+
+    #[test]
+    fn command_import_oversize_and_ratelimit_reject() {
+        // 负面路径：payload 超上限（读内存前拦下）返 0；同拍第二次返 0（限流
+        // 1 次/拍/沙箱），下一拍 sent 清后恢复
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(COMMANDER_WAT), 10_000, id(884)).unwrap();
+        fill_link_snapshot(&mut handle, 1, None, &[], Vec::new(), 4, 4096); // 上限 4 < 6
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超限应拒绝");
+        assert!(handle.store.data().link_pending.is_empty(), "超限不入队");
+        // 恢复上限再发：成功；同拍第二发限流拒绝
+        fill_link_snapshot(&mut handle, 1, None, &[], Vec::new(), 8192, 4096);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "首封应入队");
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "同拍第二次应限流拒绝");
+        assert_eq!(handle.store.data().link_pending.len(), 1, "只有首封入队");
+    }
+
+    #[test]
+    fn report_import_without_parent_returns_two() {
+        // 链三态·放生：无链（parent=None）-> report 返回 2（无链或断链）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(REPORTER_WAT), 10_000, id(885)).unwrap();
+        fill_link_snapshot(&mut handle, 0, None, &[], Vec::new(), 8192, 4096);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 2, "无链应返回 2");
+        assert!(handle.store.data().link_pending.is_empty());
+    }
+
+    #[test]
+    fn report_import_queues_uplink_to_parent() {
+        // 链三态·活链：parent 有值 -> 返回 1，to=母体入队（上行沿链投）
+        let mgr = SandboxManager::new().unwrap();
+        let parent = id(900);
+        let mut handle = mgr.create_sandbox(&wasm(REPORTER_WAT), 10_000, id(886)).unwrap();
+        fill_link_snapshot(&mut handle, 0, Some(parent), &[], Vec::new(), 8192, 4096);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "活链上行应入队");
+        let pending = &handle.store.data().link_pending;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].from, id(886));
+        match &pending[0].kind {
+            LinkOutKind::Report { to } => assert_eq!(*to, parent, "上行目标应为快照母体"),
+            other => panic!("应为 Report，实际 {other:?}"),
+        }
+        assert_eq!(pending[0].payload, b"STATUS".to_vec());
+    }
+
+    #[test]
+    fn send_import_hits_visible_peer_and_queues() {
+        // 数据通道：坐标在 peer 快照（=发送方视口内实体）精确命中 -> 返回 1，
+        // to=命中实体入队
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(SENDER_WAT), 10_000, id(887)).unwrap();
+        fill_link_snapshot(
+            &mut handle,
+            0,
+            None,
+            &[],
+            vec![link_peer(901, (7.0, 8.0), &[])],
+            8192,
+            4096,
+        );
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "视口内命中应入队");
+        match &handle.store.data().link_pending[0].kind {
+            LinkOutKind::Send { to } => assert_eq!(*to, id(901), "目标应为坐标命中的实体"),
+            other => panic!("应为 Send，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_import_misses_returns_minus_one() {
+        // 负面路径：坐标无 peer（视口外/空场）-> -1；坐标非有限 -> 0（参数坏）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(SENDER_WAT), 10_000, id(888)).unwrap();
+        // 空 peers：坐标无人 -> -1
+        fill_link_snapshot(&mut handle, 0, None, &[], Vec::new(), 8192, 4096);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), -1, "坐标无实体应 -1");
+        // 非 finite 坐标（0.0/0.0=NaN）：参数坏 -> 0
+        let nan_sender = r#"(module
+  (import "env" "send" (func $send (param f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "HELLO")
+  (func (export "on_tick")
+    f64.const 0.0 f64.const 0.0 f64.div f64.const 0.0
+    i32.const 0 i32.const 5 call $send global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let mut h2 = mgr.create_sandbox(&wasm(nan_sender), 10_000, id(889)).unwrap();
+        fill_link_snapshot(&mut h2, 0, None, &[], Vec::new(), 8192, 4096);
+        mgr.call_on_tick(&mut h2).unwrap();
+        assert_eq!(call_i32_export(&mut h2, "get_ret"), 0, "非有限坐标应参数坏拒绝");
+    }
+
+    #[test]
+    fn storage_write_roundtrip_and_over_capacity_reject() {
+        // 存储件：写入返回 N 且镜像同步（同拍读自己可见）；超容 -1 拒绝不截断
+        //（读内存前拦下，硬盘写一半=坏盘）；len=0 合法清空
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(STORAGE_WRITER_WAT), 10_000, id(890)).unwrap();
+        // 超容（上限 4 < 6）：-1 拒绝，镜像不动
+        fill_link_snapshot(&mut handle, 0, None, &[0x11], Vec::new(), 8192, 4);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), -1, "超容应拒绝不截断");
+        assert_eq!(handle.store.data().link_storage_own, vec![0x11], "拒绝不得动镜像");
+        // 恢复上限写入：返回 6，镜像同步
+        fill_link_snapshot(&mut handle, 0, None, &[0x11], Vec::new(), 8192, 4096);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 6, "写入应返回字节数");
+        assert_eq!(
+            handle.store.data().link_storage_own,
+            b"INTEL1".to_vec(),
+            "镜像应同步（同拍读自己可见）"
+        );
+        assert!(matches!(
+            handle.store.data().link_pending[0].kind,
+            LinkOutKind::StorageWrite
+        ));
+    }
+
+    #[test]
+    fn storage_read_near_success_and_self_read() {
+        // 存储件读：贴身 peer 命中返回 N 写 memory（peer 在贴身圈内：dist 1.0
+        // < 0.5+0.5+0.5=1.5）；读自己坐标=镜像（距离 0 天然成立）；哨兵字节不受扰
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&storage_reader_wat("1.0", "0.0")), 10_000, id(891))
+            .unwrap();
+        fill_link_snapshot(
+            &mut handle,
+            0,
+            None,
+            b"OWNDATA",
+            vec![link_peer(902, (1.0, 0.0), b"PEERDATA")],
+            8192,
+            4096,
+        );
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 8, "贴身读应返回 8 字节");
+        assert_eq!(call_i32_export(&mut handle, "get_first"), b'P' as i32, "应读到对方块首字节");
+        assert_eq!(read_memory(&mut handle, 2048, 1), vec![0x77], "写入不应越过 N 边界");
+        // 读自己：坐标=自己快照 pos（(0,0) 默认）-> 读镜像 7 字节
+        let mut h2 = mgr
+            .create_sandbox(&wasm(&storage_reader_wat("0.0", "0.0")), 10_000, id(892))
+            .unwrap();
+        fill_link_snapshot(&mut h2, 0, None, b"OWNDATA", Vec::new(), 8192, 4096);
+        mgr.call_on_tick(&mut h2).unwrap();
+        assert_eq!(call_i32_export(&mut h2, "get_ret"), 7, "读自己应返回镜像字节数");
+        assert_eq!(call_i32_export(&mut h2, "get_first"), b'O' as i32, "应读到自己块首字节");
+    }
+
+    #[test]
+    fn storage_read_distance_and_absence_negative_paths() {
+        // 负面路径四连：坐标无实体 -1 / 够不着 -2（距离判据严格 <）/ 空块 -3 /
+        // cap 不足 0——四种语义互不混淆
+        let mgr = SandboxManager::new().unwrap();
+        // 远 peer（视口内但够不着）：-2
+        let mut handle = mgr
+            .create_sandbox(&wasm(&storage_reader_wat("30.0", "30.0")), 10_000, id(893))
+            .unwrap();
+        fill_link_snapshot(
+            &mut handle,
+            0,
+            None,
+            &[],
+            vec![link_peer(903, (30.0, 30.0), b"FAR")],
+            8192,
+            4096,
+        );
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), -2, "视口内但够不着应 -2");
+        // 空场坐标：-1
+        let mut h2 = mgr
+            .create_sandbox(&wasm(&storage_reader_wat("99.0", "99.0")), 10_000, id(894))
+            .unwrap();
+        fill_link_snapshot(&mut h2, 0, None, &[], Vec::new(), 8192, 4096);
+        mgr.call_on_tick(&mut h2).unwrap();
+        assert_eq!(call_i32_export(&mut h2, "get_ret"), -1, "坐标无实体应 -1");
+        // 贴身但对方空块：-3（"没硬盘"与"空硬盘"区分；peer 在贴身圈内）
+        let mut h3 = mgr
+            .create_sandbox(&wasm(&storage_reader_wat("1.0", "0.0")), 10_000, id(895))
+            .unwrap();
+        fill_link_snapshot(
+            &mut h3,
+            0,
+            None,
+            &[],
+            vec![link_peer(904, (1.0, 0.0), &[])],
+            8192,
+            4096,
+        );
+        mgr.call_on_tick(&mut h3).unwrap();
+        assert_eq!(call_i32_export(&mut h3, "get_ret"), -3, "对方空块应 -3");
+        // 贴身有块但 cap 不足：0（不写任何字节）
+        let small_cap = r#"(module
+  (import "env" "storage_read" (func $storage_read (param f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    f64.const 1.0 f64.const 0.0 i32.const 100 i32.const 2
+    call $storage_read global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let mut h4 = mgr.create_sandbox(&wasm(small_cap), 10_000, id(896)).unwrap();
+        fill_link_snapshot(
+            &mut h4,
+            0,
+            None,
+            &[],
+            vec![link_peer(905, (1.0, 0.0), b"PEERDATA")],
+            8192,
+            4096,
+        );
+        mgr.call_on_tick(&mut h4).unwrap();
+        assert_eq!(call_i32_export(&mut h4, "get_ret"), 0, "cap 不足应返回 0 不写");
+        // 空场读取也不限流占用（失败不置位）：下一拍同沙箱仍可读——用 h3（-3
+        // 失败路径）复跑验证 sent 未置位
+        mgr.call_on_tick(&mut h3).unwrap();
+        assert_eq!(call_i32_export(&mut h3, "get_ret"), -3, "失败路径不占限流（可重试）");
+    }
+
+    #[test]
+    fn storage_read_rate_limited_per_tick() {
+        // 限流：storage_read 成功一次后同拍第二次返 0（五 import 各 1 次/拍）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&storage_reader_wat("1.0", "0.0")), 10_000, id(897))
+            .unwrap();
+        fill_link_snapshot(
+            &mut handle,
+            0,
+            None,
+            &[],
+            vec![link_peer(906, (1.0, 0.0), b"PEERDATA")],
+            8192,
+            4096,
+        );
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 8, "首次贴身读应成功");
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "同拍第二次应限流拒绝");
+    }
+
+    /// 链消息观察者 WAT：on_command/on_report/on_message 各记一票，from 存全局
+    ///（payload 首字节存 $first 验证 grow 写入）
+    const LINK_OBSERVER_WAT: &str = r#"(module
+  (global $cmd (mut i32) (i32.const 0))
+  (global $rep (mut i32) (i32.const 0))
+  (global $msg (mut i32) (i32.const 0))
+  (global $from (mut i64) (i64.const -1))
+  (global $first (mut i32) (i32.const 0))
+  (memory (export "memory") 1)
+  (func (export "on_command") (param $ptr i32) (param $len i32)
+    (global.set $cmd (i32.add (global.get $cmd) (i32.const 1)))
+    (global.set $first (i32.load8_u (local.get $ptr))))
+  (func (export "on_report") (param $from i64) (param $ptr i32) (param $len i32)
+    (global.set $rep (i32.add (global.get $rep) (i32.const 1)))
+    (global.set $from (local.get $from)))
+  (func (export "on_message") (param $from i64) (param $ptr i32) (param $len i32)
+    (global.set $msg (i32.add (global.get $msg) (i32.const 1)))
+    (global.set $from (local.get $from)))
+  (func (export "get_cmd") (result i32) global.get $cmd)
+  (func (export "get_rep") (result i32) global.get $rep)
+  (func (export "get_msg") (result i32) global.get $msg)
+  (func (export "get_from") (result i64) global.get $from)
+  (func (export "get_first") (result i32) global.get $first)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn deliver_message_grows_memory_and_calls_on_command() {
+        // on_command 投递：grow 新页写入（offset=旧末尾）、回调被调、payload
+        // 首字节可读、消耗记在预算尺度
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(LINK_OBSERVER_WAT), 100_000, id(910)).unwrap();
+        let mem = handle.instance.get_memory(&mut handle.store, "memory").unwrap();
+        let before_pages = mem.size(&handle.store);
+        let used = mgr
+            .deliver_message(&mut handle, "on_command", 7, false, b"TURN+2", 10_000)
+            .unwrap()
+            .expect("导出了 on_command 应返回 Some(used)");
+        assert!(used > 0 && used <= 10_000, "消耗应记在预算尺度内（used={used}）");
+        let mem = handle.instance.get_memory(&mut handle.store, "memory").unwrap();
+        assert!(mem.size(&handle.store) > before_pages, "消息应经 grow 新页写入");
+        assert_eq!(call_i32_export(&mut handle, "get_cmd"), 1, "on_command 应被调一次");
+        assert_eq!(call_i32_export(&mut handle, "get_first"), b'T' as i32, "payload 首字节应可读");
+        // on_report/on_message 的 from 参数 = 源 EntityId 低 64 位（i64 直传）
+        let from = 0x1122334455667788u64;
+        mgr.deliver_message(&mut handle, "on_report", from, true, b"x", 10_000)
+            .unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_rep"), 1, "on_report 应被调一次");
+        assert_eq!(
+            call_i64_export(&mut handle, "get_from"),
+            from as i64,
+            "from 应为源 EntityId 低 64 位"
+        );
+        mgr.deliver_message(&mut handle, "on_message", from, true, b"y", 10_000)
+            .unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_msg"), 1, "on_message 应被调一次");
+    }
+
+    #[test]
+    fn deliver_message_without_export_is_noop() {
+        // 负面路径：缺省导出 -> Ok(None) 零副作用（信塞进无人收件箱，不 grow
+        // 不调用不崩世界）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(LIFE_TRUE_WAT), 1000, id(911)).unwrap();
+        assert!(
+            mgr.deliver_message(&mut handle, "on_message", 1, true, b"x", 10_000)
+                .unwrap()
+                .is_none(),
+            "未导出应返回 None"
+        );
+    }
+
+    /// 坏签名观察者：导出了 on_message 但签名不符（无参返 i32）
+    const LINK_BAD_SIG_WAT: &str = r#"(module
+  (memory (export "memory") 1)
+  (func (export "on_message") (result i32) i32.const 7)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn deliver_message_bad_signature_leaves_no_half_side_effect() {
+        // P2-A 先例：签名核验先于 grow+写——错误签名导出时投递 Err，内存分毫
+        // 不动（无"字节已落内存但回调没跑"的半副作用残局）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(LINK_BAD_SIG_WAT), 1000, id(912)).unwrap();
+        let before = handle
+            .instance
+            .get_memory(&mut handle.store, "memory")
+            .unwrap()
+            .size(&handle.store);
+        assert!(
+            mgr.deliver_message(&mut handle, "on_message", 1, true, b"123", 10_000)
+                .is_err(),
+            "签名不匹配应 Err"
+        );
+        let after = handle
+            .instance
+            .get_memory(&mut handle.store, "memory")
+            .unwrap()
+            .size(&handle.store);
+        assert_eq!(after, before, "签名核验失败不得动内存");
+    }
+
+    #[test]
+    fn deliver_message_restores_fuel() {
+        // 燃料不污染（on_contact/bridge_on_reply 同款）：包裹前 fuel=55_555 ->
+        // 调用后恢复原值（收信烧独立预算不扣主配额）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr.create_sandbox(&wasm(LINK_OBSERVER_WAT), 100_000, id(913)).unwrap();
+        handle.store.set_fuel(55_555).unwrap();
+        mgr.deliver_message(&mut handle, "on_message", 1, true, b"7", 10_000)
+            .unwrap();
+        assert_eq!(
+            handle.store.get_fuel().unwrap(),
+            55_555,
+            "调用后 fuel 应恢复原值（收信不扣主配额手续费）"
+        );
+    }
+
+    /// 调用沙箱无参 i64 导出（from 断言观测）
+    fn call_i64_export(handle: &mut SandboxHandle, name: &str) -> i64 {
+        let func = handle
+            .instance
+            .get_typed_func::<(), i64>(&mut handle.store, name)
+            .unwrap();
+        func.call(&mut handle.store, ()).unwrap()
     }
 }

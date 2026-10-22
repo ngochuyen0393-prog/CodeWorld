@@ -22,8 +22,8 @@ mod players;
 use anyhow::{Context, Result};
 use codeworld_arena::attack::{PendingAttack, DEFAULT_KILL_WASM};
 use codeworld_arena::sandbox::{
-    DuelVerdict, PendingDestroy, PendingFieldPulse, PendingSpawn, PendingThrust, ProbeBridge,
-    SandboxHandle, SandboxManager,
+    DuelVerdict, LinkOutKind, LinkPeer, PendingDestroy, PendingFieldPulse, PendingSpawn,
+    PendingThrust, ProbeBridge, SandboxHandle, SandboxManager,
 };
 use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 use codeworld_core::pending::PendingChange;
@@ -126,6 +126,14 @@ struct EntitySandboxMap {
     bridge_payload_max: usize,
     /// 每沙箱桥在途上限（D-001b 护栏装配值；拍首填进每沙箱快照）
     bridge_inflight_max: u32,
+    /// 链消息 payload 单信上限（D-011 护栏装配值；拍首填进每沙箱快照）
+    link_payload_max: usize,
+    /// 公开存储块容量上限（D-011 护栏装配值；拍首填进每沙箱快照）
+    storage_cap: usize,
+    /// 世界内链消息投递信箱（D-011 跨拍缓冲）：collect 扇出/沿链后压入，
+    /// 下一拍 a-1 deliver 消费——消息两拍节律的载体（拍 N 入队、拍 N+1 回调，
+    /// 与外桥回信同节律）。链消息不进快照（在途消息=当拍生命周期，api.md 载明）
+    link_inbox: Vec<PendingLinkMessage>,
     /// 决斗会话表（D-005 刀0）：世界只记账不裁判——每条=一根已插上的"内存映射
     /// 数据线"（游魂以攻方燃料赌注在守方内存持续读写数拍）。挂在 EntitySandboxMap
     /// 平级（与 sandboxes/attack_events 同层）：会话是世界记账结构，不是沙箱内部
@@ -134,6 +142,23 @@ struct EntitySandboxMap {
     /// 决斗游魂单窗预算（D-005 刀0：每拍每会话给游魂的步数，从攻方燃料赌注扣；
     /// main() 从 config.duel_step_fuel 装配，默认 10_000——与 probe/contact 同档）
     duel_step_fuel: u64,
+}
+
+/// 世界内链消息（D-011 投递侧内部结构）：collect 扇出/沿链寻址后的逐目标消息，
+/// 压 link_inbox 下一拍 a-1 deliver 消费。export/with_from 决定回调签名：
+/// on_command=(i32,i32)（收母体剑诀无需知道母体是谁——链连着呢）；
+/// on_report/on_message=(i64,i32,i32)，from=源 EntityId 低 64 位（field 信箱先例）
+struct PendingLinkMessage {
+    /// 发送方（回调 from 参的数据源）
+    from: EntityId,
+    /// 投递目标（扇出后的具体孩子 / 沿链母体 / 坐标命中实体）
+    to: EntityId,
+    /// 回调导出名（"on_command" / "on_report" / "on_message"）
+    export: &'static str,
+    /// 回调是否带 from 参（on_command=false，其余=true）
+    with_from: bool,
+    /// 信体（世界不解释内容，#038 只送信不拆信）
+    payload: Vec<u8>,
 }
 
 impl EntitySandboxMap {
@@ -178,6 +203,9 @@ impl EntitySandboxMap {
             bridge: None,
             bridge_payload_max: 8192,
             bridge_inflight_max: 4,
+            link_payload_max: 8192,
+            storage_cap: 4096,
+            link_inbox: Vec::new(),
             duel_sessions: Vec::new(),
             duel_step_fuel: 10_000,
         })
@@ -635,6 +663,233 @@ impl EntitySandboxMap {
                     payload: letter.payload,
                     endpoint,
                 });
+            }
+        }
+    }
+
+    /// 链路拍首快照（D-011）：每沙箱填 children/parent/radius/peers/own 镜像
+    /// 与护栏装配——import 闭包是 'static 拿不到 world，一切经 SandboxData 快照
+    /// 传递（与 visible/nearest_enemy/bridge 快照同款模式）。
+    ///
+    /// - link_children：名下活链造物数（link_to==自己 且 存活）——command 返回值
+    ///   的依据，实际扇出在阶段二 collect_link_sends 重查（孩子当拍死=丢弃+INFO）
+    /// - link_peers：视口内存活实体（与 visible 同批同源口径，EntityId 升序、
+    ///   排除自己），带坐标/半径/公开块快照——send 寻址与 storage_read 的数据源
+    /// - link_storage_own：自己公开块镜像——storage_write 同步更新（同拍读自己
+    ///   可见新值），真源在世界侧实体字段（随实体入快照）
+    fn fill_link_snapshots(&mut self, world: &WorldState, viewport: &BoundingBox) {
+        // 视口内存活实体清单（含自己，EntityId 升序——fill_visible_snapshots
+        // 同款排序，peers 派生时排除自己）
+        let mut alive_visible: Vec<(EntityId, (f64, f64), f64)> = world
+            .entities
+            .values()
+            .filter(|e| e.is_alive())
+            .filter(|e| {
+                let (x, y) = e.pos();
+                viewport.contains(x, y)
+            })
+            .map(|e| (e.id, e.pos(), e.radius()))
+            .collect();
+        alive_visible.sort_by_key(|a| a.0 .0);
+        let (payload_max, cap) = (self.link_payload_max, self.storage_cap);
+        for (id, handle) in self.sandboxes.iter_mut() {
+            let Some(e) = world.entities.get(id) else {
+                continue; // 无实体的残留沙箱（不应出现，防御性跳过）
+            };
+            let peers: Vec<LinkPeer> = alive_visible
+                .iter()
+                .filter(|(eid, _, _)| eid != id)
+                .map(|(eid, pos, radius)| LinkPeer {
+                    id: *eid,
+                    pos: *pos,
+                    radius: *radius,
+                    storage: world.entities[eid].storage().to_vec(),
+                })
+                .collect();
+            let children = world
+                .entities
+                .values()
+                .filter(|c| c.is_alive() && c.link_to() == Some(*id))
+                .count() as u32;
+            let d = handle.store.data_mut();
+            d.link_children = children;
+            d.link_parent = e.link_to();
+            d.link_radius = e.radius();
+            d.link_storage_own = e.storage().to_vec();
+            d.link_peers = peers;
+            d.link_payload_max = payload_max;
+            d.storage_cap = cap;
+        }
+        tracing::debug!("[link] 链路拍首快照已填充");
+    }
+
+    /// 链消息投递（D-011 a-1 前半，外桥回信同相位）：drain 跨拍信箱，逐封投递
+    ///
+    /// - 先投上拍入队的链消息（两拍节律：拍 N 入队、拍 N+1 a-1 回调，与外桥
+    ///   回信一致——接收方主代码下一拍 on_tick 可感知）
+    /// - 同拍多消息按（目标，源）EntityId 升序定序（确定性铁律）
+    /// - 目标已死/沙箱已销毁 -> 无人认领丢弃+INFO（死亡竞态，同外桥"回信无人
+    ///   认领"文案族）
+    /// - 预算复用 probe_fuel（接收方为收信付费的上限是防守预算，与 on_attack/
+    ///   on_probe/bridge_on_reply 同族独立预算，不占主配额）
+    /// - 缺省导出 -> deliver_message 内部 Ok(None) 零副作用丢弃（信塞进无人
+    ///   收件箱；链消息无 inflight 记账，投递即终结）
+    fn deliver_link_messages(&mut self, world: &WorldState) {
+        if self.link_inbox.is_empty() {
+            return;
+        }
+        let mut msgs = std::mem::take(&mut self.link_inbox);
+        msgs.sort_by_key(|m| (m.to.0, m.from.0)); // （目标,源）升序确定性
+        for msg in msgs {
+            let Some(handle) = self.sandboxes.get_mut(&msg.to) else {
+                tracing::info!(
+                    target = %msg.to.0,
+                    from = %msg.from.0,
+                    export = msg.export,
+                    bytes = msg.payload.len(),
+                    "[link] 消息无人认领（沙箱已销毁），丢弃"
+                );
+                continue;
+            };
+            let alive = world
+                .entities
+                .get(&msg.to)
+                .map(|e| e.is_alive())
+                .unwrap_or(false);
+            if !alive {
+                tracing::info!(
+                    target = %msg.to.0,
+                    from = %msg.from.0,
+                    "[link] 消息无人认领（实体已死），丢弃"
+                );
+                continue;
+            }
+            match self.manager.deliver_message(
+                handle,
+                msg.export,
+                msg.from.0.as_u128() as u64,
+                msg.with_from,
+                &msg.payload,
+                self.probe_fuel,
+            ) {
+                Ok(_) => {
+                    tracing::info!(
+                        target = %msg.to.0,
+                        from = %msg.from.0,
+                        export = msg.export,
+                        bytes = msg.payload.len(),
+                        "[link] 消息投递"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target = %msg.to.0,
+                        export = msg.export,
+                        error = %e,
+                        "[link] 消息投递失败（调用异常，丢弃）"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 链路出站收集（D-011 a-1 后半）：collect 各沙箱排队请求，分流落账/扇出
+    ///
+    /// - collect 即清五个 sent flag（下一拍可再发——每 import 1 次/拍限流以拍
+    ///   为单位）
+    /// - storage_write：落世界侧实体字段（真源，随实体入快照）当拍闭环，不进
+    ///   投递信箱；发送方已死 -> 盘随人亡，丢弃+INFO
+    /// - command：按链账本扇出（link_to==发送方 且 存活，EntityId 升序确定序
+    ///   逐个压 inbox）；#038 濒死回传——发送方死活不查（消息发出≠载体存活）
+    /// - report/send：直接压 inbox（to 已在 import 层寻址）
+    fn collect_link_sends(&mut self, world: &mut WorldState) {
+        for (id, handle) in self.sandboxes.iter_mut() {
+            {
+                let d = handle.store.data_mut();
+                d.link_command_sent = false;
+                d.link_report_sent = false;
+                d.link_send_sent = false;
+                d.link_sw_sent = false;
+                d.link_sr_sent = false;
+            }
+            let pending = std::mem::take(&mut handle.store.data_mut().link_pending);
+            for out in pending {
+                match out.kind {
+                    LinkOutKind::StorageWrite => {
+                        match world.entities.get(&out.from) {
+                            Some(e) if e.is_alive() => {
+                                if let Some(e) = world.entities.get_mut(&out.from) {
+                                    e.set_storage(out.payload);
+                                }
+                                tracing::info!(
+                                    entity = %out.from.0,
+                                    "[link] 公开块落账（世界侧真源，随实体入快照）"
+                                );
+                            }
+                            _ => {
+                                tracing::info!(
+                                    entity = %out.from.0,
+                                    "[link] 死实体写盘丢弃（盘随人亡）"
+                                );
+                            }
+                        }
+                    }
+                    LinkOutKind::Command => {
+                        // 扇出：名下全部活链造物（link_to==发送方 且 存活），
+                        // EntityId 升序确定序（deliver 侧再按（目标,源）总排序）
+                        let mut children: Vec<EntityId> = world
+                            .entities
+                            .iter()
+                            .filter(|(_, e)| e.is_alive() && e.link_to() == Some(*id))
+                            .map(|(eid, _)| *eid)
+                            .collect();
+                        children.sort_by_key(|e| e.0);
+                        let fanout = children.len();
+                        if fanout == 0 {
+                            // 拍首快照有孩子、collect 时全没了（死亡竞态）：
+                            // 无收件人，INFO 一条（诚实世界）
+                            tracing::info!(
+                                entity = %id.0,
+                                "[link] command 无活链收件人（孩子当拍死亡竞态），丢弃"
+                            );
+                        }
+                        for child in children {
+                            self.link_inbox.push(PendingLinkMessage {
+                                from: out.from,
+                                to: child,
+                                export: "on_command",
+                                with_from: false,
+                                payload: out.payload.clone(),
+                            });
+                        }
+                        if fanout > 0 {
+                            tracing::info!(
+                                entity = %id.0,
+                                fanout,
+                                bytes = out.payload.len(),
+                                "[link] command 扇出完成（入 inbox 待下一拍投递）"
+                            );
+                        }
+                    }
+                    LinkOutKind::Report { to } => {
+                        self.link_inbox.push(PendingLinkMessage {
+                            from: out.from,
+                            to,
+                            export: "on_report",
+                            with_from: true,
+                            payload: out.payload,
+                        });
+                    }
+                    LinkOutKind::Send { to } => {
+                        self.link_inbox.push(PendingLinkMessage {
+                            from: out.from,
+                            to,
+                            export: "on_message",
+                            with_from: true,
+                            payload: out.payload,
+                        });
+                    }
+                }
             }
         }
     }
@@ -1166,6 +1421,9 @@ fn main() -> Result<()> {
     // ——两者默认都落世界工作目录）
     sandbox_map.bridge_payload_max = config.bridge_payload_max;
     sandbox_map.bridge_inflight_max = config.bridge_inflight;
+    // D-011 世界内链护栏装配（照 bridge_payload_max 模式：拍首填进每沙箱快照）
+    sandbox_map.link_payload_max = config.link_payload_max;
+    sandbox_map.storage_cap = config.storage_cap;
     sandbox_map.bridge = if config.bridge_enabled {
         match bridges::BridgeOutbox::new(
             std::path::Path::new(&config.bridge_config),
@@ -1378,6 +1636,8 @@ fn tick_with_intents(
         BoundingBox::new(min_x, min_y, max_x, max_y)
     };
     sandbox_map.fill_visible_snapshots(world, &bounds);
+    // 链路拍首快照（D-011）：children/parent/peers/own 镜像——import 层数据源
+    sandbox_map.fill_link_snapshots(world, &bounds);
     // 桥拍首填充（D-001b）：热重载检查 + 每沙箱桥快照（None=复位，零开销）
     sandbox_map.fill_bridge_snapshots();
 
@@ -1675,6 +1935,7 @@ fn tick_with_intents(
                                     field_drag_delta: 0.0,
                                     liquid_density: 0.0,
                                     liquid_drag: 0.0,
+                                    link: 0,
                                     fuel_limit,
                                 });
                         }
@@ -1744,6 +2005,13 @@ fn tick_with_intents(
     //       排在 pending 应用之前：桥不改世界状态，只读 alive 与投递，与管线正交。
     sandbox_map.deliver_bridge_replies(world);
     sandbox_map.collect_bridge_sends(world);
+    //   a-1 世界内链收发（D-011，外桥同相位）：先投上拍入队的链消息（两拍节律
+    //       ——拍 N 玩家代码入队、拍 N+1 a-1 回调，与外桥回信一致；同拍多消息
+    //       按（目标,源）EntityId 升序定序），再收集本拍排队（command 按链账本
+    //       扇出 / report 沿链 / send 坐标寻址 / storage_write 落账当拍闭环）。
+    //       链消息不进快照（在途消息=当拍生命周期，api.md 载明）。
+    sandbox_map.deliver_link_messages(world);
+    sandbox_map.collect_link_sends(world);
     //   a. 应用 PendingChanges（spawn/destroy/set_pos/set_velocity，架构 4.1 a 步）
     //      先并入阶段一排队的移动请求（env.move_by），随本步统一应用（与攻击排队同模式）；
     //      再并入产权校验通过的销毁请求（env.destroy，门二）一起应用
@@ -1935,6 +2203,26 @@ fn tick_with_intents(
         .filter(|(_, e)| !e.is_alive())
         .map(|(id, _)| *id)
         .collect();
+    //      d-link 断链清算（D-011）：母体死亡当拍名下全部链断（link_to 清 None
+    //      + INFO 一条汇总）。断链不杀造物（生死归 binding 契约——电话挂了人
+    //      活着，#035/#038 契约=遗嘱 vs 控制=活电话）；断链不可逆（MVP 无复活）。
+    //      排在遗嘱窗口之前：遗嘱 spawn 的孤儿不再挂死链（接线侧也验创造者存活）。
+    let mut broken_links = 0usize;
+    for e in world.entities.values_mut() {
+        if let Some(parent) = e.link_to() {
+            if dead_ids.contains(&parent) {
+                e.set_link_to(None);
+                broken_links += 1;
+            }
+        }
+    }
+    if broken_links > 0 {
+        tracing::info!(
+            tick = current_tick,
+            broken = broken_links,
+            "[link] 母体死亡，链断（孤儿按 binding 契约活）"
+        );
+    }
     //      d-will 遗嘱窗口（D-007 ③，#043 死亡谢幕）：必须在 remove 之前（沙箱还在
     //      才能执行遗嘱）、retain 之前（遗嘱产物出生要读死者坐标与产权）。
     //      遗嘱排队的 spawn 当拍喂回既有管线（遗嘱执行人资格放行），attack 丢弃
@@ -2569,6 +2857,20 @@ fn process_spawn_requests(
         // 托管执行）；绑定对象=创造者（fade_on_death 的"主人"）
         entity.set_binding(req.binding);
         entity.set_bound_to(Some(req.creator));
+        // D-011 spawn 第 20 参 link：链声明写进造物数据（binding 家族新成员——
+        // 契约管生死、链管通信）。import 层已钳制非法值为无链；创造者已死（遗嘱
+        // 执行人资格放行的 spawn）不挂链——出生时母体就死了=出生即放生，否则
+        // 死母体的链永远没人给它断（断链清算只跑在母体死亡当拍）
+        if codeworld_core::entity::clamp_link(req.link) == codeworld_core::entity::LINK_ACTIVE {
+            if creator.is_alive() {
+                entity.set_link_to(Some(req.creator));
+            } else {
+                tracing::info!(
+                    creator = %req.creator.0,
+                    "[process_spawns] 遗嘱造物声明活链但母体已死，按放生落地（出生即断链）"
+                );
+            }
+        }
         // D-003 spawn 第 10 参 motion：运动身份写进造物数据（import 层已钳制，
         // 此处直存；D-009 液体造物已被上面强制 static）——dynamic 造物即刻受
         // 完整物理（身体=声明 radius 的圆）
@@ -4026,7 +4328,7 @@ fn hunter_wat() -> String {
   (import "env" "scan" (func $scan (param i32 i32) (result i32)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
   (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 4096) "{shell_escaped}\00")
   (data (i32.const 16384) ".\00")
@@ -4092,7 +4394,8 @@ fn hunter_wat() -> String {
           (f64.const 1.0)
           (f64.const 0.0)
           (f64.const 0.0)
-          (f64.const 0.0)))
+          (f64.const 0.0)
+          (i32.const 0)))
         (return)))
     ;; 3. 贴身机会刀（dist <= 1.0 在贴身判距内；投机者不追击肉搏）
     (if (f64.le (local.get $dist) (f64.const 1.0))
@@ -4925,7 +5228,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "W\00")
@@ -4947,6 +5250,7 @@ mod tests {
     f64.const 0.0
     f64.const {density}
     f64.const {drag}
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -5025,7 +5329,7 @@ mod tests {
         iron.set_mass(10.0); // ρ物≈12.7 > 1 沉
         let iron_id = iron.id;
         world.entities.insert(iron_id, iron);
-        let mut aloft = std::collections::HashSet::new();
+        let aloft = std::collections::HashSet::new();
         let mut wood_peak = 0.0f64;
         let mut late_wood_peak = 0.0f64; // 末段相位鲁棒观测（振荡收敛中的浮体不在固定位相）
         for t in 0..20 {
@@ -8705,6 +9009,423 @@ mod tests {
         let _ = std::fs::remove_file(&vault_path);
     }
 
+    // === D-011 世界内链路段编排（拍首快照 + a-1 投递/收集 + 断链清算 + spawn 接线）===
+
+    /// 母体 WAT：on_tick 每拍 command(0,6) 广播 "TURN+2"（每拍 1 次限流，
+    /// 后续拍返 0 也无妨——世界节律定天花板）
+    const LINK_MOTHER_WAT: &str = r#"(module
+  (import "env" "command" (func $command (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "TURN+2")
+  (func (export "on_tick")
+    i32.const 0 i32.const 6 call $command drop)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 孩子观察 WAT：on_command 记票（get_got 观测导出——两拍节律的断言锚）
+    const LINK_CHILD_OBSERVER_WAT: &str = r#"(module
+  (global $got (mut i32) (i32.const 0))
+  (memory (export "memory") 1)
+  (func (export "on_command") (param $ptr i32) (param $len i32)
+    (global.set $got (i32.add (global.get $got) (i32.const 1))))
+  (func (export "get_got") (result i32) global.get $got)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 上行孩子 WAT：on_tick 每拍 report(0,6) 上报 "STATUS"（侦察弹报坐标语义）
+    const LINK_CHILD_REPORTER_WAT: &str = r#"(module
+  (import "env" "report" (func $report (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "STATUS")
+  (func (export "on_tick")
+    i32.const 0 i32.const 6 call $report drop)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 收信母体 WAT：on_report 记 from（母体多孩子区分靠 from=源 EntityId 低
+    /// 64 位——field 信箱同款先例）
+    const LINK_MOTHER_LISTENER_WAT: &str = r#"(module
+  (global $from (mut i64) (i64.const -1))
+  (memory (export "memory") 1)
+  (func (export "on_report") (param $from i64) (param $ptr i32) (param $len i32)
+    (global.set $from (local.get $from)))
+  (func (export "get_from") (result i64) global.get $from)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 挂链孩子落地（测试辅助：跳过 import 层直接走阶段二接线——import 层
+    /// 校验已由 arena 侧测试覆盖，这里测 link 接线与编排链路。child_u 仅作
+    /// 日志标记不进 id——造物 id 是世界生成的随机 EntityId）
+    fn spawn_linked_child(
+        world: &mut WorldState,
+        map: &mut EntitySandboxMap,
+        mother: EntityId,
+        child_u: u128,
+        pos: (f64, f64),
+        code: &str,
+        link: i32,
+    ) -> EntityId {
+        let before: std::collections::HashSet<EntityId> =
+            world.entities.keys().copied().collect();
+        let req = PendingSpawn {
+            creator: mother,
+            pos,
+            code: code.to_string(),
+            glyph: "K".to_string(),
+            color: "lime".to_string(),
+            radius: 0.5,
+            mass: 1.0,
+            binding: 0,
+            motion: 0,
+            vx: 0.0,
+            vy: 0.0,
+            blob: Vec::new(),
+            field_radius: 0.0,
+            field_gravity_scale: 1.0,
+            field_drag_delta: 0.0,
+            liquid_density: 0.0,
+            liquid_drag: 0.0,
+            link,
+            fuel_limit: 1_000_000,
+        };
+        process_spawn_requests(world, map, vec![req], 1, &[]);
+        world
+            .entities
+            .keys()
+            .find(|id| !before.contains(id))
+            .copied()
+            .unwrap_or_else(|| panic!("造物 child_u={child_u} 应已落地"))
+    }
+
+    #[test]
+    fn fill_link_snapshots_fills_children_parent_peers_and_own() {
+        // 拍首快照：children=名下活链孩子数 / parent=自己 link_to / peers=视口
+        // 内存活实体（升序排除自己，带半径与存储块）/ own=自己公开块镜像
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let mother = make_entity_with_sandbox(&mut world, &mut map, 71, (0.0, 0.5), LIFE_WAT_MAIN);
+        let child = make_entity_with_sandbox(&mut world, &mut map, 72, (3.0, 0.5), LIFE_WAT_MAIN);
+        let stray = make_entity_with_sandbox(&mut world, &mut map, 73, (6.0, 0.5), LIFE_WAT_MAIN);
+        // 孩子挂活链 + 写公开块；路人写公开块
+        world.entities.get_mut(&child).unwrap().set_link_to(Some(mother));
+        world.entities.get_mut(&child).unwrap().set_storage(b"CHILD-SSD".to_vec());
+        world.entities.get_mut(&stray).unwrap().set_storage(b"STRAY".to_vec());
+        map.fill_link_snapshots(&world, &unbounded_bb());
+        // 母体：1 个活链孩子 + 视口内 2 个 peer（孩子+路人，排除自己）
+        let md = map.sandboxes[&mother].store.data();
+        assert_eq!(md.link_children, 1, "母体名下应有 1 个活链孩子");
+        assert_eq!(md.link_parent, None, "母体自己无链");
+        assert_eq!(md.link_peers.len(), 2, "视口内应有 2 个 peer（排除自己）");
+        assert_eq!(md.link_peers[0].id, child, "peers 应 EntityId 升序（72<73）");
+        assert_eq!(md.link_peers[0].storage, b"CHILD-SSD".to_vec(), "peer 块应随快照");
+        // 孩子：parent=母体 + 0 孩子
+        let cd = map.sandboxes[&child].store.data();
+        assert_eq!(cd.link_parent, Some(mother), "孩子的母体快照应是其 link_to");
+        assert_eq!(cd.link_children, 0, "孩子名下无孩子");
+        assert_eq!(cd.link_storage_own, b"CHILD-SSD".to_vec(), "own 镜像应同步");
+    }
+
+    #[test]
+    fn collect_link_sends_fans_out_command_in_entity_id_order() {
+        // 广播扇出：一母三子，command 一次三子全收——inbox 顺序=目标 EntityId
+        // 升序（确定性铁律；孩子 id 是世界生成的随机 Uuid，按实得 id 排序对断言）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let mother = make_entity_with_sandbox(&mut world, &mut map, 81, (0.0, 0.5), LINK_MOTHER_WAT);
+        let mut children = Vec::new();
+        children.push(spawn_linked_child(&mut world, &mut map, mother, 82, (2.0, 0.5), LINK_CHILD_OBSERVER_WAT, 1));
+        children.push(spawn_linked_child(&mut world, &mut map, mother, 83, (3.0, 0.5), LINK_CHILD_OBSERVER_WAT, 1));
+        children.push(spawn_linked_child(&mut world, &mut map, mother, 84, (4.0, 0.5), LINK_CHILD_OBSERVER_WAT, 1));
+        let mut sorted = children.clone();
+        sorted.sort_by_key(|e| e.0);
+        map.fill_link_snapshots(&world, &unbounded_bb());
+        map.run_player_code(&world, &unbounded_bb());
+        map.collect_link_sends(&mut world);
+        let inbox = &map.link_inbox;
+        assert_eq!(inbox.len(), 3, "一次 command 应扇出三封");
+        assert_eq!(inbox[0].to, sorted[0], "投递顺序应按目标 EntityId 升序（确定性）");
+        assert_eq!(inbox[1].to, sorted[1]);
+        assert_eq!(inbox[2].to, sorted[2]);
+        for msg in inbox {
+            assert_eq!(msg.from, mother);
+            assert_eq!(msg.export, "on_command");
+            assert!(!msg.with_from, "on_command 无 from 参");
+            assert_eq!(msg.payload, b"TURN+2".to_vec());
+        }
+        // sent flag collect 即清（下一拍可再发）
+        assert!(
+            !map.sandboxes[&mother].store.data().link_command_sent,
+            "collect 后 sent 标记应清"
+        );
+    }
+
+    #[test]
+    fn link_broadcast_reaches_child_on_next_tick_e2e() {
+        // 锚 11 两拍节律 e2e：tick1 母体 command（阶段一排队→a-1 扇出压 inbox）
+        // → tick2 a-1 投递（孩子 on_command 被调，get_got=1）——与外桥回信同款
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        let mother = make_entity_with_sandbox(&mut world, &mut map, 91, (0.0, 0.5), LINK_MOTHER_WAT);
+        let child = spawn_linked_child(&mut world, &mut map, mother, 92, (2.5, 0.5), LINK_CHILD_OBSERVER_WAT, 1);
+        // tick1：command 扇出（inbox 压入，尚未投递）
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(
+            !map.link_inbox.is_empty(),
+            "tick1 扇出后 inbox 应有待投消息"
+        );
+        let handle = map.sandboxes.get_mut(&child).unwrap();
+        let got = {
+            let func = handle
+                .instance
+                .get_typed_func::<(), i32>(&mut handle.store, "get_got")
+                .unwrap();
+            func.call(&mut handle.store, ()).unwrap()
+        };
+        assert_eq!(got, 0, "tick1 内孩子尚未收到（两拍节律：回调在下一拍 a-1）");
+        // tick2：a-1 先投 tick1 的信（孩子 on_command 被调），后收本拍 command
+        //（母体每拍广播——tick2 的信再入 inbox 等 tick3 投，持续节律自洽）
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        let handle = map.sandboxes.get_mut(&child).unwrap();
+        let got = {
+            let func = handle
+                .instance
+                .get_typed_func::<(), i32>(&mut handle.store, "get_got")
+                .unwrap();
+            func.call(&mut handle.store, ()).unwrap()
+        };
+        assert_eq!(got, 1, "tick2 a-1 孩子应收到母体剑诀");
+        assert_eq!(map.link_inbox.len(), 1, "tick2 本拍广播应再入 inbox（持续节律）");
+    }
+
+    #[test]
+    fn deliver_link_messages_drops_when_target_dead() {
+        // 死亡竞态：目标已死（沙箱已 remove）-> 消息无人认领丢弃（INFO 人工核对）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let mother = make_entity_with_sandbox(&mut world, &mut map, 93, (0.0, 0.5), LINK_MOTHER_WAT);
+        let child = spawn_linked_child(&mut world, &mut map, mother, 94, (2.5, 0.5), LINK_CHILD_OBSERVER_WAT, 1);
+        map.fill_link_snapshots(&world, &unbounded_bb());
+        map.run_player_code(&world, &unbounded_bb());
+        map.collect_link_sends(&mut world);
+        // 孩子死透（d 步同款清理：沙箱 remove）
+        map.remove(&child);
+        map.deliver_link_messages(&world);
+        assert!(map.link_inbox.is_empty(), "死目标消息应消费完（丢弃）");
+    }
+
+    #[test]
+    fn collect_link_sends_storage_write_lands_in_entity() {
+        // 存储件落账：孩子 storage_write -> collect 写进世界侧实体字段（真源），
+        // 随实体入快照（重启不丢的盘面）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let child = make_entity_with_sandbox(&mut world, &mut map, 95, (0.0, 0.5), STORAGE_WRITER_MAIN_WAT);
+        map.fill_link_snapshots(&world, &unbounded_bb());
+        map.run_player_code(&world, &unbounded_bb());
+        map.collect_link_sends(&mut world);
+        assert_eq!(
+            world.entities[&child].storage(),
+            b"INTEL1".to_vec(),
+            "写盘应落世界侧实体字段"
+        );
+        // StorageWrite 不进投递信箱（当拍闭环落账）
+        assert!(
+            !map.link_inbox.iter().any(|m| m.export == "storage_write"),
+            "写盘不是消息，不进投递信箱"
+        );
+    }
+
+    /// 写盘 WAT（main 侧编排测试用）：on_tick 调 storage_write(0,6)
+    const STORAGE_WRITER_MAIN_WAT: &str = r#"(module
+  (import "env" "storage_write" (func $storage_write (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "INTEL1")
+  (func (export "on_tick")
+    i32.const 0 i32.const 6 call $storage_write drop)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    #[test]
+    fn report_uplink_reaches_mother_with_from_low64() {
+        // 锚 3 report 沿链：孩子 report -> 下一拍母体 on_report 收到，from=
+        // 发送造物 EntityId 低 64 位
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        let mother = make_entity_with_sandbox(&mut world, &mut map, 96, (0.0, 0.5), LINK_MOTHER_LISTENER_WAT);
+        let child = spawn_linked_child(&mut world, &mut map, mother, 97, (2.5, 0.5), LINK_CHILD_REPORTER_WAT, 1);
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        let handle = map.sandboxes.get_mut(&mother).unwrap();
+        let from = {
+            let func = handle
+                .instance
+                .get_typed_func::<(), i64>(&mut handle.store, "get_from")
+                .unwrap();
+            func.call(&mut handle.store, ()).unwrap()
+        };
+        assert_eq!(
+            from,
+            child.0.as_u128() as u64 as i64,
+            "母体应收到的 from=孩子 EntityId 低 64 位"
+        );
+    }
+
+    #[test]
+    fn mother_death_breaks_links_children_survive() {
+        // 锚 1 链三态·断链：母体死亡当拍名下全部链断（link_to 清 None+INFO），
+        // 断链不杀造物（生死归 binding 契约——电话挂了人活着）；断链不可逆，
+        // command 再无收件人
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        let mother = make_entity_with_sandbox(&mut world, &mut map, 98, (0.0, 0.5), LINK_MOTHER_WAT);
+        let child = spawn_linked_child(&mut world, &mut map, mother, 99, (2.5, 0.5), LINK_CHILD_OBSERVER_WAT, 1);
+        world.entities.get_mut(&mother).unwrap().kill();
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(
+            !world.entities.contains_key(&mother),
+            "母体应按死亡清理移除"
+        );
+        assert!(
+            world.entities.get(&child).unwrap().is_alive(),
+            "断链不杀造物（孤儿按 binding 契约活）"
+        );
+        assert_eq!(
+            world.entities[&child].link_to(),
+            None,
+            "母体死当拍链应断（link_to 清 None）"
+        );
+        // 断链后母体名下无活链：新母体沙箱（已随母体移除）——直接验证孩子端：
+        // link_to=None 后 fill 的 parent 快照=None，report 恒返 2（放生语义）
+        map.fill_link_snapshots(&world, &unbounded_bb());
+        map.run_player_code(&world, &unbounded_bb());
+        let parent = map.sandboxes[&child].store.data().link_parent;
+        assert_eq!(parent, None, "断链后孩子 report 应走无链路径");
+    }
+
+    #[test]
+    fn spawn_link_wiring_and_unlinked_default() {
+        // 锚 1 链三态·放生 + spawn 接线：link=1 -> set_link_to(Some(creator))；
+        // link=0 -> None（默认现状零回归）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let mother = make_entity_with_sandbox(&mut world, &mut map, 61, (0.0, 0.5), LIFE_WAT_MAIN);
+        let linked = spawn_linked_child(&mut world, &mut map, mother, 62, (2.0, 0.5), LIFE_WAT_MAIN, 1);
+        let unlinked = spawn_linked_child(&mut world, &mut map, mother, 63, (4.0, 0.5), LIFE_WAT_MAIN, 0);
+        assert_eq!(
+            world.entities[&linked].link_to(),
+            Some(mother),
+            "link=1 应挂活链指向创造者"
+        );
+        assert_eq!(
+            world.entities[&unlinked].link_to(),
+            None,
+            "link=0 应放生（默认现状）"
+        );
+    }
+
+    #[test]
+    fn duel_takeover_keeps_link_and_report_routes_to_original_mother() {
+        // 锚 4 夺剑反杀（#038 预言的涌现验证）：造物被攻陷（换血=决斗会话
+        // 收尾同款 replace 路径）后链仍在（link_to 是实体字段，代码改不了），
+        // 新主代码 report 照投原母体——原主不知道剑已易主，情报单向透明
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let mother = make_entity_with_sandbox(&mut world, &mut map, 64, (0.0, 0.5), LINK_MOTHER_LISTENER_WAT);
+        let child = spawn_linked_child(&mut world, &mut map, mother, 65, (2.5, 0.5), LINK_CHILD_OBSERVER_WAT, 1);
+        // 攻陷：新游魂代码进驻飞剑沙箱（replace=决斗收尾的换血路径）
+        let old = map.sandboxes.remove(&child).unwrap();
+        let new_handle = map
+            .manager
+            .replace_sandbox(old, &wasm(LINK_CHILD_REPORTER_WAT), 1_000_000)
+            .unwrap();
+        map.sandboxes.insert(child, new_handle);
+        // 链账本不在沙箱里：换血不动实体字段
+        assert_eq!(
+            world.entities[&child].link_to(),
+            Some(mother),
+            "夺剑后链应仍连原母体（link_to 是实体字段）"
+        );
+        // 新主代码 report 照投原母体（两拍节律）
+        map.fill_link_snapshots(&world, &unbounded_bb());
+        map.run_player_code(&world, &unbounded_bb());
+        map.collect_link_sends(&mut world);
+        map.deliver_link_messages(&world);
+        let handle = map.sandboxes.get_mut(&mother).unwrap();
+        let from = {
+            let func = handle
+                .instance
+                .get_typed_func::<(), i64>(&mut handle.store, "get_from")
+                .unwrap();
+            func.call(&mut handle.store, ()).unwrap()
+        };
+        assert_eq!(
+            from,
+            child.0.as_u128() as u64 as i64,
+            "易主后的 report 应照投原母体（from=飞剑 id）"
+        );
+    }
+
+    /// 素 life 模块（链测试通用占位代码——无 on_tick 无副作用）
+    const LIFE_WAT_MAIN: &str = r#"(module (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 链演示守卫（G4）：players/link-demo.wat 真文件——全文作为玩家代码走
+    /// 真实管线：语法坏/20 参签名漂移/link 参数写错都会在此红（示例即文档，
+    /// field-demo 守卫同款哲学）
+    #[test]
+    fn link_demo_example_compiles_and_flies_kite() {
+        const LINK_DEMO_WAT: &str = include_str!("../../../players/link-demo.wat");
+        let mut world = WorldState::new();
+        let creator = EntityId(Uuid::from_u128(65));
+        world
+            .entities
+            .insert(creator, make_entity_of_owner(65, 66, (10.0, 0.0)));
+        let mut map = test_sandbox_map();
+        map.create(creator, &wasm(LINK_DEMO_WAT), 1_000_000).unwrap();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        // 拍1：风筝手放飞（spawn link=1 侦察弹）
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        let scout_id = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .map(|e| e.id)
+            .expect("侦察弹应诞生（示例语法/参数坏了会在此红）");
+        assert_eq!(
+            world.entities[&scout_id].link_to(),
+            Some(creator),
+            "侦察弹应挂活链（spawn 第 20 参 link=1 落库）"
+        );
+        let x0 = world.entities[&scout_id].pos().0;
+        // 拍2：侦察弹初始方向 1.0 向东走 + report 上行（collect 压 inbox）
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(
+            world.entities[&scout_id].pos().0 > x0,
+            "侦察弹应向东走（初始方向 1.0 的 move_by 生效）"
+        );
+        assert_eq!(map.link_inbox.len(), 1, "侦察弹 report 应已入投递信箱");
+        // 手动投递（tick 的 d2 字幕步会排水 log_markers，故绕开整拍直验回调）
+        map.deliver_link_messages(&world);
+        let markers = map.collect_all_log_markers();
+        assert!(
+            markers.contains(&7),
+            "母体应收到侦察弹 report（on_report 的 marker 7）"
+        );
+    }
+
     // === 两只真性格生物（攻击者 A / 防御者 D）：行为与胜负演进 ===
 
     /// 构造自定义外观实体（生物测试用：A 红 / D 青，glyph 各自设定）
@@ -9219,7 +9940,7 @@ mod tests {
         let shell_escaped = shell_wat_escaped();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (import "env" "log" (func $log (param i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
@@ -9250,7 +9971,8 @@ mod tests {
           (f64.const 1.0)
           (f64.const 0.0)
           (f64.const 0.0)
-          (f64.const 0.0))))))
+          (f64.const 0.0)
+          (i32.const 0))))))
   (func (export "life") (result i32) i32.const 1))"#,
             shell_len = CTRL_SHELL_WAT.len(),
         )
@@ -9954,6 +10676,7 @@ mod tests {
             field_drag_delta: 0.0,
             liquid_density: 0.0,
             liquid_drag: 0.0,
+            link: 0,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
@@ -10013,6 +10736,7 @@ mod tests {
             field_drag_delta: 0.0,
             liquid_density: 0.0,
             liquid_drag: 0.0,
+            link: 0,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
@@ -10988,7 +11712,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -11010,6 +11734,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -11206,6 +11931,7 @@ mod tests {
                 field_drag_delta: 0.0,
                 liquid_density: 0.0,
                 liquid_drag: 0.0,
+                link: 0,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 7);
@@ -11245,7 +11971,7 @@ mod tests {
         let escaped = wat_escape(creation_code);
         let spawner = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -11266,6 +11992,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -11468,6 +12195,7 @@ mod tests {
                 field_drag_delta: 0.0,
                 liquid_density: 0.0,
                 liquid_drag: 0.0,
+                link: 0,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -11707,7 +12435,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -11736,6 +12464,7 @@ mod tests {
         (f64.const 0.0)
         (f64.const 0.0)
         (f64.const 0.0)
+        (i32.const 0)
         (call $spawn)
         (drop))))
   (func (export "life") (result i32) i32.const 1))"#,
@@ -11832,7 +12561,7 @@ mod tests {
         let escaped = wat_escape(relic_code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "R\00")
@@ -11855,6 +12584,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn drop))"#,
             escaped = escaped,
             len = relic_code.len(),
@@ -11880,7 +12610,7 @@ mod tests {
         let shell_escaped = shell_wat_escaped();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{shell_escaped}\00")
   (data (i32.const 16384) "*\00")
@@ -11906,6 +12636,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn drop))"#,
             shell_len = CTRL_SHELL_WAT.len(),
         )
@@ -12221,7 +12952,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "F\00")
@@ -12243,6 +12974,7 @@ mod tests {
     f64.const {fdd}
     f64.const 0.0
     f64.const 0.0
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,

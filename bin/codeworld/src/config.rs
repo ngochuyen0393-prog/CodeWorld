@@ -111,6 +111,14 @@ pub struct Config {
     /// 每沙箱桥在途信件上限（D-001b 护栏），默认 4（防灌爆出站队列；途满再发返 3，
     /// 世界不排队不重试）。CODEWORLD_BRIDGE_INFLIGHT 覆盖。
     pub bridge_inflight: u32,
+    /// 链消息 payload 单信上限字节数（D-011 护栏，容量护栏非玩法数值），默认
+    /// 8192（与桥 payload_max 同锚）。command/report/send/storage_write 共用。
+    /// CODEWORLD_LINK_PAYLOAD_MAX 覆盖。
+    pub link_payload_max: usize,
+    /// 公开存储块容量上限字节数（D-011 护栏，容量护栏非玩法数值——想要大存储
+    /// 用沙箱内存，storage 不是 spawn 参数），默认 4096。超容拒绝不截断。
+    /// CODEWORLD_STORAGE_CAP 覆盖。
+    pub storage_cap: usize,
     /// 决斗游魂单窗预算（D-005 刀0：每拍会话窗口给游魂的步数，从攻方燃料赌注
     /// 扣除——死油箱，赌注=spawn 继承的攻方配额 #047）。默认 10_000，与
     /// probe/contact/field 同档（轻窗口）；CODEWORLD_DUEL_STEP_FUEL 覆盖。
@@ -150,6 +158,8 @@ impl Default for Config {
             bridge_payload_max: 8192,
             bridge_timeout_s: 5,
             bridge_inflight: 4,
+            link_payload_max: 8192,
+            storage_cap: 4096,
             duel_step_fuel: 10_000,
         }
     }
@@ -306,6 +316,14 @@ impl Config {
         }
         if let Some(n) = env_u64("CODEWORLD_BRIDGE_INFLIGHT") {
             cfg.bridge_inflight = n as u32;
+        }
+        // D-011 世界内链护栏（照 CODEWORLD_BRIDGE_PAYLOAD_MAX 模式：解析失败
+        // 回退默认，坏值不进世界）
+        if let Some(n) = env_usize("CODEWORLD_LINK_PAYLOAD_MAX") {
+            cfg.link_payload_max = n;
+        }
+        if let Some(n) = env_usize("CODEWORLD_STORAGE_CAP") {
+            cfg.storage_cap = n;
         }
         cfg
     }
@@ -922,6 +940,43 @@ mod tests {
         let c = Config::load();
         std::env::remove_var("CODEWORLD_BRIDGE_TIMEOUT_S");
         assert_eq!(c.bridge_timeout_s, 5, "0 应回退默认超时 5 秒");
+    }
+
+    // === 世界内链路段护栏（D-011：CODEWORLD_LINK_PAYLOAD_MAX/CODEWORLD_STORAGE_CAP）===
+
+    #[test]
+    fn default_link_guardrails_match_design() {
+        // 创建：链两护栏默认值=design-link 六节出厂锚（payload 8KB 与桥同锚、
+        // 存储块 4KB）
+        let c = Config::default();
+        assert_eq!(c.link_payload_max, 8192, "链消息上限默认应为 8KB");
+        assert_eq!(c.storage_cap, 4096, "存储块容量默认应为 4KB");
+    }
+
+    #[test]
+    fn load_link_env_overrides_default() {
+        // 修改：两项 env 覆盖生效
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_LINK_PAYLOAD_MAX", "2048");
+        std::env::set_var("CODEWORLD_STORAGE_CAP", "1024");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_LINK_PAYLOAD_MAX");
+        std::env::remove_var("CODEWORLD_STORAGE_CAP");
+        assert_eq!(c.link_payload_max, 2048);
+        assert_eq!(c.storage_cap, 1024);
+    }
+
+    #[test]
+    fn load_link_numeric_invalid_falls_back() {
+        // 边界：非法数值回退默认（容错语义同其他数值项，坏值不进世界）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_LINK_PAYLOAD_MAX", "huge");
+        std::env::set_var("CODEWORLD_STORAGE_CAP", "nope");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_LINK_PAYLOAD_MAX");
+        std::env::remove_var("CODEWORLD_STORAGE_CAP");
+        assert_eq!(c.link_payload_max, 8192);
+        assert_eq!(c.storage_cap, 4096);
     }
 
     #[test]
