@@ -15,8 +15,9 @@ use crate::entity::Entity;
 pub const CREATION_CODE: &str = "creation";
 
 /// 弹丸 code_hash 标识（历史实体兼容判定：#045/D-018 后世界不再产生 PROJECTILE_CODE
-/// 实体，shoot import 已退役——存量旧快照实体走通用速度积分路径照飞照落；
-/// 本模块/net.rs 共用同一常量，kind=projectile 前端分支保留过渡期消亡检测）
+/// 实体，shoot import 已退役——该 code_hash 仅兼容历史快照反序列化，恢复即清场
+///（弹丸不跨重启：main() 快照恢复按哑弹 retain 清场），运行时无活旧弹丸；
+/// 本模块/net.rs 共用同一常量，kind=projectile 前端分支纯协议历史兼容）
 pub const PROJECTILE_CODE: &str = "projectile";
 
 /// 造物是否声明为全活 dynamic（D-003 motion 第 10 参：motion=1 的 creation
@@ -43,8 +44,9 @@ pub const MELEE_REACH: f64 = 0.5;
 /// 自定，此值=文档/解算器/测试共用的参照值）
 pub const PROJECTILE_RADIUS: f64 = 0.15;
 
-/// 实体是否是弹丸（历史实体兼容判定，D-018 后新世界不产生——存量旧快照实体
-/// 走通用物理；排除语义保留：不可锁定/不可被撞/不参与接触）
+/// 实体是否是弹丸（历史实体兼容判定，D-018 后新世界不产生——仅兼容历史快照
+/// 反序列化，恢复即清场，运行时无活旧弹丸；排除语义保留为防御性守卫+测试
+/// 构造兼容锚：不可锁定/不可被撞/不参与接触）
 pub fn is_projectile(e: &Entity) -> bool {
     e.code_hash == PROJECTILE_CODE
 }

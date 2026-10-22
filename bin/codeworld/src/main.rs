@@ -1825,8 +1825,14 @@ fn tick_with_intents(
         } else {
             std::collections::HashSet::new()
         };
+    // #044 确定性：HashSet 遍历无序，多接触同拍的触发/回调顺序必须固定——
+    // 按对内 Uuid 升序排序后遍历（EntityId 无 Ord 走内层 Uuid；a.id<b.id 已
+    // 保证排序键即全序），同拍多对接触的 on_contact 收到顺序世界无关机器数据
+    let mut touching_sorted: Vec<(EntityId, EntityId)> =
+        touching_now.iter().copied().collect();
+    touching_sorted.sort_by_key(|&(a, b)| (a.0, b.0));
     let mut contacts: Vec<ContactPair> = Vec::new();
-    for (a, b) in &touching_now {
+    for (a, b) in &touching_sorted {
         if !sandbox_map.last_touching.contains(&(*a, *b)) {
             let pos = world
                 .entities
@@ -2680,6 +2686,9 @@ pub fn solve_launch_vector(
     sy: f64,
     tx: f64,
     ty: f64,
+    // _base_speed：定装基准速历史占位（期五第五刀的驾驶档 12）——期五第六刀
+    // 改速度梯搜索后此参被忽略不再进解算（梯表 CTRL_SHOOT_SPEED_LADDER 内嵌）；
+    // 保留占位免翻动十余处调用面（前端镜像 solveLaunchVector 同构无此参）
     _base_speed: f64,
 ) -> Option<(f64, f64)> {
     let dx = tx - sx;
@@ -3019,7 +3028,7 @@ fn deliver_attacks(
                 target = %target_id.0,
                 dist,
                 reach = attacker.radius() + target.radius() + codeworld_core::collision::MELEE_REACH,
-                "[deliver_attacks] 攻击落空（距离不足：非贴身够不着，远程打击请用 shoot 弹丸）"
+                "[deliver_attacks] 攻击落空（距离不足：非贴身够不着——远程打击=spawn 造物弹带出生初速，模板见 docs/newbie-first-thrower.md）"
             );
             continue;
         }

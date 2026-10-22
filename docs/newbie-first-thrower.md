@@ -18,7 +18,7 @@
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
   (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
   (import "env" "spawn" (func $spawn
-    (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64)
+    (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64)
     (result i32)))
   (memory (export "memory") 1)
   ;; ↓↓↓ 改这里 1：子弹代码（data 段 [4096..)，别与 scan 缓冲 [0..16) 重叠）
@@ -51,25 +51,27 @@
         (call $log (i32.const 12))
         (local.set $ux (f64.div (local.get $dx) (local.get $dist)))
         (local.set $uy (f64.div (local.get $dy) (local.get $dist)))
-        ;; ↓↓↓ 改这里 3：子弹长度 = data 段 [4096] 转义文本的准确字节数
+        ;; ↓↓↓ 改这里 3：子弹长度 = data 段 [4096] 解码后的准确字节数（转义还原成原文再数，见 §4 坑 1）
         (drop (call $spawn
-          (i32.const 4096)          ; 子弹代码指针
-          (i32.const 661)           ; 子弹代码字节数（数准！截断/超长都编译失败；见 §4 坑 1。本值=上方示例的实测，自己改了代码要重数）
-          (f64.add (local.get $mx) (f64.mul (local.get $ux) (f64.const 0.75)))
-          (f64.add (local.get $my) (f64.mul (local.get $uy) (f64.const 0.75)))
-          (i32.const 16384)         ; 字形指针
-          (i32.const 16448)         ; 颜色指针
-          (f64.const 0.15)          ; 子弹半径（小圆点=难被打中）
-          (f64.const 0.5)           ; 子弹质量（轻弹弯垂/重弹平直，自己调手感）
-          (i32.const 0)             ; binding 0=unbound
-          (i32.const 1)             ; motion 1=dynamic（全活，受完整物理——必填！）
-          (f64.div (f64.sub (local.get $dx) (f64.const 0.75)) (f64.const 1.805))
-          (f64.const 9.53)          ; 出生初速 (vx, vy)——弹道的心脏
-          (i32.const 0) (i32.const 0)   ; 出生数据包（无）
-          (f64.const 0.0)           ; 力场三参（无场）
-          (f64.const 1.0)
-          (f64.const 0.0))))
-        (return))
+          (i32.const 4096)          ;; 1  code_ptr：子弹代码指针
+          (i32.const 676)           ;; 2  code_len：子弹代码字节数（数准！截断/超长都编译失败；见 §4 坑 1。本值=上方示例解码后实测，自己改了代码要重数）
+          (f64.add (local.get $mx) (f64.mul (local.get $ux) (f64.const 0.75)))  ;; 3  x：出生点（沿发射方向外推出膛，见 §三）
+          (f64.add (local.get $my) (f64.mul (local.get $uy) (f64.const 0.75)))  ;; 4  y
+          (i32.const 16384)         ;; 5  glyph_ptr：字形指针
+          (i32.const 16448)         ;; 6  color_ptr：颜色指针
+          (f64.const 0.15)          ;; 7  radius：子弹半径（小圆点=难被打中）
+          (f64.const 0.5)           ;; 8  mass：子弹质量（轻弹弯垂/重弹平直，自己调手感）
+          (i32.const 0)             ;; 9  binding 0=unbound
+          (i32.const 1)             ;; 10 motion 1=dynamic（全活，受完整物理——必填！）
+          (f64.div (f64.sub (local.get $dx) (f64.const 0.75)) (f64.const 1.805))  ;; 11 vx：两拍回弧水平分量
+          (f64.const 9.53)          ;; 12 vy：出生初速——弹道的心脏
+          (i32.const 0) (i32.const 0)   ;; 13/14 出生数据包（无）
+          (f64.const 0.0)           ;; 15 field_radius（力场三参：无场）
+          (f64.const 1.0)           ;; 16 field_gravity_scale（1.0=不改写重力）
+          (f64.const 0.0)           ;; 17 field_drag_delta（0=不改写阻力）
+          (f64.const 0.0)           ;; 18 liquid_density（0=非液体默认）
+          (f64.const 0.0)))         ;; 19 liquid_drag（0=无水中阻尼）
+        (return)))
     ;; 贴身机会刀（投掷器也能近战）
     (if (f64.le (local.get $dist) (f64.const 1.0))
       (then
@@ -120,7 +122,7 @@
 
 ## 四、常见坑
 
-1. **子弹代码字节数数错** → `spawn` 编译失败，弹不出生（世界日志有 `[process_spawns] 造物 WAT 编译失败`）。转义后的字节数 ≠ 原文长度：`\n` 变 `\0a`、`"` 变 `\"` 都会变长。
+1. **子弹代码字节数数错** → `spawn` 编译失败，弹不出生（世界日志有 `[process_spawns] 造物 WAT 编译失败`）。要数的是**解码后**的字节数：世界从内存读到的是转义还原后的原文——`\0a` 解回一个换行、`\"` 解回一个引号（各算 1 字节），结尾 `\00` 是 NUL 哨兵不算。把 data 段转义文本当字面数（本模板字面 719）或把哨兵算进去（677）都错，正确值 = **676**（模板原文长度）。别目测，写段小脚本把 data 段文本先解码再数（转义规则：`\"`→引号、`\\`→反斜杠、`\hh` 两位十六进制→对应字节）。
 2. **忘写 `motion=1`** → 子弹是 static 桩，出生即钉死。
 3. **忘写出生点外推** → spawn 撞自己身体被拒（日志 `出生点与现有身体重叠`）。
 4. **scan 缓冲 [0..16) 与子弹代码 data 段重叠** → 子弹代码被坐标覆盖，编译失败。子弹代码放 [4096..)。

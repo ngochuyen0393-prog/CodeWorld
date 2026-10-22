@@ -311,7 +311,8 @@ impl DefaultPhysicsEngine {
     /// - 圆实体：落点解析（地面=半径线 / 落在身体上=接触即停，见 circle_landing_y）
     /// - 造物（creation，格对齐 AABB）：直落地面（y≥ground_y），落点身体重叠则
     ///   悬停原位下拍重试（造物运动罕见，MVP 不做 AABB 堆叠解析）
-    /// - 带速度实体（生物/dynamic 造物，【D-018】含造物弹与存量旧弹丸）：冲量
+    /// - 带速度实体（生物/dynamic 造物，【D-018】含造物弹；存量旧弹丸仅历史
+    ///   快照反序列化兼容——恢复即清场，运行时无活旧弹丸）：冲量
     ///   路径速度积分（重力→阻力→极速钳→中点位移→CCD 扫掠截断→落地清零）；
     ///   【历史注记】原 step_projectiles 弹丸专属管线（半隐式欧拉）随 #045 弹丸
     ///   退役并入本路径——一切有速度实体同一套弹道物理
@@ -1164,8 +1165,8 @@ mod tests {
     use codeworld_core::collision::PROJECTILE_CODE;
 
     /// 构造旧弹丸实体（历史兼容测试用：D-018 后世界不再产生 PROJECTILE_CODE
-    /// 实体，存量走通用路径照飞照落；本构造器服务 find_nearest 排除/step 通用
-    /// 路径兼容锚）
+    /// 实体——仅历史快照反序列化兼容且恢复即清场，运行时无活旧弹丸；本构造器
+    /// 仅供测试复现历史形态，服务 find_nearest 排除/step 通用路径兼容锚）
     fn make_projectile(id_u: u128, pos: (f64, f64), vel: (f64, f64), created_tick: u64) -> Entity {
         let mut e = Entity::new(
             EntityId(Uuid::from_u128(id_u)),
@@ -1684,10 +1685,11 @@ mod tests {
 
     #[test]
     fn step_legacy_projectile_now_uses_generic_ballistic_path() {
-        // 兼容锚：旧 PROJECTILE_CODE 实体（历史存档，新世界不再产生）不再被
-        // step 跳过——velocity≠0 走冲量路径照飞（弹道物理通用化覆盖一切实体）。
-        // 排除语义保留在各消费点：find_hit_target 不可锁定/detect_touching 不接触/
-        // CCD 目标过滤不撞弹丸
+        // 兼容锚（测试构造历史形态）：旧 PROJECTILE_CODE 实体新世界不再产生
+        //（仅历史快照反序列化兼容，恢复即清场——本测试用构造器复现历史形态，
+        // 验证 step 不再按 kind 跳过：velocity≠0 走冲量路径，弹道物理通用化
+        // 覆盖一切实体）。排除语义保留为防御性守卫：find_hit_target 不可锁定/
+        // detect_touching 不接触/CCD 目标过滤不撞弹丸
         let engine = DefaultPhysicsEngine::new();
         let mut world = WorldState::new();
         let p = make_projectile(1, (0.0, 10.0), (3.0, 0.0), 0);
@@ -1697,7 +1699,7 @@ mod tests {
         let (vx, vy) = world.entities.get(&pid).unwrap().velocity();
         assert!(
             (vx - 3.0 * 0.95).abs() < 1e-9 && (vy + 9.8 * 0.95).abs() < 1e-9,
-            "旧弹丸实体应走通用冲量路径（重力+阻力），实际 ({vx},{vy})"
+            "历史形态弹丸（测试构造）应走通用冲量路径（重力+阻力），实际 ({vx},{vy})"
         );
         assert!(
             world.entities.get(&pid).unwrap().pos().0 > 0.0,
@@ -2423,8 +2425,8 @@ mod tests {
 
     #[test]
     fn step_projectile_in_water_slows_and_softens_fall() {
-        // 弹丸入水改弹道锚（本刀可见效果之一；【D-018】迁移为通用路径——旧弹丸
-        // 实体走 step 冲量路径，wet 路由同样命中）：标准弹（r=0.15/m=1 →
+        // 弹丸入水改弹道锚（本刀可见效果之一；【D-018】迁移为通用路径——历史
+        // 形态弹丸（测试构造）走 step 冲量路径，wet 路由同样命中）：标准弹（r=0.15/m=1 →
         // ρ物≈14.1 很稠）入水（ρ=1, k=0.5）——水平速度被阻尼减半后吃更钝
         // 阻力、下坠被浮力托缓（|g_final|<9.8）：弹道变短变缓
         let engine = DefaultPhysicsEngine::new();

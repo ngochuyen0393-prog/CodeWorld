@@ -778,28 +778,33 @@
   var CTRL_SHOOT_SPEED_LADDER = [13.8, 15, 16, 17, 18, 20, 22]; // 同 Rust 梯
   var PROJ_GRAVITY = -9.8;            // 世界重力（core DefaultPhysics 默认）
   var PROJ_DRAG = 0.05;               // 世界阻力（#034 默认）
-  var PROJ_BODY = 0.15;               // 弹丸身体半径（落地判定线）
-  var PROJ_MASS = 1.0;                // 定装弹质量
+  var PROJ_BODY = 0.15;               // 定装造物弹身体半径（落地判定线；=main.rs CTRL_SHELL_RADIUS）
+  var PROJ_MASS = 1.0;                // 定装弹质量（=CTRL_SHOOT_MASS）
   var PROJ_MAX_SPEED = 25;            // 世界极速
-  var PROJ_MAX_AGE = 30;              // 弹丸寿命上限（拍）
+  var PROJ_MAX_AGE = 30;              // 解算模拟步数上限（拍，=CTRL_SOLVE_MAX_TICKS）——#045 后世界无统一弹寿命：造物弹自管 life()，弹幕总量上限=世界实体上限 64
   var PROJ_TRAIL = 1.5;               // 弹丸尾迹世界长度（格；0.6→1.5 期五第六刀）
 
   // 弹道模拟采样（镜像 main.rs solve_launch_vector 内 simulate_path：与
-  // crates/physics step_projectiles 同序——先重力、后阻力、再极速钳、再位移），
+  // crates/physics step 冲量路径同序——重力→阻力→极速钳→中点位移），
   // 返回逐拍末坐标（含起点），落地 y<半径截断。
-  // 【#044 子步宪法锚·弹道积分/预览采样】N=1 整步积分，步数只由弹丸状态
-  // 决定（落地 y<半径 或寿命 30 拍截断）——纯状态驱动，零机器数据
+  // 【D-018-R1 镜像同步】位移=中点口径（本拍定律前+定律后速度）/2——匀加速
+  // 一拍的解析解。世界物理已换轨（弹丸专属半隐式管线随 #045 退役，造物弹走
+  // step 通用路径），预测侧必须同步——#028 镜像铁律，否则"弧线说打得到=
+  // 世界真命中"契约断裂（与 main.rs 侧中点位移同步落地）。
+  // 【#044 子步宪法锚·弹道积分/预览采样】N=1 整步积分，步数只由弹道状态
+  // 决定（落地 y<半径 或步数上限截断）——纯状态驱动，零机器数据
   // （墙钟/CPU/帧率），同输入必然同弧线（decisions #044 / D-015）
   function simTrajectory(sx, sy, vx, vy) {
     var pts = [{ x: sx, y: sy }];
     var x = sx, y = sy;
     for (var i = 0; i < PROJ_MAX_AGE; i++) {
+      var vx0 = vx, vy0 = vy; // 定律前速度（本拍位移的左端点）
       vy += PROJ_GRAVITY;
       var f = 1 - PROJ_DRAG / PROJ_MASS;
       vx *= f; vy *= f;
       var sp = Math.sqrt(vx * vx + vy * vy);
       if (sp > PROJ_MAX_SPEED) { var k = PROJ_MAX_SPEED / sp; vx *= k; vy *= k; }
-      x += vx; y += vy;
+      x += (vx0 + vx) / 2; y += (vy0 + vy) / 2; // 中点位移（step 冲量路径同款）
       pts.push({ x: x, y: y });
       if (y < PROJ_BODY) break; // 落地截断
     }

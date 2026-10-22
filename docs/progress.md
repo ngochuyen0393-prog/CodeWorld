@@ -6,7 +6,7 @@
 - 在做：D-018 收口——shoot import/弹丸专属管线/痕迹机制/三常数全退役（decisions #045 执行刀）；弹道物理通用化为一切有速度实体（step 冲量路径+CCD 扫掠截断，积分器双轨注记入码：中点位移保留=跳跃锚、半隐式轨随弹丸退役）；H 搅局者/操控射击/遗嘱烟花全迁造物弹（spawn 第 11/12 参初速+on_contact 接触代码攻）；弹头延迟 2 拍消亡（结算需攻击者在册）；CCD 停点 1cm 推进修接触浮点缝隙；投掷器教学 docs/newbie-first-thrower.md。Gate：workspace 1034 绿/0 failed（基线 1069-删 37 个 shoot 专属测试+新增通用锚，删测授权见任务书⑥）/本刀 hunks clippy 零警告/4 条 clippy 新 lint 警告属 HEAD 既有代码（mask/avatars/net/bridge 区，非本刀 hunks）。
 - 卡在：无。**已 rebase 落回 master（9cee29b，基于 D-009 162fd82）**：液体物理迁入 step 冲量路径（D-009 液体测试全绿）、三 WAT 生成器与 PendingSpawn 构造同步 19 参、CCD 接近性判据修正（重叠分离中放行——D-009 浮沉实测暴露）、液体造物不作 CCD 目标、木浮铁沉布景适配。详见 .cc-scratch/cc-report-d018.md §八。
 - 下一步：① D-001c 活弹待遇参数判据拍板（土豆）② D-011 链路已解锁可派 ③ 待土豆人工验收：watch 日志观察 H 投掷弹道手感（每 8 拍一发、两拍回弧）/浏览器操控射击（点敌人出定装弹）/遗嘱烟花（spawn 造物带初速）④ 弹幕躺尸堆积极限=实体上限 64 认账（#045），寿命管理第二课候选。
->>>>>>> a1804fc (feat(core,physics,arena,bin,docs): D-018 弹丸退役工程——shoot 移除/弹道通用化/痕迹退役/三常数划线/D-H 迁移造物弹/投掷器模板第一课)
+- 追加（2026-10-22 D-018-R1 双审修复小刀）：投掷器教学模板修至真实可抄（spawn import 19 参/单分号注释改 `;;`/投掷 then 块括号结构修正/code_len 实测 676 填入）——wasmtime 实测完整模板编译通过（审查曾实测旧版必炸）；前端 simTrajectory 镜像同步中点口径；net-protocol 退役口径补齐；P2 批（文案/兼容口径统一/接触遍历排序）见 .cc-scratch/cc-report-d018-r1.md。
 
 ## 上一轮（2026-10-22 D-009 水体系统 收工更新，其 step_projectiles 液体耦合已随 D-018 通用化迁入 step 冲量路径）
 - 在做：D-009 收工——液体造物声明家族（spawn 第 18/19 参 liquid_density/liquid_drag，域 [0,5] 钳制）+ 浮沉公式涌现（g_final=g×(1−ρ液/ρ物×f) 钳 [-98,+98]、浸入比竖径夹逼、附加质量 m_eff 进阻力分母、多域取最高密度、aloft 优先）+ 零速入水速度制路由 + 弹丸入水改弹道 + 快照 liquids 矩形投影 + 前端密度映射画色 + examples/liquid-demo.wat（守卫测试同源）+ 文档五件（api.md 19 参+「液体（D-009）」节/decisions #053/dev-plan ✅/game-menu 浮力✅+1.7 常数/progress）。decisions.md #053。

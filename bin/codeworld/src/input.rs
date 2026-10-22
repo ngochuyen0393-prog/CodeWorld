@@ -115,7 +115,8 @@ pub enum ControlledAction {
     /// None = 视野内无目标（本拍挥空不出刀，但操控仍接管本拍）
     Attack(Option<(f64, f64)>),
     /// 操控射击（#036）：目标世界坐标（发射方向由此计算；弹道参数=驾驶档定装，
-    /// main.rs 常量——玩家代码 env.shoot 才是自定义弹道）
+    /// main.rs 常量——自定义弹道=玩家代码 spawn 出生初速（env.shoot 已随 #045
+    /// 退役，教学模板见 docs/newbie-first-thrower.md））
     Shoot { tx: f64, ty: f64 },
 }
 

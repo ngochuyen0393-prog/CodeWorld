@@ -201,8 +201,8 @@ pub(crate) struct EntitySnapshot {
 /// kind 判定（纯映射，任务书定案）：开局四生物=npc；creation=造物（static 钉死）；
 /// creation_dynamic=D-003 全活造物（motion=1，圆身体受完整物理；【D-018】造物弹
 /// 也走此 kind——前端按圆渲染）；弹丸=projectile（历史实体兼容判定：#045/D-018
-/// 后世界不再产生 PROJECTILE_CODE 实体，kind 分支保留供残存旧快照实体的消亡
-/// 检测过渡期；新弹=creation_dynamic）；players 目录在线名
+/// 后世界不再产生 PROJECTILE_CODE 实体，恢复快照即按哑弹清场——正常快照永不含
+/// 该 kind，分支纯协议历史兼容防御；新弹=creation_dynamic）；players 目录在线名
 /// （或残影躯壳）=player；其余未知 code_hash 兜底 npc。
 fn entity_kind(code_hash: &str, entity_id: EntityId, players: &PlayerDirectory, motion: i32) -> &'static str {
     match code_hash {
