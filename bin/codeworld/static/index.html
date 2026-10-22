@@ -70,6 +70,18 @@
   vendored 依赖入仓属白名单例外）。当前 Canvas 2D 与 Three 是两层独立 canvas
   叠加；PixiJS 引入时（后续刀）替换 Canvas 2D 层并与 Three 共享 WebGL context
   （混搭指南 pixijs.com/8.x/guides/third-party/mixing-three-and-pixi）。
+
+  D-004b 卡通渲染角色（渲染升级 D-004 四阶段第 2 步「抽取自建」）：把
+  KallkaGo/ToonShading（MIT）的卡通渲染 shader 从 React+CSM 参考实现里抽出
+  来，去 CSM 化包成独立 GenshinToonMaterial（extends THREE.ShaderMaterial，
+  MToon 同款架构：自带完整 main()、主光走 uLightPosition uniform、不接 three
+  灯照循环），three 层从线框立方体升级为完整测试角色场景（绫华 glb+三视角
+  轮播+材质微调面板）。三视角循环（正脸/左45°/右45°，各停 3s）验证 FaceSDF
+  阴影方向敏感性；用户拖拽即停轮播转手动。深度偏移 rim 由每帧 depth pre-pass
+  提供场景深度（attachDepthProvider）。URL hash #d3d 直接开 3D 层，
+  #d3d-still 停轮播冻帧（视觉回归截图入口）。模型 8.5MB 为 miHoYo 版权测试
+  资产不入 git（models/README.md 说明从上游 workspace 拷贝）；贴图/解码器/
+  shader/材质全部入仓。合规见仓库根 LICENSE-THIRD-PARTY.md。
 -->
 <style>
   /* hidden 属性全局兜底（期五第二刀根因修复）：本页容器显式写了 display:flex，
@@ -171,12 +183,42 @@
   }
   #threeBtn:hover { border-color: #8b949e; }
   #threeStatus { color: #8b949e; }
+  /* D-004b 材质微调按钮：与 threeBtn 同款；3D 层加载成功才显示 */
+  #matBtn {
+    background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+    font: inherit; padding: 0 8px; cursor: pointer;
+  }
+  #matBtn:hover { border-color: #8b949e; }
+  /* D-004b 材质微调面板：stage 内右下角浮层（z-index:3 在 tip(2) 之上、
+     横幅(4)/弹窗(5) 之下）；pointer-events:auto 可拖滑条，占屏小不碍战场 */
+  #matPanel {
+    position: absolute; right: 10px; bottom: 10px; z-index: 3;
+    background: rgba(22, 27, 34, 0.92); border: 1px solid #30363d;
+    border-radius: 6px; padding: 10px 12px; width: 230px;
+    pointer-events: auto;
+  }
+  #matPanel .row {
+    display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+    font-size: 12px; color: #c9d1d9;
+  }
+  #matPanel .row label { width: 58px; flex: none; color: #8b949e; }
+  #matPanel .row input[type="range"] { flex: 1; min-width: 0; }
+  #matPanel .row b { width: 36px; flex: none; text-align: right; color: #e6edf3; font-weight: 400; }
+  #matPanel .close {
+    position: absolute; top: 2px; right: 6px; background: none; border: none;
+    color: #8b949e; font: inherit; cursor: pointer; padding: 2px;
+  }
+  #matPanel .close:hover { color: #c9d1d9; }
   /* D-004a Three 层透明画布：叠 Canvas 2D 之上（cv 无定位=绘制层之下）、
-     tip(2)/横幅(4)/弹窗(5) 之下；pointer-events:none 不吞点击（战场交互全归 cv） */
+     tip(2)/横幅(4)/弹窗(5) 之下；pointer-events:none 不吞点击（战场交互全归 cv）。
+     D-004b：3D 层开着角色场景时 JS 会切 pointer-events:auto（OrbitControls
+     需要接收拖拽；3D 开启时战场点击被 3D 场景占屏属可接受，关闭即完全还原） */
   #threeCanvas {
     position: absolute; inset: 0; z-index: 1;
     pointer-events: none; display: block; width: 100%; height: 100%;
   }
+  #threeCanvas.interactive { pointer-events: auto; cursor: grab; }
+  #threeCanvas.interactive:active { cursor: grabbing; }
 </style>
 </head>
 <body>
@@ -200,6 +242,16 @@
   <div id="dcBanner" hidden>
     <span id="dcBannerText"></span>
   </div>
+  <!-- D-004b 材质微调面板（3D 层开启时经「材质」按钮开合；滑条直改共享 uniforms 实时生效） -->
+  <div id="matPanel" hidden>
+    <button class="close" type="button" id="matPanelClose">✕</button>
+    <div class="row"><label>rim 宽</label><input type="range" id="s-rimW" min="0" max="2" step="0.01" value="1"><b id="v-rimW">1</b></div>
+    <div class="row"><label>rim 强度</label><input type="range" id="s-rimI" min="0" max="3" step="0.01" value="1"><b id="v-rimI">1</b></div>
+    <div class="row"><label>描边宽</label><input type="range" id="s-outW" min="0" max="1" step="0.01" value="0.4"><b id="v-outW">0.4</b></div>
+    <div class="row"><label>昼夜</label><input type="range" id="s-day" min="-1" max="1" step="0.01" value="0.5"><b id="v-day">0.5</b></div>
+    <div class="row"><label>金属度</label><input type="range" id="s-metal" min="0" max="1" step="0.01" value="0.5"><b id="v-metal">0.5</b></div>
+    <div class="row"><label>SDF 强度</label><input type="range" id="s-sdf" min="1" max="5" step="0.01" value="2"><b id="v-sdf">2</b></div>
+  </div>
 </div>
 <div id="bar">
   <span id="conn" class="wait">连接中……</span>
@@ -211,6 +263,7 @@
   <button id="camBtn" type="button">镜头：跟随</button>
   <button id="threeBtn" type="button">3D 层：关</button>
   <span id="threeStatus"></span>
+  <button id="matBtn" type="button" hidden>材质</button>
   <button id="logoutBtn" type="button">登出</button>
   <span id="mouse">x=- , y=-</span>
 </div>
@@ -287,6 +340,7 @@
   var view = null;              // 当前可视世界窗口（全景=viewport；跟随=相机窗口）
   var terrainData = null;       // 地形折线 {x0,dx,heights}（D-016；null=平地/旧协议，回落 y=0 横线）
   var fieldsData = [];          // 力场环 [{x,y,radius,formed}]（D-012：radius=spawn 第15参 field_radius 投影；空=无场世界；formed=false=成型中虚线环）
+  var liquidsData = [];         // 水域矩形 [{x,y,w,h,density}]（D-009：密度映射画色——查表+线性插值，纯装饰非世界事实；空=无水世界）
   var loggedOut = null;         // 已登出的处置（'take'|'stay_auto'|'stay_ai'，#025）；null=未登出
                                 // 登出后连接降级观战继续直播；此时断线不自动重连（重连=抢回操控）
   var logoutPanelBusy = false;  // 弹窗决策/淡出进行中：禁一切面板交互（防双发 logout）
@@ -335,6 +389,8 @@
     terrainData = snap.terrain || null;
     // 力场环（D-012）：每拍全量数组（空=无场世界）；formed=false=成型中（虚线环）
     fieldsData = snap.fields || [];
+    // 水域矩形（D-009）：每拍全量数组（空=无水世界）；颜色=密度映射画色
+    liquidsData = snap.liquids || [];
     // 击杀标记（第四刀 B2）：相邻两帧对比，消失的实体在最后坐标留渐隐 ✕
     if (prevFrame) {
       var kills = collectKills(prevFrame.ents, ents);
@@ -452,6 +508,7 @@
     projPrev = null; // 弹丸尾迹锚点随缓冲清空（重连后无历史方向，尾迹从零起步）
     terrainData = null; // 地形折线随缓冲清空（下一帧快照按 terrain 字段有无重建）
     fieldsData = [];    // 力场环随缓冲清空（下一帧快照按 fields 字段重建，D-012）
+    liquidsData = [];   // 水域矩形随缓冲清空（下一帧快照按 liquids 字段重建，D-009）
     itvEl.textContent = '-';
   }
 
@@ -1050,6 +1107,24 @@
       ctx.moveTo(0, gy);
       ctx.lineTo(viewW, gy);
       ctx.stroke();
+    }
+
+    // 水域矩形（D-009 可视铁律：水域必须可视）：半透明填充矩形，颜色=密度
+    // 映射（查表+线性插值——渲染层装饰非世界事实，玩家造 ρ=0.8 的"蓝油"
+    // 世界不拦不判）。色表：0.75 淡黄（油）/ 1.0 蓝（水）/ 1.4 琥珀（蜂蜜）/
+    // 2.5 橙红（岩浆）；[0.1,0.75) 白蓝、(2.5,5.0] 深红。画在实体层之下
+    //（水是区域布景不是身体），alpha 固定 0.45 半透明
+    if (liquidsData && liquidsData.length) {
+      for (var wi = 0; wi < liquidsData.length; wi++) {
+        var wd = liquidsData[wi];
+        var wtl = worldToScreen(wd.x, wd.y + wd.h);           // 矩形左上（世界 y 向上）
+        var wbr = worldToScreen(wd.x + wd.w, wd.y);           // 矩形右下
+        var ww = wbr.x - wtl.x, wh = wbr.y - wtl.y;
+        if (ww < 1 || wh < 1) continue;                        // 视口外/过小剔除
+        if (wbr.x < 0 || wtl.x > viewW || wbr.y < 0 || wtl.y > viewH) continue;
+        ctx.fillStyle = liquidColor(wd.density);
+        ctx.fillRect(wtl.x, wtl.y, ww, wh);
+      }
     }
 
     // 世界边界可视化（第四刀 C2）：viewport 域边缘落在画面内（相机贴边）时画界线，
@@ -1687,35 +1762,109 @@
   requestAnimationFrame(loop);
 })();
 </script>
-<!-- D-004a Three.js 3D 层：module 脚本（defer 语义，DOM 就绪后执行；与上方经典
-     脚本 IIFE 互不感知，通过 DOM id 桥接——零改动现有操控/WS/渲染代码） -->
+<!-- D-004b Three.js 3D 层：module 脚本（defer 语义，DOM 就绪后执行；与上方经典
+     脚本 IIFE 互不感知，通过 DOM id 桥接——零改动现有操控/WS/渲染代码）。
+     importmap：'three' -> r160 单文件（自包含无二级 import），'three/addons/' ->
+     vendored 官方 jsm 0.160.1（与 vendor 三件套同版本，保持包内相对路径） -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.min.js",
+    "three/addons/": "./vendor/examples/jsm/"
+  }
+}
+</script>
 <script type="module">
-  // ==== D-004a：Three.js 空场景共存层（渲染升级 D-004 第 1 步第③件）====
+  // ==== D-004b：卡通渲染测试角色场景（渲染升级 D-004 第 2 步）====
   //
-  // 混搭架构锚（官方混搭指南 pixijs.com/8.x/guides/third-party/mixing-three-and-pixi）：
-  // - 本层 Three 持有页面上唯一的 WebGL context；未来 PixiJS 层不再自建 context，
-  //   以 pixiRenderer.init({ context: threeRenderer.getContext(),
-  //   clearBeforeRender: false }) 与 Three 共享同一 context 混画（Pixi 画 2D/UI，
-  //   Three 画 3D 世界，一帧双引擎）。
-  // - 当前形态：Canvas 2D 战场与 Three 是「两层独立 canvas 叠加」（本层 z-index:1
-  //   在上、pointer-events:none 不吞点击）；PixiJS 引入时（后续刀）替换 Canvas 2D
-  //   层——届时收敛为 Pixi(2D/UI) + Three(3D) 共享 context 的定案形态。
-  // - 生命周期：开 = 建 renderer + 场景 + rAF 循环；关 = cancelAnimationFrame +
-  //   几何/材质/renderer 全量 dispose + forceContextLoss + canvas 移除——零后台
-  //   循环、零 context 泄漏，反复开关可重建。
-  import * as THREE from './vendor/three.module.min.js';
+  // 混搭架构锚（D-004a 定案）：Canvas 2D 战场与 Three 是「两层独立 canvas 叠加」；
+  // 本层 Three 持有页面上唯一的 WebGL context。生命周期：开 = 建 renderer +
+  // 加载模型贴图 + rAF 循环；关 = cancelAnimationFrame + 材质/几何/深度RT/
+  // KTX2 worker/renderer 全量 dispose + forceContextLoss + canvas 移除——零后台
+  // 循环、零 context 泄漏，反复开关可重建。
+  //
+  // 三视角轮播：正脸/左45°/右45° 各停 3s + 0.6s 缓动过渡，验证 FaceSDF 阴影
+  // 方向敏感性（左右脸阴影应对称）；用户在 3D 画布 pointerdown 即停轮播转手动
+  // OrbitControls。still 模式（#d3d-still）不轮播且冻结 uTime（视觉回归截图
+  // 稳定帧）；full 模式（#d3d-*-full）3D 画布临时全窗口铺满（相机 aspect 与
+  // KallkaGo 全屏 demo 一致，对比截图用）。
+  import * as THREE from 'three';
+  import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+  import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+  import { GenshinToonMaterial } from './genshin-toon/GenshinToonMaterial.js';
 
   var stageEl = document.getElementById('stage');
   var btnEl = document.getElementById('threeBtn');
   var statusEl = document.getElementById('threeStatus');
+  var matBtnEl = document.getElementById('matBtn');
+  var matPanelEl = document.getElementById('matPanel');
+  var matPanelCloseEl = document.getElementById('matPanelClose');
 
-  var layer = null; // 开启态句柄 {canvas, renderer, scene, camera, cube, geo, mat, raf}；null=关
+  // 截图/验证入口：hash 含 d3d 自动开层；still=停轮播冻帧；full=3D 画布全窗口
+  var HASH = location.hash || '';
+  var STILL_MODE = HASH.indexOf('still') >= 0;
+  var FULL_MODE = HASH.indexOf('full') >= 0;
+
+  // 3D 层加载链路观测：#d3d* 模式下关键节点上报服务端日志（无头截图看不到
+  // F12 console，加载卡死时靠这个定位断在哪一层）
+  function cw3dLog(msg) {
+    if (HASH.indexOf('d3d') < 0) return;
+    console.info('[cw3d] ' + msg);
+    try { fetch('/__log?m=' + encodeURIComponent(String(msg).slice(0, 4000))).catch(function () {}); } catch (e) { /* 尽力上报 */ }
+  }
+  // console.error 透传上报（three 的 shader 编译错/WebGL 报错都走这里）
+  (function () {
+    var origErr = console.error;
+    console.error = function () {
+      var parts = Array.prototype.slice.call(arguments).map(function (a) {
+        try { return typeof a === 'string' ? a.slice(0, 4000) : (a && a.message ? String(a.message).slice(0, 4000) : JSON.stringify(a).slice(0, 500)); } catch (e) { return String(a); }
+      });
+      cw3dLog('console.error: ' + parts.join(' | '));
+      origErr.apply(console, arguments);
+    };
+  })();
+
+  var layer = null; // 开启态句柄；null=关。字段：canvas/renderer/scene/camera/controls/
+                    // group/rigged/depth/ktx2/raf/lastT + 轮播状态 auto/viewIdx/...
+  var matPanelBound = false; // 材质面板滑条只绑一次（反复开关层不叠加监听器）
+
+  // 三视角底账：rotation.y 0 / +45° / -45°（正脸/左45/右45），停 3s + 0.6s 缓动
+  var VIEW_RY = [0, Math.PI / 4, -Math.PI / 4];
+  var HOLD_MS = 3000, ROT_MS = 600;
 
   function stageSize() {
+    // full 模式（对比截图）：3D 画布全窗口铺满，尺寸对齐窗口（相机 aspect 与
+    // KallkaGo 全屏 demo 一致；stage 内嵌会吃掉 caption/bar 高度导致 aspect 不齐）
+    if (FULL_MODE) {
+      return { w: Math.max(1, window.innerWidth), h: Math.max(1, window.innerHeight) };
+    }
     return { w: Math.max(1, stageEl.clientWidth), h: Math.max(1, stageEl.clientHeight) };
   }
 
-  // 建层：透明 WebGL 画布 + 空场景最小可信物（自转彩色线框立方体 + RGB 坐标轴）
+  // 9 张贴图并行加载（路径照 RES.ts 底账；colorSpace/mipmap 由材质内部自动设置）
+  function loadTextures() {
+    var texLoader = new THREE.TextureLoader();
+    return Promise.all([
+      texLoader.loadAsync('./textures/face/faceLightmap.png'),
+      texLoader.loadAsync('./textures/hair/light.png'),
+      texLoader.loadAsync('./textures/body/light.png'),
+      texLoader.loadAsync('./textures/hair/ramp.png'),
+      texLoader.loadAsync('./textures/body/ramp.png'),
+      texLoader.loadAsync('./textures/body/emissive.png'),
+      texLoader.loadAsync('./textures/matcap/metalMap.png'),
+      texLoader.loadAsync('./textures/hair/normal.png'),
+      texLoader.loadAsync('./textures/body/normal.png'),
+    ]).then(function (t) {
+      return {
+        faceLightMap: t[0], hairLightMap: t[1], bodyLightMap: t[2],
+        hairRampMap: t[3], bodyRampMap: t[4], emissiveMap: t[5],
+        metalMap: t[6], hairNormalMap: t[7], bodyNormalMap: t[8],
+      };
+    });
+  }
+
+  // 建层：透明 WebGL 画布 + 卡通角色场景
   function openLayer() {
     if (layer) return;
     var canvas = document.createElement('canvas');
@@ -1731,58 +1880,218 @@
       return;
     }
     renderer.setPixelRatio(window.devicePixelRatio || 1);
-    renderer.setClearColor(0x000000, 0); // 背景全透明，2D 战场透出来
+    renderer.setClearColor(0x000000, 0); // 背景全透明，2D 战场透出来（KallkaGo transparent 底账）
     var sz = stageSize();
     renderer.setSize(sz.w, sz.h, false); // updateStyle=false：显示尺寸全由 CSS 100% 控制
 
     var scene = new THREE.Scene();
-    var camera = new THREE.PerspectiveCamera(50, sz.w / sz.h, 0.1, 100);
-    camera.position.set(2.4, 1.8, 2.6);
+    // 相机底账：fov50 / near0.1 / far200 / pos(0,0,2)（照参考 demo）
+    var camera = new THREE.PerspectiveCamera(50, sz.w / sz.h, 0.1, 200);
+    camera.position.set(0, 0, 2);
     camera.lookAt(0, 0, 0);
 
-    // 彩色线框立方体：顶点色按坐标渐变（r=x / g=y / b=z），转起来立体感一眼可辨
-    var geo = new THREE.BoxGeometry(1, 1, 1);
-    var pos = geo.attributes.position;
-    var colors = new Float32Array(pos.count * 3);
-    for (var i = 0; i < pos.count; i++) {
-      colors[i * 3]     = 0.3 + (pos.getX(i) + 0.5) * 0.7; // x -> 红
-      colors[i * 3 + 1] = 0.3 + (pos.getY(i) + 0.5) * 0.7; // y -> 绿
-      colors[i * 3 + 2] = 0.3 + (pos.getZ(i) + 0.5) * 0.7; // z -> 蓝
-    }
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    var mat = new THREE.MeshBasicMaterial({ wireframe: true, vertexColors: true });
-    var cube = new THREE.Mesh(geo, mat);
-    scene.add(cube);
-    scene.add(new THREE.AxesHelper(1.5)); // RGB 坐标轴固定不转，立方体绕轴自转（参照系清晰）
+    layer = {
+      canvas: canvas, renderer: renderer, scene: scene, camera: camera,
+      controls: null, group: null, rigged: null, depth: null, ktx2: null,
+      raf: 0, lastT: performance.now(),
+      auto: !STILL_MODE, viewIdx: 0, phase: 'hold', phaseT: 0, fromRy: 0, toRy: 0,
+    };
+    statusEl.textContent = '3D: 加载中…';
+    console.info('[cw3d] 3D 层开启（three r' + THREE.REVISION + '，加载绫华中）');
 
-    layer = { canvas: canvas, renderer: renderer, scene: scene, camera: camera,
-              cube: cube, geo: geo, mat: mat, raf: 0 };
-    (function frame() {
-      if (!layer) return; // 关层后可能仍有一帧在途：null 即停，绝不复活循环
-      layer.cube.rotation.y += 0.008; // 缓慢自转
-      layer.cube.rotation.x += 0.004;
-      layer.renderer.render(layer.scene, layer.camera);
-      layer.raf = requestAnimationFrame(frame);
-    })();
-
-    btnEl.textContent = '3D 层：开';
-    statusEl.textContent = '3D: 开(r' + THREE.REVISION + ')';
-    console.info('[cw3d] 3D 层开启（three r' + THREE.REVISION + '）');
+    buildScene().then(function (built) {
+      if (!layer) { disposeBuilt(built); return; } // 加载中已被关层：立即释放半成品
+      Object.assign(layer, built);
+      afterLoad();
+    }).catch(function (err) {
+      cw3dLog('加载失败: ' + (err && (err.stack || err.message || err)));
+      console.error('[cw3d] 角色场景加载失败：', err);
+      if (layer) closeLayer();
+      statusEl.textContent = '3D: 加载失败(见console)';
+    });
   }
 
-  // 关层：动画停 + 资源全量释放 + 画布移除（底栏状态归零；重开=全新重建）
+  // 场景装配：贴图/模型并行加载 -> 材质分派 -> 深度 provider
+  async function buildScene() {
+    var renderer = layer.renderer, scene = layer.scene, camera = layer.camera;
+
+    var textures = await loadTextures();
+    cw3dLog('贴图加载完成(9张)');
+    if (!layer) throw new Error('closed');
+
+    var ktx2 = new KTX2Loader().setTranscoderPath('./vendor/basis/').detectSupport(renderer);
+    var gltfLoader = new GLTFLoader().setKTX2Loader(ktx2);
+    // GLB 实测无 KHR_draco_mesh_compression 扩展（D-004b 二进制检测），
+    // 不接 DRACOLoader——少一份解码器死资产
+    var gltf = await gltfLoader.loadAsync('./models/ayakaktx2opt.glb');
+    cw3dLog('glb 加载+KTX2解码完成: meshes=' + (gltf.scene ? gltf.scene.children.length : '?'));
+    if (!layer) throw new Error('closed');
+
+    // 环境光底账 #fff3e3/1.02（Sketch.tsx）：场景对象存档语义；shader 侧的
+    // ambient 间接光贡献由 setAmbientLight 同值提供（预除 PI，见 common.js）
+    scene.add(new THREE.AmbientLight(0xfff3e3, 1.02));
+    GenshinToonMaterial.setAmbientLight('#fff3e3', 1.02);
+
+    var group = new THREE.Group();
+    group.position.set(0, -0.7, 0); // 模型偏移（Ayaka 底账 y=-0.7）
+    group.add(gltf.scene);
+    scene.add(group);
+
+    var rigged = GenshinToonMaterial.applyToSkeleton(gltf.scene, { textures: textures });
+    var depth = GenshinToonMaterial.attachDepthProvider(renderer, scene, camera, [rigged.outlineRoot]);
+
+    return { group: group, rigged: rigged, depth: depth, ktx2: ktx2 };
+  }
+
+  // 装配完成：控制器 + 三视角 + 面板 + rAF 主循环
+  function afterLoad() {
+    var canvas = layer.canvas, camera = layer.camera, renderer = layer.renderer;
+    var rigged = layer.rigged;
+
+    // OrbitControls 底账：minDistance 0.5 / maxDistance 10（Sketch.tsx 同款），
+    // 绑 3D 画布（pointer-events:auto 才能收拖拽；3D 开启时占屏属可接受，关闭即还原）
+    var controls = new OrbitControls(camera, canvas);
+    controls.minDistance = 0.5;
+    controls.maxDistance = 10;
+    controls.enabled = false; // 轮播期间禁用；用户按下即接管
+    layer.controls = controls;
+    canvas.classList.add('interactive'); // pointer-events:none -> auto（CSS 类切换）
+    canvas.addEventListener('pointerdown', function () {
+      if (!layer) return;
+      layer.auto = false;          // 用户接管：停轮播转手动
+      controls.enabled = true;
+    });
+
+    syncResolution();
+
+    // 材质面板：滑条直改共享 uniforms（任一实例做代理即全量生效）。
+    // 面板滑条是固定 DOM，绑定一次防反复开关层叠加监听器；apply 闭包每次取
+    // 当前层的材质实例（rigged 换新后旧引用不残留）
+    matBtnEl.hidden = false;
+    if (!matPanelBound) {
+      matPanelBound = true;
+      bindSlider('s-rimW', 'v-rimW', function (v) { if (layer) layer.rigged.materials[0].rimWidth = v; });
+      bindSlider('s-rimI', 'v-rimI', function (v) { if (layer) layer.rigged.materials[0].rimIntensity = v; });
+      bindSlider('s-outW', 'v-outW', function (v) { if (layer) layer.rigged.materials[0].outlineWidth = v; });
+      bindSlider('s-day', 'v-day', function (v) { if (layer) layer.rigged.materials[0].isDay = v; });
+      bindSlider('s-metal', 'v-metal', function (v) { if (layer) layer.rigged.materials[0].metallic = v; });
+      bindSlider('s-sdf', 'v-sdf', function (v) { if (layer) layer.rigged.materials[0].intensity = v; });
+    }
+
+    if (STILL_MODE) {
+      layer.rigged.shared.uTime.value = 1.0; // 冻帧：自发光呼吸固定（视觉回归稳定帧）
+      // still 下可指定初始视角（三视角截图入口）：#d3d-still-l45 / -r45
+      if (HASH.indexOf('l45') >= 0) { layer.viewIdx = 1; layer.group.rotation.y = VIEW_RY[1]; }
+      else if (HASH.indexOf('r45') >= 0) { layer.viewIdx = 2; layer.group.rotation.y = VIEW_RY[2]; }
+      console.info('[cw3d] still 模式：停轮播 + uTime 冻结');
+    }
+
+    btnEl.textContent = '3D 层：开';
+    statusEl.textContent = '3D: 开(r' + THREE.REVISION + '·绫华)';
+    cw3dLog('渲染就绪（材质 ' + rigged.materials.length + ' + 描边 ' +
+      rigged.outlineMaterials.length + '；_uv7=' +
+      (rigged.outlineMaterials.some(function (m) { return m.defines.CW_HAS_UV7; }) ? '有' : '无(退化)') + '）');
+    // 诊断：每个 mesh 的 geometry attribute 清单 + 材质 defines（shader 编译错定位用）
+    layer.group.traverse(function (o) {
+      if (o.isMesh) {
+        cw3dLog('mesh=' + (o.material.name || '?') + ' attrs=[' +
+          Object.keys(o.geometry.attributes).join(',') + '] defines=' +
+          JSON.stringify(o.material.defines || {}));
+      }
+    });
+
+    layer.lastT = performance.now();
+    var firstFrame = true;
+    (function frame(now) {
+      if (!layer) return; // 关层后可能仍有一帧在途：null 即停，绝不复活循环
+      var dtMs = Math.min(now - layer.lastT, 100);
+      layer.lastT = now;
+      var dt = dtMs / 1000;
+
+      layer.depth.prePass();          // 帧序① depth pre-pass（rim 深度采样源）
+      if (layer.auto) tickViews(dtMs); // 帧序② 前置：三视角轮播推进（改 rotation）
+      if (!STILL_MODE) layer.rigged.materials[0].update(dt); // uTime 共享推进
+      layer.renderer.render(layer.scene, layer.camera); // 帧序②③ outline+body 主 pass
+      if (firstFrame) { // 首帧渲染完成信号（still 截图观察点）
+        firstFrame = false;
+        if (firstFrameResolve) { firstFrameResolve(); firstFrameResolve = null; }
+        cw3dLog('首帧渲染完成');
+      }
+      layer.raf = requestAnimationFrame(frame);
+    })(performance.now());
+  }
+
+  // 三视角轮播状态机：HOLD(3s) -> ROT(0.6s easeInOutQuad) -> 下一视角
+  function tickViews(dtMs) {
+    layer.phaseT += dtMs;
+    if (layer.phase === 'hold') {
+      if (layer.phaseT >= HOLD_MS) {
+        layer.fromRy = layer.group.rotation.y;
+        layer.viewIdx = (layer.viewIdx + 1) % VIEW_RY.length;
+        layer.toRy = VIEW_RY[layer.viewIdx];
+        layer.phase = 'rot';
+        layer.phaseT = 0;
+      }
+    } else {
+      var k = Math.min(1, layer.phaseT / ROT_MS);
+      var e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2; // easeInOutQuad
+      layer.group.rotation.y = layer.fromRy + (layer.toRy - layer.fromRy) * e;
+      if (k >= 1) {
+        layer.phase = 'hold';
+        layer.phaseT = 0;
+      }
+    }
+  }
+
+  // 材质面板滑条绑定：input 事件实时生效 + 数值回显
+  function bindSlider(sid, vid, apply) {
+    var el = document.getElementById(sid);
+    var out = document.getElementById(vid);
+    el.addEventListener('input', function () {
+      var v = parseFloat(el.value);
+      out.textContent = String(v);
+      apply(v);
+    });
+  }
+
+  // 分辨率同步：uResolution = 绘制缓冲像素（shader 的 SDF 邻域/描边 aspect 用）
+  function syncResolution() {
+    var s = layer.renderer.getDrawingBufferSize(new THREE.Vector2());
+    var shared = layer.rigged.shared;
+    shared.uResolution.value.set(s.x, s.y);
+  }
+
+  // 半成品释放（加载中途被关层）：贴图/材质还没进共享表全量，能释放多少释放多少
+  function disposeBuilt(built) {
+    try { if (built.depth) built.depth.dispose(); } catch (e) { /* 半成品尽力释放 */ }
+    try { if (built.ktx2) built.ktx2.dispose(); } catch (e) { /* 同上 */ }
+    console.info('[cw3d] 加载中关闭：半成品已释放');
+  }
+
+  // 关层：动画停 + 资源全量释放 + 画布移除（底栏/面板状态归零；重开=全新重建）
   function closeLayer() {
     if (!layer) return;
     cancelAnimationFrame(layer.raf);
-    layer.geo.dispose();
-    layer.mat.dispose();
-    layer.renderer.dispose();
-    layer.renderer.forceContextLoss();
-    layer.canvas.remove();
-    layer = null;
+    var layerRef = layer;
+    layer = null; // 先置空：在途 async 回调/rAF 一律短路
+    if (layerRef.depth) layerRef.depth.dispose();
+    if (layerRef.rigged) {
+      layerRef.rigged.materials.forEach(function (m) { m.dispose(); });
+      layerRef.rigged.outlineMaterials.forEach(function (m) { m.dispose(); });
+      // 几何：描边克隆与主体共享 geometry，traverse 主树 dispose 一次即可
+      layerRef.group.traverse(function (o) { if (o.isMesh && o.geometry) o.geometry.dispose(); });
+    }
+    if (layerRef.ktx2) layerRef.ktx2.dispose();
+    if (layerRef.controls) layerRef.controls.dispose();
+    layerRef.renderer.dispose();
+    layerRef.renderer.forceContextLoss();
+    layerRef.canvas.remove();
+    GenshinToonMaterial.resetShared(); // 共享 uniform 表随层销毁（防跨层串值）
+    matBtnEl.hidden = true;
+    matPanelEl.hidden = true;
     btnEl.textContent = '3D 层：关';
     statusEl.textContent = '';
-    console.info('[cw3d] 3D 层关闭（renderer 已释放）');
+    console.info('[cw3d] 3D 层关闭（renderer/材质/深度RT 已释放）');
   }
 
   function toggle() {
@@ -1790,10 +2099,34 @@
     else openLayer();
   }
 
+  matBtnEl.addEventListener('click', function () {
+    matPanelEl.hidden = !matPanelEl.hidden;
+  });
+  matPanelCloseEl.addEventListener('click', function () {
+    matPanelEl.hidden = true;
+  });
+
   btnEl.addEventListener('click', toggle);
   window.addEventListener('keydown', function (ev) {
     if (ev.key === 't' || ev.key === 'T') toggle(); // 双入口之二：快捷键（按钮见上）
   });
+
+  // URL hash 入口：#d3d 自动开 3D 层（无头验证 + 重开），#d3d-still 停轮播冻帧
+  var firstFrameResolve = null;
+  if (HASH.indexOf('d3d') >= 0) {
+    openLayer();
+    // 无头截图时序锚：#d3d-still 下注入一个「非 async 动态 script」（服务端
+    // /__hold/N 保持 N 秒才响应）——动态非 async script 会推迟 load 事件但
+    // 不占主线程（此刻模型/KTX2 已在异步加载），无头截图在 load 后即拍，
+    // 由此锚定在「首帧渲染完成后、画面静止」的稳定窗口。head 里放 hold
+    // script 的方案是错的：parser 阻塞会连带推迟 defer module 的执行。
+    if (STILL_MODE) {
+      var hold = document.createElement('script');
+      hold.src = '/__hold/20000';
+      hold.async = false;
+      document.head.appendChild(hold);
+    }
+  }
 
   // 窗口尺寸变化：3D 画布开着就同步（CSS 100% 只拉伸显示，重设绘制缓冲+相机
   // 纵横比才不糊不变形；与经典脚本 resize() 各自监听同一事件，互不干扰）
@@ -1803,7 +2136,20 @@
     layer.renderer.setSize(sz.w, sz.h, false);
     layer.camera.aspect = sz.w / sz.h;
     layer.camera.updateProjectionMatrix();
+    if (layer.rigged) syncResolution();
   });
+
+  // full 模式（对比截图用）：3D 画布全窗口铺满 + 隐藏 2D 层 UI（caption/bar/
+  // 断线横幅入镜会污染逐像素对比；正常使用不受影响，仅截图 hash 生效）
+  if (FULL_MODE) {
+    var style = document.createElement('style');
+    style.textContent =
+      '#threeCanvas { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; }' +
+      '#cv { display: none !important; }' + // 2D 战场层（含等待文案）一并隐藏——污染对比
+      '#caption, #bar, #dcBanner, #logoutBanner, #tip, #matPanel { display: none !important; }';
+    document.head.appendChild(style);
+    window.dispatchEvent(new Event('resize')); // 已开层时补一次尺寸同步
+  }
 </script>
 </body>
 </html>
