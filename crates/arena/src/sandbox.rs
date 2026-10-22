@@ -3,7 +3,7 @@
 //! 架构文档六节（WASM 沙箱设计）+ 6.3（安全防线）。
 //! 基于 wasmtime，启用 fuel 指令计量。spike/route_a 已验证 API。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use uuid::Uuid;
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
@@ -293,6 +293,45 @@ impl SandboxData {
     }
 }
 
+/// 游魂窗口执行体的 store 数据（D-005 刀0：call_duel_step 窗口内专用）
+///
+/// 游魂是临时执行体（每拍重编译实例化，烧完即弃）——不进 SandboxData 主表。
+/// import 闭包是 'static 拿不到调用方引用，守方沙箱经本结构里的指针传递
+///（与 ProbeBridge/SandboxData.terrain 同款窗口契约模式）。
+pub struct DuelGhostData {
+    /// 守方沙箱指针（内存映射直连的"数据线插头"）。
+    /// # SAFETY 契约：仅在 call_duel_step 函数体存活期内非空且指向存活的
+    /// SandboxHandle（挂载 -> 实例化 -> call -> drop 发生在同一函数体作用域）；
+    /// 窗口结束游魂 store 随局部变量销毁，import 闭包不再可能被调。
+    pub defender: *mut SandboxHandle,
+    /// 当前窗口拍号（env.duel_round 的返回值，0 起）
+    pub round: u32,
+    /// 本窗口决斗读累计字节数（世界记账日志用）
+    pub bytes_read: u64,
+    /// 本窗口决斗写累计字节数（世界记账日志用）
+    pub bytes_written: u64,
+}
+
+/// 游魂窗口投票（D-005 刀0：游魂 on_duel 返回值的机械翻译——世界零裁判，
+/// 只翻译游魂自己的返回值，胜负不由世界判定）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuelVerdict {
+    /// 游魂返回非 1 值：继续会话（下拍再开窗）
+    Continue,
+    /// 游魂返回 1：宣布完成，会话正常收尾
+    Done,
+}
+
+/// 游魂窗口的执行结果（call_duel_step 成功路径的产物；
+/// 崩溃走 Err——实例化失败/导出缺失/trap 由调用方按崩溃死关闭会话）
+#[derive(Debug, Clone, Copy)]
+pub struct DuelStepOutcome {
+    /// 本窗口游魂实际烧掉的 fuel（预算 - 剩余）
+    pub fuel_used: u64,
+    /// 游魂投票（返回值 1=Done，其余=Continue）
+    pub outcome: DuelVerdict,
+}
+
 /// probe 通路桥（三层感知 Phase A：import 闭包访问目标沙箱的桥接上下文）
 ///
 /// 为什么需要：import 闭包是 'static 的，无法持有 host 引用；probe 又必须同步
@@ -358,6 +397,10 @@ pub struct SandboxHandle {
 pub struct SandboxManager {
     engine: Engine,
     linker: Linker<SandboxData>,
+    /// 决斗游魂专用 linker（D-005 刀0）：只提供三个决斗原语 import——
+    /// 游魂的最小环境（通信自由，注入无门：进来只有决斗三原语，
+    /// 走私任何其他 env.* import 的模块拒绝实例化）
+    duel_linker: Linker<DuelGhostData>,
 }
 
 impl SandboxManager {
@@ -378,8 +421,10 @@ impl SandboxManager {
         config.static_memory_maximum_size(64 * 1024 * 1024);
         let engine = Engine::new(&config)?;
         let linker = Self::make_linker(&engine, max_speed)?;
+        // 决斗游魂 linker（D-005 刀0）：与主 linker 分家——游魂窗口的最小 import 环境独立成表
+        let duel_linker = Self::make_duel_linker(&engine)?;
         tracing::debug!(max_speed, "SandboxManager 创建");
-        Ok(Self { engine, linker })
+        Ok(Self { engine, linker, duel_linker })
     }
 
     /// 构造 Linker，注册系统 import 函数（env.log / env.attack_at）
@@ -1450,6 +1495,111 @@ impl SandboxManager {
         Ok(linker)
     }
 
+    /// 构造决斗游魂 linker（D-005 刀0：内存映射直连的三个 import，世界只当硬件）
+    ///
+    /// 最小环境铁律：游魂窗口内可调的 import 只有这三个——
+    /// - `env.duel_read(ptr, len, out_ptr) -> i32`：读守方内存 → 写进游魂自己的
+    ///   memory out_ptr 处；返回实际字节数，越界/非法返回 -1
+    /// - `env.duel_write(ptr, bytes_ptr, len) -> i32`：把游魂自己 memory
+    ///   [bytes_ptr, +len) 的字节写进守方内存 ptr 处；返回写入字节数，越界返回 -1
+    /// - `env.duel_round() -> i32`：当前窗口拍号（0 起，游魂做轮次策略用）
+    ///
+    /// 读就是读、写就是写，中间无世界代码、无语义解释（宪法二：世界只当硬件）。
+    /// 走私其他 env.* import 的游魂模块在实例化时被拒（Err）。
+    fn make_duel_linker(engine: &Engine) -> Result<Linker<DuelGhostData>> {
+        let mut linker = Linker::new(engine);
+        // env.duel_read(ptr, len, out_ptr) -> i32：守方内存 → 游魂内存的单向搬运
+        linker.func_wrap(
+            "env",
+            "duel_read",
+            |mut caller: Caller<DuelGhostData>, ptr: i32, len: i32, out_ptr: i32| -> i32 {
+                let bridge = caller.data().defender;
+                if ptr < 0 || len < 0 || out_ptr < 0 || bridge.is_null() {
+                    tracing::debug!("[duel] duel_read 参数非法/数据线未挂载，返回 -1");
+                    return -1;
+                }
+                // SAFETY：窗口契约（见 DuelGhostData.defender 文档）——指针仅在
+                // call_duel_step 函数体存活期内非空且指向存活守方沙箱
+                let defender = unsafe { &mut *bridge };
+                // 守方 fuel 守卫（#046 账本铁律）：host 侧 memory.read 会被 wasmtime
+                // 计量进守方油箱（每步约 4 步）——决斗通道的字节搬运必须烧攻方赌注，
+                // 操作前后快照/恢复，守方 fuel 分毫不动（账户跟人不跟房子）
+                let prev_fuel = defender.store.get_fuel().unwrap_or(0);
+                let read = duel_read_bytes(defender, ptr as u32, len as u32);
+                let _ = defender.store.set_fuel(prev_fuel);
+                match read {
+                    Ok(bytes) => {
+                        let n = bytes.len();
+                        // 落笔游魂自己的内存（越界 -1：游魂自己量入为出，世界不 grow 不补偿）
+                        match ghost_memory_write(&mut caller, out_ptr, &bytes) {
+                            Ok(()) => {
+                                caller.data_mut().bytes_read += n as u64;
+                                tracing::debug!(
+                                    ptr,
+                                    len,
+                                    out_ptr,
+                                    "[duel] 游魂读守方内存 {n} 字节"
+                                );
+                                n as i32
+                            }
+                            Err(e) => {
+                                tracing::debug!(ptr, out_ptr, error = %e, "[duel] 游魂内存落笔越界，读作废返回 -1");
+                                -1
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(ptr, len, error = %e, "[duel] 守方内存读越界/失败，返回 -1");
+                        -1
+                    }
+                }
+            },
+        )?;
+        // env.duel_write(ptr, bytes_ptr, len) -> i32：游魂内存 → 守方内存的单向搬运
+        linker.func_wrap(
+            "env",
+            "duel_write",
+            |mut caller: Caller<DuelGhostData>, ptr: i32, bytes_ptr: i32, len: i32| -> i32 {
+                let bridge = caller.data().defender;
+                if ptr < 0 || bytes_ptr < 0 || len < 0 || bridge.is_null() {
+                    tracing::debug!("[duel] duel_write 参数非法/数据线未挂载，返回 -1");
+                    return -1;
+                }
+                // 先从游魂自己的内存取字节（越界 -1，与读同款量入为出）
+                let payload = match ghost_memory_read(&mut caller, bytes_ptr, len) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::debug!(bytes_ptr, len, error = %e, "[duel] 游魂内存取字节越界，写作废返回 -1");
+                        return -1;
+                    }
+                };
+                // SAFETY：同 duel_read 窗口契约
+                let defender = unsafe { &mut *bridge };
+                let prev_fuel = defender.store.get_fuel().unwrap_or(0);
+                let write = duel_write_bytes(defender, ptr as u32, &payload);
+                let _ = defender.store.set_fuel(prev_fuel);
+                match write {
+                    Ok(()) => {
+                        let n = payload.len();
+                        caller.data_mut().bytes_written += n as u64;
+                        tracing::debug!(ptr, len, "[duel] 游魂写守方内存 {n} 字节");
+                        n as i32
+                    }
+                    Err(e) => {
+                        tracing::debug!(ptr, len, error = %e, "[duel] 守方内存写越界/失败，返回 -1");
+                        -1
+                    }
+                }
+            },
+        )?;
+        // env.duel_round() -> i32：当前窗口拍号（世界唯一的"场外信息"，机械事实）
+        linker.func_wrap("env", "duel_round", |caller: Caller<DuelGhostData>| -> i32 {
+            caller.data().round as i32
+        })?;
+        tracing::debug!("[duel] 决斗游魂 linker 构造完成（最小环境：三原语 import）");
+        Ok(linker)
+    }
+
     /// 创建沙箱：编译 WASM + 实例化 + 设置 fuel + 绑定 entity_id
     ///
     /// `entity_id` 写入 SandboxData，使 import 函数 env.attack_at 能识别攻击者。
@@ -1842,10 +1992,177 @@ impl SandboxManager {
         Ok(Some(used))
     }
 
+    /// 决斗读：读 defender 沙箱线性内存 [ptr, ptr+len) 到字节缓冲（D-005 交付2，
+    /// "沙箱通道"的最小物理实现——世界只当硬件，读就是读）
+    ///
+    /// 守方未导出 memory / 越界 -> Err。host 直调入口（测试与未来世界侧工具用）；
+    /// 游魂窗口内的实际搬运走 import 闭包（经 duel_read_bytes 同一硬件层）。
+    pub fn duel_read(&self, defender: &mut SandboxHandle, ptr: u32, len: u32) -> Result<Vec<u8>> {
+        duel_read_bytes(defender, ptr, len)
+    }
+
+    /// 决斗写：把字节写进 defender 沙箱线性内存 [ptr, ptr+len)（D-005 交付2，
+    /// 写就是写，无中间世界代码、无语义解释）
+    ///
+    /// 守方未导出 memory / 越界 -> Err。
+    pub fn duel_write(&self, defender: &mut SandboxHandle, ptr: u32, bytes: &[u8]) -> Result<()> {
+        duel_write_bytes(defender, ptr, bytes)
+    }
+
+    /// 游魂窗口（D-005 交付3）：把攻方游魂模块实例化为临时执行体，给它独立
+    /// fuel 预算（从 DuelSession.fuel_stake 扣，账本铁律 #046——烧的是攻方的钱），
+    /// 在"能对守方内存读写"的环境里跑约定导出 `on_duel`（() -> i32，返回值即投票：
+    /// 1=宣布完成会话收尾，其余=继续）。
+    ///
+    /// 最小实例化策略（刀0 拍板）：每拍临时实例化（Module::new + instantiate +
+    /// 跑一步 + drop）——pooling/实例池化是拍速升级议题的既定坑，刀0 不碰，
+    /// 每拍重编译的代价诚实接受（design-duel 弹药库两坑记档）。
+    ///
+    /// 崩溃三路全走 Err（调用方按崩溃死关闭会话，世界只看见崩溃）：
+    /// 模块编译失败 / 实例化失败（含走私多余 import）/ on_duel 导出缺失 / trap。
+    /// budget=0 拒绝开窗（Windows 下 wasm 零 fuel 执行是进程 abort，.cc-bugs #5）。
+    pub fn call_duel_step(
+        &self,
+        attacker_module: &[u8],
+        defender: &mut SandboxHandle,
+        budget: u64,
+        round: u32,
+    ) -> Result<DuelStepOutcome> {
+        if budget == 0 {
+            anyhow::bail!("[duel] 游魂窗口预算为 0，拒绝开窗（零 fuel 执行是进程 abort 红线）");
+        }
+        // 每拍临时实例化：编译（不受 fuel 约束）——失败=游魂崩溃
+        let module = Module::new(&self.engine, attacker_module)
+            .context("[duel] 游魂模块编译失败（崩溃死）")?;
+        // 游魂 store：数据线插头（守方指针）+ 窗口拍号；指针在本函数体存活期内有效
+        let mut ghost = Store::new(
+            &self.engine,
+            DuelGhostData {
+                defender: defender as *mut SandboxHandle,
+                round,
+                bytes_read: 0,
+                bytes_written: 0,
+            },
+        );
+        ghost.set_fuel(budget)?;
+        // 实例化（最小 linker：走私多余 import 在此被拒）——失败=游魂崩溃
+        let instance = self
+            .duel_linker
+            .instantiate(&mut ghost, &module)
+            .context("[duel] 游魂实例化失败（崩溃死：垃圾模块/走私 import）")?;
+        // 约定导出 on_duel——缺失=游魂崩溃（世界不给无意识的游魂开窗）
+        let func = instance
+            .get_typed_func::<(), i32>(&mut ghost, "on_duel")
+            .context("[duel] 游魂缺 on_duel 导出（崩溃死）")?;
+        // 跑一步：投票 1=Done 收尾，其余=Continue；trap=崩溃
+        let call_result = func.call(&mut ghost, ());
+        let fuel_left = ghost.get_fuel().unwrap_or(0);
+        let fuel_used = budget.saturating_sub(fuel_left);
+        match call_result {
+            Ok(vote) => {
+                tracing::debug!(
+                    round,
+                    budget,
+                    fuel_used,
+                    "[duel] 游魂窗口完成（fuel_used 记 debug，账本烧攻方赌注）"
+                );
+                Ok(DuelStepOutcome {
+                    fuel_used,
+                    outcome: if vote == 1 { DuelVerdict::Done } else { DuelVerdict::Continue },
+                })
+            }
+            Err(e) => anyhow::bail!("[duel] 游魂 on_duel trap（崩溃死）：{e}（本窗已烧 {fuel_used}）"),
+        }
+    }
+
     /// 引擎引用
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
+}
+
+/// 决斗读硬件层（D-005 交付2）：读守方线性内存 [ptr, ptr+len)
+///
+/// 守方未导出 memory / 越界 -> Err。import 闭包与 manager.duel_read 共用本层
+/// （闭包是 'static 拿不到 manager，直接调模块级函数，同一份实现零重复）。
+fn duel_read_bytes(defender: &mut SandboxHandle, ptr: u32, len: u32) -> Result<Vec<u8>> {
+    let memory = defender
+        .instance
+        .get_memory(&mut defender.store, "memory")
+        .ok_or_else(|| anyhow::anyhow!("[duel] 守方未导出 memory，无可映射内存"))?;
+    let size = memory.data_size(&defender.store);
+    let start = ptr as usize;
+    // checked_add：32 位平台 ptr+len 回绕防御（与 read_payload_from_caller 同款）
+    let end = start
+        .checked_add(len as usize)
+        .ok_or_else(|| anyhow::anyhow!("[duel] 读地址回绕 ptr={ptr} len={len}"))?;
+    if end > size {
+        anyhow::bail!("[duel] 决斗读越界：[{ptr}, {}) 超出守方线性内存 {size}", ptr as usize + len as usize);
+    }
+    let mut buf = vec![0u8; len as usize];
+    memory.read(&defender.store, start, &mut buf)?;
+    tracing::debug!(ptr, len, "[duel] 决斗读硬件层完成（守方内存 -> 字节缓冲）");
+    Ok(buf)
+}
+
+/// 决斗写硬件层（D-005 交付2）：把 bytes 写进守方线性内存 [ptr, ..)
+///
+/// 守方未导出 memory / 越界 -> Err。
+fn duel_write_bytes(defender: &mut SandboxHandle, ptr: u32, bytes: &[u8]) -> Result<()> {
+    let memory = defender
+        .instance
+        .get_memory(&mut defender.store, "memory")
+        .ok_or_else(|| anyhow::anyhow!("[duel] 守方未导出 memory，无可映射内存"))?;
+    let size = memory.data_size(&defender.store);
+    let start = ptr as usize;
+    let end = start
+        .checked_add(bytes.len())
+        .ok_or_else(|| anyhow::anyhow!("[duel] 写地址回绕 ptr={ptr} len={}", bytes.len()))?;
+    if end > size {
+        anyhow::bail!("[duel] 决斗写越界：[{ptr}, {}) 超出守方线性内存 {size}", ptr as usize + bytes.len());
+    }
+    memory.write(&mut defender.store, start, bytes)?;
+    tracing::debug!(ptr, len = bytes.len(), "[duel] 决斗写硬件层完成（字节缓冲 -> 守方内存）");
+    Ok(())
+}
+
+/// 游魂自己的内存读（env.duel_write 取源字节用）：[ptr, ptr+len)，越界 Err
+fn ghost_memory_read(caller: &mut Caller<DuelGhostData>, ptr: i32, len: i32) -> Result<Vec<u8>> {
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or_else(|| anyhow::anyhow!("[duel] 游魂未导出 memory"))?;
+    let data = memory.data(&*caller);
+    let start = ptr as usize;
+    let end = start
+        .checked_add(len as usize)
+        .ok_or_else(|| anyhow::anyhow!("[duel] 游魂读地址回绕 ptr={ptr} len={len}"))?;
+    if end > data.len() {
+        anyhow::bail!("[duel] 游魂读越界：[{ptr}, {end}) 超出自身线性内存 {}", data.len());
+    }
+    Ok(data[start..end].to_vec())
+}
+
+/// 游魂自己的内存写（env.duel_read 落笔用）：越界 Err（世界不 grow 不补偿）
+fn ghost_memory_write(
+    caller: &mut Caller<DuelGhostData>,
+    ptr: i32,
+    bytes: &[u8],
+) -> Result<()> {
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or_else(|| anyhow::anyhow!("[duel] 游魂未导出 memory"))?;
+    let data_len = memory.data(&*caller).len();
+    let start = ptr as usize;
+    let end = start
+        .checked_add(bytes.len())
+        .ok_or_else(|| anyhow::anyhow!("[duel] 游魂写地址回绕 ptr={ptr}"))?;
+    if end > data_len {
+        anyhow::bail!("[duel] 游魂写越界：[{ptr}, {end}) 超出自身线性内存 {data_len}");
+    }
+    memory.data_mut(&mut *caller)[start..end].copy_from_slice(bytes);
+    Ok(())
 }
 
 /// &[u8] 前 4 字节（le）转 i32（不足补 0；WASM i32 限制，完整 Vec 需内存传递 Phase 2）
@@ -4874,5 +5191,170 @@ mod tests {
             handle.store.data().thrust_fuel_cost, 0,
             "拒绝的出力不记账 fuel 代价"
         );
+    }
+
+    // === 决斗制攻杀 D-005 刀0：内存映射直连 + 游魂窗口（design-duel）===
+
+    /// 决斗守方靶 WAT：导出 memory + 头部 16 字节魔数（游魂的侦察目标）
+    const DUEL_DEFENDER_WAT: &str = r#"(module
+  (memory (export "memory") 1)
+  (data (i32.const 0) "DEFENDER-MAGIC01")
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 决斗游魂 WAT：读守方 [0,16) 进自己内存、把读到的东西写回守方 [64,80)、
+    /// 经决斗通道把当前窗口拍号写在守方 [48]，返回 0（继续）
+    const DUEL_GHOST_WAT: &str = r#"(module
+  (import "env" "duel_read" (func $duel_read (param i32 i32 i32) (result i32)))
+  (import "env" "duel_write" (func $duel_write (param i32 i32 i32) (result i32)))
+  (import "env" "duel_round" (func $duel_round (result i32)))
+  (memory (export "memory") 1)
+  (func (export "on_duel") (result i32)
+    (drop (call $duel_read (i32.const 0) (i32.const 16) (i32.const 0)))
+    (drop (call $duel_write (i32.const 64) (i32.const 0) (i32.const 16)))
+    (i32.store8 (i32.const 32) (call $duel_round))
+    (drop (call $duel_write (i32.const 48) (i32.const 32) (i32.const 1)))
+    (i32.const 0)))"#;
+
+    /// 决斗游魂 WAT（收工版）：同上但返回 1（宣布完成，会话正常收尾）
+    const DUEL_GHOST_DONE_WAT: &str = r#"(module
+  (import "env" "duel_read" (func $duel_read (param i32 i32 i32) (result i32)))
+  (import "env" "duel_write" (func $duel_write (param i32 i32 i32) (result i32)))
+  (import "env" "duel_round" (func $duel_round (result i32)))
+  (memory (export "memory") 1)
+  (func (export "on_duel") (result i32)
+    (drop (call $duel_read (i32.const 0) (i32.const 16) (i32.const 0)))
+    (i32.const 1)))"#;
+
+    /// 违规游魂 WAT：除了三个决斗 import 还想用 env.log（最小环境应拒绝实例化）
+    const DUEL_GHOST_SMUGGLER_WAT: &str = r#"(module
+  (import "env" "log" (func $log (param i32)))
+  (import "env" "duel_read" (func $duel_read (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "on_duel") (result i32) (i32.const 0)))"#;
+
+    fn duel_stage() -> (SandboxManager, SandboxHandle, SandboxHandle) {
+        let mgr = SandboxManager::new().unwrap();
+        let defender = mgr
+            .create_sandbox(&wasm(DUEL_DEFENDER_WAT), 1_000_000, id(901))
+            .unwrap();
+        let plain = mgr
+            .create_sandbox(&wasm(TARGET_WAT_ARENA), 1_000_000, id(902))
+            .unwrap();
+        (mgr, defender, plain)
+    }
+
+    /// 无决斗 import 的素模块（游魂缺 on_duel 导出的崩溃构造）
+    const TARGET_WAT_ARENA: &str = r#"(module (memory (export "memory") 1))"#;
+
+    #[test]
+    fn duel_read_write_primitives_normal_and_oob() {
+        // 交付2：决斗读/写原语——正常路径读写守方内存；越界 Err；守方无 memory Err
+        let (mgr, mut defender, _plain) = duel_stage();
+        // 正常写：把字节写进守方 [100, 105)
+        mgr.duel_write(&mut defender, 100, b"HELLO").unwrap();
+        // 正常读：读回来一致（读就是读，写就是写，中间无世界代码）
+        let bytes = mgr.duel_read(&mut defender, 100, 5).unwrap();
+        assert_eq!(bytes, b"HELLO", "决斗读应取回刚写入的字节");
+        // 越界读：ptr+len 超出线性内存 -> Err
+        let size = {
+            let mem = defender.instance.get_memory(&mut defender.store, "memory").unwrap();
+            mem.data_size(&defender.store)
+        };
+        assert!(mgr.duel_read(&mut defender, size as u32, 1).is_err(), "读越界应 Err");
+        assert!(mgr.duel_write(&mut defender, size as u32, b"x").is_err(), "写越界应 Err");
+        // 末尾恰好压线：[size-1, size) 合法（闭区间外才越界）
+        mgr.duel_read(&mut defender, size as u32 - 1, 1).unwrap();
+        // 守方未导出 memory -> Err（布景没有可映射的内存）
+        let mut memless = mgr.create_sandbox(&wasm(DEAD_PLAYER_WAT_ARENA), 1_000, id(903)).unwrap();
+        assert!(mgr.duel_read(&mut memless, 0, 1).is_err(), "无 memory 守方读取应 Err");
+        assert!(mgr.duel_write(&mut memless, 0, b"x").is_err(), "无 memory 守方写入应 Err");
+    }
+
+    /// 无 memory 的最小模块（布景构造用）
+    const DEAD_PLAYER_WAT_ARENA: &str = r#"(module (func (export "life") (result i32) i32.const 0))"#;
+
+    #[test]
+    fn call_duel_step_ghost_reads_and_writes_defender_memory() {
+        // 交付3：游魂窗口——游魂读到守方魔数、写回守方、拿到拍号；返回 0=继续
+        let (mgr, mut defender, _) = duel_stage();
+        let ghost = wasm(DUEL_GHOST_WAT);
+        let outcome = mgr.call_duel_step(&ghost, &mut defender, 10_000, 0).unwrap();
+        assert_eq!(outcome.outcome, DuelVerdict::Continue, "返回 0 = 继续会话");
+        assert!(outcome.fuel_used > 0, "游魂窗口应烧 fuel（烧的是攻方赌注）");
+        assert!(outcome.fuel_used < 10_000, "轻量游魂不应烧穿窗口预算");
+        // 游魂把守方魔数写回了守方 [64, 80)——读->写全链证据
+        let echoed = mgr.duel_read(&mut defender, 64, 16).unwrap();
+        assert_eq!(echoed, b"DEFENDER-MAGIC01", "游魂应把读到的守方内存写回守方");
+        // 游魂拿到的拍号 = 传入的 round
+        let round_byte = mgr.duel_read(&mut defender, 48, 1).unwrap();
+        assert_eq!(round_byte[0], 0, "round=0 窗口，duel_round 应返回 0");
+    }
+
+    #[test]
+    fn call_duel_step_round_number_flows_through() {
+        // 交付3：duel_round 返回当前窗口拍号（游魂可据此做轮次策略）
+        let (mgr, mut defender, _) = duel_stage();
+        let ghost = wasm(DUEL_GHOST_WAT);
+        mgr.call_duel_step(&ghost, &mut defender, 10_000, 7).unwrap();
+        let round_byte = mgr.duel_read(&mut defender, 48, 1).unwrap();
+        assert_eq!(round_byte[0], 7, "游魂应看到第 7 号窗口");
+    }
+
+    #[test]
+    fn call_duel_step_done_vote_finishes() {
+        // 交付3：游魂返回 1 = 宣布完成（会话正常收尾的投票）
+        let (mgr, mut defender, _) = duel_stage();
+        let ghost = wasm(DUEL_GHOST_DONE_WAT);
+        let outcome = mgr.call_duel_step(&ghost, &mut defender, 10_000, 3).unwrap();
+        assert_eq!(outcome.outcome, DuelVerdict::Done, "返回 1 = Done");
+    }
+
+    #[test]
+    fn call_duel_step_garbage_module_is_crash() {
+        // 交付4 负路径：游魂 payload 是垃圾字节 -> 实例化失败 = 崩溃（Err，会话由调用方关闭）
+        let (mgr, mut defender, _) = duel_stage();
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        assert!(
+            mgr.call_duel_step(garbage, &mut defender, 10_000, 0).is_err(),
+            "垃圾模块实例化失败应 Err"
+        );
+        // 守方无损：魔数原样
+        assert_eq!(mgr.duel_read(&mut defender, 0, 16).unwrap(), b"DEFENDER-MAGIC01");
+    }
+
+    #[test]
+    fn call_duel_step_missing_on_duel_is_crash() {
+        // 交付4 负路径：游魂没导出 on_duel = 崩溃（约定导出名缺失）
+        let (mgr, mut defender, plain) = duel_stage();
+        let mut plain = plain;
+        assert!(
+            mgr.call_duel_step(&wasm(TARGET_WAT_ARENA), &mut defender, 10_000, 0).is_err(),
+            "缺 on_duel 导出应 Err"
+        );
+        assert!(mgr.duel_read(&mut plain, 0, 1).is_ok(), "旁观沙箱不受影响");
+    }
+
+    #[test]
+    fn duel_ghost_import_env_is_minimal_three() {
+        // 交付3：游魂 import 环境最小集=三个决斗原语——走私 env.log 的模块拒绝实例化
+        let (mgr, mut defender, _) = duel_stage();
+        assert!(
+            mgr.call_duel_step(&wasm(DUEL_GHOST_SMUGGLER_WAT), &mut defender, 10_000, 0)
+                .is_err(),
+            "世界不给游魂多余通道（通信自由，注入无门——进来只有决斗三原语）"
+        );
+    }
+
+    #[test]
+    fn duel_step_burns_stake_not_defender_fuel() {
+        // 账本铁律 #046：游魂烧攻方赌注，守方 fuel 分毫不动（host 侧 memory 操作
+        // 会被 wasmtime 计量进守方油箱——守卫快照/恢复必须抹平）
+        let (mgr, mut defender, _) = duel_stage();
+        let before = defender.store.get_fuel().unwrap();
+        let ghost = wasm(DUEL_GHOST_WAT);
+        let outcome = mgr.call_duel_step(&ghost, &mut defender, 10_000, 0).unwrap();
+        let after = defender.store.get_fuel().unwrap();
+        assert_eq!(before, after, "守方 fuel 不应因决斗窗口变化（账户跟人不跟房子）");
+        assert!(outcome.fuel_used > 0, "游魂自己烧自己的预算");
     }
 }

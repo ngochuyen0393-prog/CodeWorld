@@ -111,6 +111,10 @@ pub struct Config {
     /// 每沙箱桥在途信件上限（D-001b 护栏），默认 4（防灌爆出站队列；途满再发返 3，
     /// 世界不排队不重试）。CODEWORLD_BRIDGE_INFLIGHT 覆盖。
     pub bridge_inflight: u32,
+    /// 决斗游魂单窗预算（D-005 刀0：每拍会话窗口给游魂的步数，从攻方燃料赌注
+    /// 扣除——死油箱，赌注=spawn 继承的攻方配额 #047）。默认 10_000，与
+    /// probe/contact/field 同档（轻窗口）；CODEWORLD_DUEL_STEP_FUEL 覆盖。
+    pub duel_step_fuel: u64,
 }
 
 impl Default for Config {
@@ -146,6 +150,7 @@ impl Default for Config {
             bridge_payload_max: 8192,
             bridge_timeout_s: 5,
             bridge_inflight: 4,
+            duel_step_fuel: 10_000,
         }
     }
 }
@@ -266,6 +271,10 @@ impl Config {
             } else {
                 cfg.asset_quota = n;
             }
+        }
+        // D-005 决斗单窗预算（模式照抄 CODEWORLD_CONTACT_FUEL：解析失败保留默认值）
+        if let Some(f) = env_u64("CODEWORLD_DUEL_STEP_FUEL") {
+            cfg.duel_step_fuel = f;
         }
         // D-001b 外桥（CODEWORLD_BRIDGE 家族）：默认禁用；非 0 数值=启用（"1" 是
         // bat 脚本惯用值）；护栏四项数值类容错（解析失败回退默认，同其他数值项）
@@ -682,6 +691,20 @@ mod tests {
         let c = Config::load();
         std::env::remove_var("CODEWORLD_CONTACT_FUEL");
         assert_eq!(c.contact_fuel, 10_000, "非法值应回退默认接触回调预算");
+    }
+
+    // === 决斗单窗预算（D-005 刀0，模式照抄 contact_fuel）===
+
+    #[test]
+    fn duel_step_fuel_default_and_env_override() {
+        // 默认 10_000（与 probe/contact/field 同档轻窗口）；CODEWORLD_DUEL_STEP_FUEL 覆盖
+        let _g = ENV_LOCK.lock().unwrap();
+        let c = Config::default();
+        assert_eq!(c.duel_step_fuel, 10_000, "决斗单窗预算默认应为 10_000（同族轻窗口档）");
+        std::env::set_var("CODEWORLD_DUEL_STEP_FUEL", "123456");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_DUEL_STEP_FUEL");
+        assert_eq!(c.duel_step_fuel, 123_456, "环境变量应覆盖决斗单窗预算");
     }
 
     #[test]

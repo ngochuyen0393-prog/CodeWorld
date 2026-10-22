@@ -2,7 +2,12 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-22 D-018 弹丸退役工程 落地）
+## 现在（2026-10-22 D-005 决斗制攻杀 刀0 最小原型 落地）
+- 在做：D-005 刀0 收口——决斗制最小原型（宪法 #038/#046/#047 工程落地，design-duel v0.3）：命中=开决斗会话不再直接换血。①arena 三硬件原语：duel_read/duel_write（内存映射直连，越界 Err）+ call_duel_step（游魂窗口：每拍临时实例化最小 linker 环境——import 只有 duel_read/duel_write/duel_round 三件，走私多余 import 拒绝实例化；on_duel 返回 1=宣布完成收尾；host 侧守方 fuel 快照/恢复守卫=账本铁律 #046 落地）②bin 会话记账：DuelSession 表挂 EntitySandboxMap（赌注=攻方 fuel_limit 快照继承制 #047；按 (defender,attacker) 字典序确定序每拍一窗；收尾三路=油尽驱逐/游魂崩溃/实体死亡，世界零裁判零胜负判定）③settle_attacks 分流：空 payload=裸奔特例（换血收尾一步到位，A/D/H/S/pioneer 与造物弹零破坏）；非空 payload=开会话（残影守方同开会话=游魂打空城）④config duel_step_fuel 10_000（CODEWORLD_DUEL_STEP_FUEL）⑤examples/duel-demo.wat（土豆验收样本，include_str 冒烟同源）⑥api.md 攻击语义节+「五点一、决斗制」节。刀外事项（双向互授/夺舍确权/偷魂外传/实例池化）全按任务书 §8 只记录不实现。
+- Gate：workspace **1090 绿 / 0 failed**（基线 1074 + 新增 16：arena 8 + bin 7 + config 1）；clippy --workspace -D warnings 零警告。改写 4 个旧换血语义测试（two_attackers_one_intercepted/none_intercepted_order/first_killer_blocks/ghost_skips_defense_inquiry）至决斗语义，断言核心不变（确定序/拦截/先杀封刀/残影跳防守）。
+- 待土豆人工验收：跑世界起 A/D，或看 examples/duel-demo.wat 冒烟（游魂读守方头部 16 字节→战利品回写→签名章→round>2 收工）。
+
+## 上一轮（2026-10-22 D-018 弹丸退役工程 落地）
 - 在做：D-018 收口——shoot import/弹丸专属管线/痕迹机制/三常数全退役（decisions #045 执行刀）；弹道物理通用化为一切有速度实体（step 冲量路径+CCD 扫掠截断，积分器双轨注记入码：中点位移保留=跳跃锚、半隐式轨随弹丸退役）；H 搅局者/操控射击/遗嘱烟花全迁造物弹（spawn 第 11/12 参初速+on_contact 接触代码攻）；弹头延迟 2 拍消亡（结算需攻击者在册）；CCD 停点 1cm 推进修接触浮点缝隙；投掷器教学 docs/newbie-first-thrower.md。Gate：workspace 1034 绿/0 failed（基线 1069-删 37 个 shoot 专属测试+新增通用锚，删测授权见任务书⑥）/本刀 hunks clippy 零警告/4 条 clippy 新 lint 警告属 HEAD 既有代码（mask/avatars/net/bridge 区，非本刀 hunks）。
 - 卡在：无。**已 rebase 落回 master（9cee29b，基于 D-009 162fd82）**：液体物理迁入 step 冲量路径（D-009 液体测试全绿）、三 WAT 生成器与 PendingSpawn 构造同步 19 参、CCD 接近性判据修正（重叠分离中放行——D-009 浮沉实测暴露）、液体造物不作 CCD 目标、木浮铁沉布景适配。详见 .cc-scratch/cc-report-d018.md §八。
 - 下一步：① D-001c 活弹待遇参数判据拍板（土豆）② D-011 链路已解锁可派 ③ 待土豆人工验收：watch 日志观察 H 投掷弹道手感（每 8 拍一发、两拍回弧）/浏览器操控射击（点敌人出定装弹）/遗嘱烟花（spawn 造物带初速）④ 弹幕躺尸堆积极限=实体上限 64 认账（#045），寿命管理第二课候选。
