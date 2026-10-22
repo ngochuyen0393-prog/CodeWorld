@@ -39,28 +39,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing_subscriber::filter::LevelFilter;
 
-/// 发射痕迹强弹动能阈值（#034 修订三）：动能（速度×质量）> 50 的弹丸算"强弹"，
-/// 痕迹寿命 1 拍加到 3 拍封顶。标定参照：H 标准抛射约 7.8（弱弹 1 拍），
-/// mass=10 中速直射 200（强弹 3 拍）。
-const TRACE_STRONG_KE: f64 = 50.0;
-
-/// 发射痕迹（#034 修订三：发射即暴露——攻击自由，但攻击留下痕迹）。
-/// 痕迹不是实体：不进 world.entities、不占碰撞/沙箱/名额，是主程序持有的
-/// 独立标记表；探测面 = 眼睛层 visible 列表 + probe 命中坐标返回发射者身份。
-#[derive(Debug, Clone)]
-struct LaunchTrace {
-    /// 痕迹 id（visible/probe 桥里的身份；独立生成，与实体 id 无关）
-    trace_id: EntityId,
-    /// 发射点（=弹丸出手位置）
-    pos: (f64, f64),
-    /// 发射者
-    shooter: EntityId,
-    /// 发射拍号
-    birth_tick: u64,
-    /// 寿命（拍）：1 拍基础，动能超阈值 +2（封顶 3）
-    ttl: u32,
-}
-
 /// 实体-沙箱映射表（架构文档 4.1 阶段一）
 ///
 /// 把 EntityId 映射到 SandboxHandle，tick 阶段一据此逐个实体执行玩家代码。
@@ -120,23 +98,16 @@ struct EntitySandboxMap {
     /// d 步 is_ghost 判不到"刚消散的残影"——故在 kill 处直接挂号，遗嘱窗口据此
     /// 跳过 on_death（会话级离场非死亡谢幕）并消费清空
     session_takes: std::collections::HashSet<EntityId>,
-    /// 在飞弹丸账本（#034 弹道系统：弹丸 -> 发射者+payload）。
-    /// Entity 本体只存物理（质量/速度/半径），发射者豁免与结算 payload 归账本；
-    /// 弹丸消亡（命中/落地/超时）时一并清理。不持久化（跨重启按哑弹清场）
-    projectiles: HashMap<EntityId, ProjectileMeta>,
-    /// 发射痕迹表（#034 修订三：发射即暴露）。独立标记非实体；expire_traces
-    /// 每拍清算，寿命尽消亡。不持久化（痕迹最长 3 拍，重启窗口即自然过期）
-    traces: Vec<LaunchTrace>,
     /// 点击走位停滞检测窗口（期四第七刀）：目标变更即重开窗，测"当前目标"的
     /// 走位进度；2 拍净位移 < 0.01 = 贴障蹭动/全挡，视为到达清目标
     move_stall: Option<input::MoveStallTrack>,
     /// 本拍连接事件（#025 期五第一刀：WS 操控令牌翻转沿，main 循环每拍写入、
     /// tick ②5 消费清空；WS 禁用/无翻转= None）。处置状态机的触发源
     conn_event: Option<net::ConnEvent>,
-    /// 操控射击排队（#036：WsShoot 意图产的定装弹请求；route 后入队，阶段二
-    /// a1.5 与 sandbox pending_shoots 同一 process_shoots 出口统一发射。
-    /// 同拍至多 1 发由 route 单行动折叠保证——操控路径与 shoot import 限流同语义）
-    ctrl_shoots: Vec<codeworld_arena::sandbox::PendingShoot>,
+    /// 操控射击排队（#036：WsShoot 意图产的定装弹；route 后入队，阶段二 a1
+    /// 与 sandbox 排队 spawn 同一 process_spawn_requests 出口统一落地。
+    /// 同拍至多 1 发由 route 单行动折叠保证——操控路径与 spawn import 限流同语义）
+    ctrl_shell_spawns: Vec<PendingSpawn>,
     /// 本拍命中事件缓冲（D-017 协议小刀）：settle_attacks 结算成功时写入，
     /// push_snapshot 随快照广播后由 tick 下一拍清空（读走即清，无观众=丢弃）。
     /// 只缓冲一拍（事件是新闻不是档案）
@@ -165,23 +136,11 @@ impl EntitySandboxMap {
     }
 
     /// 创建映射表（指定世界极速，#034 修订一：发射钳制与飞行钳制同源装配）。
-    /// 阻力取 core DefaultPhysics 默认值（D-007 收尾 P1-3：未显式装配 drag 的
-    /// 旧调用点保持默认口径零回归）
-    #[cfg(test)] // D-007 收尾 P1-3 后生产装配走 new_with_reach_physics（drag 走
-    // bin Config 装配值）；本构造器仅测试基线用（无此标注 dead_code 误报）
+    /// 【D-018】够不着判定阻力装配（new_with_reach_physics）随 shoot import
+    /// 退役——阻力只活在物理步与操控解算器，沙箱侧不再有判定消费点
     fn new_with_max_speed(max_speed: f64) -> Result<Self> {
-        Self::new_with_reach_physics(
-            max_speed,
-            codeworld_core::physics::DefaultPhysics::default_values().drag_coefficient,
-        )
-    }
-
-    /// 创建映射表（指定世界极速 + 够不着判定阻力，D-007 收尾 P1-3）：shoot 够
-    /// 不着弹道模拟的 drag 与真实弹丸同一装配源——main() 从 bin Config 传
-    /// config.drag_coefficient，CODEWORLD_DRAG 覆盖后判定不与真实弹道分叉
-    fn new_with_reach_physics(max_speed: f64, drag: f64) -> Result<Self> {
         Ok(Self {
-            manager: SandboxManager::new_with_reach_physics(max_speed, drag)?,
+            manager: SandboxManager::new_with_max_speed(max_speed)?,
             sandboxes: HashMap::new(),
             visible_ids: Vec::new(),
             visible_positions: Vec::new(),
@@ -204,31 +163,14 @@ impl EntitySandboxMap {
             session_takes: std::collections::HashSet::new(),
             move_stall: None,
             conn_event: None,
-            ctrl_shoots: Vec::new(),
+            ctrl_shell_spawns: Vec::new(),
             attack_events: Vec::new(),
-            projectiles: HashMap::new(),
-            traces: Vec::new(),
             asset_mirror: mirror::AssetMirror::new(),
             asset_quota: codeworld_arena::assets::SANDBOX_ASSET_QUOTA_BYTES,
             bridge: None,
             bridge_payload_max: 8192,
             bridge_inflight_max: 4,
         })
-    }
-
-    /// 发射痕迹清算（#034 修订三）：寿命尽的痕迹消亡。
-    /// 时序语义：诞生拍（阶段二诞生，当拍清算不消）→ 次拍起的眼睛层可见 →
-    /// 可见拍数耗尽后的清算拍消亡——弱弹恰好可见一拍
-    fn expire_traces(&mut self, current_tick: u64) {
-        let before = self.traces.len();
-        self.traces
-            .retain(|t| current_tick < t.birth_tick + t.ttl as u64);
-        if self.traces.len() != before {
-            tracing::debug!(
-                expired = before - self.traces.len(),
-                "[trace] 发射痕迹消散"
-            );
-        }
     }
 
     /// 填充可见实体快照（三层感知 Phase A 眼睛层，阶段一执行玩家代码【前】调用）
@@ -248,15 +190,8 @@ impl EntitySandboxMap {
             .map(|e| (e.id, e.pos()))
             .collect();
         visible.sort_by_key(|a| a.0 .0);
-        // 发射痕迹并入可见列表（#034 修订三：发射即暴露，痕迹排在实体之后——
-        // probe 侧同坐标实体优先）。痕迹非实体：只进感知列表，不进渲染/物理
-        let trace_entries: Vec<(EntityId, (f64, f64))> = self
-            .traces
-            .iter()
-            .filter(|t| viewport.contains(t.pos.0, t.pos.1))
-            .map(|t| (t.trace_id, t.pos))
-            .collect();
-        visible.extend(trace_entries);
+        // 【D-018】#034 修订三的"发射痕迹并入可见列表"随痕迹机制退役（#045
+        // 连带）：造物弹天然在实体列表暴露，独立痕迹标记多余
         self.visible_ids = visible.iter().map(|(id, _)| *id).collect();
         self.visible_positions = visible.iter().map(|(_, p)| *p).collect();
         for (id, handle) in self.sandboxes.iter_mut() {
@@ -350,15 +285,6 @@ impl EntitySandboxMap {
         let manager_ptr: *const SandboxManager = &self.manager;
         let bridge_ids = self.visible_ids.clone();
         let bridge_positions = self.visible_positions.clone();
-        let bridge_traces: Vec<codeworld_arena::sandbox::TraceProbe> = self
-            .traces
-            .iter()
-            .map(|t| codeworld_arena::sandbox::TraceProbe {
-                trace_id: t.trace_id,
-                shooter: t.shooter,
-                birth_tick: t.birth_tick,
-            })
-            .collect();
         let probe_fuel = self.probe_fuel;
         // D-016 地形指针（与 probe 桥同款 cast：world 是本函数不可变借用，
         // terrain 指针仅阶段一 on_tick 窗口内挂载进 SandboxData，窗口期 world 存活）
@@ -402,7 +328,6 @@ impl EntitySandboxMap {
                 manager: manager_ptr,
                 caller_id: entity_id,
                 probe_fuel,
-                traces: bridge_traces.clone(),
             };
             handle.store.data_mut().probe_bridge = &mut bridge;
             // D-016 地形快照挂载：on_tick 窗口内 env.move_by/spawn 的钻地判据
@@ -813,23 +738,6 @@ impl EntitySandboxMap {
         all
     }
 
-    /// 收集本 tick 所有沙箱排队的射击请求（#034 env.shoot 推入，弹道系统）
-    ///
-    /// drain 各沙箱 pending_shoots 后清空，保证不跨拍残留。在 tick 阶段二
-    /// process_shoots 调用。
-    fn collect_pending_shoots(&mut self) -> Vec<codeworld_arena::sandbox::PendingShoot> {
-        let mut all = Vec::new();
-        for handle in self.sandboxes.values_mut() {
-            all.append(&mut handle.store.data_mut().pending_shoots);
-        }
-        // 操控射击（#036）：并入同一发射出口（驾驶档定装参数已定，直接落地）
-        all.append(&mut self.ctrl_shoots);
-        if !all.is_empty() {
-            tracing::info!(count = all.len(), "[collect_pending_shoots] 收集射击请求");
-        }
-        all
-    }
-
     /// 收件：调目标【当前沙箱】的 on_attack 询问是否拦截（架构 4.2 两阶段-收件）
     ///
     /// 只问不改：不换血、不击杀；防守方 fuel 随每次调用自然消耗（围殴=磨算力）。
@@ -1172,9 +1080,9 @@ fn main() -> Result<()> {
     // 实体-沙箱映射表（架构 4.1 阶段一：玩家代码执行）
     // 注意：从快照恢复的实体只有元数据、无沙箱（WASM 实例不持久化），
     //       这些实体 run_player_code 会跳过；重新挂沙箱属 Phase 2 范畴。
-    // D-007 收尾 P1-3：够不着判定 drag 用装配值（与物理步同一 config.drag_coefficient，
-    // CODEWORLD_DRAG 覆盖后判定与真实弹道同源不分叉）
-    let mut sandbox_map = EntitySandboxMap::new_with_reach_physics(config.max_speed, config.drag_coefficient)?;
+    // 【D-018】极速同源装配保留（发射/spawn 初速钳制与飞行钳制同源）；
+    //         D-007 够不着判定 drag 装配随 shoot import 退役
+    let mut sandbox_map = EntitySandboxMap::new_with_max_speed(config.max_speed)?;
     // probe 预算装配（三层感知 Phase A：config 可调的 on_probe 独立小 fuel）
     sandbox_map.probe_fuel = config.probe_fuel;
     // D-007 三兄弟预算装配（接触回调/遗嘱钩子，模式同 probe_fuel）
@@ -1655,23 +1563,58 @@ fn tick_with_intents(
             input::ControlledAction::Shoot { tx, ty } => {
                 // 操控射击（#036 + 期五第六刀炮塔解算器）：升力独立同款——悬空射击
                 // 拍照常免重力；走位目标未清（边走边射）。弹道参数按目标实时解算
-                //（驾驶档基准 12+阻力补偿，够不着爬坡封顶 18）；无解不发射（INFO
-                // 明示，不打必落空的哑弹）
+                //（驾驶档基准 12+阻力补偿，够不着爬坡封顶 22）；无解不发射（INFO
+                // 明示，不打必落空的哑弹）。
+                // 【D-018】载体从"世界配发弹丸"换为 spawn 定装造物弹（#045：世界
+                // 不配发身体）——解算器只解初速，弹=dynamic 造物（小圆点/同款质量/
+                // unbound），出生点沿发射方向外推（见 muzzle offset 注释），命中归
+                // 接触通道（on_contact 代码攻）
                 if let Some(e) = world.entities.get(id) {
                     if e.pos().1 > e.radius() {
                         aloft.insert(*id);
                     }
-                    match solve_launch_vector(e.pos().0, e.pos().1, *tx, *ty, CTRL_SHOOT_SPEED) {
+                    let (sx, sy) = e.pos();
+                    let r_self = e.radius();
+                    match solve_launch_vector(sx, sy, *tx, *ty, CTRL_SHOOT_SPEED) {
                         Some((vx, vy)) => {
+                            // 发射点外推（投掷器模板教学点）：出生点沿发射方向前移
+                            // (r_self + r_bullet + 0.1)——出生重叠拒绝（#030）的
+                            // 物理诚实外推（同一拍内从身体边缘出膛，非瞬移）
+                            let dx = *tx - sx;
+                            let dy = *ty - sy;
+                            let d = (dx * dx + dy * dy).sqrt();
+                            let muzzle = r_self + CTRL_SHELL_RADIUS + 0.1;
+                            let birth = (
+                                sx + dx / d * muzzle,
+                                sy + dy / d * muzzle,
+                            );
+                            let fuel_limit = sandbox_map
+                                .sandboxes
+                                .get(id)
+                                .map(|h| h.store.data().fuel_limit)
+                                .unwrap_or(1_000_000);
+                            let color = e.appearance.color.clone();
                             sandbox_map
-                                .ctrl_shoots
-                                .push(codeworld_arena::sandbox::PendingShoot {
-                                    shooter: *id,
-                                    vx,
-                                    vy,
+                                .ctrl_shell_spawns
+                                .push(PendingSpawn {
+                                    creator: *id,
+                                    pos: birth,
+                                    code: CTRL_SHELL_WAT.to_string(),
+                                    glyph: ".".to_string(),
+                                    color,
+                                    radius: CTRL_SHELL_RADIUS,
                                     mass: CTRL_SHOOT_MASS,
                                     binding: 0,
-                                    payload: Vec::new(),
+                                    motion: codeworld_core::entity::MOTION_DYNAMIC,
+                                    vx,
+                                    vy,
+                                    blob: Vec::new(),
+                                    field_radius: 0.0,
+                                    field_gravity_scale: 1.0,
+                                    field_drag_delta: 0.0,
+                                    liquid_density: 0.0,
+                                    liquid_drag: 0.0,
+                                    fuel_limit,
                                 });
                         }
                         None => {
@@ -1791,13 +1734,21 @@ fn tick_with_intents(
 
     //   a1. 造物处理（门二：env.spawn 排队的请求在此编译/建实体/建沙箱/插入世界）。
     //       放在 destroy 应用之后：本拍自毁的创造者不再造物；上限按应用后世界实况算。
-    //       放在攻击处理之前：造物出生即进入世界（本拍攻击队列已定，下拍才会与之交互）
+    //       放在攻击处理之前：造物出生即进入世界（本拍攻击队列已定，下拍才会与之交互）。
+    //       【D-018】操控定装弹（ctrl_shell_spawns）并入同一出口：spawn 路径就是
+    //       唯一发射路径（#045 世界不配发身体）。
     process_spawns(world, sandbox_map, current_tick);
+    let ctrl_shells = std::mem::take(&mut sandbox_map.ctrl_shell_spawns);
+    if !ctrl_shells.is_empty() {
+        // 操控射击的发射者本拍活着（Shoot 分支刚解算过）——常规放行名单
+        let creators: Vec<EntityId> = ctrl_shells.iter().map(|r| r.creator).collect();
+        process_spawn_requests(world, sandbox_map, ctrl_shells, current_tick, &creators);
+    }
 
     //   a1.4 力场清单收集（D-012 登记制刷场）：每拍全量重算覆盖关系（无 enter/
     //       exit 缓存挂摘——0.1s 判例的实现底座就是每拍刷）。成型期过滤（诞生
     //       N 拍内不结算物理但已可见）+ on_field 应答覆盖（场有表达权世界有
-    //       结算权）。产物喂物理两步（弹道步+位置重力步）。
+    //       结算权）。产物喂物理步（位置重力步——【D-018】弹道已并入同一 step）。
     let field_overrides = sandbox_map.take_field_delta_overrides();
     let fields = codeworld_physics::fields::collect_fields(
         world,
@@ -1811,46 +1762,34 @@ fn tick_with_intents(
 
     //   a1.42 液体域清单收集（D-009 登记制刷场，照 fields 先例）：每拍全量重算
     //       覆盖关系（无 enter/exit 缓存），alive+liquid_density>0 的格对齐 AABB
-    //       即水域。产物喂物理两步（弹道步+位置重力步）——数据流两端日志此为
-    //       收集端，结算端在 physics step 内（实体在水中 INFO 带 f 值）。
+    //       即水域。产物喂物理步（【D-018】弹道已并入 c 步冲量路径）——数据流
+    //       两端日志此为收集端，结算端在 physics step 内（实体在水中 INFO 带 f 值）。
     let liquids = codeworld_physics::liquid::collect_liquid_domains(world);
     if !liquids.is_empty() {
         tracing::info!(tick = current_tick, count = liquids.len(), "[liquid] 本拍液体域清单收集");
     }
 
-    //   a1.45 力场脉冲应用（D-012 交付物 8：分离式发射器）：排在弹道步之前——
-    //       本拍被推的弹丸照常参与 step_projectiles 积分（推膛内炮弹→当拍出膛）
+    //   a1.45 力场脉冲应用（D-012 交付物 8：分离式发射器）：排在物理步之前——
+    //       本拍被推的动体照常参与 c 步速度积分（推膛内炮弹→当拍出膛）
     let field_pulses = collect_field_pulses(sandbox_map);
     if !field_pulses.is_empty() {
         apply_field_pulses(world, field_pulses, physics.params().max_speed);
     }
 
-    //   a1.5 弹道步（#034 弹道系统）：
-    //       ① 发射落地：env.shoot 排队请求 -> 弹丸实体（离体即世界物体，出手前归代码）
-    //       ② 整场积分：弹丸吃重力/阻力/位移（速度积分制，弹丸不吃 aloft——它就是要落地的），
-    //          撞身体/落地/超时产出事件（飞行中归世界）；域内弹丸按改后参数被结算（D-012）
-    process_shoots(world, sandbox_map, current_tick);
-    // 发射痕迹清算（#034 修订三）：寿命尽的痕迹消亡（排在 process_shoots 之后——
-    // 本拍刚诞生的痕迹当拍不清，次拍起的眼睛层可见一至三拍）
-    sandbox_map.expire_traces(current_tick);
-    let projectile_events = {
-        let shooters: HashMap<EntityId, EntityId> = sandbox_map
-            .projectiles
-            .iter()
-            .map(|(p, meta)| (*p, meta.shooter))
-            .collect();
-        physics.step_projectiles_with_liquids(world, current_tick, &shooters, &fields, &liquids)
-    };
+    //   a1.5 【D-018 退役注记】弹道步（#034 step_projectiles 弹丸专属管线）已并入
+    //       c 步 physics.step 的冲量路径（通用"有速度实体"物理：重力→阻力→极速
+    //       钳→中点位移→CCD 扫掠截断→落地清零）——发射走 spawn（a1），命中归
+    //       接触通道（c 步后 detect_touching→on_contact 代码攻），不再有独立
+    //       弹道步与弹丸事件结算。
 
     //   a2. 处理攻击（架构 4.2 两阶段模型：阶段一 on_tick 调 env.attack_at 排队的请求在此统一执行）
     //      插在 apply_pending_changes 之后、decay_survival 之前：攻击产生的死亡先于每日衰减处理。
     //      import 函数只排队（无 world 访问权），实际 hit/miss/拦截/结算在此判断：
     //      收件（逐刀问目标当前沙箱 on_attack，不换血不击杀）-> 结算（攻击者 id 升序逐刀执行）。
     //      操控攻击（空格）并入同一队列走既有两阶段结算（操控不豁免物理，宪法）；
-    //      弹丸命中/落地结算并入同一批次（#034：无第二结算路径，命后归结算）；
+    //      造物弹的命中投递走接触通道（c 步 on_contact 代码自攻，本拍 a2 不涉及）；
     //      无可见目标 = 挥空不出刀（但操控仍接管了本拍）。
     let mut pending_attacks = sandbox_map.collect_pending_attacks();
-    settle_projectile_events(sandbox_map, &projectile_events, &mut pending_attacks);
     if let Some((id, input::ControlledAction::Attack(Some(tpos)))) = &action {
         pending_attacks.push(PendingAttack::strike(*id, *tpos, Vec::new()));
     }
@@ -1924,19 +1863,15 @@ fn tick_with_intents(
         .map(|(id, _)| *id)
         .collect();
     //      d-will 遗嘱窗口（D-007 ③，#043 死亡谢幕）：必须在 remove 之前（沙箱还在
-    //      才能执行遗嘱）、retain 之前（遗嘱产物发射/出生要读死者坐标与产权）。
-    //      遗嘱排队的 spawn/shoot 当拍喂回既有管线（先后顺序与 a1/a1.5 同：先造物
-    //      后弹道），attack 丢弃（死人不出刀）。残影消散/登出 take 不触发（函数内过滤）。
-    let (will_shoots, will_spawns) = run_death_wills(sandbox_map, &dead_ids);
+    //      才能执行遗嘱）、retain 之前（遗嘱产物出生要读死者坐标与产权）。
+    //      遗嘱排队的 spawn 当拍喂回既有管线（遗嘱执行人资格放行），attack 丢弃
+    //      （死人不出刀）。【D-018】遗嘱 shoot 通道随 shoot 退役——烟花=遗嘱 spawn
+    //      造物带出生初速（同款效果，载体=造物）。残影消散/登出 take 不触发（函数内过滤）。
+    let will_spawns = run_death_wills(sandbox_map, &dead_ids);
     if !will_spawns.is_empty() {
         // 遗嘱执行人资格：创造者本拍刚死的 spawn 放行（产权链照常继承）
         let creators: Vec<EntityId> = will_spawns.iter().map(|r| r.creator).collect();
         process_spawn_requests(world, sandbox_map, will_spawns, current_tick, &creators);
-    }
-    if !will_shoots.is_empty() {
-        // 死者最后一发照常出膛（发射位置读死者实况坐标——retain 前仍在 world）
-        let shooters: Vec<EntityId> = will_shoots.iter().map(|s| s.shooter).collect();
-        process_shoot_requests(world, sandbox_map, will_shoots, current_tick, &shooters);
     }
     for id in &dead_ids {
         sandbox_map.remove(id);
@@ -2140,8 +2075,8 @@ fn apply_thrust_requests(
 /// 收集本拍各沙箱排队的力场脉冲请求（D-012 交付物 8：分离式发射器）
 ///
 /// drain 各沙箱 pending_field_pulses 后清空（不跨拍残留）。在 tick 阶段二
-/// a1.4（process_spawns 之后、弹道步之前）调用：本拍被推的弹丸照常参与
-/// step_projectiles 积分（推膛内炮弹→当拍出膛）。
+/// a1.45（process_spawns 之后、物理步之前）调用：本拍被推动体照常参与
+/// c 步速度积分（推膛内炮弹→当拍出膛；【D-018】弹道已并入物理步）。
 fn collect_field_pulses(sandbox_map: &mut EntitySandboxMap) -> Vec<PendingFieldPulse> {
     let mut all = Vec::new();
     for handle in sandbox_map.sandboxes.values_mut() {
@@ -2624,24 +2559,33 @@ fn process_spawn_requests(
 }
 
 /// 操控定装弹基准炮口速度（格/拍，#036 驾驶档）。12 远低于世界极速 25——发射
-/// 钳制必过。操控层是"驾驶"：基准档不由玩家调，自定义弹道走玩家代码 env.shoot。
+/// 钳制必过。操控层是"驾驶"：基准档不由玩家调，自定义弹道走玩家代码 spawn
+/// 投掷器（【D-018】shoot 已退役——自定义弹道=玩家自己拼投掷器，api.md 指针）。
 /// 期五第六刀起实际初速由解算器在速度梯（见 [`CTRL_SHOOT_SPEED_LADDER`]）中
 /// 搜索确定，此值×补偿系数是梯首档（最常用的观感档）。
 const CTRL_SHOOT_SPEED: f64 = 12.0;
 /// 阻力补偿系数：世界每拍速度衰 5%（drag 0.05/mass 1.0），补偿档=基准×1.15。
 const CTRL_SHOOT_DRAG_COMP: f64 = 1.15;
+/// 定装小弹半径（【D-018】造物弹自定尺寸——此值=与退役弹丸同款的"同款小弹"
+/// 观感锚，出生预检外推与解算器撞体窗口共用；数值锚
+/// [`codeworld_core::collision::PROJECTILE_RADIUS`]）
+pub const CTRL_SHELL_RADIUS: f64 = codeworld_core::collision::PROJECTILE_RADIUS;
 /// 自适应火力上限（格/拍）= 速度梯末档。该值决定"够不着"的有效门槛：
-/// 离散拍物理（半隐式欧拉，位移=重力后末速度）下弹道顶点峰值
-/// ≈ sy + Σ(vy_n)，v=22 高弧顶点 ~12.8 格（12 格高的 S 需 vy≈21.5）、
-/// 15 格地面目标需 ~17；13.8 档射程仅 ~10 格（vy>9.8 才能飞过首拍）。
-/// 地面无解门槛 ~25 格（22 档射程），低档优先所以常规目标不受影响。
+/// 离散拍物理（中点位移，D-018 通用口径）下弹道顶点峰值 ≈ sy + Σ(vy_n +
+/// g/2)，v=22 高弧顶点 ~13 格（12 格高的 S 需 vy≈19）、15 格地面目标需 ~15；
+/// 13.8 档射程 ~14 格（中点口径重力响应提前半拍，比退役前半隐式弹道远）。
+/// 地面无解门槛 ~30 格（22 档射程），低档优先所以常规目标不受影响。
 pub const CTRL_SHOOT_MAX_EFF_SPEED: f64 = 22.0;
 /// 解算收敛容差（格）：弹道全程与目标的最小距离 ≤ 此值视为可命中。
-/// 0.65 = CCD 撞体窗口满值（r弹 0.15 + r身 0.5）——与服务器结算判据完全一致，
-/// 不是放宽（弹道扫过窗口即真实命中）。
+/// 0.65 = CCD 撞体窗口满值（r弹 0.15 + r身 0.5）——与服务器接触通道判据
+/// 一致（弹道扫过窗口=相切=接触触发），不是放宽。
 const CTRL_SOLVE_TOLERANCE: f64 = 0.65;
 /// 近距阈值：低于此距离一律低弧（近距高弧解近乎垂直吊射自己脑门，反直觉坏解）
 const CTRL_SOLVE_CLOSE_RANGE: f64 = 2.0;
+/// 解算模拟寿命上限（拍）：弹道积分的截断步数。数值沿用退役弹丸的寿命 30 拍
+///（【D-018】PROJECTILE_MAX_AGE_TICKS 已随弹丸退役删除，寿命自管归造物代码；
+/// 解算器保留同值只作预测侧截断——30 拍内不落地的候选解视为够不着）。
+const CTRL_SOLVE_MAX_TICKS: u64 = 30;
 /// 速度搜索梯（格/拍，从低到高）：离散拍物理下速度决定可飞角度域与射程
 ///（见 [`CTRL_SHOOT_MAX_EFF_SPEED`] 注），解析公式严重失真，故速度也由搜索
 /// 确定——逐档尝试，首个可行解即返回（低速度观感档位优先）。末档=火力上限。
@@ -2657,6 +2601,41 @@ const CTRL_SHOOT_SPEED_LADDER: [f64; 7] = [
 /// 操控定装弹质量（#034：mass 只参与物理弹道，永不参与攻击结算）
 const CTRL_SHOOT_MASS: f64 = 1.0;
 
+/// 操控定装子弹代码（【D-018】造物弹的"极简弹头"——一体式投掷器的子弹模板）：
+/// 无 on_tick（出生即有速度飞出，飞行全归物理），on_contact 命中即出刀
+///（attack_at 空 payload=默认击杀模块）。命中后**延迟 2 拍**消亡（$fired 置位、
+/// life() 里的 $age 计数——接触拍排刀、次拍两阶段结算需要自己还活着，死亡
+/// 先于结算=死者刀作废白打；命中→出刀→结算→消亡的完整生命周期，寿命自管
+/// 的代码版，#045 替代链：命中=接触通道代码攻）。操控定装弹与 H 搅局者共用。
+const CTRL_SHELL_WAT: &str = r#"(module
+  (import "env" "attack_at" (func $attack (param f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (global $fired (mut i32) (i32.const 0))
+  (global $age (mut i32) (i32.const 0))
+  (func (export "life") (result i32)
+    (if (global.get $fired)
+      (then
+        (global.set $age (i32.add (global.get $age) (i32.const 1)))
+        (if (i32.ge_u (global.get $age) (i32.const 2))
+          (then (i32.const 0) (return)))))
+    (i32.const 1))
+  (func (export "get_age") (result i32) global.get $age)
+  (func (export "get_fired") (result i32) global.get $fired)
+  (func (export "on_contact") (param f64 f64)
+    (if (global.get $fired) (then (return)))
+    (i32.const 1) (global.set $fired)
+    (drop (call $attack (local.get 0) (local.get 1) (i32.const 0) (i32.const 0)))))"#;
+
+/// CTRL_SHELL_WAT 内嵌转义（投掷器 data 段用）：先剥 CR（CRLF 源文件会把
+/// \r 带进 raw string——WAT 字符串禁裸 CR 同禁裸 LF）、引号转 \"、换行转 \0a
+///（WAT 字符串禁裸换行——arena 测试 wat_escape 同款规则的最小版）
+fn shell_wat_escaped() -> String {
+    CTRL_SHELL_WAT
+        .replace('\r', "")
+        .replace('"', "\\\"")
+        .replace('\n', "\\0a")
+}
+
 /// 操控弹炮塔解算器（期五第六刀重写：不再恒定 60° 仰角——那是高空目标
 /// 四发哑弹的根因，顶点 ~9.6 够不到 12 格高的 S）。给定发射点/目标点/基准
 /// 炮口速度，解出能命中目标的初速矢量。
@@ -2669,22 +2648,30 @@ const CTRL_SHOOT_MASS: f64 = 1.0;
 /// "N=世界状态的纯函数"在此已然成立：解算结果是 (sx,sy,tx,ty) 与世界常数的
 /// 纯函数。docs/decisions.md #044 / dev-plan D-015。
 ///
+/// 【D-018 积分器同步】simulate_path 已按 step 冲量路径的中点位移口径重写
+///（重力→阻力→极速钳→中点位移）——#028 镜像铁律：世界物理变了（弹丸专属
+/// 半隐式管线退役，造物弹走 step 通用路径），预测侧镜像必须同步，否则
+/// "解算说能打中=世界真命中"契约断裂。中点位移 = 匀加速一拍的解析解
+///（x += (v0+v1)/2），弹道比退役前半隐式弹道远（重力响应提前半拍）；
+/// 定装参数（基准 12/补偿 1.15/速度梯/容差 0.65）全部不动=操控手感档位不变，
+/// 弹道数字随物理诚实修正。
+///
 /// 选型说明（闭式解 vs 模拟搜索）：教科书闭式解
 /// tanθ = (v² ± √(v⁴ - g(g·d² + 2·Δy·v²))) / (g·d) 假设连续时间物理，本世界
-/// 是离散拍物理（重力先作用于整拍再位移）：vy < 9.8 的弹**首拍即砸地**，
-/// 可飞角度域/射程随速度非线性跳变（13.8 档射程 ~10 格 vs 连续公式 ~19 格），
-/// 连续解系统性失真（30° 定角方案当年也因此报废）。故本解算器用模拟搜索：
-/// 速度梯逐档 × 角度域粗扫+两轮细化，每个候选按真实物理步序（重力→阻力→
-/// 极速钳→位移，与 step_projectiles 同序）模拟弹道全程，取全程最小距离。
-/// 判据（0.65=CCD 撞体窗口）与服务器结算完全一致——解算"说能打中"当且仅当
-/// 世界物理"真的会命中"，不哑弹。每次解算 ≤5 档 ×~28 角 ×30 拍模拟，微秒级。
+/// 是离散拍物理：可飞角度域/射程随速度非线性跳变（连续解系统性失真，30°
+/// 定角方案当年因此报废）。故本解算器用模拟搜索：速度梯逐档 × 角度域粗扫
+/// +两轮细化，每个候选按真实物理步序（重力→阻力→极速钳→中点位移，与
+/// physics step 冲量路径同序镜像）模拟弹道全程，取全程最小距离。
+/// 判据（0.65=CCD 撞体窗口）与服务器接触通道一致——解算"说能打中"当且仅当
+/// 世界物理"真的会命中"（接触触发），不哑弹。每次解算 ≤5 档 ×~28 角 ×30 拍
+/// 模拟，微秒级。
 ///
 /// 弧线分支（决定搜索区间）：近距（<[`CTRL_SOLVE_CLOSE_RANGE`]）一律低弧
 /// [1°,45°]；否则目标高于发射点（Δy>0）取高弧 [46°,89°]（高抛观感，任务书
 /// 业界对标；双根语义：+ 号 tanθ 大 = 角陡 = 高弧），否则低弧。
 ///
 /// 前端弧线预览镜像同算法（#028 镜像铁律，契约锚 net-protocol.md）——
-/// 改一处必须同步另一处。
+/// 改一处必须同步另一处（含本次中点位移口径同步）。
 ///
 /// 返回 None（无解）的路径：零距离目标（贴脸走 attack 分流不解算）/
 /// 全速度梯×全角度无一进入命中窗口（目标够不着或物理上打不准）。
@@ -2703,15 +2690,16 @@ pub fn solve_launch_vector(
     }
     let phys = codeworld_core::physics::DefaultPhysics::default();
     let high_arc = d >= CTRL_SOLVE_CLOSE_RANGE && dy > 0.0;
-    // 模拟弹道全程：真实物理步序（与 crates/physics step_projectiles 同序镜像），
-    // 返回逐拍末坐标（含起点），落地 y<半径截断。
+    // 模拟弹道全程：真实物理步序（与 crates/physics step 冲量路径同序镜像：
+    // 重力→阻力→极速钳→中点位移），返回逐拍末坐标（含起点），落地 y<半径截断。
     // 【#044 子步宪法锚·弹道积分】逐拍 N=1 整步积分，步数只由弹丸状态决定
-    // （落地 y<半径 或 寿命 30 拍截断）——纯状态驱动，无任何机器数据参与。
+    // （落地 y<半径 或 模拟寿命截断）——纯状态驱动，无任何机器数据参与。
     let simulate_path = |mut vx: f64, mut vy: f64| -> Vec<(f64, f64)> {
-        let r = codeworld_core::collision::PROJECTILE_RADIUS;
+        let r = CTRL_SHELL_RADIUS;
         let mut pts = vec![(sx, sy)];
         let (mut x, mut y) = (sx, sy);
-        for _ in 0..codeworld_physics::default::PROJECTILE_MAX_AGE_TICKS {
+        for _ in 0..CTRL_SOLVE_MAX_TICKS {
+            let (vx0, vy0) = (vx, vy); // 定律前速度（本拍位移的左端点）
             vy += phys.gravity;
             let f = 1.0 - phys.drag_coefficient / CTRL_SHOOT_MASS;
             vx *= f;
@@ -2722,8 +2710,9 @@ pub fn solve_launch_vector(
                 vx *= k;
                 vy *= k;
             }
-            x += vx;
-            y += vy;
+            // 中点位移（step 冲量路径同款）：位移 = (定律前 + 定律后) / 2
+            x += (vx0 + vx) * 0.5;
+            y += (vy0 + vy) * 0.5;
             pts.push((x, y));
             if y < r {
                 break;
@@ -2800,176 +2789,12 @@ pub fn solve_launch_vector(
     None // 全速度梯×全角度无一进入命中窗口 = 够不着，不发射哑弹
 }
 
-/// 发射处理（#034 弹道系统：env.shoot 排队请求 -> 弹丸实体落地成世界物体）
+/// 【D-018 退役注记】process_shoots / process_shoot_requests /
+/// settle_projectile_events（#034 弹丸发射与事件结算管线）随 #045 标准弹丸
+/// 退役删除——发射=env.spawn 一体式造物弹（a1 步 process_spawns 出口），命中=
+/// 接触通道代码攻（c 步 detect_touching → on_contact → 造物代码 attack_at），
+/// 世界不再有弹丸专属结算路径。教学模板见 docs/newbie-first-thrower.md。
 ///
-/// 离体即世界物体（#034 立法第 1 条）：弹丸是逻辑+物理+渲染三层同体的世界实体，
-/// 出手前归代码（排队中），本步之后归世界（物理步接管），命中后归结算（deliver 管线）。
-/// - 发射者必须存活（死者不出手，防御性复查）
-/// - 世界实体上限同 spawn 口径（弹丸也是世界实体，占名额）
-/// - 弹丸外观：glyph="."（小圆点）、颜色=发射者 glyph 色（前端弹道可溯源）
-/// - 弹丸半径 PROJECTILE_RADIUS（0.15）、质量/初速 import 层已钳制
-///
-/// 返回无（弹丸下一段在 tick 的弹道步积分；命中/落地事件归弹道步产出）。
-fn process_shoots(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, current_tick: u64) {
-    let requests = sandbox_map.collect_pending_shoots();
-    process_shoot_requests(world, sandbox_map, requests, current_tick, &[]);
-}
-
-/// 射击请求落地（process_shoots 主体；will_shooters = 遗嘱放行名单，D-007 ③）
-///
-/// 发射者已死分支的例外：遗嘱钩子当拍排队的 shoot 放行（死者最后一发照常出膛
-/// ——烟花/遗物弹，发射位置读死者实况坐标）。常规路径传空名单，行为与拆分前
-/// 完全一致。
-fn process_shoot_requests(
-    world: &mut WorldState,
-    sandbox_map: &mut EntitySandboxMap,
-    requests: Vec<codeworld_arena::sandbox::PendingShoot>,
-    current_tick: u64,
-    will_shooters: &[EntityId],
-) {
-    for req in requests {
-        // 发射者必须存活（死者不出手，防御性复查；遗嘱例外：死亡谢幕窗口放行）
-        let will_pass = will_shooters.contains(&req.shooter);
-        let Some(shooter) = world
-            .entities
-            .get(&req.shooter)
-            .filter(|e| e.is_alive() || will_pass)
-        else {
-            tracing::warn!(
-                shooter = %req.shooter.0,
-                "[process_shoots] 发射者已死，射击请求作废"
-            );
-            continue;
-        };
-        if world.entities.len() >= sandbox_map.max_entities {
-            tracing::warn!(
-                shooter = %req.shooter.0,
-                entities = world.entities.len(),
-                cap = sandbox_map.max_entities,
-                "[process_shoots] 达世界实体上限，射击请求作废"
-            );
-            continue;
-        }
-        let projectile_id = EntityId::new();
-        // 发射者数据先取值（借 world 不可变引用，插入前释放借用）
-        let (birth_pos, owner, color) = (shooter.pos(), shooter.owner, shooter.appearance.color.clone());
-        let mut projectile = Entity::new(
-            projectile_id,
-            owner, // 产权链：弹丸归属发射者的 owner（与造物同哲学）
-            codeworld_core::collision::PROJECTILE_CODE.to_string(),
-            birth_pos, // 从发射者当前位置出手（阶段二实况坐标，含本拍移动）
-            Appearance::new(".".to_string(), color, 1.0),
-            current_tick,
-            1_000_000,
-        );
-        projectile.set_radius(codeworld_core::collision::PROJECTILE_RADIUS);
-        projectile.set_mass(req.mass);
-        projectile.set_velocity((req.vx, req.vy));
-        // #034 修订四：绑定契约写进弹丸数据（出生声明，世界每拍托管执行——
-        // 遗嘱模式：契约不需要链路）+ 账本留档（结算侧 grace 判定数据源）
-        projectile.set_binding(req.binding);
-        projectile.set_bound_to(Some(req.shooter));
-        sandbox_map.projectiles.insert(
-            projectile_id,
-            ProjectileMeta {
-                shooter: req.shooter,
-                payload: req.payload,
-                binding: req.binding,
-            },
-        );
-        // 发射痕迹（#034 修订三：发射即暴露——攻击自由，但攻击留下痕迹）。
-        // 痕迹寿命 1 拍基础，动能（速度×质量）超阈值加到 3 拍封顶：强弹痕迹更长，
-        // 反制手段（哨塔网/痕迹追踪反击）玩家自己长，世界只保证"打了就有记录"
-        let speed = (req.vx * req.vx + req.vy * req.vy).sqrt();
-        let kinetic_energy = speed * req.mass;
-        let ttl: u32 = if kinetic_energy > TRACE_STRONG_KE { 3 } else { 1 };
-        sandbox_map.traces.push(LaunchTrace {
-            trace_id: EntityId::new(),
-            pos: birth_pos,
-            shooter: req.shooter,
-            birth_tick: current_tick,
-            ttl,
-        });
-        world.entities.insert(projectile_id, projectile);
-        tracing::info!(
-            projectile = %projectile_id.0,
-            shooter = %req.shooter.0,
-            pos = ?birth_pos,
-            vx = req.vx,
-            vy = req.vy,
-            mass = req.mass,
-            kinetic_energy,
-            trace_ttl = ttl,
-            "[shoot] 弹丸发射+痕迹留下（离体即世界物体：出手前归代码，飞行中归世界）"
-        );
-    }
-}
-
-/// 弹道事件结算（#034：物理步产出的命中/落地事件 -> 既有两阶段攻击管线）
-///
-/// - HitBody：命中已知的身体 -> PendingAttack（attacker=发射者、target=目标坐标、
-///   payload=弹丸携带字节），走 deliver_attacks 语义（on_attack 防御询问->拦截/
-///   换血/击杀掠夺）。弹丸消亡（物理步已标记死亡）。
-/// - Landed：落地 -> 落点做点命中（#031 判据复用，find_hit_target 在 deliver 里跑），
-///   打不中任何身体 = 落地哑弹。
-/// - Expired：超时哑弹，无结算。
-///
-/// 无第二结算路径：本函数只"翻译"成 PendingAttack，换血/掠夺全在 settle_attacks。
-fn settle_projectile_events(
-    sandbox_map: &mut EntitySandboxMap,
-    events: &[codeworld_physics::default::ProjectileEvent],
-    pending_attacks: &mut Vec<PendingAttack>,
-) {
-    use codeworld_physics::default::ProjectileEvent;
-    for ev in events {
-        match ev {
-            ProjectileEvent::HitBody { projectile, target, point } => {
-                let Some(meta) = sandbox_map.projectiles.get(projectile) else {
-                    tracing::warn!(projectile = %projectile.0, "[弹丸命中] 无账本（跨重启残留？），跳过结算");
-                    continue;
-                };
-                let meta = meta.clone();
-                sandbox_map.projectiles.remove(projectile);
-                tracing::info!(
-                    projectile = %projectile.0,
-                    target = %target.0,
-                    point = ?point,
-                    "[弹丸命中] 结算并入两阶段管线（弹丸消亡）"
-                );
-                pending_attacks.push(PendingAttack::projectile_strike(
-                    meta.shooter,
-                    *point,
-                    meta.payload,
-                    meta.binding == codeworld_core::entity::BINDING_GRACE_OWNER,
-                ));
-            }
-            ProjectileEvent::Landed { projectile, point } => {
-                let Some(meta) = sandbox_map.projectiles.get(projectile) else {
-                    tracing::warn!(projectile = %projectile.0, "[弹丸落地] 无账本，跳过结算");
-                    continue;
-                };
-                let meta = meta.clone();
-                sandbox_map.projectiles.remove(projectile);
-                tracing::info!(
-                    projectile = %projectile.0,
-                    point = ?point,
-                    "[弹丸落地] 落点点命中结算（打不中任何身体=哑弹消亡）"
-                );
-                pending_attacks.push(PendingAttack::projectile_strike(
-                    meta.shooter,
-                    *point,
-                    meta.payload,
-                    meta.binding == codeworld_core::entity::BINDING_GRACE_OWNER,
-                ));
-            }
-            ProjectileEvent::Expired { projectile } => {
-                sandbox_map.projectiles.remove(projectile);
-                tracing::info!(projectile = %projectile.0, "[弹丸哑弹] 超时消亡（寿命上限防永飞）");
-            }
-        }
-    }
-}
-
 /// 生存点数扣减（架构文档 4.1 节阶段二 b 步）
 ///
 /// 遍历存活实体调用 survival.decay(current_tick)，归零则标记死亡。
@@ -3026,36 +2851,13 @@ pub(crate) struct AttackEventRecord {
 /// 绑定契约托管清算（#034 修订四：世界每拍执行出生声明——遗嘱模式，
 /// 契约不需要链路）。排在攻击结算/生存衰减之后：本拍所有死亡来源
 /// （击杀/衰减/life()=false/登出）都已落地，同生契约当拍生效。
-/// - fade_on_death（弹丸与造物同款）：绑定对象已死或不在 → 本体即刻消亡
+/// - fade_on_death（造物弹与塔同款出生声明）：绑定对象已死或不在 → 本体即刻消亡
+///   （【D-018】弹丸账本随弹丸退役——造物弹的 fade 走通用 bound_to 路径，
+///   与塔同一扇门，零特殊通道）
 /// - grace_owner：不在此清算（豁免在 deliver_attacks 结算路径执行）
 /// - unbound：跳过（离体即世界之物，同生不共死=现状默认）
-fn enforce_binding_deaths(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap) {
+fn enforce_binding_deaths(world: &mut WorldState, _sandbox_map: &mut EntitySandboxMap) {
     use codeworld_core::entity::BINDING_FADE_ON_DEATH;
-    // 弹丸先清（账本同步）：主人死的同生弹即刻消亡（哑弹，INFO 日志）
-    let dead_shells: Vec<(EntityId, EntityId)> = sandbox_map
-        .projectiles
-        .iter()
-        .filter(|(_, meta)| meta.binding == BINDING_FADE_ON_DEATH)
-        .filter(|(_, meta)| {
-            !world
-                .entities
-                .get(&meta.shooter)
-                .map(|e| e.is_alive())
-                .unwrap_or(false)
-        })
-        .map(|(pid, meta)| (*pid, meta.shooter))
-        .collect();
-    for (pid, shooter) in dead_shells {
-        if let Some(e) = world.entities.get_mut(&pid) {
-            e.kill();
-        }
-        sandbox_map.projectiles.remove(&pid);
-        tracing::info!(
-            projectile = %pid.0,
-            shooter = %shooter.0,
-            "[binding] 同生契约生效，随主消亡（弹丸哑弹）"
-        );
-    }
     // 造物与一切声明体：binding=fade 且绑定对象已死/不在 → 消亡
     //（塔随创造者消亡；bound_to=None 的 fade 声明视为主人已失，即刻消亡）
     let doomed: Vec<EntityId> = world
@@ -3086,22 +2888,6 @@ fn enforce_binding_deaths(world: &mut WorldState, sandbox_map: &mut EntitySandbo
             "[binding] 同生契约生效，随主消亡（造物）"
         );
     }
-}
-
-/// 在飞弹丸账本（#034 弹道系统）
-///
-/// Entity 本体只存物理（质量/速度/半径/坐标）；发射者与携带 payload 归本账本——
-/// 撞身体/落地结算时据此组装 PendingAttack（attacker=发射者，走既有两阶段管线：
-/// 攻杀仍是代码对代码，mass 永不参与结算铁律在管线侧天然成立）。消亡即清理。
-#[derive(Debug, Clone)]
-struct ProjectileMeta {
-    /// 发射者（物理步撞身体豁免它；结算掠夺归属它）
-    shooter: EntityId,
-    /// 弹丸携带的攻击字节（空=默认击杀模块）
-    payload: Vec<u8>,
-    /// 绑定契约（#034 修订四：unbound 照飞 / fade_on_death 随主消亡 /
-    /// grace_owner 落地不砸发射者）
-    binding: i32,
 }
 
 /// 处理阶段一排队的攻击请求（架构 4.2 两阶段模型 + 4.1 阶段二 a2 步）
@@ -3526,21 +3312,20 @@ fn notify_contacts(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, c
 ///
 /// 对本拍每个死亡实体（沙箱还在）调用 on_death（host 侧独立预算包裹，预算即
 /// 遗嘱字数上限：烧尽即写不完，世界不补偿不重试），并抢救其遗嘱产物：
-/// - pending_shoots / pending_spawns 收集返回，由调用方当拍喂回既有管线
-///   （遗嘱模式=#035 推广：生前签好条款世界照办，本人无需在场——创造者已死
-///   分支对遗嘱队列开例外放行）
+/// - pending_spawns 收集返回，由调用方当拍喂回既有管线（遗嘱模式=#035 推广：
+///   生前签好条款世界照办，本人无需在场——创造者已死分支对遗嘱队列开例外
+///   放行）。【D-018】遗嘱 shoot 通道随 shoot 退役——烟花=遗嘱 spawn 造物带
+///   出生初速（同款谢幕效果，载体=造物弹）
 /// - pending_attacks 丢弃（死人不出刀，与"死者攻击作废"既有语义对齐）
 ///
 /// 时机契约：必须在 sandbox_map.remove 之前（沙箱还在才能执行遗嘱）、必须在
-/// retain 之前（死者实体还在 world，遗嘱产物的发射坐标/产权继承要读它）。
+/// retain 之前（死者实体还在 world，遗嘱产物的出生坐标/产权继承要读它）。
 /// 触发排除：残影消散（会话离场合同，消散≠死亡谢幕）、登出 take（会话级离场
-/// 非死亡）；decay/被杀/life()=false/处置期死亡全触发。无沙箱（弹丸/框架实体）
-/// 自然跳过。
+/// 非死亡）；decay/被杀/life()=false/处置期死亡全触发。无沙箱（框架实体）自然跳过。
 fn run_death_wills(
     sandbox_map: &mut EntitySandboxMap,
     dead_ids: &[EntityId],
-) -> (Vec<codeworld_arena::sandbox::PendingShoot>, Vec<PendingSpawn>) {
-    let mut will_shoots = Vec::new();
+) -> Vec<PendingSpawn> {
     let mut will_spawns = Vec::new();
     for id in dead_ids {
         // 会话级离场（登出 take / 残影到期消散）：非死亡谢幕，不触发遗嘱
@@ -3555,7 +3340,7 @@ fn run_death_wills(
             continue;
         }
         let Some(handle) = sandbox_map.sandboxes.get_mut(id) else {
-            // 无沙箱（弹丸/框架实体）：无遗嘱可言（debug 级，弹丸消亡是常态不刷屏）
+            // 无沙箱（框架实体）：无遗嘱可言（debug 级，常态不刷屏）
             tracing::debug!(entity_id = %id.0, "[will] 无沙箱，无遗嘱");
             continue;
         };
@@ -3573,9 +3358,8 @@ fn run_death_wills(
                 tracing::warn!(entity_id = %id.0, error = %e, "[will] 遗嘱执行失败（不影响死亡清理）");
             }
         }
-        // 遗嘱产物抢救（沙箱销毁前）：shoot/spawn 当拍放行，attack 丢弃
+        // 遗嘱产物抢救（沙箱销毁前）：spawn 当拍放行（shoot 通道随 D-018 退役），attack 丢弃
         let data = handle.store.data_mut();
-        will_shoots.append(&mut data.pending_shoots);
         will_spawns.append(&mut data.pending_spawns);
         let discarded = data.pending_attacks.len();
         data.pending_attacks.clear();
@@ -3597,7 +3381,7 @@ fn run_death_wills(
         sandbox_map.session_takes.clear();
         tracing::debug!(stale, "[will] session_takes 死条目清场（遗嘱窗口已过）");
     }
-    (will_shoots, will_spawns)
+    will_spawns
 }
 
 /// 解析 log marker 流中的盾量上报（战况字幕数据源，纯函数）
@@ -3741,7 +3525,7 @@ fn spawn_test_entities(
     );
     // H 搅局者（可选登场）：出生中场上空 (10,8)，受重力 1-2 tick 内落地站稳
     let h_ok = if h_enabled {
-        spawn(HUNTER_CODE, "H", "yellow", (10.0, 8.0), &wasm(HUNTER_WAT))
+        spawn(HUNTER_CODE, "H", "yellow", (10.0, 8.0), &wasm(&hunter_wat()))
     } else {
         false
     };
@@ -3908,29 +3692,45 @@ fn defender_wat(shield: i32) -> String {
     )
 }
 
-/// 搅局者 H 的玩家代码 WAT（黄色，性格：投机者——挑软柿子捏，远程搅局为主）
+/// 搅局者 H 的玩家代码 WAT 生成器（黄色，性格：投机者——挑软柿子捏，远程搅局为主）
 ///
-/// 策略（on_tick 每 tick 执行；#034 弹道系统生物适配：主战手段换 shoot 抛射，
-/// 近战只留贴身机会刀——原 3 格参战刀在接触化后全落空，投机者不追击肉搏）：
+/// 策略（on_tick 每 tick 执行；【D-018】#045 弹丸退役后的投掷器形态：主战手段
+/// = spawn 一体式投掷（"第一课：拼一个投掷器"的实战范例），近战只留贴身机会刀
+/// ——投机者不追击肉搏）：
 /// 1. scan 找最近敌人，找不到（log 0）就待机（全场只剩自己时不折腾）
-/// 2. 每 8 拍向最近敌人抛射一发（log 12）：vx = dx/1.71（mass 0.5 阻力下两拍
-///    回到出手高度的弹道系数）、vy = +14.7（顶一拍半重力的上抛补偿）、
-///    mass 0.5、空 payload 击杀弹。打不打得中看敌人站没站在弹道上——
-///    参数是生物自己拼的，打不中=参数没拼对（弹道涌现，框架不管）
+/// 2. 每 8 拍向最近敌人投掷一发造物弹（log 12）：spawn 一体式（子弹代码内嵌
+///    data 段）+ 出生初速第 11/12 参。弹道系数按中点口径换算重标（积分器双轨
+///    注记见 physics step：半隐式轨随弹丸退役）——vx = dx/1.805、vy = +9.53
+///    （mass 0.5 阻力 factor 0.9 下两拍回到出手高度的解析换算：两拍 y 位移和
+///    = 1.805·vy - 17.199 ≈ 0 → vy=9.53；两拍 x 位移和 = 1.805·vx = dx），
+///    同款两拍回弧手感（t2 末恰落 10 格外目标身位，验收锚
+///    hunter_shoots_projectile_at_eighth_tick_and_hits_static_victim 同态保留）。
+///    mass 0.5、radius 0.15 同款小弹、binding 0、motion 1=dynamic。打不打得中
+///    看敌人站没站在弹道上——参数是生物自己拼的（弹道涌现，框架不管）
 /// 3. 距离 <= 1.0（贴身判距内）：机会刀（log 5）对敌人坐标排空 payload
 /// 4. 其余：观望游走（log 4，x 方向 ±0.5，方向按 tick 奇偶——WAT 无随机源）
 /// 5. on_attack（被攻击时）：50% 拦截（奇数 tick 拦，log 6），否则放行
 ///
+/// 发射点外推（投掷器教学点）：出生点沿发射方向前移 (0.5+0.15+0.1)=0.75 格
+/// ——出生重叠拒绝（#030）的物理诚实外推，出膛即离身（CCD 无发射者豁免）。
+///
 /// 日志 marker：0=无敌待机 4=观望游走 5=贴身机会刀 6=拦截成功 12=抛射
-const HUNTER_WAT: &str = r#"(module
+fn hunter_wat() -> String {
+    // 子弹 WAT 内嵌转义：外层 WAT 的 data 段字符串里 " 转义为 \"
+    let shell_escaped = shell_wat_escaped();
+    format!(
+        r#"(module
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
   (import "env" "scan" (func $scan (param i32 i32) (result i32)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
   (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
-  ;; tick 计数：on_attack 的 50% 伪随机源（奇=拦截），也是游走方向源与射击节拍源
+  (data (i32.const 4096) "{shell_escaped}\00")
+  (data (i32.const 16384) ".\00")
+  (data (i32.const 16448) "yellow\00")
+  ;; tick 计数：on_attack 的 50% 伪随机源（奇=拦截），也是游走方向源与投掷节拍源
   (global $ticks (mut i32) (i32.const 0))
   ;; 被攻击：奇数 tick 拦截（log 6），偶数放行
   (func (export "on_attack") (param i32) (result i32)
@@ -3944,6 +3744,7 @@ const HUNTER_WAT: &str = r#"(module
   (func (export "on_tick")
     (local $ex f64) (local $ey f64) (local $mx f64) (local $my f64)
     (local $dx f64) (local $dy f64) (local $dist f64)
+    (local $ux f64) (local $uy f64)
     global.get $ticks i32.const 1 i32.add global.set $ticks
     ;; 1. 扫描最近敌人；没有就待机
     (if (i32.eqz (call $scan (i32.const 0) (i32.const 8)))
@@ -3960,17 +3761,37 @@ const HUNTER_WAT: &str = r#"(module
     (local.set $dist (f64.sqrt
       (f64.add (f64.mul (local.get $dx) (local.get $dx))
                (f64.mul (local.get $dy) (local.get $dy)))))
-    ;; 2. 每 8 拍抛射一发（vx=dx/1.71 两拍回弧、vy=+14.7 上抛补偿、mass 0.5、
-    ;;    binding 0=unbound——弹道照旧回归锚）。装填拍到此为止（不游走不出刀）
-    ;;    ——弹丸从实况位置出手，本拍移动会带偏弹道
+    ;; 2. 每 8 拍投掷一发造物弹（spawn 一体式：vx=(dx-0.75)/1.805 两拍回弧
+    ;;    （dx 扣除外推 0.75=出生点到靶的剩余距离）、vy=+9.53 上抛补偿、
+    ;;    mass 0.5、radius 0.15、binding 0、motion 1——弹道照旧回归锚）。
+    ;;    装填拍到此为止（不游走不出刀）——弹从实况位置出手，本拍移动会带偏
+    ;;    弹道。发射点=自身位置沿发射方向外推 0.75 格（r和+余量，#030 出生
+    ;;    重叠拒绝的物理诚实出膛）
     (if (i32.eqz (i32.rem_u (global.get $ticks) (i32.const 8)))
       (then
         (call $log (i32.const 12))
-        (drop (call $shoot
-          (f64.div (local.get $dx) (f64.const 1.71))
-          (f64.const 14.7)
+        (local.set $ux (f64.div (local.get $dx) (local.get $dist)))
+        (local.set $uy (f64.div (local.get $dy) (local.get $dist)))
+        (drop (call $spawn
+          (i32.const 4096)
+          (i32.const {shell_len})
+          (f64.add (local.get $mx) (f64.mul (local.get $ux) (f64.const 0.75)))
+          (f64.add (local.get $my) (f64.mul (local.get $uy) (f64.const 0.75)))
+          (i32.const 16384)
+          (i32.const 16448)
+          (f64.const 0.15)
           (f64.const 0.5)
-          (i32.const 0) (i32.const 0) (i32.const 0)))
+          (i32.const 0)
+          (i32.const 1)
+          (f64.div (f64.sub (local.get $dx) (f64.const 0.75)) (f64.const 1.805))
+          (f64.const 9.53)
+          (i32.const 0)
+          (i32.const 0)
+          (f64.const 0.0)
+          (f64.const 1.0)
+          (f64.const 0.0)
+          (f64.const 0.0)
+          (f64.const 0.0)))
         (return)))
     ;; 3. 贴身机会刀（dist <= 1.0 在贴身判距内；投机者不追击肉搏）
     (if (f64.le (local.get $dist) (f64.const 1.0))
@@ -3984,7 +3805,10 @@ const HUNTER_WAT: &str = r#"(module
     (if (i32.eqz (i32.and (global.get $ticks) (i32.const 1)))
       (then (drop (call $move_by (f64.const 0.5) (f64.const 0.0))))
       (else (drop (call $move_by (f64.const -0.5) (f64.const 0.0))))))
-  (func (export "life") (result i32) i32.const 1))"#;
+  (func (export "life") (result i32) i32.const 1))"#,
+        shell_len = CTRL_SHELL_WAT.len(),
+    )
+}
 
 /// 伪装者 S 的玩家代码 WAT（紫色，性格：间谍——悬停高空+高调侦察+撒谎身份+轻装替身）
 ///
@@ -4884,12 +4708,19 @@ mod tests {
         pond.set_liquid_density(1.0);
         pond.set_liquid_drag(0.35);
         world.entities.insert(pond.id, pond);
-        // 木球与铁球：域内测试插入（r=0.5 生物身体）
-        let mut wood = make_entity_of_owner(1, 88, (30.5, 0.5));
+        let mut pond2 = make_entity_of_owner(10, 88, (31.0, 0.0));
+        pond2.code_hash = "creation".to_string();
+        pond2.set_liquid_density(1.0);
+        pond2.set_liquid_drag(0.35);
+        world.entities.insert(pond2.id, pond2);
+        // 木球与铁球：域内测试插入（r=0.5 生物身体）。【D-018 CCD 语义适配】
+        // 两球错位出生（圆心距 1.3 ≥ 半径和）——深重叠双球在撞体截断下=固体
+        // 堆叠（浮体被沉体压住浮不起来是正确物理），对比实验要求两球独立浮沉
+        let mut wood = make_entity_of_owner(1, 88, (30.3, 0.5));
         wood.set_mass(0.4); // ρ物≈0.51 < 1 浮
         let wood_id = wood.id;
         world.entities.insert(wood_id, wood);
-        let mut iron = make_entity_of_owner(2, 88, (30.5, 0.9));
+        let mut iron = make_entity_of_owner(2, 88, (31.6, 0.5));
         iron.set_mass(10.0); // ρ物≈12.7 > 1 沉
         let iron_id = iron.id;
         world.entities.insert(iron_id, iron);
@@ -4898,11 +4729,11 @@ mod tests {
         let mut late_wood_peak = 0.0f64; // 末段相位鲁棒观测（振荡收敛中的浮体不在固定位相）
         for t in 0..20 {
             let liquids = codeworld_physics::liquid::collect_liquid_domains(&world);
-            assert_eq!(liquids.len(), 1, "水域造物应每拍入液体域清单");
+            assert_eq!(liquids.len(), 2, "两块水域造物应每拍入液体域清单");
             assert_eq!(
                 (liquids[0].min, liquids[0].max),
                 ((30.0, 0.0), (31.0, 1.0)),
-                "水域=AABB（格对齐 1×1）"
+                "水域=AABB（格对齐 1×1，id 序稳定投影）"
             );
             physics.step_with_liquids(&mut world, &aloft, &[], &liquids);
             let wy = world.entities.get(&wood_id).unwrap().pos().1;
@@ -8805,21 +8636,58 @@ mod tests {
   (func (export "get_shield") (result i32) global.get $shield)
   (func (export "get_intercepts") (result i32) global.get $intercepts))"#;
 
-    /// 一次性射手 WAT：首拍向固定方向 shoot（vx=4, vy=+14.7 两拍回弧, mass 1.0），
-    /// 之后待机。配合靶位 (12.41, 0.5)（射手位 +7.41 = 1.8525×vx 两拍回弧落点）
-    const SHOOTER_ONCE_WAT: &str = r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+    /// 一次性投掷器 WAT（【D-018】造物弹版）：首拍 spawn 一体式造物弹（出生点
+    /// 沿 +x 外推 0.75 格出膛、vx=3.6897（=6.66 格/1.805 两拍回弧系数）、
+    /// vy=+9.53 上抛补偿、mass 1.0、radius 0.15、motion 1），之后待机。
+    /// 配合靶位 (12.41, 0.5)（出生位 (5.75,0.5) +6.66 格两拍回弧落点——t2 末
+    /// 弹心距靶 0.62 < 0.65 接触窗口，命中归接触通道次拍结算）
+    fn shooter_once_wat() -> String {
+        let shell_escaped = shell_wat_escaped();
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (import "env" "log" (func $log (param i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
+  (data (i32.const 0) "{shell_escaped}\00")
+  (data (i32.const 16384) ".\00")
+  (data (i32.const 16448) "red\00")
   (func (export "on_tick")
     (if (i32.eqz (global.get $done))
       (then
         (global.set $done (i32.const 1))
         (call $log (i32.const 21))
-        (drop (call $shoot (f64.const 4.0) (f64.const 14.7)
-                           (f64.const 1.0) (i32.const 0) (i32.const 0) (i32.const 0))))))
-  (func (export "life") (result i32) i32.const 1))"#;
+        (drop (call $spawn
+          (i32.const 0)
+          (i32.const {shell_len})
+          (f64.const 5.75)
+          (f64.const 0.5)
+          (i32.const 16384)
+          (i32.const 16448)
+          (f64.const 0.15)
+          (f64.const 1.0)
+          (i32.const 0)
+          (i32.const 1)
+          (f64.const 3.6897)
+          (f64.const 9.53)
+          (i32.const 0)
+          (i32.const 0)
+          (f64.const 0.0)
+          (f64.const 1.0)
+          (f64.const 0.0)
+          (f64.const 0.0)
+          (f64.const 0.0))))))
+  (func (export "life") (result i32) i32.const 1))"#,
+            shell_len = CTRL_SHELL_WAT.len(),
+        )
+    }
+
+    /// 造物弹判定（测试辅助，D-018 后的"弹"=code_hash=creation 且 motion=dynamic
+    /// 的小半径造物——区别于塔等 static 造物；legacy 弹丸判定 is_projectile 仍
+    /// 服务历史实体兼容测试）
+    fn is_creation_shell(e: &Entity) -> bool {
+        codeworld_core::collision::is_dynamic_creation(e) && e.radius() <= 0.15 + 1e-9
+    }
 
     /// 构造弹丸实体（测试用：code_hash=projectile + 半径/速度）
     fn make_projectile(id_u: u128, pos: (f64, f64), vel: (f64, f64)) -> Entity {
@@ -8837,26 +8705,30 @@ mod tests {
         e
     }
 
-    #[test]
+            #[test]
     fn smoke_ballistics_launch_to_intercept_evidence_chain() {
-        // 验收#3 冒烟（进程内代 + 证据链）：射手向静态盾靶发射弹丸，两拍命中被盾拦截。
-        // 证据链四事件走状态取证（battle.log 对应行：[shoot] 射击已排队 / [弹丸诞生] /
-        // [弹丸命中] / [player_log] marker=7——真实起服 INFO 日志可直接 grep）：
-        // 发射=射手沙箱 api_calls 含 shoot；飞行=弹丸实体离手位移；命中拦截=弹丸消亡
-        // + 靶盾 3→2 + 靶沙箱 markers 含拦截 marker 7。
-        // 弹道：射手(5,0.5) 初速 (4,14.7) mass1，两拍回弧：t1 (8.8,5.155) t2 落靶身。
+        // 验收#3 冒烟（进程内代 + 证据链，【D-018】造物弹版）：投掷器向静态盾靶
+        // 投掷造物弹，两拍命中接触 + 次拍结算被盾拦截。
+        // 证据链四事件走状态取证（battle.log 对应行：[spawn] 造物请求已排队 /
+        // [造物诞生] / [contact] / [player_log] marker=7——真实起服 INFO 日志可
+        // 直接 grep）：发射=射手沙箱 api_calls 含 spawn；飞行=造物弹离手位移；
+        // 命中拦截=造物弹消亡 + 靶盾 3→2。
+        // 弹道（中点口径）：出生 (5.75,0.5) 初速 (3.6897,9.53)，两拍回弧：
+        // t1 (9.557,5.137) t2 落靶身接触；接触拍 on_contact 排队 attack，次拍
+        // a2 结算（拦截）+ 弹 life()=0 消亡——投掷器时序教学点。
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), SHOOTER_ONCE_WAT);
+        let shooter =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), &shooter_once_wat());
         let target = make_entity_with_sandbox(&mut world, &mut map, 2, (12.41, 0.5), SHOOT_TARGET_WAT);
         let mut time = TimeEngine::new();
         let physics = DefaultPhysicsEngine::new();
         let mut renderer = test_renderer();
         let mut storage = StorageEngine::open_in_memory().unwrap();
         let mut pending: Vec<PendingChange> = Vec::new();
-        // tick1：射击排队 -> 弹丸诞生 -> 第一拍飞行
+        // tick1：spawn 排队 -> 造物弹诞生 -> 第一拍飞行
         tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
-        // 证据链1 发射：射手沙箱调过 shoot（api_calls 元数据）
+        // 证据链1 发射：射手沙箱调过 spawn（api_calls 元数据）
         assert!(
             map.sandboxes
                 .get(&shooter)
@@ -8864,30 +8736,37 @@ mod tests {
                 .store
                 .data()
                 .api_calls
-                .contains(&"shoot".to_string()),
-            "证据链1：射手应调过 shoot"
+                .contains(&"spawn".to_string()),
+            "证据链1：投掷器应调过 spawn"
         );
-        // 证据链2 飞行：弹丸实体在世且已离手位移（第一拍积分到 (8.8,5.155) 附近）
-        assert_eq!(world.entities.len(), 3, "tick1 世界应有 射手+靶+弹丸");
+        // 证据链2 飞行：造物弹在世且已离手位移（第一拍积分到 (9.3475,5.1367)
+        // 附近——出生 (5.75,0.5) + 中点位移 (3.5975,4.63675)）
+        assert_eq!(world.entities.len(), 3, "tick1 世界应有 投掷器+靶+造物弹");
         let proj = world
             .entities
             .values()
-            .find(|e| codeworld_core::collision::is_projectile(e))
-            .expect("tick1 应有 1 颗在飞弹丸");
+            .find(|e| is_creation_shell(e))
+            .expect("tick1 应有 1 颗在飞造物弹");
         assert!(
-            (proj.pos().0 - 8.8).abs() < 1e-9 && (proj.pos().1 - 5.155).abs() < 1e-9,
-            "证据链2：弹丸第一拍应飞到 (8.8,5.155)，实际 {:?}",
+            (proj.pos().0 - 9.3475).abs() < 1e-3 && (proj.pos().1 - 5.1367).abs() < 1e-3,
+            "证据链2：造物弹第一拍应飞到 (9.3475,5.1367)，实际 {:?}",
             proj.pos()
         );
-        // tick2：弹丸命中靶身 -> 盾拦截 -> 弹丸消亡（死亡清理移除）
+        // tick2：造物弹命中靶身（接触截断）-> on_contact 排队 attack（次拍结算）
         tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
-        // 证据链3 命中：弹丸消亡（死亡清理移除）
         assert!(
-            world
-                .entities
-                .values()
-                .all(|e| !codeworld_core::collision::is_projectile(e)),
-            "证据链3：命中后弹丸应消亡"
+            world.entities.get(&target).unwrap().is_alive(),
+            "接触拍：拦截结算在次拍，靶仍存活"
+        );
+        // tick3：attack 结算被盾拦截（弹 $age=1 仍存活——结算需要攻击者在册）
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(world.entities.get(&target).unwrap().is_alive(), "盾拦截：靶存活");
+        // tick4：弹 $age=2 life()=0 消亡（命中即消亡的代码版，死亡清理移除）
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        // 证据链3 命中：造物弹消亡（命中即亡，死亡清理移除）
+        assert!(
+            world.entities.values().all(|e| !is_creation_shell(e)),
+            "证据链3：命中后造物弹应消亡（$fired→life=0）"
         );
         // 证据链4 拦截：靶存活 + 盾 3→2 + 拦截计数 1（状态取证——markers 每拍字幕步
         // 被 drain 不可靠，沙箱内计数器才是持久证据；真实起服的 [player_log] marker=7
@@ -8896,7 +8775,7 @@ mod tests {
         assert_eq!(
             call_i32_export(&mut map, &target, "get_shield"),
             2,
-            "证据链4：盾 3 拦 1 刀应剩 2（弹丸结算走 on_attack 管线）"
+            "证据链4：盾 3 拦 1 刀应剩 2（造物弹 attack 走 on_attack 管线）"
         );
         assert_eq!(
             call_i32_export(&mut map, &target, "get_intercepts"),
@@ -8960,30 +8839,27 @@ mod tests {
         );
     }
 
-    // === #036 期五第五刀：操控定装弹（WS 远程射击；驾驶档，玩家代码 shoot 才是自定义弹道）===
+    // === #036 期五第五刀：操控定装弹（WS 远程射击；驾驶档，自定义弹道=玩家拼投掷器）===
 
-    /// 世界内弹丸计数（断言辅助）
+    /// 世界内造物弹计数（断言辅助，【D-018】弹=dynamic 小半径造物）
     fn count_projectiles(world: &WorldState) -> usize {
-        world
-            .entities
-            .values()
-            .filter(|e| codeworld_core::collision::is_projectile(e))
-            .count()
+        world.entities.values().filter(|e| is_creation_shell(e)).count()
     }
 
     // ===== 炮塔解算器（期五第六刀）：solve_launch_vector 纯函数测试 =====
 
-    /// 弹道模拟采样（测试辅助）：定装弹从 出发逐拍推演，与弹道步
-    /// step_projectiles 同序（重力→阻力→极速钳→位移），落地 y<半径截断。
-    /// 返回逐拍末坐标（含起点）。
+    /// 弹道模拟采样（测试辅助）：定装造物弹从 出发逐拍推演，与 physics step
+    /// 冲量路径同序（重力→阻力→极速钳→中点位移，【D-018】积分器同步），
+    /// 落地 y<半径截断。返回逐拍末坐标（含起点）。
     /// 【#044 子步宪法锚】N=1 整步积分，步数由状态决定（落地/寿命截断），
     /// 纯状态驱动零机器数据——与 solve_launch_vector 内 simulate_path 同构。
     fn sim_trajectory(sx: f64, sy: f64, mut vx: f64, mut vy: f64) -> Vec<(f64, f64)> {
         let p = codeworld_core::physics::DefaultPhysics::default();
-        let r = codeworld_core::collision::PROJECTILE_RADIUS;
+        let r = CTRL_SHELL_RADIUS;
         let mut pts = vec![(sx, sy)];
         let (mut x, mut y) = (sx, sy);
-        for _ in 0..codeworld_physics::default::PROJECTILE_MAX_AGE_TICKS {
+        for _ in 0..CTRL_SOLVE_MAX_TICKS {
+            let (vx0, vy0) = (vx, vy);
             vy += p.gravity;
             let f = 1.0 - p.drag_coefficient / CTRL_SHOOT_MASS;
             vx *= f;
@@ -8994,8 +8870,8 @@ mod tests {
                 vx *= k;
                 vy *= k;
             }
-            x += vx;
-            y += vy;
+            x += (vx0 + vx) * 0.5;
+            y += (vy0 + vy) * 0.5;
             pts.push((x, y));
             if y < r {
                 break;
@@ -9152,10 +9028,12 @@ mod tests {
 
     #[test]
     fn ws_shoot_intent_spawns_projectile_with_fixed_loadout() {
-        // 端到端：WsShoot 意图 -> 操控目标发射弹丸（解算初速/mass 1.0/
-        // binding 0/payload 空），弹丸进世界+账本，发射位=拍末实况坐标
+        // 端到端（【D-018】造物弹版）：WsShoot 意图 -> 操控目标 spawn 定装造物弹
+        //（解算初速/mass 1.0/binding 0/motion dynamic），弹进世界，出生位=
+        // 发射点沿发射方向外推 0.75 格（发射者半径+弹半径+余量）
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
+        let owner = world.entities.get(&pid).unwrap().owner;
         let intents = vec![input::Intent::WsShoot { x: 45.0, y: 0.5 }];
         tick_with_intents(
             &mut world,
@@ -9167,29 +9045,25 @@ mod tests {
             &mut map,
             &intents,
         );
-        assert_eq!(count_projectiles(&world), 1, "WsShoot 诞生恰好 1 发弹丸");
-        let p = world
-            .entities
-            .values()
-            .find(|e| codeworld_core::collision::is_projectile(e))
-            .unwrap();
-        // 首步位置=解算初速经首拍物理（重力+阻力→位移）的消费结果——
-        // 与纯函数解算逐位一致（镜像铁律的服务器内侧锚）
+        assert_eq!(count_projectiles(&world), 1, "WsShoot 诞生恰好 1 发造物弹");
+        let p = world.entities.values().find(|e| is_creation_shell(e)).unwrap();
+        // 首步位置=出生点（发射点外推 0.75）+ 解算初速经首拍物理（重力+阻力→
+        // 中点位移）的消费结果——与纯函数解算逐位一致（镜像铁律的服务器内侧锚；
+        // x 向直射目标，外推 ux=1）
         let sol = solve_launch_vector(30.0, 0.5, 45.0, 0.5, CTRL_SHOOT_SPEED)
             .expect("15 格地面目标应有解");
         let pts = sim_trajectory(30.0, 0.5, sol.0, sol.1);
         let (ex, ey) = pts[1];
         let (px, py) = p.pos();
         assert!(
-            (px - ex).abs() < 1e-6 && (py - ey).abs() < 1e-6,
-            "首步位置应为解算初速经首拍物理（{ex},{ey}），实际 ({px},{py})"
+            (px - ex - 0.75).abs() < 1e-6 && (py - ey).abs() < 1e-6,
+            "首步位置应为出生点(外推0.75)+解算初速经首拍物理（{ex},{ey}），实际 ({px},{py})"
         );
         assert!(py > 0.6, "首步 y 应离地上升（弹道离地），实际 {py}");
         assert_eq!(p.mass(), CTRL_SHOOT_MASS, "定装质量");
         assert_eq!(p.binding(), 0, "定装绑定=unbound");
-        let meta = map.projectiles.values().next().expect("弹丸账本在册");
-        assert_eq!(meta.shooter, pid, "发射者=操控目标");
-        assert!(meta.payload.is_empty(), "定装 payload 空（默认击杀模块）");
+        assert_eq!(p.owner, owner, "产权链：造物弹归属操控目标 owner");
+        assert!(world.entities.get(&pid).unwrap().is_alive(), "操控目标存活");
     }
 
     #[test]
@@ -9213,8 +9087,8 @@ mod tests {
 
     #[test]
     fn ws_shoot_rate_limited_to_one_per_tick() {
-        // 同拍限流沿用（shoot import 1 发/拍在操控路径同样生效）：一批两次点击射
-        // 后到折叠成单行动 -> 恰 1 发
+        // 同拍限流沿用（spawn 1 次/拍在操控路径同样生效——route 单行动折叠）：
+        // 一批两次点击射后到折叠成单行动 -> 恰 1 发
         let (mut world, mut time, physics, mut renderer, mut storage, mut pending, mut map, _pid, _me_dir) =
             control_stage(AUTO_MOVER_WAT);
         let intents = vec![
@@ -9314,210 +9188,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn process_shoots_spawns_projectile_entity_with_meta() {
-        // 发射落地：PendingShoot -> 弹丸实体（code_hash=projectile/半径 0.15/速度/质量/
-        // glyph=. / 颜色=发射者色）+ 发射账本（发射者+payload）
-        let mut world = WorldState::new();
-        let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        world.entities.get_mut(&shooter).unwrap().appearance.color = "purple".to_string();
-        map.sandboxes
-            .get_mut(&shooter)
-            .unwrap()
-            .store
-            .data_mut()
-            .pending_shoots
-            .push(codeworld_arena::sandbox::PendingShoot {
-                shooter,
-                vx: 3.0,
-                vy: 4.0,
-                mass: 0.5,
-                binding: 0,
-                payload: vec![1, 2, 3],
-            });
-        process_shoots(&mut world, &mut map, 7);
-        assert_eq!(world.entities.len(), 2, "弹丸应入世");
-        let proj = world
-            .entities
-            .values()
-            .find(|e| codeworld_core::collision::is_projectile(e))
-            .expect("应有弹丸实体");
-        assert_eq!(proj.pos(), (5.0, 0.5), "从发射者当前位置出手");
-        assert_eq!(proj.velocity(), (3.0, 4.0));
-        assert_eq!(proj.mass(), 0.5);
-        assert_eq!(proj.radius(), 0.15, "弹丸身体半径 0.15");
-        assert_eq!(proj.appearance.glyph, ".", "弹丸小圆点");
-        assert_eq!(proj.appearance.color, "purple", "颜色=发射者 glyph 色");
-        assert_eq!(proj.created_tick, 7);
-        let (pid, meta) = map.projectiles.iter().next().expect("应有发射账本");
-        assert_eq!(meta.shooter, shooter, "账本记发射者");
-        assert_eq!(meta.payload, vec![1, 2, 3], "账本记 payload");
-        let _ = pid;
-    }
-
-    // === 发射痕迹（#034 修订三：发射即暴露，世界只保证"打了就有记录"）===
-
-    fn push_shoot(map: &mut EntitySandboxMap, shooter: EntityId, vx: f64, vy: f64, mass: f64) {
-        map.sandboxes
-            .get_mut(&shooter)
-            .unwrap()
-            .store
-            .data_mut()
-            .pending_shoots
-            .push(codeworld_arena::sandbox::PendingShoot {
-                shooter,
-                vx,
-                vy,
-                mass,
-                binding: 0,
-                payload: vec![],
-            });
-    }
-
-    #[test]
-    fn shoot_leaves_one_tick_trace_for_weak_shell() {
-        // 弱弹（动能 5 = 速度5×质量1 < 阈值50）痕迹 1 拍：位置=发射点、记发射者与拍号
-        let mut world = WorldState::new();
-        let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        push_shoot(&mut map, shooter, 3.0, 4.0, 1.0);
-        process_shoots(&mut world, &mut map, 7);
-        assert_eq!(map.traces.len(), 1, "发射应留痕迹");
-        let t = &map.traces[0];
-        assert_eq!(t.pos, (5.0, 0.5), "痕迹位置=发射点");
-        assert_eq!(t.shooter, shooter, "痕迹记发射者");
-        assert_eq!(t.birth_tick, 7, "痕迹记发射拍号");
-        assert_eq!(t.ttl, 1, "弱弹痕迹寿命 1 拍");
-        // 痕迹不是实体：不进世界账面、不占碰撞
-        assert!(world
-            .entities
-            .values()
-            .all(|e| e.id != t.trace_id), "痕迹实体不进 world");
-    }
-
-    #[test]
-    fn shoot_leaves_three_tick_trace_for_high_kinetic_shell() {
-        // 强弹（动能 200 = 速度20×质量10 > 阈值50）痕迹 3 拍封顶
-        let mut world = WorldState::new();
-        let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        push_shoot(&mut map, shooter, 20.0, 0.0, 10.0);
-        process_shoots(&mut world, &mut map, 7);
-        assert_eq!(map.traces[0].ttl, 3, "强弹痕迹寿命封顶 3 拍");
-    }
-
-    #[test]
-    fn launch_trace_expires_after_ttl() {
-        // 寿命：诞生拍（阶段二）存续，之后每拍结算递减——弱弹在诞生次拍清算后消失
-        let mut world = WorldState::new();
-        let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        push_shoot(&mut map, shooter, 3.0, 4.0, 1.0);
-        process_shoots(&mut world, &mut map, 7);
-        map.expire_traces(7);
-        assert_eq!(map.traces.len(), 1, "诞生拍清算不消（还没被任何一拍看见过）");
-        map.expire_traces(8);
-        assert!(map.traces.is_empty(), "次拍清算消亡（恰好可见一拍：第 8 拍的眼睛层）");
-    }
-
-    #[test]
-    fn launch_trace_enters_visible_lists() {
-        // 可探测：痕迹进 visible 列表（眼睛层），对所有沙箱可见（含发射者自己——
-        // 自己当然知道自己开过火）
-        let mut world = WorldState::new();
-        let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        push_shoot(&mut map, shooter, 3.0, 4.0, 1.0);
-        process_shoots(&mut world, &mut map, 7);
-        let bb = BoundingBox::new(-50.0, -25.0, 50.0, 25.0);
-        map.fill_visible_snapshots(&world, &bb);
-        let vis = map.sandboxes[&shooter].store.data().visible.clone();
-        assert!(
-            vis.contains(&(5.0, 0.5)),
-            "痕迹坐标应出现在可见列表（发射者自己视角）"
-        );
-        // probe 桥的数据源同样带痕迹（traces 摘要与 visible 平行）
-        assert_eq!(map.traces.len(), 1);
-    }
 
     // === 绑定契约（#034 修订四：出生声明，世界每拍托管执行——遗嘱模式）===
-
-    fn push_binding_shoot(
-        map: &mut EntitySandboxMap,
-        shooter: EntityId,
-        vx: f64,
-        vy: f64,
-        mass: f64,
-        binding: i32,
-    ) {
-        map.sandboxes
-            .get_mut(&shooter)
-            .unwrap()
-            .store
-            .data_mut()
-            .pending_shoots
-            .push(codeworld_arena::sandbox::PendingShoot {
-                shooter,
-                vx,
-                vy,
-                mass,
-                binding,
-                payload: vec![],
-            });
-    }
-
-    #[test]
-    fn fade_on_death_shell_dies_same_tick_owner_dies() {
-        // 同生弹：主人死那一拍弹即无（托管执行不等下一拍物理）——弹丸标记死亡
-        // （死亡清理链移除）+ 发射账本清空
-        let mut world = WorldState::new();
-        let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        push_binding_shoot(&mut map, shooter, 3.0, 0.0, 1.0, codeworld_core::entity::BINDING_FADE_ON_DEATH);
-        process_shoots(&mut world, &mut map, 3);
-        assert_eq!(map.projectiles.len(), 1, "弹已出手在飞");
-        // 主人当场死亡（击杀/衰减/登出三路同源：实体 kill 即死）
-        world.entities.get_mut(&shooter).unwrap().kill();
-        enforce_binding_deaths(&mut world, &mut map);
-        assert!(
-            !map.projectiles.iter().any(|(pid, _)| world
-                .entities
-                .get(pid)
-                .map(|e| e.is_alive())
-                .unwrap_or(false)),
-            "同生契约生效：弹丸不再有活体在册"
-        );
-        assert!(map.projectiles.is_empty(), "发射账本同步清空");
-        let proj = world
-            .entities
-            .values()
-            .find(|e| codeworld_core::collision::is_projectile(e))
-            .expect("弹丸实体仍在账面（尸体由清理链移除）");
-        assert!(!proj.is_alive(), "弹丸已标记死亡");
-    }
-
-    #[test]
-    fn unbound_shell_keeps_flying_after_owner_death() {
-        // unbound 回归锚：主人死弹照飞（离体即世界之物，同生不共死=现状默认）
-        let mut world = WorldState::new();
-        let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        push_binding_shoot(&mut map, shooter, 3.0, 0.0, 1.0, codeworld_core::entity::BINDING_UNBOUND);
-        process_shoots(&mut world, &mut map, 3);
-        world.entities.get_mut(&shooter).unwrap().kill();
-        enforce_binding_deaths(&mut world, &mut map);
-        assert_eq!(map.projectiles.len(), 1, "unbound 弹不随主消亡");
-        assert!(
-            world
-                .entities
-                .values()
-                .find(|e| codeworld_core::collision::is_projectile(e))
-                .unwrap()
-                .is_alive(),
-            "unbound 弹照飞"
-        );
-    }
 
     #[test]
     fn fade_on_death_tower_dies_with_creator_unbound_tower_survives() {
@@ -9597,26 +9269,39 @@ mod tests {
         assert_eq!(strikes.len(), 1, "unbound 落地砸自己照常进结算");
         assert_eq!(strikes[0].target, shooter, "目标就是发射者自己");
     }
-
     #[test]
     fn grace_owner_upward_shell_lands_at_feet_without_self_kill() {
-        // 端到端冒烟（进程内代 headless）：grace_owner 上抛弹（binding=2）垂直升空
-        // -> CCD 落回脚下（落点在自己身体内）-> 落地结算被豁免 -> 发射者无伤
-        const GRACE_UPWARD_WAT: &str = r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
-  (global $done (mut i32) (i32.const 0))
-  (memory (export "memory") 1)
-  (func (export "on_tick")
-    (if (i32.eqz (global.get $done))
-      (then
-        (global.set $done (i32.const 1))
-        (drop (call $shoot (f64.const 0.0) (f64.const 14.7)
-                           (f64.const 1.0) (i32.const 0) (i32.const 0) (i32.const 2))))))
-  (func (export "life") (result i32) i32.const 1))"#;
+        // 端到端冒烟（进程内代 headless，【D-018】造物弹版）：grace_owner 上抛
+        // 造物弹（spawn 第 9 参 binding=2）垂直升空 -> CCD 落回贴身旁停驻 ->
+        // 贴身接触触发 on_contact 出刀被 grace 豁免 -> 发射者无伤。
+        // 造物弹出生点外推 0.75 格贴身旁（#030 出生重叠拒绝），初速 (0,14.7)
+        // 垂直上抛——落点在发射者贴身邻域（宽限接触通道触发）
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), GRACE_UPWARD_WAT);
+        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
         let points_before = world.entities.get(&shooter).unwrap().survival.points();
+        // 主程序直发造物弹（spawn 路径同款构造）：binding=2 grace_owner、垂直初速
+        let shell = PendingSpawn {
+            creator: shooter,
+            pos: (5.75, 0.5),
+            code: CTRL_SHELL_WAT.to_string(),
+            glyph: ".".to_string(),
+            color: "red".to_string(),
+            radius: 0.15,
+            mass: 1.0,
+            binding: codeworld_core::entity::BINDING_GRACE_OWNER,
+            motion: codeworld_core::entity::MOTION_DYNAMIC,
+            vx: 0.0,
+            vy: 14.7,
+            blob: Vec::new(),
+            field_radius: 0.0,
+            field_gravity_scale: 1.0,
+            field_drag_delta: 0.0,
+            liquid_density: 0.0,
+            liquid_drag: 0.0,
+            fuel_limit: 1_000_000,
+        };
+        process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
         let mut time = TimeEngine::new();
         let physics = DefaultPhysicsEngine::new();
         let mut renderer = test_renderer();
@@ -9625,13 +9310,6 @@ mod tests {
         for _ in 0..8 {
             tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
         }
-        assert!(
-            world
-                .entities
-                .values()
-                .all(|e| !codeworld_core::collision::is_projectile(e)),
-            "弹丸已落地消亡"
-        );
         let me = world.entities.get(&shooter).expect("发射者存活未清理");
         assert!(me.is_alive(), "grace_owner 上抛弹落回脚下不炸自己");
         assert_eq!(
@@ -9639,62 +9317,24 @@ mod tests {
             points_before,
             "豁免结算无掠夺（点数不动）"
         );
-    }
-
-
-    #[test]
-    fn process_shoots_dead_shooter_and_cap_void_requests() {
-        // 发射防御：发射者已死作废；达世界实体上限作废
-        let mut world = WorldState::new();
-        let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        map.sandboxes
-            .get_mut(&shooter)
-            .unwrap()
-            .store
-            .data_mut()
-            .pending_shoots
-            .push(codeworld_arena::sandbox::PendingShoot {
-                shooter,
-                vx: 1.0,
-                vy: 0.0,
-                mass: 1.0,
-                binding: 0,
-                payload: vec![],
-            });
-        world.entities.get_mut(&shooter).unwrap().kill();
-        process_shoots(&mut world, &mut map, 1);
-        assert_eq!(world.entities.len(), 1, "死者不出手（弹丸不诞生）");
-        // 上限：cap=1 已满
-        let mut world = WorldState::new();
-        let mut map = test_sandbox_map();
-        map.max_entities = 1;
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), PLAYER_WAT);
-        map.sandboxes
-            .get_mut(&shooter)
-            .unwrap()
-            .store
-            .data_mut()
-            .pending_shoots
-            .push(codeworld_arena::sandbox::PendingShoot {
-                shooter,
-                vx: 1.0,
-                vy: 0.0,
-                mass: 1.0,
-                binding: 0,
-                payload: vec![],
-            });
-        process_shoots(&mut world, &mut map, 1);
-        assert_eq!(world.entities.len(), 1, "达上限弹丸不诞生");
+        // 弹已落定（停驻贴地面/贴身，速度清零）——grace 豁免场景下不炸发射者
+        if let Some(shell_entity) = world.entities.values().find(|e| is_creation_shell(e)) {
+            assert_eq!(
+                shell_entity.velocity(),
+                (0.0, 0.0),
+                "上抛弹应已落定（CCD 触地截断贴面）"
+            );
+        }
     }
 
     #[test]
     fn projectile_flies_on_after_shooter_death_and_strike_voided() {
-        // owner 死亡时在飞弹丸照飞（已离体归世界），命中结算因攻击者已死作废
-        //（#002 死者刀作废既有法）：弹丸消亡、目标存活
+        // owner 死亡时在飞造物弹照飞（已离体归世界），命中投递因攻击者已死作废
+        //（#002 死者刀作废既有法）：造物弹消亡（$age 延迟死亡）、目标存活
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        let shooter = make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), SHOOTER_ONCE_WAT);
+        let shooter =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.5), &shooter_once_wat());
         let target = make_entity_with_sandbox(&mut world, &mut map, 2, (12.41, 0.5), TARGET_WAT);
         let mut time = TimeEngine::new();
         let physics = DefaultPhysicsEngine::new();
@@ -9702,19 +9342,22 @@ mod tests {
         let mut storage = StorageEngine::open_in_memory().unwrap();
         let mut pending: Vec<PendingChange> = Vec::new();
         tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
-        // 弹丸已出手（tick1 诞生在飞），发射者当场阵亡
+        // 造物弹已出手（tick1 诞生在飞），发射者当场阵亡
         world.entities.get_mut(&shooter).unwrap().kill();
         tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        // tick2 接触触发 on_contact（attack 排队）；tick3 结算——【D-018 新语义】
+        // attacker=造物弹自己（独立沙箱自飞自攻，dev-plan D-018 定案"攻击者身份=
+        // 子弹非手枪"），发射者之死不作废弹的刀：target 被杀掠夺归弹（owner 链）；
+        // tick4 弹 $age=2 消亡
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
         assert!(
-            world
-                .entities
-                .values()
-                .all(|e| !codeworld_core::collision::is_projectile(e)),
-            "弹丸照飞并已消亡（命中/落地路径收口）"
+            !world.entities.contains_key(&target),
+            "owner 死后造物弹照打（弹=独立攻击者，非发射者的刀）：目标被击杀移除"
         );
         assert!(
-            world.entities.get(&target).unwrap().is_alive(),
-            "发射者已死，弹丸命中结算作废（死者刀作废）目标存活"
+            world.entities.values().all(|e| !is_creation_shell(e)),
+            "造物弹照飞并已消亡（接触→延迟自灭收口）"
         );
         assert!(!world.entities.contains_key(&shooter), "死者被清理");
     }
@@ -9749,11 +9392,13 @@ mod tests {
 
     #[test]
     fn hunter_shoots_projectile_at_eighth_tick_and_hits_static_victim() {
-        // H 新行为：每 8 拍向最近敌人抛射（vx=dx/1.71、vy=+14.7、mass 0.5）。
-        // H@9.5（游走 7 拍后）对 10.5 格外的静止靶：两拍回弧落点恰在靶身 -> t9 命中击杀
+        // H 新行为（【D-018】投掷器版）：每 8 拍向最近敌人投掷造物弹（vx=dx/1.805、
+        // vy=+9.53、mass 0.5、radius 0.15、motion dynamic——中点口径两拍回弧系数）。
+        // H@9.5（游走 7 拍后）对 ~10.5 格外的静止靶：两拍回弧落点恰在靶身 -> 接触
+        // 拍（t9）on_contact 出刀、次拍（t10）结算击杀——G5 验收锚同态保留
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        let h = make_entity_with_sandbox(&mut world, &mut map, 1, (10.0, 0.5), HUNTER_WAT);
+        let h = make_entity_with_sandbox(&mut world, &mut map, 1, (10.0, 0.5), &hunter_wat());
         let victim = make_entity_with_sandbox(&mut world, &mut map, 2, (20.0, 0.5), TARGET_WAT);
         let mut time = TimeEngine::new();
         let physics = DefaultPhysicsEngine::new();
@@ -9761,17 +9406,14 @@ mod tests {
         let mut storage = StorageEngine::open_in_memory().unwrap();
         let mut pending: Vec<PendingChange> = Vec::new();
         let mut saw_projectile = false;
-        for _ in 0..10 {
+        for _ in 0..11 {
             tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
-            saw_projectile |= world
-                .entities
-                .values()
-                .any(|e| codeworld_core::collision::is_projectile(e) && e.is_alive());
+            saw_projectile |= world.entities.values().any(|e| is_creation_shell(e) && e.is_alive());
         }
-        assert!(saw_projectile, "10 拍内应见到 H 抛出的弹丸实体");
+        assert!(saw_projectile, "11 拍内应见到 H 投出的造物弹实体");
         assert!(
             !world.entities.contains_key(&victim),
-            "静止靶在 H 的两拍回弧弹道上 -> 弹丸命中击杀（无防守放行，死亡清理移除）"
+            "静止靶在 H 的两拍回弧弹道上 -> 造物弹接触出刀击杀（无防守放行，死亡清理移除）"
         );
         assert!(world.entities.get(&h).unwrap().is_alive(), "H 存活");
     }
@@ -9924,7 +9566,7 @@ mod tests {
             .entities
             .insert(enemy, make_creature(81, (20.0, 20.0), "far", "F", "gray"));
         let mut map = test_sandbox_map();
-        map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
+        map.create(h, &wasm(&hunter_wat()), 1_000_000).unwrap();
         map.create(enemy, &wasm(PLAYER_WAT), 1_000_000).unwrap();
         map.run_player_code(&world, &unbounded_bb());
         let markers = map.collect_all_log_markers();
@@ -9966,7 +9608,7 @@ mod tests {
             .entities
             .insert(enemy, make_creature(83, (1.0, 0.0), "prey", "P", "gray"));
         let mut map = test_sandbox_map();
-        map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
+        map.create(h, &wasm(&hunter_wat()), 1_000_000).unwrap();
         map.create(enemy, &wasm(TARGET_WAT), 1_000_000).unwrap();
         map.run_player_code(&world, &unbounded_bb());
         let markers = map.collect_all_log_markers();
@@ -9994,7 +9636,7 @@ mod tests {
         // H 防守：50% 拦截（tick 奇偶伪随机）——奇数 tick 拦截（marker 6），偶数放行
         let mut map = test_sandbox_map();
         let h = EntityId(Uuid::from_u128(84));
-        map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
+        map.create(h, &wasm(&hunter_wat()), 1_000_000).unwrap();
         // on_tick 自增 $ticks：调 1 次 -> ticks=1（奇）
         map.manager
             .call_on_tick(map.sandboxes.get_mut(&h).unwrap())
@@ -10033,7 +9675,7 @@ mod tests {
             .entities
             .insert(h, make_creature(85, (0.0, 0.0), "hunter", "H", "yellow"));
         let mut map = test_sandbox_map();
-        map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
+        map.create(h, &wasm(&hunter_wat()), 1_000_000).unwrap();
         map.run_player_code(&world, &unbounded_bb());
         let markers = map.collect_all_log_markers();
         assert!(
@@ -10063,7 +9705,7 @@ mod tests {
             .entities
             .insert(victim, make_creature(87, (1.0, 0.0), "prey", "P", "gray"));
         let mut map = test_sandbox_map();
-        map.create(h, &wasm(HUNTER_WAT), 1_000_000).unwrap();
+        map.create(h, &wasm(&hunter_wat()), 1_000_000).unwrap();
         map.create(victim, &wasm(TARGET_WAT), 1_000_000).unwrap();
         // 阶段一：H 参战排刀
         map.run_player_code(&world, &unbounded_bb());
@@ -11519,14 +11161,42 @@ mod tests {
         )
     }
 
-    /// 遗嘱射击模块：life=0 + on_death 排队 shoot（烟花：遗嘱排队的弹当拍发射）
-    const DYING_WILL_SHOOT_WAT: &str = r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
+    /// 遗嘱烟花模块生成器（【D-018】：shoot 通道退役——烟花=on_death 排队
+    /// spawn 造物弹（子弹代码内嵌+出生初速第 11/12 参），遗嘱 spawn 当拍放行）
+    fn dying_will_firework_wat() -> String {
+        let shell_escaped = shell_wat_escaped();
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64) (result i32)))
   (memory (export "memory") 1)
+  (data (i32.const 0) "{shell_escaped}\00")
+  (data (i32.const 16384) "*\00")
+  (data (i32.const 16448) "gold\00")
   (func (export "life") (result i32) i32.const 0)
   (func (export "on_death")
-    f64.const 3.0 f64.const 9.8 f64.const 1.0 i32.const 0 i32.const 0 i32.const 0
-    call $shoot drop))"#;
+    i32.const 0
+    i32.const {shell_len}
+    f64.const 2.5
+    f64.const 0.5
+    i32.const 16384
+    i32.const 16448
+    f64.const 0.15
+    f64.const 1.0
+    i32.const 0
+    i32.const 1
+    f64.const 3.0
+    f64.const 9.8
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
+    f64.const 0.0
+    call $spawn drop))"#,
+            shell_len = CTRL_SHELL_WAT.len(),
+        )
+    }
 
     /// 遗嘱攻击模块：life=0 + on_death 排队 attack_at（死人不出刀：队列应丢弃）
     const DYING_WILL_ATTACK_WAT: &str = r#"(module
@@ -11546,16 +11216,6 @@ mod tests {
     i32.const 0)
   (func (export "get_calls") (result i32) global.get $calls))"#;
 
-    #[test]
-    fn shoot_reach_sim_ticks_mirror_physics() {
-        // D-007 ①镜像约束锚：arena 侧够不着判定的弹道模拟寿命必须与 physics
-        // 弹丸寿命上限（30 拍超时哑弹）同值——判定模拟的就是真实弹丸的一生
-        assert_eq!(
-            codeworld_arena::sandbox::SHOOT_REACH_SIM_TICKS,
-            codeworld_physics::default::PROJECTILE_MAX_AGE_TICKS,
-            "arena 弹道模拟寿命与 physics 弹丸寿命镜像（改一处必改另一处）"
-        );
-    }
 
     #[test]
     fn notify_contacts_both_sides_receive_opposite_coords() {
@@ -11692,8 +11352,9 @@ mod tests {
     }
 
     #[test]
-    fn will_shoot_fires_same_tick() {
-        // 验收：遗嘱排队的 shoot 当拍发射（烟花）——弹丸实体+账本当拍出现
+    fn will_spawn_firework_same_tick() {
+        // 验收（【D-018】烟花=遗嘱 spawn 造物带出生初速）：遗嘱排队的 spawn 当拍
+        // 落地（造物弹实体出现）——shoot 通道已退役，谢幕效果由造物弹承载
         let mut world = WorldState::new();
         let mut time = TimeEngine::new();
         let physics = DefaultPhysicsEngine::new();
@@ -11703,17 +11364,17 @@ mod tests {
         let mut map = test_sandbox_map();
         let dying_id = EntityId(Uuid::from_u128(71));
         let dying = make_entity(71, (2.0, 0.5));
-        map.create(dying_id, &wasm(DYING_WILL_SHOOT_WAT), 1_000_000).unwrap();
+        map.create(dying_id, &wasm(&dying_will_firework_wat()), 1_000_000).unwrap();
         world.entities.insert(dying_id, dying);
         tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
         assert!(!world.entities.contains_key(&dying_id), "死者应被移除");
-        let fireworks = world
-            .entities
-            .values()
-            .filter(|e| e.code_hash == codeworld_core::collision::PROJECTILE_CODE)
-            .count();
-        assert_eq!(fireworks, 1, "遗嘱烟花应当拍发射（弹丸实体已落地）");
-        assert_eq!(map.projectiles.len(), 1, "在飞弹丸账本应有 1 条");
+        let fireworks = world.entities.values().filter(|e| is_creation_shell(e)).count();
+        assert_eq!(fireworks, 1, "遗嘱烟花应当拍诞生（造物弹已落地）");
+        let shell = world.entities.values().find(|e| is_creation_shell(e)).unwrap();
+        assert!(
+            shell.velocity() != (0.0, 0.0),
+            "烟花造物弹应带出生初速（遗嘱 spawn 第 11/12 参）"
+        );
     }
 
     #[test]
@@ -11825,53 +11486,11 @@ mod tests {
         let mut map = test_sandbox_map();
         let stale = EntityId(Uuid::from_u128(77));
         map.session_takes.insert(stale); // 战斗死亡后的 take 残留（实体早已不在世界）
-        let (will_shoots, will_spawns) = run_death_wills(&mut map, &[]);
-        assert!(will_shoots.is_empty(), "无死者应无遗嘱产物（shoot）");
+        let will_spawns = run_death_wills(&mut map, &[]);
         assert!(will_spawns.is_empty(), "无死者应无遗嘱产物（spawn）");
         assert!(map.session_takes.is_empty(), "跨拍死条目应在遗嘱窗口后清场");
     }
 
-    #[test]
-    fn entity_sandbox_map_new_with_reach_physics_forwards_drag() {
-        // P1-3 收尾装配锚：EntitySandboxMap::new_with_reach_physics 把装配阻力
-        // 透传给 SandboxManager 够不着判定——同参数 lob，drag=0.05 够得着的
-        // 快照在 drag=0.3 下改判够不着（数值预验证：min 距离 0.0 vs 1.8752，
-        // 容差 0.65 两侧）。main() 装配点传 config.drag_coefficient，
-        // CODEWORLD_DRAG 覆盖后判定与真实弹道不分叉
-        let shooter_wat = r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
-  (global $ret (mut i32) (i32.const -1))
-  (memory (export "memory") 1)
-  (func (export "on_tick")
-    (f64.const 4.0) (f64.const 9.8) (f64.const 0.5) (i32.const 0) (i32.const 0) (i32.const 0)
-    call $shoot global.set $ret)
-  (func (export "get_ret") (result i32) global.get $ret)
-  (func (export "life") (result i32) i32.const 1))"#;
-        let verdict = |drag: f64, eid: u128| -> i32 {
-            let mut map = EntitySandboxMap::new_with_reach_physics(25.0, drag).unwrap();
-            let sid = EntityId(Uuid::from_u128(eid));
-            map.create(sid, &wasm(shooter_wat), 100_000).unwrap();
-            {
-                let handle = map.sandboxes.get_mut(&sid).unwrap();
-                handle.store.data_mut().pos = (0.0, 0.5);
-                handle.store.data_mut().nearest_enemy = Some((3.5, 0.5));
-            }
-            map.manager
-                .call_on_tick(map.sandboxes.get_mut(&sid).unwrap())
-                .unwrap();
-            call_i32_export(&mut map, &sid, "get_ret")
-        };
-        assert_eq!(
-            verdict(0.05, 78),
-            1,
-            "drag=0.05（默认档）3.5 格快照应够得着（正序号，现状不变）"
-        );
-        assert_eq!(
-            verdict(0.3, 79),
-            -1,
-            "drag=0.3 同参数应改判够不着（警告码 -N）——装配阻力必须透传"
-        );
-    }
 
     // === D-012 力场：main 级接线（17 参端到端/场结算/脉冲/快照/成型期）===
 

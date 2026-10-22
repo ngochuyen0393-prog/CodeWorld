@@ -14,8 +14,9 @@ use crate::entity::Entity;
 /// 创造物 code_hash 标识（process_spawns 写入，本模块/net.rs 共用同一常量）
 pub const CREATION_CODE: &str = "creation";
 
-/// 弹丸 code_hash 标识（#034 离体之物：shoot 产出的飞行体，无沙箱无 on_tick，
-/// 物理由 physics step_projectiles 接管；本模块/net.rs 共用同一常量）
+/// 弹丸 code_hash 标识（历史实体兼容判定：#045/D-018 后世界不再产生 PROJECTILE_CODE
+/// 实体，shoot import 已退役——存量旧快照实体走通用速度积分路径照飞照落；
+/// 本模块/net.rs 共用同一常量，kind=projectile 前端分支保留过渡期消亡检测）
 pub const PROJECTILE_CODE: &str = "projectile";
 
 /// 造物是否声明为全活 dynamic（D-003 motion 第 10 参：motion=1 的 creation
@@ -36,11 +37,14 @@ pub fn is_dynamic_creation_candidate(motion: i32) -> bool {
 /// design-ballistics.md 否决清单：attack_at 加射程属性已被土豆否决）
 pub const MELEE_REACH: f64 = 0.5;
 
-/// 弹丸身体半径（#034：弹丸是小圆点，身体半径固定 0.15——shoot 无半径参，
-/// 弹丸碰撞判据 = 弹丸中心距实体中心 < r弹(0.15) + r实）
+/// 定装小弹半径（历史名 PROJECTILE_RADIUS，#034 弹丸退役 #045/D-018 后数值
+/// 继续沿用：操控定装弹（#036 驾驶档）与投掷器模板第一课的"同款小弹"尺寸锚
+/// ——0.15 不再是世界常数而是教学/定装口径；造物弹半径本由 spawn 第 7 参
+/// 自定，此值=文档/解算器/测试共用的参照值）
 pub const PROJECTILE_RADIUS: f64 = 0.15;
 
-/// 实体是否是弹丸（#034 离体之物识别；与 CREATION_CODE 同款 code_hash 判据）
+/// 实体是否是弹丸（历史实体兼容判定，D-018 后新世界不产生——存量旧快照实体
+/// 走通用物理；排除语义保留：不可锁定/不可被撞/不参与接触）
 pub fn is_projectile(e: &Entity) -> bool {
     e.code_hash == PROJECTILE_CODE
 }
@@ -283,7 +287,11 @@ fn clamp_point_to_aabb_dist(
 /// CCD 线段-圆首触参数（#034 修订二：路径扫掠）。
 /// 线段 a->b 与圆（center, r）的扫掠重叠判据：路径上任一点距圆心 < r。
 /// 返回 Some(t)：首触的线段参数（0=起点即重叠，1=终点恰触）；
-/// None：路径未扫过身体。起点已在重叠区（异常态）返回 0。
+/// None：路径未扫过身体。
+/// 起点已在重叠区：**仅当正在接近**（速度朝圆心，f·d<0）才返回 0——
+/// 重叠但分离中（D-009 浮体上浮穿过沉体的涌现场景）不拦截，否则浮沉
+/// 物理被截断卡死（D-018 撞体截断接入 step 后实测：木球贴铁球出生、
+/// 上浮每拍被 Some(0.0) 清零速度，浮沉涌现消失）。
 pub fn segment_first_contact_circle(
     a: (f64, f64),
     b: (f64, f64),
@@ -297,8 +305,9 @@ pub fn segment_first_contact_circle(
     let qb = 2.0 * (f.0 * d.0 + f.1 * d.1);
     let qc = f.0 * f.0 + f.1 * f.1 - r * r;
     if qc < 0.0 {
-        // 起点已在重叠区（严格 < 判据下的内部）
-        return Some(0.0);
+        // 起点已在重叠区（严格 < 判据下的内部）：严格分离中（f·d>0，远离圆心）
+        // 放行；在内部横穿（f·d≤0，含零位移）=撞内壁，t=0
+        return if qb > 0.0 && qa > 0.0 { None } else { Some(0.0) };
     }
     if qa <= 0.0 {
         // 零长度线段：起点不在重叠区（qc >= 0）则无接触

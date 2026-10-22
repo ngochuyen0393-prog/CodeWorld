@@ -25,12 +25,6 @@ pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 /// MVP 一刀切的简单规则；规则由宪法允许后续玩法化（decisions.md #012）。
 pub const SPAWN_RANGE: f64 = 10.0;
 
-/// shoot 初速模长上限（#034 修订一：MAX_SHOOT_SPEED=50 硬编码退役——发射钳制
-/// 改用世界极速常数 WORLD_MAX_SPEED（默认 25，视觉可读性常数），经
-/// SandboxManager::new_with_max_speed 装配，与飞行中钳制（DefaultPhysics.max_speed）
-/// 同源一个世界常数。此常量仅作 new() 的缺省值）
-pub const MAX_SHOOT_SPEED: f64 = codeworld_core::physics::WORLD_MAX_SPEED;
-
 /// spawn 外观字符串（glyph/color，NUL 结尾）最大字节数
 ///
 /// import 层扫描上限：内存里没有 NUL 时最多读这么多字节就拒绝，
@@ -131,28 +125,6 @@ pub struct PendingSpawn {
     pub liquid_drag: f64,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
-}
-
-/// 本 tick 排队的射击请求（#034 env.shoot 推入，阶段二收集统一处理）
-///
-/// import 层只做零 world 校验（限流 1 发/tick、速度模长 ≤50、mass 钳制、
-/// payload ≤1MB）；发射位置在阶段二读发射者当拍坐标（阶段一快照坐标会被
-/// move_by 移动更新，从哪里出手以移动后的实况为准——与攻击坐标解析同哲学）。
-#[derive(Debug, Clone)]
-pub struct PendingShoot {
-    /// 发射者（沙箱所属实体）
-    pub shooter: EntityId,
-    /// 初速 x 分量（import 层已校验：有限、模长 ≤50）
-    pub vx: f64,
-    /// 初速 y 分量
-    pub vy: f64,
-    /// 弹丸质量（import 层已钳制 0.05..=100.0）
-    pub mass: f64,
-    /// 绑定契约（#034 修订四 shoot 第 6 参；import 层已钳制非法值为 unbound：
-    /// 0=照飞 1=fade_on_death 主人死弹消 2=grace_owner 落地不砸发射者）
-    pub binding: i32,
-    /// 弹丸携带的攻击字节（同 attack_at payload 语义：空=默认击杀模块）
-    pub payload: Vec<u8>,
 }
 
 /// 本 tick 排队的 destroy 请求（env.destroy 推入，阶段二产权校验后应用）
@@ -258,11 +230,6 @@ pub struct SandboxData {
     /// 本 tick 排队的力场脉冲请求（D-012 env.field_pulse 推入，阶段二收集统一
     /// 应用后 drain 清空；每实体每拍限 1 次在 import 层保证）
     pub pending_field_pulses: Vec<PendingFieldPulse>,
-    /// 本 tick 排队的射击请求（#034 env.shoot 推入，阶段二收集后 drain 清空；
-    /// 每实体每拍限 1 发在 import 层保证）
-    pub pending_shoots: Vec<PendingShoot>,
-    /// 该沙箱累计已成功排队的射击发数（#034 shoot 返回值：弹丸序号，跨拍递增）
-    pub shots_fired: i32,
     /// 本 tick 的悬停声明（env.hover 置位，host 阶段一收件并入免重力集合后清空；
     /// 每拍重申语义——玩家代码要持续对抗世界规则，上一拍声明不延续）
     pub hover_declared: bool,
@@ -326,17 +293,6 @@ impl SandboxData {
     }
 }
 
-/// 发射痕迹摘要（#034 修订三：痕迹不是实体不进沙箱表，probe 桥携带的最小证据）
-#[derive(Debug, Clone, Copy)]
-pub struct TraceProbe {
-    /// 痕迹 id（与 visible_ids 中该痕迹的条目对应）
-    pub trace_id: EntityId,
-    /// 发射者
-    pub shooter: EntityId,
-    /// 发射拍号
-    pub birth_tick: u64,
-}
-
 /// probe 通路桥（三层感知 Phase A：import 闭包访问目标沙箱的桥接上下文）
 ///
 /// 为什么需要：import 闭包是 'static 的，无法持有 host 引用；probe 又必须同步
@@ -353,7 +309,8 @@ pub struct TraceProbe {
 pub struct ProbeBridge {
     /// 可见实体 id 列表（viewport 过滤 + 存活 + EntityId 升序；含 caller 自己——
     /// probe 的坐标查找在此列表上排除自己，作为 host 快照遗漏时的第二道防线。
-    /// #034 修订三起也包含发射痕迹的条目——痕迹坐标后追加）
+    /// 【D-018】发射痕迹并入 visible 的旧口径随痕迹机制退役（#045 连带）：
+    /// 造物弹天然在 visible 列表，独立痕迹标记多余）
     pub visible_ids: Vec<EntityId>,
     /// 与 visible_ids 一一平行的坐标列表
     pub visible_positions: Vec<(f64, f64)>,
@@ -365,9 +322,6 @@ pub struct ProbeBridge {
     pub caller_id: EntityId,
     /// on_probe 独立小 fuel 预算（架构 3.3 probe_target_instruction_limit，config 可调）
     pub probe_fuel: u64,
-    /// 本拍可见的发射痕迹（#034 修订三；probe 命中痕迹坐标返回发射者身份，
-    /// 与沙箱表无交集——痕迹不建沙箱）
-    pub traces: Vec<TraceProbe>,
 }
 
 /// 地形钻地判据（D-016）："y < ground(x)" 的沙箱侧实现。
@@ -387,111 +341,6 @@ fn terrain_depth_violation(
         unsafe { (*terrain).height(x) }
     };
     (y < ground).then_some(ground)
-}
-
-/// 够不着判定寿命上限（D-007 ①）：弹道模拟全程拍数。
-/// 【镜像约束】与 codeworld_physics::default::PROJECTILE_MAX_AGE_TICKS（30，
-/// 弹丸超时哑弹上限）同值——改一处必改另一处，bin 侧镜像锚测试
-/// `shoot_reach_sim_ticks_mirror_physics` 咬合两边（arena 不依赖 physics
-/// crate，此处独立声明）。
-pub const SHOOT_REACH_SIM_TICKS: u64 = 30;
-
-/// 够不着判定容差（D-007 ①）：弹道全程与目标最小距离 ≤ 0.65 视为够得着。
-/// 0.65 = CCD 撞体窗口（r弹 0.15 + 默认身体半径 0.5），与 bin 侧
-/// CTRL_SOLVE_TOLERANCE（预测侧解算器）同口径——判据一致才能保证
-/// "代码层说够不着"与"驾驶层说够不着"及"服务器真结算"三方同判。
-const SHOOT_REACH_TOLERANCE: f64 = 0.65;
-
-/// 点到线段最小距离（D-007 ①辅助）：弹道拍间是直线段，仅拍末采样会漏
-/// 最近点，必须按段扫（与 bin solve_launch_vector 的 seg_min_dist 同式，
-/// 与服务器 CCD 撞体窗口同判据）。
-fn seg_point_distance(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> f64 {
-    let (abx, aby) = (b.0 - a.0, b.1 - a.1);
-    let len2 = abx * abx + aby * aby;
-    let t = if len2 < 1e-12 {
-        0.0
-    } else {
-        (((p.0 - a.0) * abx + (p.1 - a.1) * aby) / len2).clamp(0.0, 1.0)
-    };
-    ((p.0 - a.0 - abx * t).powi(2) + (p.1 - a.1 - aby * t).powi(2)).sqrt()
-}
-
-/// 够不着判定弹道模拟（D-007 ①）：从 from 以初速 (vx,vy)/mass 模拟弹丸全程，
-/// 返回弹道各段到目标点的最小距离。物理步序与 crates/physics step_projectiles
-/// 完全同序（重力→阻力→极速钳→位移，落地 CCD 或寿命尽截断）；
-/// 阻力用装配值 drag（D-007 收尾 P1-3：与真实弹丸同一 drag 源，含 apply_drag
-/// 同款符号翻转钳零——drag/mass ≥ 1 时钳 0，方向永不翻转），重力取 core
-/// DefaultPhysics 默认值（与 bin solve_launch_vector 预测侧同源），
-/// 极速钳用管理器装配的世界极速（与飞行钳制同源）。
-/// 落地截断镜像 step_projectiles 的地形 CCD 判据（terrain.segment_first_contact，
-/// y < height(x)+r弹 口径；D-007 收尾 P1-1：hills/mountain 下坡面挡弹如实判定）；
-/// terrain 指针判空回退平地旧口径 y < r弹（平地=全零高度数组，两判据等价，
-/// 无 host 挂载的测试环境零回归）。
-/// 判据在调用方：最小距离 ≤ SHOOT_REACH_TOLERANCE = 够得着。
-#[allow(clippy::too_many_arguments)] // D-007 收尾扩到 8 参（drag/terrain 环境同步）：
-// 弹道模拟的物理输入族，8 参为镜像 step_projectiles 的固有形状，不拆结构体
-fn shoot_reach_min_distance(
-    from: (f64, f64),
-    vx: f64,
-    vy: f64,
-    mass: f64,
-    target: (f64, f64),
-    max_speed: f64,
-    drag: f64,
-    terrain: *const codeworld_core::terrain::Terrain,
-) -> f64 {
-    let phys = codeworld_core::physics::DefaultPhysics::default_values();
-    let r = codeworld_core::collision::PROJECTILE_RADIUS;
-    let (mut x, mut y) = from;
-    let (mut vx, mut vy) = (vx, vy);
-    let mut min = f64::MAX;
-    let mut prev = from;
-    for _ in 0..SHOOT_REACH_SIM_TICKS {
-        // 重力→阻力→极速钳→位移（与 step_projectiles 逐拍同序）
-        vy += phys.gravity;
-        // 阻力定律镜像 apply_drag：衰减越过零点（drag/mass ≥ 1）钳到 0
-        let f = 1.0 - drag / mass;
-        let decay = |comp: f64| -> f64 {
-            let next = comp * f;
-            if comp != 0.0 && next.signum() != comp.signum() {
-                0.0
-            } else {
-                next
-            }
-        };
-        vx = decay(vx);
-        vy = decay(vy);
-        let sp = (vx * vx + vy * vy).sqrt();
-        if sp > max_speed {
-            let k = max_speed / sp;
-            vx *= k;
-            vy *= k;
-        }
-        x += vx;
-        y += vy;
-        // 落地截断：镜像 step_projectiles 的 terrain.segment_first_contact CCD；
-        // 触地时最小距离只计入 prev→触地点段（真实弹丸在触地点消亡做哑弹
-        // 点命中，之后的路径不存在）。判空回退平地 y<r弹（整段计入=旧口径）。
-        let contact_t = if terrain.is_null() {
-            (y < r).then_some(1.0)
-        } else {
-            // SAFETY：窗口契约（见 SandboxData.terrain 文档）——窗口期内指针指向
-            // 存活的 world.terrain，import 闭包只在此窗口内被玩家代码调用
-            unsafe { (*terrain).segment_first_contact(prev, (x, y), r) }
-        };
-        match contact_t {
-            Some(t) => {
-                let end = (prev.0 + (x - prev.0) * t, prev.1 + (y - prev.1) * t);
-                min = min.min(seg_point_distance(prev, end, target));
-                break; // 触地消亡：弹道到此为止（与 step_projectiles Landed 同语义）
-            }
-            None => {
-                min = min.min(seg_point_distance(prev, (x, y), target));
-                prev = (x, y);
-            }
-        }
-    }
-    min
 }
 
 /// 沙箱句柄（持有 Store + Instance）
@@ -519,28 +368,17 @@ impl SandboxManager {
     }
 
     /// 创建管理器（指定世界极速，#034 修订一）：发射钳制与飞行钳制同源。
-    /// 阻力取 core DefaultPhysics 默认值（D-007 收尾 P1-3：未显式装配 drag 的
-    /// 旧调用点保持默认口径零回归）
+    /// 【D-018】够不着判定阻力装配（new_with_reach_physics）随 shoot import
+    /// 退役——阻力只活在物理步/解算器，不再有判定侧消费点
     pub fn new_with_max_speed(max_speed: f64) -> Result<Self> {
-        Self::new_with_reach_physics(
-            max_speed,
-            codeworld_core::physics::DefaultPhysics::default_values().drag_coefficient,
-        )
-    }
-
-    /// 创建管理器（指定世界极速 + 够不着判定阻力，D-007 收尾 P1-3）：
-    /// shoot 够不着弹道模拟的 drag 与真实弹丸同一装配源（bin CODEWORLD_DRAG
-    /// 覆盖后判定不与真实弹道分叉）；极速值经 move 闭包进 shoot import，
-    /// 管理器本体不再存副本
-    pub fn new_with_reach_physics(max_speed: f64, drag: f64) -> Result<Self> {
         let mut config = Config::new();
         config.consume_fuel(true);
         // 内存限制：每个 WASM 实例最大 64MB（CLAUDE.md 技术约束）
         // static_memory_maximum_size 设静态内存上限；完整动态内存硬上限用 ResourceLimiter（Phase 2）
         config.static_memory_maximum_size(64 * 1024 * 1024);
         let engine = Engine::new(&config)?;
-        let linker = Self::make_linker(&engine, max_speed, drag)?;
-        tracing::debug!(max_speed, drag, "SandboxManager 创建");
+        let linker = Self::make_linker(&engine, max_speed)?;
+        tracing::debug!(max_speed, "SandboxManager 创建");
         Ok(Self { engine, linker })
     }
 
@@ -554,7 +392,7 @@ impl SandboxManager {
     ///   - len 超过 MAX_PAYLOAD_LEN（1MB）直接拒绝：不入队、不拷贝内存
     ///     （防大块拷贝 + 超大模块编译阻塞 tick，编译不受 fuel 约束）。
     ///   - 返回 1=已排队，0=拒绝（超限）。
-    fn make_linker(engine: &Engine, max_speed: f64, drag: f64) -> Result<Linker<SandboxData>> {
+    fn make_linker(engine: &Engine, max_speed: f64) -> Result<Linker<SandboxData>> {
         let mut linker = Linker::new(engine);
         // env.log(v)：玩家代码日志（v 为玩家自定义 marker，含义见各生物 WAT 注释）。
         // 记 api_calls 元数据 + marker 值序列（log_markers，host 字幕解析用）
@@ -897,9 +735,8 @@ impl SandboxManager {
                 // 置空同一循环体作用域），本函数只在窗口内被调，ProbeBridge 存活。
                 let bridge = unsafe { &mut *bridge_ptr };
                 // 坐标查找（可见列表内 + 排除自己：host 快照已排除，此处为第二道防线）。
-                // #034 修订三：同坐标实体与痕迹并存时实体优先（痕迹作兜底证据）
-                let is_trace_id =
-                    |id: &EntityId| bridge.traces.iter().any(|t| &t.trace_id == id);
+                // 【D-018】#034 修订三的"同坐标实体与痕迹并存"双轨查找随痕迹机制
+                // 退役（#045 连带：造物天然在 visible 列表，痕迹分支已删）
                 let coordinate_match = |(id, p): (&EntityId, (f64, f64))| {
                     *id != caller_id && p == (tx, ty)
                 };
@@ -907,46 +744,12 @@ impl SandboxManager {
                     .visible_ids
                     .iter()
                     .zip(bridge.visible_positions.iter().copied())
-                    .find(|(id, p)| coordinate_match((id, *p)) && !is_trace_id(id))
-                    .or_else(|| {
-                        bridge
-                            .visible_ids
-                            .iter()
-                            .zip(bridge.visible_positions.iter().copied())
-                            .find(|(id, p)| coordinate_match((id, *p)) && is_trace_id(id))
-                    })
+                    .find(|(id, p)| coordinate_match((id, *p)))
                     .map(|(id, _)| *id);
                 let Some(target_id) = target_id else {
                     tracing::info!(entity_id = %caller_id.0, tx, ty, "[probe] 坐标无可见实体");
                     return -1;
                 };
-                // 痕迹证据分支（#034 修订三）：坐标上是痕迹不是实体——不建沙箱，
-                // 直接构造 24 字节身份响应（发射者 id u128 LE + 发射拍号 u64 LE），
-                // 返回 -3（与 -1 无实体 / -2 无 on_probe 同族负值语义区分）
-                if let Some(trace) = bridge.traces.iter().find(|t| t.trace_id == target_id) {
-                    let mut body = Vec::with_capacity(24);
-                    body.extend_from_slice(&trace.shooter.0.as_u128().to_le_bytes());
-                    body.extend_from_slice(&trace.birth_tick.to_le_bytes());
-                    if resp_cap <= 0 {
-                        tracing::warn!(entity_id = %caller_id.0, resp_cap, "[probe] resp_cap 非正，痕迹证据丢弃");
-                        return -1;
-                    }
-                    let written = write_bytes_to_caller(&mut caller, resp_ptr, &body, resp_cap as usize);
-                    if written == 0 {
-                        tracing::warn!(entity_id = %caller_id.0, resp_ptr, "[probe] 痕迹证据写入失败（指针非法/无 memory）");
-                        return -1;
-                    }
-                    tracing::info!(
-                        prober = %caller_id.0,
-                        trace = %trace.trace_id.0,
-                        shooter = %trace.shooter.0,
-                        birth_tick = trace.birth_tick,
-                        tx,
-                        ty,
-                        "[probe] 命中发射痕迹：返回发射者身份（攻击留下痕迹）"
-                    );
-                    return -3;
-                }
                 // SAFETY: sandboxes 指针窗口内有效；目标 != caller（上一步排除），
                 // 不会与外层持有的 caller 自身 &mut handle aliasing（不同 entry）。
                 let sandboxes = unsafe { &mut *bridge.sandboxes };
@@ -1050,7 +853,7 @@ impl SandboxManager {
         //   - binding 第 9 参钳制非法值回 unbound（#034 修订四）
         //   - motion 第 10 参钳制非法值回 static（D-003）：0=钉死默认/1=全活 dynamic
         //   - 出生初速第 11/12 参：vx/vy 有限 + 模长 ≤ 世界极速（经装配 max_speed，
-        //     与 shoot 同源同口径，恰等放行；D-018 一体式发射提前落地）
+        //     与飞行钳制同源同口径（世界极速恰等放行）；D-018 一体式发射落地）
         //   - 出生数据包第 13/14 参：blob_len ≤0 = 空包合法（无包语义）；
         //     > MAX_SPAWN_BLOB_LEN 整次拒绝（读内存前拦下防大拷贝，不裁剪——
         //     裁剪数据包=偷改玩家数据）；D-017 挂靠立法：世界不解释内容
@@ -1249,7 +1052,7 @@ impl SandboxManager {
                     return 0;
                 }
                 // 出生初速校验（spawn 第 11/12 参，D-018 一体式发射提前落地）：
-                // 有限性 + 模长 ≤ 世界极速（经装配 max_speed，与 shoot 同源同口径；
+                // 有限性 + 模长 ≤ 世界极速（经装配 max_speed，与飞行钳制同源同口径；
                 // 严格 > 拒绝——恰等于极速放行）
                 if !vx.is_finite() || !vy.is_finite() {
                     tracing::warn!(
@@ -1266,7 +1069,7 @@ impl SandboxManager {
                         entity_id = %creator.0,
                         speed = speed2.sqrt(),
                         max = max_speed,
-                        "[spawn] 出生初速超世界极速，拒绝（与 shoot 同口径：恰等放行）"
+                        "[spawn] 出生初速超世界极速，拒绝（恰等放行）"
                     );
                     return 0;
                 }
@@ -1436,123 +1239,11 @@ impl SandboxManager {
                 }
             },
         )?;
-        // env.shoot(vx, vy, mass, payload_ptr, payload_len) -> i32：射击（#034 第 12 个
-        // 玩家 import，弹道系统）：从调用者当前位置发射弹丸。初速/质量由代码定，
-        // payload 同 attack_at 语义（空=默认击杀模块）。离体即世界物体（#034 立法第 1 条）。
-        // import 层只做零 world 校验（排队模式同 attack_at）：
-        //   - 限流：每实体每 tick 最多 1 发（防弹幕灌爆）
-        //   - 速度：vx/vy 有限且模长 ≤ 50（防一拍穿世界）
-        //   - mass：钳制 0.05..=100.0（除零护栏，#034）
-        //   - payload：len > MAX_PAYLOAD_LEN 直接拒绝（同 attack_at）
-        //   - 返回：弹丸序号（该实体累计第几发，1 起）或 0=拒绝。
-        //     发射位置与世界实体上限在阶段二判（import 拿不到 world）。
-        linker.func_wrap(
-            "env",
-            "shoot",
-            move |mut caller: Caller<SandboxData>,
-                  vx: f64,
-                  vy: f64,
-                  mass: f64,
-                  payload_ptr: i32,
-                  payload_len: i32,
-                  binding: i32|
-                  -> i32 {
-                caller.data_mut().api_calls.push("shoot".to_string());
-                let shooter = caller.data().entity_id;
-                // 限流：同实体一拍至多 1 发
-                if !caller.data().pending_shoots.is_empty() {
-                    tracing::warn!(
-                        entity_id = %shooter.0,
-                        "[shoot] 本 tick 已射击，限流拒绝（1 发/tick）"
-                    );
-                    return 0;
-                }
-                // 速度校验：有限 + 模长 ≤ 世界极速（#034 修订一，原硬编码 50 退役）
-                if !vx.is_finite() || !vy.is_finite() {
-                    tracing::warn!(
-                        entity_id = %shooter.0,
-                        vx,
-                        vy,
-                        "[shoot] 初速非有限，拒绝"
-                    );
-                    return 0;
-                }
-                let speed2 = vx * vx + vy * vy;
-                if speed2 > max_speed * max_speed {
-                    tracing::warn!(
-                        entity_id = %shooter.0,
-                        speed = speed2.sqrt(),
-                        max = max_speed,
-                        "[shoot] 初速超世界极速，拒绝（视觉可读性常数：攻击必须看得见飞过来）"
-                    );
-                    return 0;
-                }
-                // payload 超限拒绝：在读 memory 之前拦下（同 attack_at）
-                if payload_len > 0 && payload_len as usize > MAX_PAYLOAD_LEN {
-                    tracing::warn!(
-                        entity_id = %shooter.0,
-                        actual_len = payload_len,
-                        max = MAX_PAYLOAD_LEN,
-                        "[shoot] payload 超限，拒绝入队"
-                    );
-                    return 0;
-                }
-                let payload = read_payload_from_caller(&mut caller, payload_ptr, payload_len);
-                // mass 钳制（除零护栏，#034）
-                let mass = codeworld_core::collision::clamp_mass(mass);
-                // #034 修订四第 6 参 binding 校验钳制（非法值钳 unbound，warn）
-                let binding = codeworld_core::entity::clamp_binding(binding);
-                // D-007 够不着判定（不审查但告知，与 mass 超界警告同哲学）：判定输入=
-                // 发射者坐标快照 + nearest_enemy 快照（import 层拿不到 world，与 scan
-                // 同源）；无快照（视野内无敌人）不判定。够不着时照常发射（哑弹自由=
-                // 玩家战术权利），仅返回值带负号提示 + INFO 日志。
-                let unreachable_target = caller.data().nearest_enemy.map(|(tx, ty)| {
-                    let from = caller.data().pos;
-                    shoot_reach_min_distance(
-                        from,
-                        vx,
-                        vy,
-                        mass,
-                        (tx, ty),
-                        max_speed,
-                        drag,
-                        caller.data().terrain,
-                    ) > SHOOT_REACH_TOLERANCE
-                });
-                caller.data_mut().shots_fired += 1;
-                let serial = caller.data().shots_fired;
-                caller.data_mut().pending_shoots.push(PendingShoot {
-                    shooter,
-                    vx,
-                    vy,
-                    mass,
-                    binding,
-                    payload,
-                });
-                if unreachable_target.unwrap_or(false) {
-                    tracing::info!(
-                        entity_id = %shooter.0,
-                        vx,
-                        vy,
-                        mass,
-                        serial,
-                        target = ?caller.data().nearest_enemy,
-                        "[shoot-unreachable] 发射参数按标准解够不着目标，照常发射（返回 -序号 提示，哑弹自由=玩家战术权利）"
-                    );
-                    return -serial;
-                }
-                tracing::info!(
-                    entity_id = %shooter.0,
-                    vx,
-                    vy,
-                    mass,
-                    binding,
-                    serial,
-                    "[shoot] 射击已排队（阶段二统一发射）"
-                );
-                serial
-            },
-        )?;
+        // 【D-018 退役】env.shoot（#034 第 12 个玩家 import）已随 #045 标准弹丸
+        // 退役移除——世界不配发身体（#038 修路不跑车/#011 零预设）。远程发射
+        // 一体式走 env.spawn 出生初速（第 11/12 参）+ 接触通道代码攻（on_contact
+        // + attack_at）；分离式走 env.field_pulse。教学模板见 docs/newbie-first-thrower.md
+        // （投掷器模板第一课）。
         // env.destroy(id_lo: i64, id_hi: i64) -> i32：销毁（门二开放，产权链 #015）。
         // EntityId(Uuid u128) 拆 lo/hi 两个 i64 传（WAT 侧负 i64 经 as u64 恢复位型）。
         // import 只排队：产权校验（只能销毁自家造物，owner 匹配）需要 world，
@@ -1585,7 +1276,7 @@ impl SandboxManager {
         // (x,y) 为中心 radius 圆域内，给所有带速度实体一次性速度叠加 (vx,vy)。
         // 物理推不是规则层：velocity≡0 的实体推不动（速度叠加对零速无效果，
         // 推别人走碰撞/击退是 D-010 碰撞响应的活）。import 层只做零 world 校验：
-        //   - 限流：每实体每 tick 最多 1 次（与 spawn/shoot 同款），多余拒绝
+        //   - 限流：每实体每 tick 最多 1 次（与 spawn 同款），多余拒绝
         //   - x/y/vx/vy 有限性（NaN/inf 拒绝）
         //   - 冲量模长 ≤ 世界极速（严格 > 拒绝恰等放行，与 spawn 初速同口径）
         //   - radius 钳 [0.1, 25.0]（超界钳回不拒绝——出生声明家族哲学）
@@ -1720,7 +1411,7 @@ impl SandboxManager {
                     tracing::info!(entity_id = %entity.0, port, "[bridge_send] 无此端点");
                     return 1;
                 }
-                // 判序第四步：每拍 1 发限流（与 shoot 同款节律——世界节律定天花板）
+                // 判序第四步：每拍 1 发限流（与 spawn 同款节律——世界节律定天花板）
                 if caller.data().bridge_sent_this_tick {
                     tracing::warn!(
                         entity_id = %entity.0,
@@ -3492,7 +3183,6 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
-            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -3532,7 +3222,6 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
-            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -3559,7 +3248,6 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
-            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -3585,7 +3273,6 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
-            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -3626,7 +3313,6 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
-            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -3659,7 +3345,6 @@ mod tests {
             manager: &mgr,
             caller_id: id(1),
             probe_fuel: 10_000,
-            traces: Vec::new(),
         };
         prober.store.data_mut().probe_bridge = &mut bridge;
         mgr.call_on_tick(&mut prober).unwrap();
@@ -3699,94 +3384,6 @@ mod tests {
         assert_eq!(ret, -1, "桥未挂载应返回 -1");
     }
 
-    // === probe 命中发射痕迹（#034 修订三：痕迹不是实体，最小证据路径）===
-
-    #[test]
-    fn probe_on_trace_coordinate_returns_shooter_identity() {
-        // probe 命中痕迹坐标 -> 返回 -3，resp 前 24 字节 = 发射者 id（u128 LE 16 字节）
-        // + 发射拍号（u64 LE 8 字节）——"此处发射过弹丸"的最小证据（不建沙箱）。
-        // 断言 resp0 = shooter u128 低 32 位（=42）、resp16 = 拍号低 32 位（=7）
-        let mgr = SandboxManager::new().unwrap();
-        let mut map = std::collections::HashMap::new(); // 空沙箱表：痕迹不占沙箱
-        let mut prober = mgr
-            .create_sandbox(&wasm(&prober_wat("7.0", "8.0")), 100_000, id(1))
-            .unwrap();
-        prober.store.data_mut().visible = vec![(7.0, 8.0)];
-        let trace_id = id(77);
-        let mut bridge = ProbeBridge {
-            visible_ids: vec![id(1), trace_id],
-            visible_positions: vec![(0.0, 0.0), (7.0, 8.0)],
-            sandboxes: &mut map,
-            manager: &mgr,
-            caller_id: id(1),
-            probe_fuel: 10_000,
-            traces: vec![TraceProbe {
-                trace_id,
-                shooter: id(42),
-                birth_tick: 7,
-            }],
-        };
-        prober.store.data_mut().probe_bridge = &mut bridge;
-        mgr.call_on_tick(&mut prober).unwrap();
-        prober.store.data_mut().probe_bridge = std::ptr::null_mut();
-        drop(bridge);
-        assert_eq!(
-            call_i32_export(&mut prober, "get_ret"),
-            -3,
-            "痕迹命中应返回 -3（痕迹证据语义，与 -1 无实体/-2 无 on_probe 区分）"
-        );
-        assert_eq!(
-            call_i32_export(&mut prober, "get_resp0"),
-            42,
-            "resp[0..4] 应为发射者 id 低 32 位"
-        );
-        assert_eq!(
-            call_i32_export(&mut prober, "get_resp16"),
-            7,
-            "resp[16..20] 应为发射拍号低 32 位"
-        );
-    }
-
-    #[test]
-    fn probe_prefers_real_entity_over_trace_at_same_coordinate() {
-        // 同坐标实体与痕迹并存（发射者原地不动的常见态）：按实体结算（on_probe
-        // 假串照回），不吃痕迹证据——实体优先于痕迹
-        let mgr = SandboxManager::new().unwrap();
-        let mut map = std::collections::HashMap::new();
-        map.insert(
-            id(2),
-            mgr.create_sandbox(&wasm(LIAR_WAT), 100_000, id(2)).unwrap(),
-        );
-        let mut prober = mgr
-            .create_sandbox(&wasm(&prober_wat("7.0", "8.0")), 100_000, id(1))
-            .unwrap();
-        prober.store.data_mut().visible = vec![(7.0, 8.0)];
-        let trace_id = id(77);
-        let mut bridge = ProbeBridge {
-            visible_ids: vec![id(1), id(2), trace_id],
-            visible_positions: vec![(0.0, 0.0), (7.0, 8.0), (7.0, 8.0)],
-            sandboxes: &mut map,
-            manager: &mgr,
-            caller_id: id(1),
-            probe_fuel: 10_000,
-            traces: vec![TraceProbe {
-                trace_id,
-                shooter: id(2),
-                birth_tick: 3,
-            }],
-        };
-        prober.store.data_mut().probe_bridge = &mut bridge;
-        mgr.call_on_tick(&mut prober).unwrap();
-        prober.store.data_mut().probe_bridge = std::ptr::null_mut();
-        drop(bridge);
-        let ret = call_i32_export(&mut prober, "get_ret");
-        assert_eq!(ret, 28, "同坐标并存应按实体 probe 结算（4 假串+24 体徵）");
-        assert_eq!(
-            call_i32_export(&mut prober, "get_resp0"),
-            0x3945494C,
-            "响应应是实体的假串而非痕迹证据"
-        );
-    }
 
     // === env.spawn / env.destroy（门二：代码造物，decisions.md #012/#015）===
 
@@ -4481,7 +4078,7 @@ mod tests {
 
     #[test]
     fn field_pulse_rate_limited_per_tick() {
-        // 限流：每实体每拍 1 次（与 spawn/shoot 同款）
+        // 限流：每实体每拍 1 次（与 spawn 同款）
         let mgr = SandboxManager::new().unwrap();
         let double = r#"(module
   (import "env" "field_pulse" (func $field_pulse (param f64 f64 f64 f64 f64) (result i32)))
@@ -4574,7 +4171,7 @@ mod tests {
 
     #[test]
     fn spawn_import_rejects_birth_velocity_over_max() {
-        // 出生初速模长 28.28 > 世界极速 25 → 拒绝返回 0，不入队（与 shoot 同口径）
+        // 出生初速模长 28.28 > 世界极速 25 → 拒绝返回 0，不入队（恰等放行口径）
         let mgr = SandboxManager::new().unwrap();
         let mut handle = mgr
             .create_sandbox(
@@ -4603,7 +4200,7 @@ mod tests {
 
     #[test]
     fn spawn_import_allows_birth_velocity_exactly_max() {
-        // 边界：初速恰等于世界极速 25 放行（严格 > 判据，与 shoot 完全同口径）
+        // 边界：初速恰等于世界极速 25 放行（严格 > 判据）
         let mgr = SandboxManager::new().unwrap();
         let mut handle = mgr
             .create_sandbox(
@@ -4971,388 +4568,7 @@ mod tests {
         assert_eq!(call_i32_export(&mut handle, "get_ret"), -5, "指针非法应返回 -N");
     }
 
-    // === env.shoot import（#034 第 12 个玩家 import：发射弹丸）===
-
-    /// 射手 WAT 生成器：on_tick 调 shoot(vx, vy, mass, 0, payload_len)（payload 从
-    /// data 段 [0..4) 读 [1,2,3,4]），返回值存全局 get_ret。
-    fn shooter_wat(vx: &str, vy: &str, mass: &str, payload_len: &str) -> String {
-        shooter_binding_wat(vx, vy, mass, payload_len, "i32.const 0")
-    }
-
-    /// 带契约的射击方 WAT（#034 修订四：shoot 第 6 参 binding）
-    fn shooter_binding_wat(vx: &str, vy: &str, mass: &str, payload_len: &str, binding: &str) -> String {
-        format!(
-            r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
-  (global $ret (mut i32) (i32.const -1))
-  (memory (export "memory") 1)
-  (data (i32.const 0) "\01\02\03\04")
-  (func (export "on_tick")
-    {vx} {vy} {mass} i32.const 0 i32.const {payload_len} {binding}
-    call $shoot global.set $ret)
-  (func (export "get_ret") (result i32) global.get $ret)
-  (func (export "life") (result i32) i32.const 1))"#,
-            vx = vx,
-            vy = vy,
-            mass = mass,
-            payload_len = payload_len,
-            binding = binding,
-        )
-    }
-
-    #[test]
-    fn shoot_import_queues_pending_shoot() {
-        // env.shoot：合法请求（速度/质量合法、限流未满）-> 排队 PendingShoot，
-        // 返回弹丸序号（该实体累计第 1 发）
-        let mgr = SandboxManager::new().unwrap();
-        let shooter_id = id(901);
-        let wat_text = shooter_wat("f64.const 3.0", "f64.const 4.0", "f64.const 0.5", "4");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, shooter_id)
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "首发射击序号应为 1");
-        let shoots = &handle.store.data().pending_shoots;
-        assert_eq!(shoots.len(), 1, "应排队 1 次射击");
-        let s = &shoots[0];
-        assert_eq!(s.shooter, shooter_id, "shooter 应为沙箱绑定实体");
-        assert_eq!(s.vx, 3.0);
-        assert_eq!(s.vy, 4.0);
-        assert_eq!(s.mass, 0.5, "#034 弹丸质量由代码定（0.5 合法域内透传）");
-        assert_eq!(s.payload, vec![1, 2, 3, 4], "payload 应从 memory data 段读取");
-        assert!(
-            handle.store.data().api_calls.contains(&"shoot".to_string()),
-            "shoot 调用应记入 api_calls 元数据"
-        );
-    }
-
-    #[test]
-    fn shoot_import_rejects_second_shot_same_tick() {
-        // 限流：同实体一拍至多 1 发（防弹幕灌爆），第二次返回 0 不入队
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
-  (global $r1 (mut i32) (i32.const -1))
-  (global $r2 (mut i32) (i32.const -1))
-  (memory (export "memory") 1)
-  (func (export "on_tick")
-    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 0 i32.const 0 call $shoot global.set $r1
-    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 0 i32.const 0 call $shoot global.set $r2)
-  (func (export "get_r1") (result i32) global.get $r1)
-  (func (export "get_r2") (result i32) global.get $r2)
-  (func (export "life") (result i32) i32.const 1))"#;
-        let mut handle = mgr
-            .create_sandbox(&wasm(wat_text), 100_000, id(902))
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_r1"), 1, "首发应排队成功");
-        assert_eq!(call_i32_export(&mut handle, "get_r2"), 0, "同拍第二发应被限流拒绝");
-        assert_eq!(handle.store.data().pending_shoots.len(), 1, "同拍只应有 1 发入队");
-    }
-
-    #[test]
-    fn shoot_import_serial_increments_across_ticks() {
-        // 序号跨拍递增：tick1 返 1、drain 后 tick2 返 2（该实体累计第几发）
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = shooter_wat("f64.const 1.0", "f64.const 9.8", "f64.const 1.0", "0");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(903))
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1);
-        handle.store.data_mut().pending_shoots.clear(); // 主程序收集后清空（drain 语义）
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 2, "次拍射击序号应递增");
-    }
-
-    #[test]
-    fn shoot_import_rejects_overspeed() {
-        // 世界极速上限（#034 修订一：MAX_SHOOT_SPEED=50 退役，改用 WORLD_MAX_SPEED=25）：
-        // (40, 40) 模长 ~56.6 > 25 -> 拒绝
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = shooter_wat("f64.const 40.0", "f64.const 40.0", "f64.const 1.0", "0");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(904))
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超速射击应被拒绝");
-        assert!(handle.store.data().pending_shoots.is_empty(), "超速请求不应入队");
-    }
-
-    #[test]
-    fn shoot_import_allows_exactly_world_max_speed() {
-        // 边界：初速模长恰等于世界极速 25 不拒（严格 > 超限判据，审查锚定）
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = shooter_wat("f64.const 25.0", "f64.const 0.0", "f64.const 1.0", "0");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(908))
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "恰等于极速应放行");
-        assert_eq!(handle.store.data().pending_shoots.len(), 1);
-    }
-
-    #[test]
-    fn shoot_import_rejects_just_above_world_max_speed() {
-        // 边界：刚过极速一点（25.5）即拒
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = shooter_wat("f64.const 25.5", "f64.const 0.0", "f64.const 1.0", "0");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(909))
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "刚过极速应拒绝");
-        assert!(handle.store.data().pending_shoots.is_empty());
-    }
-
-    #[test]
-    fn shoot_import_uses_manager_max_speed_not_hardcoded() {
-        // 口径同源：new_with_max_speed(10) 的管理器按 10 判超限——发射钳制与
-        // 飞行钳制（DefaultPhysics.max_speed）同源一个世界常数，不再各自硬编码
-        let mgr = SandboxManager::new_with_max_speed(10.0).unwrap();
-        let wat_text = shooter_wat("f64.const 12.0", "f64.const 0.0", "f64.const 1.0", "0");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(910))
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "12 > 自定义极速 10 应拒绝");
-    }
-
-    #[test]
-    fn shoot_import_rejects_non_finite_velocity() {
-        // NaN 初速（0/0 除零）-> 拒绝，防污染世界状态
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = shooter_wat(
-            "f64.const 0.0 f64.const 0.0 f64.div",
-            "f64.const 1.0",
-            "f64.const 1.0",
-            "0",
-        );
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(905))
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "NaN 初速应被拒绝");
-        assert!(handle.store.data().pending_shoots.is_empty());
-    }
-
-    #[test]
-    fn shoot_import_clamps_mass_out_of_bounds() {
-        // mass 护栏（与 spawn 第 8 参同口径）：0.001 -> 0.05，1000 -> 100
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = shooter_wat("f64.const 1.0", "f64.const 0.0", "f64.const 0.001", "0");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(906))
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1);
-        assert_eq!(handle.store.data().pending_shoots[0].mass, 0.05, "低下限应钳到 0.05");
-    }
-
-    // === 够不着警告码（D-007 ①：不审查但告知——照常发射，返回负序号提示）===
-
-    #[test]
-    fn shoot_unreachable_target_returns_negative_serial_but_still_queues() {
-        // 发射参数按标准解够不着最近敌人快照（(30,0.5) 远超 (4,9.8) 抛射射程）：
-        // 世界照常发射（哑弹自由=玩家战术权利）——pending_shoots 仍入队 1 发参数原样，
-        // 返回值改 -序号（负数=带警告的弹丸序号，玩家代码 sign 即知）
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "4");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(920))
-            .unwrap();
-        handle.store.data_mut().pos = (0.0, 0.5);
-        handle.store.data_mut().nearest_enemy = Some((30.0, 0.5));
-        mgr.call_on_tick(&mut handle).unwrap();
-        let ret = call_i32_export(&mut handle, "get_ret");
-        assert_eq!(ret, -1, "够不着目标应返回 -序号（警告码）");
-        let shoots = &handle.store.data().pending_shoots;
-        assert_eq!(shoots.len(), 1, "够不着也照常入队（哑弹自由）");
-        assert_eq!(shoots[0].vx, 4.0, "入队参数原样（vx）");
-        assert_eq!(shoots[0].vy, 9.8, "入队参数原样（vy）");
-        assert_eq!(shoots[0].mass, 0.5, "入队参数原样（mass）");
-    }
-
-    #[test]
-    fn shoot_reachable_target_returns_positive_serial() {
-        // 快照目标够得着（(3.5,0.5) 在抛射弧线正下，首段水平线扫过）-> 正序号（现状不变）
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "4");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(921))
-            .unwrap();
-        handle.store.data_mut().pos = (0.0, 0.5);
-        handle.store.data_mut().nearest_enemy = Some((3.5, 0.5));
-        mgr.call_on_tick(&mut handle).unwrap();
-        let ret = call_i32_export(&mut handle, "get_ret");
-        assert_eq!(ret, 1, "够得着目标返回正序号（无警告）");
-        assert_eq!(handle.store.data().pending_shoots.len(), 1);
-    }
-
-    #[test]
-    fn shoot_without_enemy_snapshot_skips_reach_check() {
-        // 无 nearest_enemy 快照（视野内无敌人）-> 不判定，照常返回正序号
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "4");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(922))
-            .unwrap();
-        handle.store.data_mut().pos = (0.0, 0.5);
-        // nearest_enemy 保持 None（Default）
-        mgr.call_on_tick(&mut handle).unwrap();
-        let ret = call_i32_export(&mut handle, "get_ret");
-        assert_eq!(ret, 1, "无快照不判定，照常返回正序号");
-        assert_eq!(handle.store.data().pending_shoots.len(), 1);
-    }
-
-    #[test]
-    fn shoot_unreachable_negative_carries_current_serial() {
-        // -N 与 N 指同一发弹：跨拍序号递增时负号随当前序号走（tick1 -1、drain 后 tick2 -2）
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "0");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(923))
-            .unwrap();
-        handle.store.data_mut().pos = (0.0, 0.5);
-        handle.store.data_mut().nearest_enemy = Some((30.0, 0.5));
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), -1, "首发警告码 -1");
-        handle.store.data_mut().pending_shoots.clear(); // 主程序收集后清空（drain 语义）
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), -2, "次拍警告码随序号 -2");
-    }
-
-    #[test]
-    fn shoot_reach_terrain_blocks_lob_that_flat_ground_reaches() {
-        // P1-1 收尾（D-007 ①）：够不着判定的落地截断吃地形（镜像 step_projectiles
-        // 的 terrain.segment_first_contact CCD）——山地陡翼坡面挡弹，平地判据下
-        // "够得着"的同参数快照改判"够不着"（警告码 -N）。
-        // 场景几何从地形样本自取（山地总爬升 16 格/坡度钳 1.5，1 格爬升 >0.8 的
-        // 陡翼必存在）：发射者在陡翼起点当地地面 +0.5 悬空高度，敌人快照同高 3 格
-        // 外——平地弹道穿身而过（对照臂=判空指针回退），挂地形后 CCD 在坡面提前
-        // 截断，触地点离目标 > 容差。
-        let terrain = codeworld_core::terrain::Terrain::new(
-            codeworld_core::terrain::TerrainPreset::Mountain,
-            42,
-        );
-        let samples = terrain.samples();
-        let si = (0..samples.len() - 4)
-            .find(|&i| samples[i + 4] - samples[i] > 0.8)
-            .expect("山地预设必有陡翼（测试前提）");
-        let sx = codeworld_core::terrain::TERRAIN_X_MIN + si as f64 * codeworld_core::terrain::TERRAIN_SPACING;
-        let sy = samples[si] + 0.5; // 发射高度 = 当地地面 + 0.5
-        let target = (sx + 3.0, sy); // 敌人快照：同高 3 格外，坡在中间
-        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "0");
-
-        // 对照臂：terrain 指针 null（SandboxData 默认）→ 平地判据，lob 穿身而过=够得着
-        let mgr_flat = SandboxManager::new().unwrap();
-        let mut h_flat = mgr_flat
-            .create_sandbox(&wasm(&wat_text), 100_000, id(930))
-            .unwrap();
-        h_flat.store.data_mut().pos = (sx, sy);
-        h_flat.store.data_mut().nearest_enemy = Some(target);
-        mgr_flat.call_on_tick(&mut h_flat).unwrap();
-        assert_eq!(
-            call_i32_export(&mut h_flat, "get_ret"),
-            1,
-            "判空回退平地判据：同参数应够得着（正序号，不 panic）"
-        );
-
-        // 挂载山地地形（窗口契约：Terrain 活在测试栈上，指针在 call 窗口内有效，
-        // call 后置空对称收尾）→ CCD 坡面截断 → 改判够不着
-        let mgr_hill = SandboxManager::new().unwrap();
-        let mut h_hill = mgr_hill
-            .create_sandbox(&wasm(&wat_text), 100_000, id(931))
-            .unwrap();
-        h_hill.store.data_mut().pos = (sx, sy);
-        h_hill.store.data_mut().nearest_enemy = Some(target);
-        h_hill.store.data_mut().terrain = &terrain;
-        mgr_hill.call_on_tick(&mut h_hill).unwrap();
-        h_hill.store.data_mut().terrain = std::ptr::null();
-        assert_eq!(
-            call_i32_export(&mut h_hill, "get_ret"),
-            -1,
-            "山地坡面挡弹：同参数应改判够不着（警告码 -N）"
-        );
-    }
-
-    #[test]
-    fn shoot_reach_drag_assembly_changes_reach_verdict() {
-        // P1-3 收尾（D-007 ①）：够不着判定的 drag 用装配值（与真实弹丸同一阻力
-        // 定律参数）——同参数 lob，drag=0.05 够得着的快照在 drag=0.3 下改判够不着
-        // （阻力大弹丸飞不远，判定必须跟着装配走）。
-        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 0.5", "0");
-        let verdict = |mgr: &SandboxManager, eid: u128| -> i32 {
-            let mut handle = mgr.create_sandbox(&wasm(&wat_text), 100_000, id(eid)).unwrap();
-            handle.store.data_mut().pos = (0.0, 0.5);
-            handle.store.data_mut().nearest_enemy = Some((3.5, 0.5));
-            mgr.call_on_tick(&mut handle).unwrap();
-            call_i32_export(&mut handle, "get_ret")
-        };
-        let mgr_lo = SandboxManager::new_with_reach_physics(25.0, 0.05).unwrap();
-        assert_eq!(
-            verdict(&mgr_lo, 932),
-            1,
-            "drag=0.05（默认档）3.5 格快照应够得着（现有行为不变）"
-        );
-        let mgr_hi = SandboxManager::new_with_reach_physics(25.0, 0.3).unwrap();
-        assert_eq!(
-            verdict(&mgr_hi, 933),
-            -1,
-            "drag=0.3 同参数应改判够不着（警告码 -N）"
-        );
-    }
-
-    #[test]
-    fn shoot_reach_drag_ge_mass_clamps_to_zero_without_panic() {
-        // drag/mass ≥ 1 的极端装配：镜像 apply_drag 符号翻转钳零（方向永不翻转），
-        // 弹丸原地不动，判定有限返回不 panic（护栏不炸沙箱）
-        let mgr = SandboxManager::new_with_reach_physics(25.0, 10.0).unwrap();
-        let wat_text = shooter_wat("f64.const 4.0", "f64.const 9.8", "f64.const 1.0", "0");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(934))
-            .unwrap();
-        handle.store.data_mut().pos = (0.0, 0.5);
-        handle.store.data_mut().nearest_enemy = Some((3.5, 0.5));
-        mgr.call_on_tick(&mut handle).unwrap();
-        let ret = call_i32_export(&mut handle, "get_ret");
-        assert_eq!(ret, -1, "弹丸被钳原地（3.5 格够不着）应返回警告码");
-        assert_eq!(handle.store.data().pending_shoots.len(), 1, "照常入队（哑弹自由）");
-    }
-
-    // === 绑定契约（#034 修订四：shoot 第 6 参 / spawn 第 9 参）===
-
-    #[test]
-    fn shoot_import_passes_binding_through() {
-        // 第 6 参 binding：1=fade_on_death / 2=grace_owner 原样透传进 PendingShoot
-        for (raw, expect) in [("i32.const 1", 1), ("i32.const 2", 2)] {
-            let mgr = SandboxManager::new().unwrap();
-            let wat_text =
-                shooter_binding_wat("f64.const 1.0", "f64.const 0.0", "f64.const 1.0", "0", raw);
-            let mut handle = mgr
-                .create_sandbox(&wasm(&wat_text), 100_000, id(911))
-                .unwrap();
-            mgr.call_on_tick(&mut handle).unwrap();
-            assert_eq!(handle.store.data().pending_shoots[0].binding, expect, "binding {raw} 应透传");
-        }
-    }
-
-    #[test]
-    fn shoot_import_clamps_invalid_binding_to_unbound() {
-        // 非法契约值（9）钳 unbound——坏声明不进世界，回退最保守现状语义
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text =
-            shooter_binding_wat("f64.const 1.0", "f64.const 0.0", "f64.const 1.0", "0", "i32.const 9");
-        let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, id(912))
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "非法契约值不拒绝发射");
-        assert_eq!(
-            handle.store.data().pending_shoots[0].binding, 0,
-            "非法契约值应钳 unbound"
-        );
-    }
+    // === 绑定契约（#034 修订四：spawn 第 9 参；shoot 第 6 参随 D-018 退役）===
 
     #[test]
     fn spawn_import_passes_binding_through_and_clamps_invalid() {
@@ -5382,26 +4598,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shoot_import_rejects_oversized_payload() {
-        // payload 超限（>1MB）-> 拒绝不入队（与 attack_at 同上限 MAX_PAYLOAD_LEN）
-        let mgr = SandboxManager::new().unwrap();
-        let wat_text = r#"(module
-  (import "env" "shoot" (func $shoot (param f64 f64 f64 i32 i32 i32) (result i32)))
-  (global $ret (mut i32) (i32.const -1))
-  (memory (export "memory") 24)
-  (func (export "on_tick")
-    f64.const 1.0 f64.const 0.0 f64.const 1.0 i32.const 0 i32.const 1048577 i32.const 0
-    call $shoot global.set $ret)
-  (func (export "get_ret") (result i32) global.get $ret)
-  (func (export "life") (result i32) i32.const 1))"#;
-        let mut handle = mgr
-            .create_sandbox(&wasm(wat_text), 100_000, id(907))
-            .unwrap();
-        mgr.call_on_tick(&mut handle).unwrap();
-        assert_eq!(call_i32_export(&mut handle, "get_ret"), 0, "超限 payload 应被拒绝");
-        assert!(handle.store.data().pending_shoots.is_empty());
-    }
 
     #[test]
     fn spawn_import_rejects_second_request_same_tick() {
