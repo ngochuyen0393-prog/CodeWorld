@@ -99,6 +99,18 @@ export class GenshinToonMaterial extends THREE.ShaderMaterial {
       uGTBlackB: new THREE.Uniform(0),
       uGTEnabled: new THREE.Uniform(1),
       uOutLineWidth: new THREE.Uniform(0.4),   // 描边宽（Ayaka uniforms 初始 0.4）
+      /* D-004c：头发天使光圈（KKK aniso）+ rim 泛化（默认值=D-004b 等价/关闭态） */
+      uAnisoShift: new THREE.Uniform(0.2),           // 条带纵向移位
+      uAnisoShininess: new THREE.Uniform(96),        // 条带锐度指数
+      uAnisoIntensity: new THREE.Uniform(0.6),       // 条带强度（0=关）
+      uAnisoSecondary: new THREE.Uniform(0),         // 第二条带强度（0=关）
+      uAnisoSecondaryShift: new THREE.Uniform(-0.3), // 第二条带移位
+      uAnisoColor: new THREE.Uniform(new THREE.Color(1, 1, 1)), // 条带颜色（白）
+      uRimColor: new THREE.Uniform(new THREE.Color(1, 1, 1)),   // rim 独立颜色（白≈旧 diffuse 因子观感）
+      uRimShadeMix: new THREE.Uniform(0),        // 背光 rim 压暗混合（0=关）
+      uRimByMatId: new THREE.Uniform(0),         // ILM 分区 rim 宽度调制开关（0=关）
+      uRimThreshold: new THREE.Uniform(0.12),    // rim 深度差阈值（旧硬编码参数化）
+      uRimFadeout: new THREE.Uniform(1.0),       // rim 软度上限（旧硬编码参数化）
     };
     // 构造参数覆写默认底账
     if (options.isDay !== undefined) shared.uIsDay.value = options.isDay;
@@ -174,6 +186,18 @@ export class GenshinToonMaterial extends THREE.ShaderMaterial {
       uGTBlackC: shared.uGTBlackC,
       uGTBlackB: shared.uGTBlackB,
       uGTEnabled: shared.uGTEnabled,
+      /* D-004c：aniso/rim 泛化共享项（face shader 不声明这些 uniform，自动跳过） */
+      uAnisoShift: shared.uAnisoShift,
+      uAnisoShininess: shared.uAnisoShininess,
+      uAnisoIntensity: shared.uAnisoIntensity,
+      uAnisoSecondary: shared.uAnisoSecondary,
+      uAnisoSecondaryShift: shared.uAnisoSecondaryShift,
+      uAnisoColor: shared.uAnisoColor,
+      uRimColor: shared.uRimColor,
+      uRimShadeMix: shared.uRimShadeMix,
+      uRimByMatId: shared.uRimByMatId,
+      uRimThreshold: shared.uRimThreshold,
+      uRimFadeout: shared.uRimFadeout,
     };
     super({
       name: options.name || (isFace ? 'GenshinToonFace' : 'GenshinToonBody'),
@@ -225,6 +249,20 @@ export class GenshinToonMaterial extends THREE.ShaderMaterial {
   set rightVec(v) { this.uniforms.uRightVec.value.copy(v); }
   get outlineWidth() { return this.uniforms.uOutLineWidth.value; }
   set outlineWidth(v) { this.uniforms.uOutLineWidth.value = v; }
+  /* ---- D-004c：天使圈/rim 泛化代理（共享表，改一处全量生效）---- */
+  get anisoIntensity() { return this.uniforms.uAnisoIntensity.value; }
+  set anisoIntensity(v) { this.uniforms.uAnisoIntensity.value = v; }
+  get anisoShift() { return this.uniforms.uAnisoShift.value; }
+  set anisoShift(v) { this.uniforms.uAnisoShift.value = v; }
+  get rimShadeMix() { return this.uniforms.uRimShadeMix.value; }
+  set rimShadeMix(v) { this.uniforms.uRimShadeMix.value = v; }
+  /* rim 色调（hue 环）：0=白（关染色）；>0 走 HSL 且饱和度随 v 前段爬坡，
+     避免 0(白)→0.01(近纯红) 的观感跳变；只写 uRimColor，无回读语义 */
+  set rimHue(v) {
+    const c = this.uniforms.uRimColor.value;
+    if (v <= 0.001) { c.setRGB(1, 1, 1); return; }
+    c.setHSL(v, Math.min(1, v * 4), 0.5);
+  }
 
   /* ---- 静态装配：traverse glTF 场景按 mat.name 分派 + 附加描边壳 ---- */
   static applyToSkeleton(root, options = {}) {
@@ -246,9 +284,13 @@ export class GenshinToonMaterial extends THREE.ShaderMaterial {
       const srcMat = mesh.material; // glTF 来的 MeshStandardMaterial
       const name = (srcMat.name || '').toLowerCase();
       const isFace = name === 'face';
-      const isHair = name === 'hair' || name === 'dress';
+      // D-004c 行为修正：hair 材质变体（天使圈 aniso）只认含 'hair' 的名字；
+      // dress 不含 'hair' → 从原「hair/dress 同组」回归 body 贴图组（观感变化入报告差异源清单）
+      const isHair = name.indexOf('hair') >= 0;
 
-      // 贴图组（Ayaka.tsx 286/321/327 行实证）：face→face 贴图组；hair/dress→hair 组；其余→body 组
+      // 贴图组：face→face 组；hair→hair 组；dress/body→body 组（dress 原在 hair 组，D-004c 修正）
+      const defines = geo.attributes.tangent ? {} : { CW_NO_TANGENT: 1 }; // 缺 TANGENT 时退化 define
+      if (isHair) defines.CW_HAIR_ANISO = 1; // 天使圈 shader 段只对 hair 编译
       const mat = new GenshinToonMaterial({
         isFace,
         name: 'toon-' + (name != null ? name : 'body'),
@@ -258,12 +300,13 @@ export class GenshinToonMaterial extends THREE.ShaderMaterial {
         side: srcMat.side,
         depthWrite: srcMat.depthWrite,
         depthTest: srcMat.depthTest,
-        // geometry 缺 TANGENT 时 three prefix 不注入声明，shader 走退化 define
-        defines: geo.attributes.tangent ? {} : { CW_NO_TANGENT: 1 },
+        defines,
         lightMap: isFace ? null : (isHair ? tex.hairLightMap : tex.bodyLightMap),
-        rampMap: tex.bodyRampMap, // face 也用 bodyRamp（Ayaka 299 行）
+        // D-004c：hair 用 hair/ramp.png。底账勘误：D-004b 实际 hair/dress 全用 bodyRamp
+        // （hairRampMap 加载后未挂材质）；本刀按底账意图接回，dress 保持 bodyRamp
+        rampMap: isHair ? tex.hairRampMap : tex.bodyRampMap, // face 也用 bodyRamp（Ayaka 299 行）
         normalMap: isFace ? null : (isHair ? tex.hairNormalMap : tex.bodyNormalMap),
-        emissiveMap: isFace || isHair ? null : tex.emissiveMap, // hair 组 emissive null（Ayaka 325）
+        emissiveMap: isFace || isHair ? null : tex.emissiveMap, // hair 组 emissive null（Ayaka 325）；dress 回 body 组后接 emissive
         metalMap: tex.metalMap,
         faceSDFMap: isFace ? tex.faceLightMap : null,
       });

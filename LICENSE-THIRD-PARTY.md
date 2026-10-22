@@ -35,6 +35,21 @@ MIT License 全文（英文原文为准）：
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE OTHER DEALINGS IN THE
 > SOFTWARE.
 
+## D-004c 天使光圈（aniso 高光）与 rim 泛化公式来源声明
+
+- **头发天使光圈（各向异性高光）**：教科书 Kajiya-Kay 移位切线（shifted
+  tangent）各向异性高光的 sin 展开（`pow(sqrt(1-dot(shiftedT,H)²), shininess)`），
+  **自实现**，未直译任何上游代码。「分区乘 mask」（specColor × 光照图通道 mask
+  的组织方式）**思路**参考 MIT 许可的
+  [Gaolingx/GenshinCelShaderURP](https://github.com/Gaolingx/GenshinCelShaderURP)
+  （`AvatarSpecularHelper.hlsl` 的 `specular_color()`），未复制其代码。
+- **rim 泛化（独立 rim 颜色 / 背光压暗 / ILM 分区 rim 宽度）**：实现全自写
+  （沿用本仓库已有的 KallkaGo 深度偏移 rim 骨架）；「rim 颜色独立分区」与
+  「rim 随光照方向衰减（背光压暗）」两个**思想**参考 GPL-3.0 的
+  [stalomeow/StarRailNPRShader](https://github.com/stalomeow/StarRailNPRShader)
+  ——仅借鉴思想，未复制其任何代码、命名、结构或常量序列（自查见 D-004c
+  任务报告的 GPL 红线自查节）。
+
 ## miHoYo 测试资产声明（重要）
 
 `bin/codeworld/static/models/ayakaktx2opt.glb`（神里绫华模型）与

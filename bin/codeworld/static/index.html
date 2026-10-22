@@ -251,6 +251,11 @@
     <div class="row"><label>昼夜</label><input type="range" id="s-day" min="-1" max="1" step="0.01" value="0.5"><b id="v-day">0.5</b></div>
     <div class="row"><label>金属度</label><input type="range" id="s-metal" min="0" max="1" step="0.01" value="0.5"><b id="v-metal">0.5</b></div>
     <div class="row"><label>SDF 强度</label><input type="range" id="s-sdf" min="1" max="5" step="0.01" value="2"><b id="v-sdf">2</b></div>
+    <!-- D-004c：天使圈（hair aniso 高光）+ rim 泛化 -->
+    <div class="row"><label>天使圈强度</label><input type="range" id="s-anisoI" min="0" max="2" step="0.01" value="0.6"><b id="v-anisoI">0.6</b></div>
+    <div class="row"><label>天使圈位移</label><input type="range" id="s-anisoShift" min="-1" max="1" step="0.01" value="0.2"><b id="v-anisoShift">0.2</b></div>
+    <div class="row"><label>rim 色调</label><input type="range" id="s-rimHue" min="0" max="1" step="0.01" value="0"><b id="v-rimHue">0</b></div>
+    <div class="row"><label>背光 rim 压暗</label><input type="range" id="s-rimShade" min="0" max="1" step="0.01" value="0"><b id="v-rimShade">0</b></div>
   </div>
 </div>
 <div id="bar">
@@ -2070,6 +2075,11 @@
       bindSlider('s-day', 'v-day', function (v) { if (layer) layer.rigged.materials[0].isDay = v; });
       bindSlider('s-metal', 'v-metal', function (v) { if (layer) layer.rigged.materials[0].metallic = v; });
       bindSlider('s-sdf', 'v-sdf', function (v) { if (layer) layer.rigged.materials[0].intensity = v; });
+      // D-004c：天使圈/rim 泛化四滑条（rimHue 经 setter 换算 hue→RGB 进 uRimColor）
+      bindSlider('s-anisoI', 'v-anisoI', function (v) { if (layer) layer.rigged.materials[0].anisoIntensity = v; });
+      bindSlider('s-anisoShift', 'v-anisoShift', function (v) { if (layer) layer.rigged.materials[0].anisoShift = v; });
+      bindSlider('s-rimHue', 'v-rimHue', function (v) { if (layer) layer.rigged.materials[0].rimHue = v; });
+      bindSlider('s-rimShade', 'v-rimShade', function (v) { if (layer) layer.rigged.materials[0].rimShadeMix = v; });
     }
 
     if (STILL_MODE) {
@@ -2079,6 +2089,29 @@
       else if (HASH.indexOf('r45') >= 0) { layer.viewIdx = 2; layer.group.rotation.y = VIEW_RY[2]; }
       console.info('[cw3d] still 模式：停轮播 + uTime 冻结');
     }
+
+    // D-004c 开/关对照开关：hash 追加 &a=<值>（天使圈强度直设，a=0 关）、&r=0/1（rim 泛化关/演示档）。
+    // 缺省不动默认底账（天使圈 0.6）；r=1 开演示档（rimHue 0.6 青蓝 + 背光压暗 0.6）。
+    // 无头截图与手动 #d3d 亲验共用同一入口。
+    function hashFlag(key) {
+      var m = HASH.match(new RegExp('[&#]' + key + '=(-?[0-9.]+)'));
+      return m ? parseFloat(m[1]) : null;
+    }
+    var aFlag = hashFlag('a');
+    if (aFlag !== null) { layer.rigged.materials[0].anisoIntensity = aFlag; }
+    var rFlag = hashFlag('r'); // 返回数字（hashFlag 现为 parseFloat），按数值比较
+    if (rFlag === 1) {
+      layer.rigged.materials[0].rimHue = 0.6;
+      layer.rigged.materials[0].rimShadeMix = 0.6;
+    } else if (rFlag === 0) {
+      layer.rigged.materials[0].rimHue = 0;
+      layer.rigged.materials[0].rimShadeMix = 0;
+    }
+    // 无头日志验证锚：天使圈/rim 当前生效值（铁律 4；cw3dLog 同时上报 /__log）
+    cw3dLog('天使圈 intensity=' + layer.rigged.materials[0].anisoIntensity +
+      ' shift=' + layer.rigged.materials[0].anisoShift +
+      '；rim 颜色=#' + layer.rigged.materials[0].uniforms.uRimColor.value.getHexString() +
+      ' 背光压暗=' + layer.rigged.materials[0].rimShadeMix);
 
     btnEl.textContent = '3D 层：开';
     statusEl.textContent = '3D: 开(r' + THREE.REVISION + '·绫华)';
