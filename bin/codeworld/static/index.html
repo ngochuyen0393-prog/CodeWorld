@@ -2098,7 +2098,8 @@
       return m ? parseFloat(m[1]) : null;
     }
     var aFlag = hashFlag('a');
-    if (aFlag !== null) { layer.rigged.materials[0].anisoIntensity = aFlag; }
+    // R1 双审 P3 加固：拦 NaN（a=. 时 parseFloat NaN 直灌 uniform 出黑块）+负强度（负条带=发梢暗带伪影）
+    if (aFlag !== null && Number.isFinite(aFlag)) { layer.rigged.materials[0].anisoIntensity = Math.max(0, aFlag); }
     var rFlag = hashFlag('r'); // 返回数字（hashFlag 现为 parseFloat），按数值比较
     if (rFlag === 1) {
       layer.rigged.materials[0].rimHue = 0.6;

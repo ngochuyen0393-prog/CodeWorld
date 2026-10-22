@@ -290,7 +290,9 @@ export class GenshinToonMaterial extends THREE.ShaderMaterial {
 
       // 贴图组：face→face 组；hair→hair 组；dress/body→body 组（dress 原在 hair 组，D-004c 修正）
       const defines = geo.attributes.tangent ? {} : { CW_NO_TANGENT: 1 }; // 缺 TANGENT 时退化 define
-      if (isHair) defines.CW_HAIR_ANISO = 1; // 天使圈 shader 段只对 hair 编译
+      // 天使圈 shader 段只对 hair 编译；缺 TANGENT 时静默关（退化切线=世界+Z 常量，
+      // 拿它当发丝走向只会渲出方向错误的条带，关掉比错着好——R1 双审 P3 加固）
+      if (isHair && geo.attributes.tangent) defines.CW_HAIR_ANISO = 1;
       const mat = new GenshinToonMaterial({
         isFace,
         name: 'toon-' + (name != null ? name : 'body'),
