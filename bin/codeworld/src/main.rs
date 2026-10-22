@@ -692,6 +692,18 @@ impl EntitySandboxMap {
             .collect();
         alive_visible.sort_by_key(|a| a.0 .0);
         let (payload_max, cap) = (self.link_payload_max, self.storage_cap);
+        // 共享真源快照（D-011-R1 P1-3）：每实体 storage 每拍单份 Arc，各沙箱
+        // peers 引用同一份——旧实现每沙箱每 peer 各 to_vec() 满盘拷贝是
+        // N²×4KB/拍（64 实体≈16MB，实体上限上调后线性恶化），N 份后归 O(N)
+        let storage_shots: HashMap<EntityId, Arc<Vec<u8>>> = alive_visible
+            .iter()
+            .map(|(eid, _, _)| {
+                (
+                    *eid,
+                    Arc::new(world.entities[eid].storage().to_vec()),
+                )
+            })
+            .collect();
         for (id, handle) in self.sandboxes.iter_mut() {
             let Some(e) = world.entities.get(id) else {
                 continue; // 无实体的残留沙箱（不应出现，防御性跳过）
@@ -703,7 +715,7 @@ impl EntitySandboxMap {
                     id: *eid,
                     pos: *pos,
                     radius: *radius,
-                    storage: world.entities[eid].storage().to_vec(),
+                    storage: storage_shots[eid].clone(), // Arc 引用计数拷贝（零深拷贝）
                 })
                 .collect();
             let children = world
@@ -739,7 +751,12 @@ impl EntitySandboxMap {
             return;
         }
         let mut msgs = std::mem::take(&mut self.link_inbox);
-        msgs.sort_by_key(|m| (m.to.0, m.from.0)); // （目标,源）升序确定性
+        // 三键定序（D-011-R1 P1-1，#044 确定性红线）：前两键（目标,源）只保证不同
+        // 收发对有序；同拍 command 扇出+send 直发同一目标时两封同（to,from）键，
+        // 稳定排序只能保留入箱原始序——原始序随 collect 侧 HashMap 迭代/玩家调用
+        // 序漂移。第三键=回调导出名字典序（"on_command"<"on_message"<"on_report"，
+        // &'static str 字典序全局稳定），把同键消息顺序锁进规范而非实现细节
+        msgs.sort_by_key(|m| (m.to.0, m.from.0, m.export));
         for msg in msgs {
             let Some(handle) = self.sandboxes.get_mut(&msg.to) else {
                 tracing::info!(
@@ -816,11 +833,11 @@ impl EntitySandboxMap {
             for out in pending {
                 match out.kind {
                     LinkOutKind::StorageWrite => {
-                        match world.entities.get(&out.from) {
+                        // 单次 get_mut 判活+落账（D-011-R1 P2-6：旧 get+get_mut 同
+                        // key 两次哈希）
+                        match world.entities.get_mut(&out.from) {
                             Some(e) if e.is_alive() => {
-                                if let Some(e) = world.entities.get_mut(&out.from) {
-                                    e.set_storage(out.payload);
-                                }
+                                e.set_storage(out.payload);
                                 tracing::info!(
                                     entity = %out.from.0,
                                     "[link] 公开块落账（世界侧真源，随实体入快照）"
@@ -2207,12 +2224,25 @@ fn tick_with_intents(
     //      + INFO 一条汇总）。断链不杀造物（生死归 binding 契约——电话挂了人
     //      活着，#035/#038 契约=遗嘱 vs 控制=活电话）；断链不可逆（MVP 无复活）。
     //      排在遗嘱窗口之前：遗嘱 spawn 的孤儿不再挂死链（接线侧也验创造者存活）。
+    //      悬垂防御（D-011-R1 P2-2）：link_to 指向不存在实体（不在表内也不在本
+    //      拍死亡名单——快照损坏场景）的永久悬垂链一并清算。前置收集（values_mut
+    //      借用下做不了 contains_key），表内死者归 dead_ids 分支语义不变
+    let dangling_parents: std::collections::HashSet<EntityId> = world
+        .entities
+        .values()
+        .filter_map(|e| e.link_to())
+        .filter(|p| !world.entities.contains_key(p))
+        .collect();
     let mut broken_links = 0usize;
+    let mut broken_dangling = 0usize;
     for e in world.entities.values_mut() {
         if let Some(parent) = e.link_to() {
             if dead_ids.contains(&parent) {
                 e.set_link_to(None);
                 broken_links += 1;
+            } else if dangling_parents.contains(&parent) {
+                e.set_link_to(None);
+                broken_dangling += 1;
             }
         }
     }
@@ -2221,6 +2251,13 @@ fn tick_with_intents(
             tick = current_tick,
             broken = broken_links,
             "[link] 母体死亡，链断（孤儿按 binding 契约活）"
+        );
+    }
+    if broken_dangling > 0 {
+        tracing::info!(
+            tick = current_tick,
+            broken = broken_dangling,
+            "[link] 悬垂链清算（链目标实体不存在，快照损坏防御）"
         );
     }
     //      d-will 遗嘱窗口（D-007 ③，#043 死亡谢幕）：必须在 remove 之前（沙箱还在
@@ -9049,6 +9086,32 @@ mod tests {
   (func (export "get_from") (result i64) global.get $from)
   (func (export "life") (result i32) i32.const 1))"#;
 
+    /// 同键双信母体 WAT（D-011-R1 P1-1 定序测试用）：on_tick 先 send 直发孩子
+    /// 坐标（on_message 路）再 command 扇出（on_command 路）——两封同（目标,源）
+    /// 键，原始入箱序 message 在前（考验投递侧第三键）
+    const LINK_SAME_KEY_MOTHER_WAT: &str = r#"(module
+  (import "env" "command" (func $command (param i32 i32) (result i32)))
+  (import "env" "send" (func $send (param f64 f64 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "ORDER")
+  (func (export "on_tick")
+    f64.const 2.5 f64.const 0.5 i32.const 0 i32.const 5 call $send drop
+    i32.const 0 i32.const 6 call $command drop)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 定序观察 WAT：on_message 回调时记下当时 on_command 的票数（cmd_at_msg）——
+    /// 投递顺序的可观测锚（1=command 先到，0=message 抢跑）
+    const LINK_ORDER_OBSERVER_WAT: &str = r#"(module
+  (global $cmd (mut i32) (i32.const 0))
+  (global $cmd_at_msg (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (func (export "on_command") (param i32 i32)
+    (global.set $cmd (i32.add (global.get $cmd) (i32.const 1))))
+  (func (export "on_message") (param i64 i32 i32)
+    (global.set $cmd_at_msg (global.get $cmd)))
+  (func (export "get_cmd_at_msg") (result i32) global.get $cmd_at_msg)
+  (func (export "life") (result i32) i32.const 1))"#;
+
     /// 挂链孩子落地（测试辅助：跳过 import 层直接走阶段二接线——import 层
     /// 校验已由 arena 侧测试覆盖，这里测 link 接线与编排链路。child_u 仅作
     /// 日志标记不进 id——造物 id 是世界生成的随机 EntityId）
@@ -9113,12 +9176,35 @@ mod tests {
         assert_eq!(md.link_parent, None, "母体自己无链");
         assert_eq!(md.link_peers.len(), 2, "视口内应有 2 个 peer（排除自己）");
         assert_eq!(md.link_peers[0].id, child, "peers 应 EntityId 升序（72<73）");
-        assert_eq!(md.link_peers[0].storage, b"CHILD-SSD".to_vec(), "peer 块应随快照");
+        assert_eq!(*md.link_peers[0].storage, b"CHILD-SSD".to_vec(), "peer 块应随快照");
         // 孩子：parent=母体 + 0 孩子
         let cd = map.sandboxes[&child].store.data();
         assert_eq!(cd.link_parent, Some(mother), "孩子的母体快照应是其 link_to");
         assert_eq!(cd.link_children, 0, "孩子名下无孩子");
         assert_eq!(cd.link_storage_own, b"CHILD-SSD".to_vec(), "own 镜像应同步");
+    }
+
+    #[test]
+    fn fill_link_snapshots_shares_peer_storage_single_copy_per_entity() {
+        // 共享真源（D-011-R1 P1-3）：两个读方同拍读同一满盘目标，peers 拿到的是
+        // 同一份 Arc 快照（结构证明=每实体单份，N 份而非 N² 份满盘拷贝）且字节
+        // 一致（共享真源语义）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let a = make_entity_with_sandbox(&mut world, &mut map, 111, (0.0, 0.5), LIFE_WAT_MAIN);
+        let b = make_entity_with_sandbox(&mut world, &mut map, 112, (2.0, 0.5), LIFE_WAT_MAIN);
+        let t = make_entity_with_sandbox(&mut world, &mut map, 113, (4.0, 0.5), LIFE_WAT_MAIN);
+        world.entities.get_mut(&t).unwrap().set_storage(vec![0xAB; 4096]);
+        map.fill_link_snapshots(&world, &unbounded_bb());
+        let da = map.sandboxes[&a].store.data();
+        let db = map.sandboxes[&b].store.data();
+        let sa = &da.link_peers.iter().find(|p| p.id == t).unwrap().storage;
+        let sb = &db.link_peers.iter().find(|p| p.id == t).unwrap().storage;
+        assert!(
+            Arc::ptr_eq(sa, sb),
+            "同目标两读方应共享同一份快照（每实体单份，非逐沙箱复制）"
+        );
+        assert_eq!(***sa, vec![0xAB_u8; 4096], "满盘字节两读方应一致（共享真源语义）");
     }
 
     #[test]
@@ -9152,6 +9238,36 @@ mod tests {
         assert!(
             !map.sandboxes[&mother].store.data().link_command_sent,
             "collect 后 sent 标记应清"
+        );
+    }
+
+    #[test]
+    fn deliver_link_messages_orders_same_key_command_before_message() {
+        // 同（目标,源）键双信定序（D-011-R1 P1-1，#044 确定性红线）：一母体同拍
+        // send 直发+command 扇出指向同一孩子，两封同（to,from）键。断言键序写死
+        // "on_command"<"on_message"：on_message 回调时 on_command 应已先到。
+        // 原始入箱序 send 在前（WAT 先调 send），无第三键时投递序=入箱序
+        //（message 先到），本测试即红——第三键是把顺序锁进规范的唯一手段
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let mother = make_entity_with_sandbox(&mut world, &mut map, 101, (0.0, 0.5), LINK_SAME_KEY_MOTHER_WAT);
+        let child = spawn_linked_child(&mut world, &mut map, mother, 102, (2.5, 0.5), LINK_ORDER_OBSERVER_WAT, 1);
+        map.fill_link_snapshots(&world, &unbounded_bb());
+        map.run_player_code(&world, &unbounded_bb());
+        map.collect_link_sends(&mut world);
+        assert_eq!(map.link_inbox.len(), 2, "同拍两封：send 直发一封+command 扇出一封");
+        map.deliver_link_messages(&world);
+        let handle = map.sandboxes.get_mut(&child).unwrap();
+        let cmd_at_msg = {
+            let func = handle
+                .instance
+                .get_typed_func::<(), i32>(&mut handle.store, "get_cmd_at_msg")
+                .unwrap();
+            func.call(&mut handle.store, ()).unwrap()
+        };
+        assert_eq!(
+            cmd_at_msg, 1,
+            "on_message 到达时 on_command 应已先到（键序 on_command<on_message 写死）"
         );
     }
 
@@ -9310,6 +9426,38 @@ mod tests {
         map.run_player_code(&world, &unbounded_bb());
         let parent = map.sandboxes[&child].store.data().link_parent;
         assert_eq!(parent, None, "断链后孩子 report 应走无链路径");
+    }
+
+    #[test]
+    fn dangling_link_to_missing_entity_cleared_on_tick() {
+        // 悬垂链防御（D-011-R1 P2-2）：link_to 指向不存在实体（不在表内也不在
+        // 本拍死亡名单——快照损坏场景，dead_ids 查不到）的永久悬垂链，tick 当拍
+        // 一并清算（清 None+INFO）；断链不杀造物照旧
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        let child = make_entity_with_sandbox(&mut world, &mut map, 103, (0.0, 0.5), LIFE_WAT_MAIN);
+        // 幽灵母体：不在实体表里（构造后从未 insert），也不在任何死亡名单
+        let ghost = EntityId(Uuid::from_u128(9999));
+        world
+            .entities
+            .get_mut(&child)
+            .unwrap()
+            .set_link_to(Some(ghost));
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert!(
+            world.entities.get(&child).unwrap().is_alive(),
+            "孩子应活着（断链不杀造物）"
+        );
+        assert_eq!(
+            world.entities[&child].link_to(),
+            None,
+            "悬垂链应当拍清算（目标实体不存在，不得永久悬挂）"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 use wasmtime::{Caller, Config, Engine, Instance, Linker, Module, Store};
 
@@ -166,8 +167,10 @@ pub struct LinkPeer {
     pub pos: (f64, f64),
     /// 身体半径快照（贴身判据 r_self + r_peer + 0.5 用）
     pub radius: f64,
-    /// 公开存储块快照（storage_read 拉读的数据源）
-    pub storage: Vec<u8>,
+    /// 公开存储块共享快照（storage_read 拉读的数据源）。Arc=host 拍首每实体
+    /// 单份快照、各读方 peers 引用同一份（D-011-R1 P1-3：N 份而非逐沙箱 N² 份
+    /// 满盘拷贝；一拍一快照，拍间不共享）
+    pub storage: Arc<Vec<u8>>,
 }
 
 /// storage_read 贴身判距冗余（与 melee 同款 0.5——读硬盘=物理凑过去读，
@@ -1815,7 +1818,8 @@ impl SandboxManager {
         // 对方公开块（读硬盘=物理凑过去读）。返回：N=读到字节（写入 memory
         // [ptr..ptr+N)）/ 0=cap 不足或指针坏 / -1=坐标无实体 / -2=够不着
         //（贴身判据 dist < r_self + r_target + 0.5 严格小于，melee 同款）/
-        // -3=对方无存储（空块返回 0 字节=有硬盘没内容，与 -3 区分）。每拍 1 次。
+        // -3=对方无存储（空块同返 -3——没写字的盘=世界视角无存储，代码事实
+        // 只此一路，api.md 同口径）。每拍 1 次。
         linker.func_wrap(
             "env",
             "storage_read",
@@ -1846,10 +1850,12 @@ impl SandboxManager {
                     return 0;
                 }
                 // 读自己：坐标=自己快照 pos，距离 0 天然成立，读镜像（storage_write
-                // 已同步——同拍写后读可见新值）
+                // 已同步——同拍写后读可见新值）。block 统一 Arc 视图：peer 路是
+                // host 拍首共享快照（引用计数拷贝零深拷贝），own 路镜像本就在
+                // SandboxData 里就地包 Arc（每拍至多一次，读方自担）
                 let (sx, sy) = caller.data().pos;
-                let block: Vec<u8> = if x == sx && y == sy {
-                    caller.data().link_storage_own.clone()
+                let block: Arc<Vec<u8>> = if x == sx && y == sy {
+                    Arc::new(caller.data().link_storage_own.clone())
                 } else {
                     // 坐标寻址：视口内实体快照精确匹配（同 send 口径）
                     let Some(peer) = caller
@@ -6065,7 +6071,7 @@ mod tests {
             id: id(id_u),
             pos,
             radius: 0.5,
-            storage: storage.to_vec(),
+            storage: Arc::new(storage.to_vec()),
         }
     }
 
