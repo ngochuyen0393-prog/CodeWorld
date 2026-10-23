@@ -132,9 +132,9 @@ pub struct PendingSpawn {
     pub restitution: f64,
     /// 摩擦（D-010 spawn 第 22 参；import 层已钳 [0,1]，0.6=Box2D v3 新默认）
     pub friction: f64,
-    /// 造物寿命（D-019 spawn 第 23 参；import 层已钳负值为 0=永生。0=永生
-    /// （默认=现状零回归）/>0=出生后 N 拍世界托管消散（非击杀无掠夺遗嘱不触发，
-    /// 残影消散同款路径语义——main.rs expire_due_lifespans 结算）
+    /// 造物寿命（D-019 spawn 第 23 参，R1 起强制声明：import 层 try_lifespan_ticks
+    /// 校验 <1 整次拒绝（0=不声明/负值同罪）。>0=出生后 N 拍世界托管消散（非击杀
+    /// 无掠夺遗嘱不触发，残影消散同款路径语义——main.rs expire_due_lifespans 结算）
     pub lifespan_ticks: u64,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
