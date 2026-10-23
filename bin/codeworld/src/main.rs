@@ -1957,6 +1957,9 @@ fn tick_with_intents(
                                     //（默认 e=0 撞停/f=0.6——操控是驾驶不是调参）
                                     restitution: 0.0,
                                     friction: 0.6,
+                                    // D-019 第 23 参：哑弹安全网寿命 30 拍——打不中的
+                                    // 弹到拍世界托管消散，不堵门不占世界名额
+                                    lifespan_ticks: 30,
                                     fuel_limit,
                                 });
                         }
@@ -2159,6 +2162,12 @@ fn tick_with_intents(
     //   b1. 绑定契约托管清算（#034 修订四：fade_on_death 随主消亡，主人死那一拍
     //       弹即无/塔即无——排在攻击与衰减之后，本拍所有死亡来源都已落地）
     enforce_binding_deaths(world);
+
+    //   b2. 寿命到期托管清算（D-019，decisions #056）：出生声明活满 N 拍后世界
+    //       托管消散——排在攻击结算（a2）之后：到期造物当拍排的刀照常结算随后
+    //       才消散（fade_on_death 同款时序保证）；排在 d 步遗嘱窗口之前：kill
+    //       的实体照常进 dead_ids 走死亡清理（消散登记让遗嘱窗口跳过谢幕）
+    expire_due_lifespans(world, sandbox_map, current_tick);
 
     //   c. 物理规则（#030 半径物理：重力落点解析 + 悬停免重力，架构 4.1 b 步；
     //      D-012：域内实体按改后参数被结算，aloft 优先级高于场；
@@ -2932,6 +2941,10 @@ fn process_spawn_requests(
         // crumple 物理步 CCD 截断处结算）
         entity.set_restitution(req.restitution);
         entity.set_friction(req.friction);
+        // D-019 spawn 第 23 参 lifespan_ticks：寿命声明写进造物数据（import 层已
+        // 钳负值为 0=永生，此处直存）——>0 的造物活满 N 拍后由世界托管消散
+        //（expire_due_lifespans，残影消散同款路径语义：非击杀无掠夺遗嘱不触发）
+        entity.set_lifespan_ticks(req.lifespan_ticks);
         // 出生初速（spawn 第 11/12 参，D-018 一体式发射提前落地）：import 层已校验
         // （有限+模长 ≤ 世界极速），此处写进造物 velocity 字段。位置积分（造物被
         // 初速带着飞）不做——那是 D-018「通用有速度实体物理」的活；velocity 字段
@@ -2972,6 +2985,7 @@ fn process_spawn_requests(
             blob_len,
             liquid_density = req.liquid_density,
             liquid_drag = req.liquid_drag,
+            lifespan_ticks = req.lifespan_ticks,
             sandboxed = !is_liquid,
             "造物诞生：玩家造物进场（门二，产权链归属创造者 owner；D-003 motion={}；D-009 液体造物=无沙箱布景）",
             if motion == codeworld_core::entity::MOTION_DYNAMIC { "dynamic 全活" } else { "static 钉死" }
@@ -3350,6 +3364,67 @@ fn enforce_binding_deaths(world: &mut WorldState) {
             entity_id = %id.0,
             bound_to = ?bound_to.map(|o| o.0),
             "[binding] 同生契约生效，随主消亡（造物）"
+        );
+    }
+}
+
+/// 寿命到期托管清算（D-019 spawn 第 23 参 lifespan_ticks，decisions.md #056：
+/// 土豆拍板"每个造物可存活多久=玩家自己设置的参数"）——世界每拍执行出生
+/// 声明：lifespan_ticks>0 的实体活满 N 拍（出生拍算第 0 拍）后到期消散。
+///
+/// 到期判定：`current_tick >= created_tick.saturating_add(lifespan_ticks)`。
+///
+/// 时序（tick 阶段二 b2）：攻击结算（a2）在前——到期造物当拍排的刀照常结算，
+/// 随后才消散（fade_on_death 同款保证）；d 步遗嘱窗口在后——kill 的实体照常
+/// 进 dead_ids 走死亡清理。
+///
+/// 消散=残影消散同款路径语义（main.rs expire_due_ghosts 的 kill + 登记）：
+/// - `entity.kill()` + `sandbox_map.session_takes.insert(id)`——run_death_wills
+///   见登记即跳过（session_takes 家族第三成员：登出 take + 残影到期消散 +
+///   寿命到期消散，同走"会话级离场非死亡谢幕"语义）
+/// - **非击杀**：不经 settle_attacks，无掠夺（survival 点数谁都不动）
+/// - **遗嘱不触发**：on_death 不执行（消散≠死亡谢幕，与残影消散同判）
+///
+/// 与既有死法正交：fade_on_death 契约死、代码自杀（life()=false）、寿命到期
+/// 三者谁先到谁触发；grace_owner 豁免与寿命无关。不过滤造物类别：液体造物
+/// （布景）带寿命同样到期消散（临时水域合法）——世界只认声明不认身份（宪法）；
+/// 生效范围天然只有 spawn 出生实体（进场生物/操控角色 lifespan 恒 0 无写入口）。
+fn expire_due_lifespans(
+    world: &mut WorldState,
+    sandbox_map: &mut EntitySandboxMap,
+    current_tick: u64,
+) {
+    // 收集后按 EntityId 升序排序再 kill（确定性纪律，settle_attacks 同款：
+    // 同拍多实体到期的消散顺序世界无关机器数据）
+    let mut due: Vec<EntityId> = world
+        .entities
+        .iter()
+        .filter(|(_, e)| {
+            e.is_alive()
+                && e.lifespan_ticks() > 0
+                && current_tick >= e.created_tick.saturating_add(e.lifespan_ticks())
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    due.sort_by_key(|id| id.0);
+    for id in due {
+        let (born_tick, lifespan_ticks) = {
+            let e = world
+                .entities
+                .get(&id)
+                .expect("刚收集的到期实体必在册（同拍无并发删除路径）");
+            (e.created_tick, e.lifespan_ticks())
+        };
+        if let Some(e) = world.entities.get_mut(&id) {
+            e.kill();
+        }
+        // 会话级离场登记：遗嘱窗口见此跳过 on_death（与残影消散同款挂号）
+        sandbox_map.session_takes.insert(id);
+        tracing::info!(
+            entity_id = %id.0,
+            born_tick,
+            lifespan_ticks,
+            "[lifespan] 寿命到期消散（非击杀无掠夺，遗嘱不触发）"
         );
     }
 }
@@ -4063,14 +4138,15 @@ fn notify_contacts(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, c
 /// 时机契约：必须在 sandbox_map.remove 之前（沙箱还在才能执行遗嘱）、必须在
 /// retain 之前（死者实体还在 world，遗嘱产物的出生坐标/产权继承要读它）。
 /// 触发排除：残影消散（会话离场合同，消散≠死亡谢幕）、登出 take（会话级离场
-/// 非死亡）；decay/被杀/life()=false/处置期死亡全触发。无沙箱（框架实体）自然跳过。
+/// 非死亡）、寿命到期消散（D-019 会话级离场同款——session_takes 家族第三成员）；
+/// decay/被杀/life()=false/处置期死亡全触发。无沙箱（框架实体）自然跳过。
 fn run_death_wills(
     sandbox_map: &mut EntitySandboxMap,
     dead_ids: &[EntityId],
 ) -> Vec<PendingSpawn> {
     let mut will_spawns = Vec::new();
     for id in dead_ids {
-        // 会话级离场（登出 take / 残影到期消散）：非死亡谢幕，不触发遗嘱
+        // 会话级离场（登出 take / 残影到期消散 / 寿命到期消散）：非死亡谢幕，不触发遗嘱
         //（挂号消费掉，防跨拍残留）
         if sandbox_map.session_takes.remove(id) {
             tracing::debug!(entity_id = %id.0, "[will] 会话级离场（take/消散），不触发遗嘱");
@@ -4113,8 +4189,8 @@ fn run_death_wills(
             );
         }
     }
-    // P2-1 收尾：消费循环结束后清场——两类合法登记（登出 take / 残影到期消散）
-    // 都在 d 步【之前】kill 且实体仍在世界，同拍必进 dead_ids 被上面的 remove
+    // P2-1 收尾：消费循环结束后清场——三类合法登记（登出 take / 残影到期消散 /
+    // 寿命到期消散）都在 d 步【之前】kill 且实体仍在世界，同拍必进 dead_ids 被上面的 remove
     // 消费掉；活到此处的全是死条目（典型：战斗死亡实体已 remove 后登出 take，
     // remove_online 返回旧 id 的登记永不进 dead_ids，跨拍残留无界增长）。
     // 语义："遗嘱窗口已过，未消费的登记全是死条目"。
@@ -4467,7 +4543,7 @@ fn hunter_wat() -> String {
   (import "env" "scan" (func $scan (param i32 i32) (result i32)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
   (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 4096) "{shell_escaped}\00")
   (data (i32.const 16384) ".\00")
@@ -4536,7 +4612,9 @@ fn hunter_wat() -> String {
           (f64.const 0.0)
           (i32.const 0)
           (f64.const 0.0)
-          (f64.const 0.6)))
+          (f64.const 0.6)
+          ;; lifespan（D-019 第 23 参，30 拍哑弹安全网：打不中的弹到拍消散不堵门）
+          (i32.const 30)))
         (return)))
     ;; 3. 贴身机会刀（dist <= 1.0 在贴身判距内；投机者不追击肉搏）
     (if (f64.le (local.get $dist) (f64.const 1.0))
@@ -4784,7 +4862,7 @@ mod tests {
         let entity = make_entity(7, (3.0, 4.0));
         let id = entity.id;
         let mut pending: Vec<PendingChange> = vec![PendingChange::Spawn { entity }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert!(world.entities.contains_key(&id), "Spawn 后实体应在 world 中");
         assert_eq!(world.entities.get(&id).unwrap().pos(), (3.0, 4.0));
     }
@@ -4796,7 +4874,7 @@ mod tests {
         let id = EntityId(Uuid::from_u128(1));
         world.entities.insert(id, make_entity(1, (0.0, 0.0)));
         let mut pending: Vec<PendingChange> = vec![PendingChange::Destroy { entity: id }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert!(
             !world.entities.get(&id).unwrap().is_alive(),
             "Destroy 应标记死亡"
@@ -4813,7 +4891,7 @@ mod tests {
             entity: id,
             new_pos: (8.0, 9.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id).unwrap().pos(), (8.0, 9.0));
     }
 
@@ -4827,7 +4905,7 @@ mod tests {
             entity: id,
             new_velocity: (1.0, 2.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id).unwrap().velocity(), (1.0, 2.0));
     }
 
@@ -4844,7 +4922,7 @@ mod tests {
             },
             PendingChange::Destroy { entity: id },
         ];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert!(pending.is_empty(), "apply 后 pending 应清空");
     }
 
@@ -4865,7 +4943,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.5),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.5), "目标位被占应留原位");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 0.5), "占据者不受影响");
     }
@@ -4886,7 +4964,7 @@ mod tests {
             PendingChange::SetPos { entity: id2, new_pos: (6.0, 0.5) }, // 先入队
             PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.5) }, // 后入队
         ];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "id 小者先到先得");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (7.0, 0.5), "id 大者被挡留原位");
     }
@@ -4905,7 +4983,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.5),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "死者不挡路，移动放行");
     }
 
@@ -4924,7 +5002,7 @@ mod tests {
             PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.5) },
             PendingChange::SetPos { entity: id2, new_pos: (9.0, 0.5) },
         ];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.5), "E1 裁决时目标位仍被 E2 占 → 被挡");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (9.0, 0.5), "E2 照常搬走");
     }
@@ -4942,7 +5020,7 @@ mod tests {
             entity: id,
             new_pos: (9.0, 9.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(
             world.entities.get(&id).unwrap().pos(),
             (2.0, 3.0),
@@ -4966,7 +5044,7 @@ mod tests {
             },
             PendingChange::Destroy { entity: unknown },
         ];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert!(pending.is_empty(), "即使目标不存在，变更也应被消费清空");
         assert!(world.entities.is_empty(), "不应插入任何实体");
     }
@@ -5374,7 +5452,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "W\00")
@@ -5399,6 +5477,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -5785,7 +5864,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 5.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(
             world.entities.get(&id1).unwrap().pos(),
             (5.0, 5.0),
@@ -5806,7 +5885,7 @@ mod tests {
             entity: id1,
             new_pos: (5.2, 5.9),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(
             world.entities.get(&id1).unwrap().pos(),
             (5.2, 5.0),
@@ -5827,7 +5906,7 @@ mod tests {
             entity: id1,
             new_pos: (5.9, 5.3),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(
             world.entities.get(&id1).unwrap().pos(),
             (5.0, 5.3),
@@ -5846,7 +5925,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "目标 (6,0) 钳到 (6,0.5)");
     }
 
@@ -5861,7 +5940,7 @@ mod tests {
             entity: id1,
             new_pos: (7.0, 5.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (7.0, 5.0));
     }
 
@@ -9332,6 +9411,7 @@ mod tests {
             link,
             restitution: 0.0,
             friction: 0.6,
+            lifespan_ticks: 0,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(world, map, vec![req], 1, &[]);
@@ -10275,7 +10355,7 @@ mod tests {
         let shell_escaped = shell_wat_escaped();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (import "env" "log" (func $log (param i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
@@ -10309,7 +10389,9 @@ mod tests {
           (f64.const 0.0)
           (i32.const 0)
           (f64.const 0.0)
-          (f64.const 0.6))))))
+          (f64.const 0.6)
+          ;; lifespan（D-019 第 23 参，0=永生默认，零回归）
+          (i32.const 0))))))
   (func (export "life") (result i32) i32.const 1))"#,
             shell_len = CTRL_SHELL_WAT.len(),
         )
@@ -10912,6 +10994,112 @@ mod tests {
         );
     }
 
+    // === D-019 造物寿命：spawn 第 23 参 lifespan_ticks（出生声明家族）===
+
+    /// 带寿命的造物请求构造（D-019 测试辅助：直构绕过 import 层——import 层
+    /// 钳制/透传已由 arena 侧测试覆盖，这里测阶段二接线与到期清算编排）
+    fn lifespan_spawn_request(creator: EntityId, lifespan_ticks: u64) -> PendingSpawn {
+        PendingSpawn {
+            creator,
+            pos: (12.0, 0.0),
+            // 造物代码带 on_death 排队造遗物（遗物=遗嘱被世界托管执行的可观测
+            // 证据，living_will_spawn_wat 同款）：到期消散走会话级离场，遗嘱不
+            // 触发 → 世界里不应出现遗物实体
+            code: living_will_spawn_wat("20.0", "5.0"),
+            glyph: "T".to_string(),
+            color: "cyan".to_string(),
+            radius: 0.5,
+            mass: 1.0,
+            binding: 0,
+            motion: 0,
+            vx: 0.0,
+            vy: 0.0,
+            blob: Vec::new(),
+            field_radius: 0.0,
+            field_gravity_scale: 1.0,
+            field_drag_delta: 0.0,
+            liquid_density: 0.0,
+            liquid_drag: 0.0,
+            link: 0,
+            restitution: 0.0,
+            friction: 0.6,
+            lifespan_ticks,
+            fuel_limit: 1_000_000,
+        }
+    }
+
+    #[test]
+    fn creation_lifespan_expiry_dissipates_no_will_no_plunder() {
+        // 端到端：lifespan=3 的造物出生拍算第 0 拍，活满 3 拍（3 次自己的
+        // on_tick），第 4 拍世界托管消散。三重断言：①到期拍消失；②世界里
+        // 没有遗物实体（遗嘱未触发——消散≠死亡谢幕，残影消散同判）；③全场
+        // survival 点数无变化（非击杀无掠夺）。
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let creator = make_entity_with_sandbox(&mut world, &mut map, 1, (10.0, 0.5), PLAYER_WAT);
+        let points_before = world.entities.get(&creator).unwrap().survival.points();
+        process_spawn_requests(&mut world, &mut map, vec![lifespan_spawn_request(creator, 3)], 1, &[]);
+        assert_eq!(
+            world.entities.values().filter(|e| e.code_hash == "creation").count(),
+            1,
+            "造物应诞生"
+        );
+        assert_eq!(
+            world.entities.values().find(|e| e.code_hash == "creation").unwrap().lifespan_ticks(),
+            3,
+            "寿命声明应落库"
+        );
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        // 前 3 拍（current_tick 1..=3）：造物仍在（born=1，到期线 1+3=4）
+        for _ in 0..3 {
+            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        }
+        assert_eq!(
+            world.entities.values().filter(|e| e.code_hash == "creation").count(),
+            1,
+            "出生拍+2 造物应仍在（活满 3 拍语义锚）"
+        );
+        // 第 4 拍（current_tick=4）：到期消散
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert_eq!(
+            world.entities.len(),
+            1,
+            "到期拍造物应消失，且世界无遗物实体（遗嘱未触发——只剩创造者）"
+        );
+        assert_eq!(
+            world.entities.get(&creator).unwrap().survival.points(),
+            points_before,
+            "无掠夺：survival 点数谁都不动"
+        );
+    }
+
+    #[test]
+    fn creation_lifespan_zero_is_eternal() {
+        // 零回归锚：lifespan=0（不声明/缺省同值）=永生——10 拍后造物照站，
+        // 现状语义零回归
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let creator = make_entity_with_sandbox(&mut world, &mut map, 1, (10.0, 0.5), PLAYER_WAT);
+        process_spawn_requests(&mut world, &mut map, vec![lifespan_spawn_request(creator, 0)], 1, &[]);
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        for _ in 0..10 {
+            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        }
+        assert_eq!(
+            world.entities.values().filter(|e| e.code_hash == "creation").count(),
+            1,
+            "lifespan=0 永生：10 拍后造物仍存活"
+        );
+    }
+
     /// 绑定造物弹实体构造（D-018b grace 测试辅助）：deliver 层实体驱动断言用——
     /// 豁免=deliver 现场读攻击者实体的出生声明（binding/bound_to），刀本身
     /// 不携带豁免数据（契约=出生声明由世界每拍托管，本来就不该每刀携带）
@@ -11018,6 +11206,7 @@ mod tests {
             link: 0,
             restitution: 0.0,
             friction: 0.6,
+            lifespan_ticks: 0,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
@@ -11080,6 +11269,7 @@ mod tests {
             link: 0,
             restitution: 0.0,
             friction: 0.6,
+            lifespan_ticks: 0,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
@@ -12059,7 +12249,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -12084,6 +12274,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -12283,6 +12474,7 @@ mod tests {
                 link: 0,
                 restitution: 0.0,
                 friction: 0.6,
+                lifespan_ticks: 0,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 7);
@@ -12322,7 +12514,7 @@ mod tests {
         let escaped = wat_escape(creation_code);
         let spawner = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -12346,6 +12538,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -12551,6 +12744,7 @@ mod tests {
                 link: 0,
                 restitution: 0.0,
                 friction: 0.6,
+                lifespan_ticks: 0,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -12593,7 +12787,7 @@ mod tests {
             1,
             "产权匹配的销毁应排队 PendingChange::Destroy"
         );
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert!(
             !world.entities.get(&creation).unwrap().is_alive(),
             "自家造物应被标记死亡"
@@ -12790,7 +12984,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -12822,6 +13016,7 @@ mod tests {
         (i32.const 0)
         (f64.const 0.0)
         (f64.const 0.6)
+        (i32.const 0)                       ;; lifespan（D-019 第 23 参，0=永生默认）
         (call $spawn)
         (drop))))
   (func (export "life") (result i32) i32.const 1))"#,
@@ -12918,7 +13113,7 @@ mod tests {
         let escaped = wat_escape(relic_code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "R\00")
@@ -12944,6 +13139,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn drop))"#,
             escaped = escaped,
             len = relic_code.len(),
@@ -12969,7 +13165,7 @@ mod tests {
         let shell_escaped = shell_wat_escaped();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{shell_escaped}\00")
   (data (i32.const 16384) "*\00")
@@ -12998,6 +13194,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn drop))"#,
             shell_len = CTRL_SHELL_WAT.len(),
         )
@@ -13313,7 +13510,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "F\00")
@@ -13338,6 +13535,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,

@@ -192,7 +192,7 @@
 
 比对对方的话（response）和它的体徵（尾块），是识破伪装的路子。目标 `on_probe` 跑在独立小 fuel 预算上，恶意死循环烧不动你的 tick。
 
-### `spawn(code_ptr: i32, code_len: i32, x: f64, y: f64, glyph_ptr: i32, color_ptr: i32, radius: f64, mass: f64, binding: i32, motion: i32, vx: f64, vy: f64, blob_ptr: i32, blob_len: i32, field_radius: f64, field_gravity_scale: f64, field_drag_delta: f64, liquid_density: f64, liquid_drag: f64, link: i32, restitution: f64, friction: f64) -> i32`
+### `spawn(code_ptr: i32, code_len: i32, x: f64, y: f64, glyph_ptr: i32, color_ptr: i32, radius: f64, mass: f64, binding: i32, motion: i32, vx: f64, vy: f64, blob_ptr: i32, blob_len: i32, field_radius: f64, field_gravity_scale: f64, field_drag_delta: f64, liquid_density: f64, liquid_drag: f64, link: i32, restitution: f64, friction: f64, lifespan_ticks: i32) -> i32`
 
 造物（门二）：提交一段 WAT 源码 + 出生坐标 + 外观 + 身体/质量参数 + **绑定契约** + **运动身份** + **出生初速** + **出生数据包**，请求造一个新实体。**造物是活实体，不是装饰**——从下一拍开始跑自己的代码，生死由它自己的 `life()` 决定（自治锚合同，存续与你的在线状态无关——除非你声明了契约）。
 
@@ -218,6 +218,7 @@
 | `link` | **链声明**（D-011 第 20 参，binding 家族新成员——契约管生死、链管通信，两轴正交自由组合）：`0`=无链（默认=放生，现状零回归）；`1`=活链（母体 `command` 下行广播可达、自己 `report` 沿链上行）。非法值警告并按 0 处理。断链唯一事件=母体实体死（当拍 link_to 清 None，INFO 一条汇总）；断链不杀造物——电话挂了人活着。**夺剑注意**：链是实体字段，造物被决斗攻陷后链仍连原母体——新主照收原母体的剑诀广播、可用 report 伪装上行（"放风筝的人自己也在被钓"，#038 原文零新立法）。详见「世界内链路段（D-011）」节 |
 | `restitution` | **弹性 e**（D-010 第 21 参，碰撞响应出生声明家族——与 radius/mass/liquid 同门，世界只认数字不认名字：钢珠/黏土/橡胶是玩家黑话）：域 [0.0, 1.0] 硬钳，非有限值警告并回退 0.0。0=撞停（默认=撞停流派零回归），1=完全弹性。**高弹注意**：1 拍/秒的拍制世界里高弹=肉眼分格跳动，0.5~0.6 是手感甜点（火箭联盟球 0.6 调研定论）。接触对组合=取大 `max(e1, e2)`（"弹力球不需要弹力地板"——高弹实体撞地面照样弹）；相对法向速度 < 1 格/拍按非弹性处理（低速闸防抖）；每对每拍最多结算一次反弹 |
 | `friction` | **摩擦 f**（D-010 第 22 参）：域 [0.0, 1.0] 硬钳，非有限值警告并回退 0.6（Box2D v3 新默认"比冰滑比橡胶涩"）。切向速度每拍撞触后 `×(1-f)`——0=冰面（滑行不衰减）、0.6=草地（数拍内停）、1=瞬停。接触对组合=几何平均 `√(f1×f2)`（一方冰=接触即冰）。落地下拍滑行、贴坡速度非零的实体会沿坡缓降（球在坡上会滚下来——物理涌现）；想停在坡上就把速度磨到 0（静=静零回归） |
+| `lifespan_ticks` | **造物寿命**（D-019 第 23 参，出生声明家族）：域 [0,+] 无上限（WAT 侧 i32，无非有限值），**0=永生**（默认=不声明/缺省同值，现状零回归）；负值警告并钳 0。>0=声明活 N 拍，到拍世界托管消散——到期判定 `current_tick >= 出生拍 + N`（出生拍算第 0 拍，活满 N 拍第 N+1 拍消散）。到期消散=**自然消散**：非击杀无掠夺（survival 点数谁都不动）、**遗嘱不触发**（on_death 不执行，与残影消散同判）；与代码自管死法（life()=false / fade_on_death 契约死）正交，谁先到谁触发。液体造物（布景）带寿命同样到期消散（临时水域合法）——世界只认声明不认身份。**建议值：弹丸类 10 拍**——打不中的弹自己收场不堵门（到期消散与死亡/残影消散同款前端表现，实体直接消失） |
 
 返回 `1` = 已排队；`0` = 拒绝（限流/参数非法，当场知道）。排队后的请求在阶段二统一处理，以下情形作废（返回值已经是 1，**以运行日志为准**）：
 
@@ -231,7 +232,7 @@
 造物属性（框架定，改不了）：owner 继承你的 owner（**产权链**，见 `destroy`）；fuel 配额继承你；出生即存活。
 
 ```wat
-(import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+(import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
 (import "env" "get_pos" (func $get_pos (result f64 f64)))
 (memory (export "memory") 1)
 ;; [0..56) 造物 WAT 源码 + NUL；[8192] 字形 + NUL；[8256] 颜色 + NUL
@@ -263,6 +264,7 @@
       (i32.const 0)                         ;; link（D-011 第 20 参，0=无链放生；1=活链）
       (f64.const 0.0)                       ;; restitution（D-010 第 21 参，0=撞停默认）
       (f64.const 0.6)                       ;; friction（第 22 参，0.6=默认摩擦）
+      (i32.const 0)                         ;; lifespan（D-019 第 23 参，0=永生默认；弹丸建议 10）
       (call $spawn) (drop))))
 ```
 

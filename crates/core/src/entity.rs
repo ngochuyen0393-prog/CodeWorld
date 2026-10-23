@@ -178,6 +178,16 @@ pub struct Entity {
     #[serde(default = "default_friction")]
     friction: f64,
 
+    // 造物寿命（D-019 出生声明第 23 参：出生时声明活几拍，到拍世界托管消散——
+    // 土豆拍板"每个造物可存活多久=玩家自己设置的参数"，decisions.md #056）。
+    // 域 [0,+] 无上限：0=永生（默认=现状零回归，不声明/缺省同 0）；负值 import
+    // 层已钳 0 + warn。到期判定 current_tick >= created_tick + lifespan（出生拍算
+    // 第 0 拍，活满 N 拍第 N+1 拍消散）。到期消散=残影消散同款路径语义：非击杀
+    // 无掠夺、遗嘱不触发（main.rs expire_due_lifespans）。
+    /// serde default：旧快照无此字段时回退 0=永生（存储向后兼容，零迁移）
+    #[serde(default = "default_lifespan_ticks")]
+    lifespan_ticks: u64,
+
     // 链账本（D-011 世界内链路段：link=binding 家族新成员，decisions.md #038
     // 通道公理世界内段）。活链造物指向母体——与 bound_to 同款形态（Option<EntityId>
     // 实体字段）、同款快照待遇。链管通信（契约管生死，两轴正交自由组合）：
@@ -264,6 +274,11 @@ fn default_friction() -> f64 {
     0.6
 }
 
+/// 造物寿命默认值（D-019：新实体与旧快照回退共用 0=永生——现状零回归）
+fn default_lifespan_ticks() -> u64 {
+    0
+}
+
 /// 液体密度合法上限（D-009：域 [0.0, 5.0]——0=非液体默认，5=岩浆级上限。
 /// 参照系=水 1.0 无量纲，油 0.75/蜂蜜 1.4/岩浆 2.5 都是玩家黑话非内置清单）
 pub const LIQUID_DENSITY_MAX: f64 = 5.0;
@@ -303,6 +318,17 @@ pub fn clamp_friction(v: f64) -> f64 {
         return clamped;
     }
     v
+}
+
+/// 造物寿命校验钳制（spawn 第 23 参口径，D-019）：域 [0,+] 无上限（WAT 侧 i32
+/// 转 Rust 侧 u64），负值钳 0（永生最保守回退）并 warn（与 clamp_binding/clamp_link
+/// 同款措辞风格——出生声明家族哲学：超界钳回+警告非拒绝；i32 无非有限值问题）
+pub fn clamp_lifespan_ticks(v: i32) -> u64 {
+    if v < 0 {
+        tracing::warn!(value = v, clamped = 0, "[lifespan] 寿命为负，钳 0（永生）");
+        return 0;
+    }
+    v as u64
 }
 
 /// 液体密度校验钳制（spawn 第 18 参口径）：域 [0.0, 5.0]，负值/非有限钳 0
@@ -508,6 +534,7 @@ impl Entity {
             liquid_drag: 0.0,
             restitution: default_restitution(),
             friction: default_friction(),
+            lifespan_ticks: default_lifespan_ticks(),
             link_to: None,
             storage: Vec::new(),
             appearance,
@@ -672,6 +699,16 @@ impl Entity {
     /// 设置摩擦（import 层已 clamp_friction，此处直存）
     pub fn set_friction(&mut self, friction: f64) {
         self.friction = friction;
+    }
+
+    /// 造物寿命（D-019 出生声明第 23 参：0=永生现状语义，>0=到拍世界托管消散）
+    pub fn lifespan_ticks(&self) -> u64 {
+        self.lifespan_ticks
+    }
+
+    /// 设置造物寿命（import 层已 clamp_lifespan_ticks，此处直存）
+    pub fn set_lifespan_ticks(&mut self, lifespan_ticks: u64) {
+        self.lifespan_ticks = lifespan_ticks;
     }
 
     /// 活链母体（D-011：None=无链放生，Some=活链可控+可传）
@@ -1456,6 +1493,43 @@ mod tests {
         let back: Entity = serde_json::from_str(&json).unwrap();
         assert_eq!(back.restitution(), 0.0, "旧快照 e 应回退 0（撞停现状）");
         assert_eq!(back.friction(), 0.6, "旧快照 f 应回退 0.6");
+    }
+
+    // === D-019 造物寿命：出生声明第 23 参（lifespan_ticks）===
+
+    #[test]
+    fn lifespan_defaults_zero_on_old_snapshot() {
+        // 边界：旧快照（无 lifespan_ticks 字段）反序列化回退 0=永生（serde default，
+        // 存储向后兼容 radius/mass/field/liquid/link 同款先例；0=永生=现状零回归）
+        let mut obj: serde_json::Value = serde_json::to_value(sample_entity()).unwrap();
+        obj.as_object_mut().unwrap().remove("lifespan_ticks");
+        let json = serde_json::to_string(&obj).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lifespan_ticks(), 0, "旧快照应回退 0（永生=现状语义）");
+    }
+
+    #[test]
+    fn lifespan_setter_and_roundtrip() {
+        // 创建/读写：第 23 参 setter 直存（import 层已 clamp_lifespan_ticks，照
+        // liquid 直存模式）+ 序列化往返保留（快照存档寿命不丢）
+        let mut e = sample_entity();
+        e.set_lifespan_ticks(30);
+        assert_eq!(e.lifespan_ticks(), 30);
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.lifespan_ticks(), 30, "寿命应往返保真");
+    }
+
+    #[test]
+    fn clamp_lifespan_ticks_negative_clamps_zero() {
+        // 出生声明家族哲学：超界钳回+警告非拒绝。域 [0,+]：0=永生合法，
+        // 负值钳 0（最保守回退=永生现状语义）；i32 无非有限值问题
+        assert_eq!(clamp_lifespan_ticks(-5), 0);
+        assert_eq!(clamp_lifespan_ticks(-1), 0);
+        assert_eq!(clamp_lifespan_ticks(0), 0);
+        assert_eq!(clamp_lifespan_ticks(1), 1);
+        assert_eq!(clamp_lifespan_ticks(30), 30);
+        assert_eq!(clamp_lifespan_ticks(i32::MAX), i32::MAX as u64);
     }
 
     #[test]

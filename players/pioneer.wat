@@ -16,7 +16,7 @@
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
 
   (memory (export "memory") 1)
 
@@ -75,7 +75,8 @@
             (f64.const 0.0)                                   ;; liquid_drag（第19参，0=无阻尼）
             (i32.const 0)                                     ;; link（D-011 第20参，0=无链放生）
             (f64.const 0.0)                                   ;; restitution（D-010 第21参，0=撞停默认）
-            (f64.const 0.6)))                                 ;; friction（第22参，0.6=默认摩擦）
+            (f64.const 0.6)                                   ;; friction（第22参，0.6=默认摩擦）
+            (i32.const 0)))                                   ;; lifespan（D-019 第 23 参，0=永生默认）
         (i32.const 5) (call $log)                             ;; marker 5 = 立塔信号
         (global.set $tower_done (i32.const 1))
         (return)))

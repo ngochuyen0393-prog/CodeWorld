@@ -132,6 +132,10 @@ pub struct PendingSpawn {
     pub restitution: f64,
     /// 摩擦（D-010 spawn 第 22 参；import 层已钳 [0,1]，0.6=Box2D v3 新默认）
     pub friction: f64,
+    /// 造物寿命（D-019 spawn 第 23 参；import 层已钳负值为 0=永生。0=永生
+    /// （默认=现状零回归）/>0=出生后 N 拍世界托管消散（非击杀无掠夺遗嘱不触发，
+    /// 残影消散同款路径语义——main.rs expire_due_lifespans 结算）
+    pub lifespan_ticks: u64,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
 }
@@ -1029,6 +1033,8 @@ impl SandboxManager {
         //   - 液体第 18/19 参（D-009）：liquid_density 钳 [0,5]（0=非液体默认）、
         //     liquid_drag 钳 [0,5]（0=无阻尼；结算时有效保留系数另钳 [0,1]）
         //   - 链第 20 参（D-011）：link 钳非法值回无链（0=放生默认/1=活链）
+        //   - 寿命第 23 参（D-019）：lifespan_ticks 域 [0,+]（i32 侧无非有限值），
+        //     负值钳 0=永生（warn）——出生声明家族哲学：超界钳回+警告非拒绝
         // 产权链 owner 继承、世界实体上限、WAT 编译都在阶段二判（返回 1=已排队，
         // 阶段二拒绝以日志为准，api.md 载明）。
         // D-009：spawn 超 17 参——wasmtime 25 的 IntoFunc 宏上限 17 参
@@ -1053,6 +1059,7 @@ impl SandboxManager {
                     wasmtime::ValType::F64, wasmtime::ValType::F64, // liquid 两参（D-009 第 18/19 参）
                     wasmtime::ValType::I32, // link（D-011 第 20 参）
                     wasmtime::ValType::F64, wasmtime::ValType::F64, // e/f 两参（D-010 第 21/22 参）
+                    wasmtime::ValType::I32, // lifespan（D-019 第 23 参）
                 ],
                 [wasmtime::ValType::I32],
             ),
@@ -1113,7 +1120,8 @@ impl SandboxManager {
                 let link = i32_at(19);
                 let restitution = f64_at(20);
                 let friction = f64_at(21);
-                // 校验体（22 参签名，与 func_wrap 时代闭包体逐行同代码）
+                let lifespan = i32_at(22);
+                // 校验体（23 参签名，与 func_wrap 时代闭包体逐行同代码）
                 #[allow(clippy::too_many_arguments)]
                 let spawn_call = |caller: &mut Caller<SandboxData>,
                                   code_ptr: i32,
@@ -1137,7 +1145,8 @@ impl SandboxManager {
                                   liquid_drag: f64,
                                   link: i32,
                                   restitution: f64,
-                                  friction: f64|
+                                  friction: f64,
+                                  lifespan: i32|
                  -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
@@ -1292,6 +1301,9 @@ impl SandboxManager {
                 // 默认 e=0/f=0.6，warn 带原值与钳后值——出生声明家族哲学同款）
                 let restitution = codeworld_core::entity::clamp_restitution(restitution);
                 let friction = codeworld_core::entity::clamp_friction(friction);
+                // D-019 第 23 参寿命声明校验钳制（域 [0,+]，负值钳 0=永生，warn
+                // ——出生声明家族哲学同款：超界钳回+警告非拒绝）
+                let lifespan_ticks = codeworld_core::entity::clamp_lifespan_ticks(lifespan);
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
@@ -1313,6 +1325,7 @@ impl SandboxManager {
                     link,
                     restitution,
                     friction,
+                    lifespan_ticks,
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
                 caller
@@ -1339,6 +1352,7 @@ impl SandboxManager {
                         link,
                         restitution,
                         friction,
+                        lifespan_ticks,
                         fuel_limit,
                     });
                 1
@@ -1367,6 +1381,7 @@ impl SandboxManager {
                     link,
                     restitution,
                     friction,
+                    lifespan,
                 );
                 results[0] = wasmtime::Val::I32(ret);
                 Ok(())
@@ -4435,14 +4450,26 @@ mod tests {
         spawner_full_wat(code, x, y, binding, "i32.const 0")
     }
 
-    /// 全参造物方 WAT（D-003：binding 第 9 参 + motion 第 10 参）
+    /// 全参造物方 WAT（D-003：binding 第 9 参 + motion 第 10 参；D-019 起
+    /// lifespan 默认永生 i32.const 0）
     fn spawner_full_wat(code: &str, x: &str, y: &str, binding: &str, motion: &str) -> String {
-        spawner_velocity_wat(code, x, y, binding, motion, "f64.const 0.0", "f64.const 0.0")
+        spawner_velocity_wat(
+            code,
+            x,
+            y,
+            binding,
+            motion,
+            "f64.const 0.0",
+            "f64.const 0.0",
+            "i32.const 0",
+        )
     }
 
     /// 带出生初速的造物方 WAT（spawn 第 11/12 参 vx/vy；14 参生成器最全档：
     /// blob 恒无包 i32.const 0/0——blob 用例走 spawner_blob_wat；D-011 起补
-    /// 第 20 参 link，默认无链 i32.const 0）
+    /// 第 20 参 link，默认无链 i32.const 0；D-019 起补第 23 参 lifespan，
+    /// 默认永生 i32.const 0）
+    #[allow(clippy::too_many_arguments)] // 测试 WAT 生成器，23 参 spawn 的表达式直传形态
     fn spawner_velocity_wat(
         code: &str,
         x: &str,
@@ -4451,11 +4478,12 @@ mod tests {
         motion: &str,
         vx: &str,
         vy: &str,
+        lifespan: &str,
     ) -> String {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -4480,6 +4508,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    {lifespan}
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -4491,6 +4520,7 @@ mod tests {
             motion = motion,
             vx = vx,
             vy = vy,
+            lifespan = lifespan,
         )
     }
 
@@ -4499,7 +4529,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
@@ -4526,6 +4556,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
@@ -4546,6 +4577,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
@@ -4561,7 +4593,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -4587,6 +4619,7 @@ mod tests {
     i32.const 0
     f64.const {e}
     f64.const {f}
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -4599,7 +4632,7 @@ mod tests {
 
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
@@ -4624,6 +4657,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -4633,7 +4667,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -4659,6 +4693,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -4708,7 +4743,7 @@ mod tests {
         // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
         let wat_text = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -4733,6 +4768,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -4756,7 +4792,7 @@ mod tests {
         let escaped = wat_escape(SPAWNED_CODE);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -4781,6 +4817,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn global.set $ret)
   (global $ret (mut i32) (i32.const -1))
   (func (export "get_ret") (result i32) global.get $ret)
@@ -4847,7 +4884,7 @@ mod tests {
         let escaped = wat_escape(SPAWNED_CODE);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "W\00")
@@ -4872,6 +4909,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -5303,6 +5341,7 @@ mod tests {
                     "i32.const 1",
                     "f64.const 20.0",
                     "f64.const 20.0",
+                    "i32.const 0",
                 )),
                 100_000,
                 id(821),
@@ -5332,6 +5371,7 @@ mod tests {
                     "i32.const 1",
                     "f64.const 25.0",
                     "f64.const 0.0",
+                    "i32.const 0",
                 )),
                 100_000,
                 id(822),
@@ -5362,6 +5402,7 @@ mod tests {
                     "i32.const 1",
                     "f64.const nan",
                     "f64.const 0.0",
+                    "i32.const 0",
                 )),
                 100_000,
                 id(823),
@@ -5391,6 +5432,7 @@ mod tests {
                     "i32.const 1",
                     "f64.const 3.0",
                     "f64.const -4.0",
+                    "i32.const 0",
                 )),
                 100_000,
                 id(824),
@@ -5421,7 +5463,7 @@ mod tests {
         let blob_escaped: String = blob_data.iter().map(|b| format!("\\{b:02x}")).collect();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -5447,6 +5489,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -6171,7 +6214,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -6197,6 +6240,7 @@ mod tests {
     {link}
     f64.const 0.0
     f64.const 0.6
+    i32.const 0
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -6331,6 +6375,56 @@ mod tests {
                 "非法 link（{bad}）应钳无链"
             );
         }
+    }
+
+    #[test]
+    fn spawn_import_passes_lifespan_and_clamps_negative() {
+        // spawn 第 23 参 lifespan（D-019）：合法值 30 透传进 PendingSpawn（阶段二
+        // set_lifespan_ticks 直存落库）；负值 -5 钳 0（永生最保守回退，坏声明
+        // 不进世界，出生声明家族同款口径）
+        let mgr = SandboxManager::new().unwrap();
+        let creator = id(890);
+        let wat_text = spawner_velocity_wat(
+            SPAWNED_CODE,
+            "f64.const 1.0",
+            "f64.const 1.0",
+            "i32.const 0",
+            "i32.const 0",
+            "f64.const 0.0",
+            "f64.const 0.0",
+            "i32.const 30",
+        );
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, creator)
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(
+            handle.store.data().pending_spawns[0].lifespan_ticks,
+            30,
+            "合法值 30 应透传（30 拍后世界托管消散）"
+        );
+        // 负值钳 0（永生）
+        let bad_text = spawner_velocity_wat(
+            SPAWNED_CODE,
+            "f64.const 1.0",
+            "f64.const 1.0",
+            "i32.const 0",
+            "i32.const 0",
+            "f64.const 0.0",
+            "f64.const 0.0",
+            "i32.const -5",
+        );
+        let mut h = mgr
+            .create_sandbox(&wasm(&bad_text), 100_000, id(891))
+            .unwrap();
+        h.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut h).unwrap();
+        assert_eq!(
+            h.store.data().pending_spawns[0].lifespan_ticks,
+            0,
+            "负 lifespan 应钳 0（永生现状语义）"
+        );
     }
 
     #[test]
