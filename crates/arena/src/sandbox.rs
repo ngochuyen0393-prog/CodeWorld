@@ -1033,8 +1033,9 @@ impl SandboxManager {
         //   - 液体第 18/19 参（D-009）：liquid_density 钳 [0,5]（0=非液体默认）、
         //     liquid_drag 钳 [0,5]（0=无阻尼；结算时有效保留系数另钳 [0,1]）
         //   - 链第 20 参（D-011）：link 钳非法值回无链（0=放生默认/1=活链）
-        //   - 寿命第 23 参（D-019）：lifespan_ticks 域 [0,+]（i32 侧无非有限值），
-        //     负值钳 0=永生（warn）——出生声明家族哲学：超界钳回+警告非拒绝
+        //   - 寿命第 23 参（D-019 R1 强制声明）：lifespan_ticks 域 [1,+]（i32 侧
+        //     无非有限值），0=不声明/负值同罪=整次拒绝出生（#030 整次拒绝哲学，
+        //     非"超界钳回"家族成员——寿命是唯一拒绝非钳制的出生声明）
         // 产权链 owner 继承、世界实体上限、WAT 编译都在阶段二判（返回 1=已排队，
         // 阶段二拒绝以日志为准，api.md 载明）。
         // D-009：spawn 超 17 参——wasmtime 25 的 IntoFunc 宏上限 17 参
@@ -1301,9 +1302,20 @@ impl SandboxManager {
                 // 默认 e=0/f=0.6，warn 带原值与钳后值——出生声明家族哲学同款）
                 let restitution = codeworld_core::entity::clamp_restitution(restitution);
                 let friction = codeworld_core::entity::clamp_friction(friction);
-                // D-019 第 23 参寿命声明校验钳制（域 [0,+]，负值钳 0=永生，warn
-                // ——出生声明家族哲学同款：超界钳回+警告非拒绝）
-                let lifespan_ticks = codeworld_core::entity::clamp_lifespan_ticks(lifespan);
+                // D-019 R1 第 23 参寿命声明强制（decisions.md #056 勘误）：域 [1,+]，
+                // 0=不声明/负值同罪=整次拒绝出生（#030 整次拒绝哲学——非钳制放行，
+                // 机关枪满地永生子弹堵死路）。WARN 带创造者/坐标/字形/收到的值
+                let Some(lifespan_ticks) = codeworld_core::entity::try_lifespan_ticks(lifespan)
+                else {
+                    tracing::warn!(
+                        entity_id = %creator.0,
+                        birth = ?(x, y),
+                        glyph = %glyph,
+                        received = lifespan,
+                        "[spawn] 寿命声明非法（<1），整次拒绝出生（D-019 R1 强制声明）"
+                    );
+                    return 0;
+                };
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
@@ -4450,8 +4462,8 @@ mod tests {
         spawner_full_wat(code, x, y, binding, "i32.const 0")
     }
 
-    /// 全参造物方 WAT（D-003：binding 第 9 参 + motion 第 10 参；D-019 起
-    /// lifespan 默认永生 i32.const 0）
+    /// 全参造物方 WAT（D-003：binding 第 9 参 + motion 第 10 参；D-019 R1 起
+    /// lifespan 强制声明 >=1，测试默认给 30 拍）
     fn spawner_full_wat(code: &str, x: &str, y: &str, binding: &str, motion: &str) -> String {
         spawner_velocity_wat(
             code,
@@ -4461,14 +4473,14 @@ mod tests {
             motion,
             "f64.const 0.0",
             "f64.const 0.0",
-            "i32.const 0",
+            "i32.const 30",
         )
     }
 
     /// 带出生初速的造物方 WAT（spawn 第 11/12 参 vx/vy；14 参生成器最全档：
     /// blob 恒无包 i32.const 0/0——blob 用例走 spawner_blob_wat；D-011 起补
-    /// 第 20 参 link，默认无链 i32.const 0；D-019 起补第 23 参 lifespan，
-    /// 默认永生 i32.const 0）
+    /// 第 20 参 link，默认无链 i32.const 0；D-019 R1 起补第 23 参 lifespan，
+    /// 强制声明 >=1（测试默认 30 拍，长跑用例自传 10000））
     #[allow(clippy::too_many_arguments)] // 测试 WAT 生成器，23 参 spawn 的表达式直传形态
     fn spawner_velocity_wat(
         code: &str,
@@ -4556,7 +4568,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
@@ -4577,7 +4589,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
@@ -4619,7 +4631,7 @@ mod tests {
     i32.const 0
     f64.const {e}
     f64.const {f}
-    i32.const 0
+    i32.const 10000
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -4657,7 +4669,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -4693,7 +4705,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -4768,7 +4780,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -4817,7 +4829,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn global.set $ret)
   (global $ret (mut i32) (i32.const -1))
   (func (export "get_ret") (result i32) global.get $ret)
@@ -4909,7 +4921,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -5341,7 +5353,7 @@ mod tests {
                     "i32.const 1",
                     "f64.const 20.0",
                     "f64.const 20.0",
-                    "i32.const 0",
+                    "i32.const 10000",
                 )),
                 100_000,
                 id(821),
@@ -5371,7 +5383,7 @@ mod tests {
                     "i32.const 1",
                     "f64.const 25.0",
                     "f64.const 0.0",
-                    "i32.const 0",
+                    "i32.const 10000",
                 )),
                 100_000,
                 id(822),
@@ -5402,7 +5414,7 @@ mod tests {
                     "i32.const 1",
                     "f64.const nan",
                     "f64.const 0.0",
-                    "i32.const 0",
+                    "i32.const 10000",
                 )),
                 100_000,
                 id(823),
@@ -5432,7 +5444,7 @@ mod tests {
                     "i32.const 1",
                     "f64.const 3.0",
                     "f64.const -4.0",
-                    "i32.const 0",
+                    "i32.const 10000",
                 )),
                 100_000,
                 id(824),
@@ -5489,7 +5501,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -6240,7 +6252,7 @@ mod tests {
     {link}
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -6378,13 +6390,15 @@ mod tests {
     }
 
     #[test]
-    fn spawn_import_passes_lifespan_and_clamps_negative() {
-        // spawn 第 23 参 lifespan（D-019）：合法值 30 透传进 PendingSpawn（阶段二
-        // set_lifespan_ticks 直存落库）；负值 -5 钳 0（永生最保守回退，坏声明
-        // 不进世界，出生声明家族同款口径）
+    fn spawn_import_rejects_lifespan_below_one() {
+        // spawn 第 23 参 lifespan（D-019 R1 强制声明，#056 勘误）：域 [1,+]——
+        // 0=不声明与负值同罪，整次拒绝出生（返回 0 且不排队，#030 整次拒绝
+        // 哲学，非钳制放行）；合法值 30 照常透传进 PendingSpawn（阶段二
+        // set_lifespan_ticks 直存落库）
         let mgr = SandboxManager::new().unwrap();
         let creator = id(890);
-        let wat_text = spawner_velocity_wat(
+        // 合法值 30 透传
+        let ok_text = spawner_velocity_wat(
             SPAWNED_CODE,
             "f64.const 1.0",
             "f64.const 1.0",
@@ -6395,36 +6409,48 @@ mod tests {
             "i32.const 30",
         );
         let mut handle = mgr
-            .create_sandbox(&wasm(&wat_text), 100_000, creator)
+            .create_sandbox(&wasm(&ok_text), 100_000, creator)
             .unwrap();
         handle.store.data_mut().pos = (10.0, 10.0);
         mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(
+            call_i32_export(&mut handle, "get_ret"),
+            1,
+            "合法声明 30 应返回 1（已排队）"
+        );
         assert_eq!(
             handle.store.data().pending_spawns[0].lifespan_ticks,
             30,
             "合法值 30 应透传（30 拍后世界托管消散）"
         );
-        // 负值钳 0（永生）
-        let bad_text = spawner_velocity_wat(
-            SPAWNED_CODE,
-            "f64.const 1.0",
-            "f64.const 1.0",
-            "i32.const 0",
-            "i32.const 0",
-            "f64.const 0.0",
-            "f64.const 0.0",
-            "i32.const -5",
-        );
-        let mut h = mgr
-            .create_sandbox(&wasm(&bad_text), 100_000, id(891))
-            .unwrap();
-        h.store.data_mut().pos = (10.0, 10.0);
-        mgr.call_on_tick(&mut h).unwrap();
-        assert_eq!(
-            h.store.data().pending_spawns[0].lifespan_ticks,
-            0,
-            "负 lifespan 应钳 0（永生现状语义）"
-        );
+        // 0=不声明 / -5=负值：整次拒绝——返回 0 且 pending_spawns 空（不诞生
+        // 不占名额，机关枪满地永生子弹的口子焊死）
+        for bad in ["i32.const 0", "i32.const -5"] {
+            let bad_text = spawner_velocity_wat(
+                SPAWNED_CODE,
+                "f64.const 1.0",
+                "f64.const 1.0",
+                "i32.const 0",
+                "i32.const 0",
+                "f64.const 0.0",
+                "f64.const 0.0",
+                bad,
+            );
+            let mut h = mgr
+                .create_sandbox(&wasm(&bad_text), 100_000, id(891))
+                .unwrap();
+            h.store.data_mut().pos = (10.0, 10.0);
+            mgr.call_on_tick(&mut h).unwrap();
+            assert_eq!(
+                call_i32_export(&mut h, "get_ret"),
+                0,
+                "寿命声明 {bad} 应返回 0（整次拒绝出生）"
+            );
+            assert!(
+                h.store.data().pending_spawns.is_empty(),
+                "寿命声明 {bad} 不应排队（整次拒绝，pending_spawns 空）"
+            );
+        }
     }
 
     #[test]

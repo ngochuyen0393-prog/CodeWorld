@@ -2929,6 +2929,19 @@ fn process_spawn_requests(
             req.motion
         };
         let entity_id = EntityId::new();
+        // D-019 R1 出生预检防御性二道门（decisions.md #056 勘误）：寿命声明 <1
+        // 的请求跳过该条。分工注释：import 层=玩家声明入口（拒绝+WARN 告知玩家）；
+        // 预检层=世界对世界的防御——防未来旁路出生通道（直构 PendingSpawn 的内部
+        // 路径）绕过强制声明立法。与 #030 同款"不诞生、不占名额"
+        if req.lifespan_ticks < 1 {
+            tracing::warn!(
+                creator = %req.creator.0,
+                pos = ?req.pos,
+                received = req.lifespan_ticks,
+                "[process_spawns] 寿命声明非法（<1），跳过该次出生（import 层已拒，此处防御性二道门，防未来旁路出生通道）"
+            );
+            continue;
+        }
         // #030 出生预检（Factorio 放置检查，半径版）：造物身体与任何存活身体重叠
         // → 该次 spawn 失败。放在编译之后、建沙箱之前（防沙箱泄漏）；不诞生、
         // 不占世界名额，下拍可重试。D-003：dynamic 造物身体=声明 radius 的圆，
@@ -3013,8 +3026,9 @@ fn process_spawn_requests(
         entity.set_restitution(req.restitution);
         entity.set_friction(req.friction);
         // D-019 spawn 第 23 参 lifespan_ticks：寿命声明写进造物数据（import 层已
-        // 钳负值为 0=永生，此处直存）——>0 的造物活满 N 拍后由世界托管消散
-        //（expire_due_lifespans，残影消散同款路径语义：非击杀无掠夺遗嘱不触发）
+        // try_lifespan_ticks 校验 >=1、预检层二道门兜底，此处直存）——>0 的造物
+        // 活满 N 拍后由世界托管消散（expire_due_lifespans，残影消散同款路径
+        // 语义：非击杀无掠夺遗嘱不触发）；字段 0 仅存于存量快照实体=v1 永生
         entity.set_lifespan_ticks(req.lifespan_ticks);
         // 出生初速（spawn 第 11/12 参，D-018 一体式发射提前落地）：import 层已校验
         // （有限+模长 ≤ 世界极速），此处写进造物 velocity 字段。位置积分（造物被
@@ -5570,7 +5584,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -9504,7 +9518,7 @@ mod tests {
             link,
             restitution: 0.0,
             friction: 0.6,
-            lifespan_ticks: 0,
+            lifespan_ticks: 10000, // R1 强制声明：测试桩长寿值，防到期误杀
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(world, map, vec![req], 1, &[]);
@@ -10483,8 +10497,8 @@ mod tests {
           (i32.const 0)
           (f64.const 0.0)
           (f64.const 0.6)
-          ;; lifespan（D-019 第 23 参，0=永生默认，零回归）
-          (i32.const 0))))))
+          ;; lifespan（D-019 R1 强制声明：>=1 才出生；测试桩长寿值防到期误杀）
+          (i32.const 10000))))))
   (func (export "life") (result i32) i32.const 1))"#,
             shell_len = CTRL_SHELL_WAT.len(),
         )
@@ -11171,25 +11185,18 @@ mod tests {
     }
 
     #[test]
-    fn creation_lifespan_zero_is_eternal() {
-        // 零回归锚：lifespan=0（不声明/缺省同值）=永生——10 拍后造物照站，
-        // 现状语义零回归
+    fn creation_lifespan_zero_rejected() {
+        // D-019 R1 强制声明（#056 勘误）：lifespan=0（不声明）=整次拒绝出生——
+        // 实体不诞生（本测试直构请求走预检二道门；玩家真实路径走 import 层，
+        // 两层拒绝语义同款），断言世界里没有该实体
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         let creator = make_entity_with_sandbox(&mut world, &mut map, 1, (10.0, 0.5), PLAYER_WAT);
         process_spawn_requests(&mut world, &mut map, vec![lifespan_spawn_request(creator, 0)], 1, &[]);
-        let mut time = TimeEngine::new();
-        let physics = DefaultPhysicsEngine::new();
-        let mut renderer = test_renderer();
-        let mut storage = StorageEngine::open_in_memory().unwrap();
-        let mut pending: Vec<PendingChange> = Vec::new();
-        for _ in 0..10 {
-            tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
-        }
         assert_eq!(
             world.entities.values().filter(|e| e.code_hash == "creation").count(),
-            1,
-            "lifespan=0 永生：10 拍后造物仍存活"
+            0,
+            "lifespan=0 不声明：整次拒绝出生，世界里没有该实体"
         );
     }
 
@@ -11424,7 +11431,7 @@ mod tests {
             link: 0,
             restitution: 0.0,
             friction: 0.6,
-            lifespan_ticks: 0,
+            lifespan_ticks: 10000, // R1 强制声明：测试桩长寿值，防到期误杀
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
@@ -11487,7 +11494,7 @@ mod tests {
             link: 0,
             restitution: 0.0,
             friction: 0.6,
-            lifespan_ticks: 0,
+            lifespan_ticks: 10000, // R1 强制声明：测试桩长寿值，防到期误杀
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
@@ -12492,7 +12499,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -12692,7 +12699,7 @@ mod tests {
                 link: 0,
                 restitution: 0.0,
                 friction: 0.6,
-                lifespan_ticks: 0,
+                lifespan_ticks: 10000, // R1 强制声明：测试桩长寿值，防到期误杀
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 7);
@@ -12756,7 +12763,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -12962,7 +12969,7 @@ mod tests {
                 link: 0,
                 restitution: 0.0,
                 friction: 0.6,
-                lifespan_ticks: 0,
+                lifespan_ticks: 10000, // R1 强制声明：测试桩长寿值，防到期误杀
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -13234,7 +13241,7 @@ mod tests {
         (i32.const 0)
         (f64.const 0.0)
         (f64.const 0.6)
-        (i32.const 0)                       ;; lifespan（D-019 第 23 参，0=永生默认）
+        (i32.const 10000)                   ;; lifespan（D-019 R1 强制声明：>=1 才出生；测试桩长寿值防到期误杀）
         (call $spawn)
         (drop))))
   (func (export "life") (result i32) i32.const 1))"#,
@@ -13357,7 +13364,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn drop))"#,
             escaped = escaped,
             len = relic_code.len(),
@@ -13412,7 +13419,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn drop))"#,
             shell_len = CTRL_SHELL_WAT.len(),
         )
@@ -13753,7 +13760,7 @@ mod tests {
     i32.const 0
     f64.const 0.0
     f64.const 0.6
-    i32.const 0
+    i32.const 10000
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,

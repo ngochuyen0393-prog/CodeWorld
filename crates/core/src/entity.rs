@@ -180,11 +180,12 @@ pub struct Entity {
 
     // 造物寿命（D-019 出生声明第 23 参：出生时声明活几拍，到拍世界托管消散——
     // 土豆拍板"每个造物可存活多久=玩家自己设置的参数"，decisions.md #056）。
-    // 域 [0,+] 无上限：0=永生（默认=现状零回归，不声明/缺省同 0）；负值 import
-    // 层已钳 0 + warn。到期判定 current_tick >= created_tick + lifespan（出生拍算
-    // 第 0 拍，活满 N 拍第 N+1 拍消散）。到期消散=残影消散同款路径语义：非击杀
-    // 无掠夺、遗嘱不触发（main.rs expire_due_lifespans）。
-    /// serde default：旧快照无此字段时回退 0=永生（存储向后兼容，零迁移）
+    // R1 起出生通道强制 >=1（0/负 import 层整次拒绝，decisions.md #056 勘误，
+    // 域 [1,+] 无上限）；字段值 0 仅存于存量快照实体=v1 时代合法出生的永生。
+    // 到期判定 current_tick >= created_tick + lifespan（出生拍算第 0 拍，活满 N
+    // 拍第 N+1 拍消散）。到期消散=残影消散同款路径语义：非击杀无掠夺、遗嘱不
+    // 触发（main.rs expire_due_lifespans）。
+    /// 存量兼容：v1 时代 0=永生出生的实体照常永生；新法（R1）只管新出生通道
     #[serde(default = "default_lifespan_ticks")]
     lifespan_ticks: u64,
 
@@ -274,7 +275,8 @@ fn default_friction() -> f64 {
     0.6
 }
 
-/// 造物寿命默认值（D-019：新实体与旧快照回退共用 0=永生——现状零回归）
+/// 造物寿命默认值（D-019 R1 存量兼容：旧快照无此字段回退 0=v1 永生语义——
+/// 只对已出生存量实体生效，不迁移不清档；新出生通道 import 层强制 >=1）
 fn default_lifespan_ticks() -> u64 {
     0
 }
@@ -320,15 +322,17 @@ pub fn clamp_friction(v: f64) -> f64 {
     v
 }
 
-/// 造物寿命校验钳制（spawn 第 23 参口径，D-019）：域 [0,+] 无上限（WAT 侧 i32
-/// 转 Rust 侧 u64），负值钳 0（永生最保守回退）并 warn（与 clamp_binding/clamp_link
-/// 同款措辞风格——出生声明家族哲学：超界钳回+警告非拒绝；i32 无非有限值问题）
-pub fn clamp_lifespan_ticks(v: i32) -> u64 {
-    if v < 0 {
-        tracing::warn!(value = v, clamped = 0, "[lifespan] 寿命为负，钳 0（永生）");
-        return 0;
+/// 造物寿命声明校验（spawn 第 23 参口径，D-019 R1 强制声明/#056 勘误）：域
+/// [1,+] 无上限（WAT 侧 i32 转 Rust 侧 u64）。**强制声明**：v >= 1 才放行
+/// Some；v < 1（0=不声明/负值同罪）返回 None，import 层整次拒绝出生（#030
+/// 整次拒绝哲学——非钳制放行：机关枪满地永生子弹堵死路，土豆终审原话）。
+/// WARN 由 import 层拒绝分支打（带 creator/坐标/字形/收到的值）；i32 无非
+/// 有限值问题
+pub fn try_lifespan_ticks(v: i32) -> Option<u64> {
+    if v < 1 {
+        return None;
     }
-    v as u64
+    Some(v as u64)
 }
 
 /// 液体密度校验钳制（spawn 第 18 参口径）：域 [0.0, 5.0]，负值/非有限钳 0
@@ -701,12 +705,13 @@ impl Entity {
         self.friction = friction;
     }
 
-    /// 造物寿命（D-019 出生声明第 23 参：0=永生现状语义，>0=到拍世界托管消散）
+    /// 造物寿命（D-019 出生声明第 23 参：R1 起新出生恒 >=1，>0=到拍世界托管
+    /// 消散；字段 0 仅存于存量快照实体=v1 永生）
     pub fn lifespan_ticks(&self) -> u64 {
         self.lifespan_ticks
     }
 
-    /// 设置造物寿命（import 层已 clamp_lifespan_ticks，此处直存）
+    /// 设置造物寿命（import 层已 try_lifespan_ticks 校验 >=1，此处直存）
     pub fn set_lifespan_ticks(&mut self, lifespan_ticks: u64) {
         self.lifespan_ticks = lifespan_ticks;
     }
@@ -1510,7 +1515,7 @@ mod tests {
 
     #[test]
     fn lifespan_setter_and_roundtrip() {
-        // 创建/读写：第 23 参 setter 直存（import 层已 clamp_lifespan_ticks，照
+        // 创建/读写：第 23 参 setter 直存（import 层已 try_lifespan_ticks 校验，照
         // liquid 直存模式）+ 序列化往返保留（快照存档寿命不丢）
         let mut e = sample_entity();
         e.set_lifespan_ticks(30);
@@ -1521,15 +1526,17 @@ mod tests {
     }
 
     #[test]
-    fn clamp_lifespan_ticks_negative_clamps_zero() {
-        // 出生声明家族哲学：超界钳回+警告非拒绝。域 [0,+]：0=永生合法，
-        // 负值钳 0（最保守回退=永生现状语义）；i32 无非有限值问题
-        assert_eq!(clamp_lifespan_ticks(-5), 0);
-        assert_eq!(clamp_lifespan_ticks(-1), 0);
-        assert_eq!(clamp_lifespan_ticks(0), 0);
-        assert_eq!(clamp_lifespan_ticks(1), 1);
-        assert_eq!(clamp_lifespan_ticks(30), 30);
-        assert_eq!(clamp_lifespan_ticks(i32::MAX), i32::MAX as u64);
+    fn try_lifespan_ticks_some_none_matrix() {
+        // D-019 R1 强制声明（#056 勘误）：域 [1,+]——>=1 放行 Some；0=不声明
+        // 与负值同罪返回 None（import 层整次拒绝出生，#030 整次拒绝哲学非
+        // 钳制放行）；i32 无非有限值问题
+        assert_eq!(try_lifespan_ticks(-5), None);
+        assert_eq!(try_lifespan_ticks(-1), None);
+        assert_eq!(try_lifespan_ticks(0), None);
+        assert_eq!(try_lifespan_ticks(1), Some(1));
+        assert_eq!(try_lifespan_ticks(30), Some(30));
+        assert_eq!(try_lifespan_ticks(10000), Some(10000));
+        assert_eq!(try_lifespan_ticks(i32::MAX), Some(i32::MAX as u64));
     }
 
     #[test]
