@@ -10931,6 +10931,11 @@ mod tests {
             "定装绑定=grace_owner（出手不伤自己，#035 修订四声明通道）"
         );
         assert_eq!(p.owner, owner, "产权链：造物弹归属操控目标 owner");
+        assert_eq!(
+            p.lifespan_ticks(),
+            30,
+            "T3b（t_8f9451f7）：定装弹出厂寿命 30（哑弹安全网——打不中的弹自己收场不堵门）"
+        );
         assert!(world.entities.get(&pid).unwrap().is_alive(), "操控目标存活");
     }
 
@@ -11197,6 +11202,363 @@ mod tests {
             world.entities.values().filter(|e| e.code_hash == "creation").count(),
             0,
             "lifespan=0 不声明：整次拒绝出生，世界里没有该实体"
+        );
+    }
+
+    #[test]
+    fn t1_entry_entity_lifespan_zero_and_eternal() {
+        // T1 零回归（t_8f9451f7）：进场生物（players 目录进场路径，Entity::new
+        // 默认构造，无寿命写入口）——lifespan_ticks() 恒 0 且长跑 4 拍不消散。
+        // 「0=永生」唯一合法残余=进场生物与旧存档快照；新出生通道 R1 强制声明
+        // 不涉进场路径
+        let dir = temp_players_dir("t1-entry-lifespan");
+        std::fs::write(dir.join("example.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let pid = find_player_id(&world, "example");
+        assert_eq!(
+            world.entities.get(&pid).unwrap().lifespan_ticks(),
+            0,
+            "进场生物 lifespan 恒 0（Entity::new 默认，无写入口）"
+        );
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 4);
+        assert!(
+            world.entities.contains_key(&pid),
+            "进场生物 4 拍后仍在（0=永生，无到期路径）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t2_expiry_info_log_captured_no_plunder_no_kill() {
+        // T2/T3 日志面（t_8f9451f7，仓库首个日志捕获测试）：到期消散必须打
+        // INFO「寿命到期消散」（世界托管死亡的可观测面），且捕获文本不含掠夺/
+        // 击杀**行为日志标记**（[plunder_survival]/[collect_pending_attacks]）。
+        // 注意不裸匹配「掠夺/击杀」中文子串——到期 INFO 原文是否定句
+        // 「（非击杀无掠夺，遗嘱不触发）」，自带这两个词，裸匹配永假。
+        // lifespan=3 与 lifespan=2 双案例（短命案例证明与具体寿命值无关）。
+        // callsite 注：tracing 宏按调用点缓存订阅兴趣，且"先评估者定缓存"——多
+        // 测试并行时其他无订阅线程若先评估过 [lifespan] 调用点，缓存 NEVER 会
+        // 永久短路（scoped fmt/Layer 订阅实测随机落空，rebuild 也只在全局订阅
+        // 就位后重建方向才正确）。终方案=进程级全局安装一次 + 线程过滤层：
+        // ① set_global_default（自家捕获层为全局订阅，此后任何线程评估调用点
+        //   都不再缓存 NEVER）；② rebuild_interest_cache() 清掉装订阅前的历史
+        // NEVER 缓存；③ on_event 按线程过滤只记本测试线程——并行测试日志互不
+        // 污染，负断言才站得住
+        use std::sync::{Arc, Mutex, OnceLock};
+        use tracing_subscriber::layer::SubscriberExt;
+        /// 本测试线程的事件缓冲（进程级共享——全局订阅者每进程只装一次，装时绑定）
+        static LOG_BUF: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+        /// 按线程过滤的捕获层（只记 message 字段；on_event 是 Layer 唯一必须方法）
+        struct ThreadCaptureLayer {
+            mine: std::thread::ThreadId,
+            buf: Arc<Mutex<Vec<String>>>,
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ThreadCaptureLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if std::thread::current().id() != self.mine {
+                    return;
+                }
+                struct MsgVisitor(String);
+                impl tracing::field::Visit for MsgVisitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut v = MsgVisitor(String::new());
+                event.record(&mut v);
+                self.buf.lock().unwrap().push(v.0);
+            }
+        }
+        let buf = LOG_BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new()))).clone();
+        let mine = std::thread::current().id();
+        // 全局安装（每进程一次；重复调用报错无害忽略）+ 重建调用点兴趣缓存
+        //（此时全局默认=自家捕获层，重建把历史 NEVER 缓存全部翻正）
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::registry()
+                .with(ThreadCaptureLayer { mine, buf: buf.clone() }),
+        );
+        tracing::callsite::rebuild_interest_cache();
+        for lifespan in [3u64, 2] {
+            buf.lock().unwrap().clear();
+            let mut world = WorldState::new();
+            let mut map = test_sandbox_map();
+            let creator =
+                make_entity_with_sandbox(&mut world, &mut map, 1, (10.0, 0.5), PLAYER_WAT);
+            process_spawn_requests(
+                &mut world,
+                &mut map,
+                vec![lifespan_spawn_request(creator, lifespan)],
+                1,
+                &[],
+            );
+            let mut time = TimeEngine::new();
+            let physics = DefaultPhysicsEngine::new();
+            let mut renderer = test_renderer();
+            let mut storage = StorageEngine::open_in_memory().unwrap();
+            let mut pending: Vec<PendingChange> = Vec::new();
+            for _ in 0..5 {
+                tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+            }
+            let text = buf.lock().unwrap().join("\n");
+            assert!(
+                text.contains("寿命到期消散"),
+                "lifespan={lifespan} 应捕获到 INFO「寿命到期消散」"
+            );
+            assert!(
+                !text.contains("[plunder_survival]")
+                    && !text.contains("[collect_pending_attacks]"),
+                "lifespan={lifespan} 到期消散日志不应含掠夺/攻击行为日志标记（自然消散非击杀）"
+            );
+            assert_eq!(
+                world.entities.values().filter(|e| e.code_hash == "creation").count(),
+                0,
+                "lifespan={lifespan} 造物应已消散"
+            );
+        }
+    }
+
+    #[test]
+    fn t2_saturating_expiry_no_panic_u64_max() {
+        // T2 饱和减法锚（t_8f9451f7）：created_tick=u64::MAX-2 + lifespan=
+        // i32::MAX 饱和到 u64::MAX——世界 tick（私有字段，快照 JSON 是唯一
+        // 合法覆写口）推到 u64::MAX 时到期判定无 panic 且实体消散。公式永不
+        // 回绕=寿命不会"溢出复活"，永生不会被算术漏洞造出来
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let creator = make_entity_with_sandbox(&mut world, &mut map, 1, (10.0, 0.5), PLAYER_WAT);
+        process_spawn_requests(&mut world, &mut map, vec![lifespan_spawn_request(creator, 3)], 1, &[]);
+        let cid = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .unwrap()
+            .id;
+        // created_tick 是 pub 字段直写；lifespan 走 setter
+        {
+            let e = world.entities.get_mut(&cid).unwrap();
+            e.created_tick = u64::MAX - 2;
+            e.set_lifespan_ticks(i32::MAX as u64);
+        }
+        // 世界 tick 覆写：serde 快照通道（Serialize/Deserialize 全字段）
+        let mut json = serde_json::to_value(&world).unwrap();
+        json["tick"] = serde_json::json!(u64::MAX - 1);
+        let mut world: WorldState = serde_json::from_value(json).unwrap();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        // 一拍：tick MAX-1 → MAX（advance_tick 饱和不回绕），到期判定
+        // MAX >= (MAX-2).saturating_add(i32::MAX)=MAX 成立 → 消散，全程无 panic
+        tick(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map);
+        assert_eq!(world.tick(), u64::MAX, "tick 推进应饱和在 u64::MAX（不回绕）");
+        assert!(
+            !world.entities.contains_key(&cid),
+            "饱和区到期判定成立：实体应消散（无 panic，寿命不溢出复活）"
+        );
+    }
+
+    #[test]
+    fn t3_plunder_contrast_expiry_plus0_vs_kill_plus1() {
+        // T3 对照组（t_8f9451f7，区分度锚）：同为"创造者贴身处的造物死了"——
+        // 场景 A 到期消散：创造者 survival +0（非击杀无掠夺）；场景 B 被
+        // attack_at 击杀：创造者 +1（3→4）。两场景唯一变量=死亡路径，+0/+1
+        // 的区分度成立（B 若也 +0 则本测试无意义，断言写死 +1 防空转）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        // 场景 A：造物声明寿命 1（born 后第 2 拍到期消散）
+        let creator = make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.0), PLAYER_WAT);
+        let victim_a = make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), TARGET_WAT);
+        {
+            let e = world.entities.get_mut(&victim_a).unwrap();
+            e.created_tick = 1;
+            e.set_lifespan_ticks(1);
+        }
+        let before = world.entities.get(&creator).unwrap().survival.points();
+        assert_eq!(before, 3, "初始 3 点（SurvivalPoints::initial 基线）");
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
+        assert!(
+            !world.entities.contains_key(&victim_a),
+            "A 场景：寿命 1 的造物第 2 拍应到期消散（拍内清出世界）"
+        );
+        assert_eq!(
+            world.entities.get(&creator).unwrap().survival.points(),
+            before,
+            "A 场景：到期消散无掠夺，创造者 +0"
+        );
+        // 场景 B：同款造物（寿命远未到期）被创造者 attack_at 贴身击杀
+        let victim_b = make_entity_with_sandbox(&mut world, &mut map, 3, (5.0, 0.0), TARGET_WAT);
+        victim_b_pos_guard(&world, victim_b);
+        let attacks = vec![PendingAttack::strike(creator, (5.0, 0.0), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
+        assert!(
+            !world.entities.get(&victim_b).unwrap().is_alive(),
+            "B 场景：空 payload 刀应击杀贴身造物"
+        );
+        assert_eq!(
+            world.entities.get(&creator).unwrap().survival.points(),
+            before + 1,
+            "B 场景：击杀掠夺 +1（与 A 的 +0 形成区分度）"
+        );
+    }
+
+    /// T3 对照组辅助：victim_b 出生位置合法（make_entity_with_sandbox 直构不经
+    /// #030 预检，贴身位 (5,0) 与杀掠先例同款几何——纯防御性断言防脚手架漂移）
+    fn victim_b_pos_guard(world: &WorldState, id: EntityId) {
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (5.0, 0.0),
+            "victim_b 应站在创造者贴身处（接触门 dist 1.0 < r+r+0.5）"
+        );
+    }
+
+    #[test]
+    fn t4_ghost_and_lifespan_same_tick_both_clear() {
+        // T4 同拍双到期（t_8f9451f7，先后顺序安全锚）：创造者（玩家，born 拍 1）
+        // 拍 2 检测下线进残影（残影期 5 拍=players.rs 现行常量无配置口），到期拍
+        // 2+5=7；其造物 born=1、lifespan=6 → 到期线 1+6=7。同拍双清算（b2 寿命
+        // 先行、d0 残影后行）必须安全：两实体都消失、无 panic、无遗物（双方
+        // session_takes 挂号=HashSet 双插入无冲突）、无掠夺
+        let dir = temp_players_dir("t4-ghost-lifespan");
+        std::fs::write(dir.join("example.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        let mut world = WorldState::new();
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        let mut map = test_sandbox_map();
+        map.players = PlayerDirectory::new(&dir);
+        // tick 1：创造者进场（born=1）
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        let creator = find_player_id(&world, "example");
+        let creator_points = world.entities.get(&creator).unwrap().survival.points();
+        // 造物 born=1、lifespan=6 → 到期拍 1+6=7（与残影到期拍 2+5=7 同拍）
+        process_spawn_requests(&mut world, &mut map, vec![lifespan_spawn_request(creator, 6)], 1, &[]);
+        let cid = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .unwrap()
+            .id;
+        // 下线锚：删文件，拍 2 d0 登记残影
+        std::fs::remove_file(dir.join("example.wat")).unwrap();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(map.players.is_ghost(&creator), "拍 2 创造者应进残影（到期拍 7）");
+        // 拍 3..6：创造者与造物都还在（两到期线同在拍 7）
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 4);
+        assert!(world.entities.contains_key(&creator), "拍 6 创造者应在残影期");
+        assert!(world.entities.contains_key(&cid), "拍 6 造物应未到期");
+        assert_eq!(
+            world.entities.get(&creator).unwrap().survival.points(),
+            creator_points,
+            "消散前无掠夺"
+        );
+        // 拍 7：同拍双到期——b2 寿命消散 + d0 残影消散，各自 session_takes 挂号
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(!world.entities.contains_key(&creator), "拍 7 创造者残影应消散");
+        assert!(!world.entities.contains_key(&cid), "拍 7 造物寿命应到期消散");
+        assert!(
+            world.entities.is_empty(),
+            "拍 7 后世界应清空（无遗物实体=遗嘱未触发）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t6_liquid_scenery_creation_expires_too() {
+        // T6 非弹丸造物（t_8f9451f7）：液体造物（liquid_density>0，纯布景无
+        // 沙箱）带 lifespan 到期同样消散——expire_due_lifespans 不过滤造物类别
+        // （世界只认声明不认身份）。此前该声明无测试锚定
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let creator = make_entity_with_sandbox(&mut world, &mut map, 1, (10.0, 0.5), PLAYER_WAT);
+        let mut req = lifespan_spawn_request(creator, 2);
+        req.liquid_density = 1.0; // 水参照系（布景类，无沙箱强制 static）
+        process_spawn_requests(&mut world, &mut map, vec![req], 1, &[]);
+        let cid = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .expect("液体造物应诞生")
+            .id;
+        assert_eq!(
+            world.entities.get(&cid).unwrap().liquid_density(),
+            1.0,
+            "液体声明应落库（ρ=水参照系）"
+        );
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 2);
+        assert!(world.entities.contains_key(&cid), "到期前（拍 2 末）液体造物应仍在");
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 1);
+        assert!(
+            !world.entities.contains_key(&cid),
+            "拍 3（born 1 + lifespan 2）液体布景应到期消散——类别不过滤"
+        );
+    }
+
+    #[test]
+    fn t7_huge_lifespan_alive_3_ticks() {
+        // T7 极大值不溢出（t_8f9451f7）：lifespan=i32::MAX 的造物跑 3 拍照常
+        // 存活（远未到期不消散）；到期判定公式安全性由 T2 饱和减法锚合成
+        //「极大值安全」
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let creator = make_entity_with_sandbox(&mut world, &mut map, 1, (10.0, 0.5), PLAYER_WAT);
+        process_spawn_requests(
+            &mut world,
+            &mut map,
+            vec![lifespan_spawn_request(creator, i32::MAX as u64)],
+            1,
+            &[],
+        );
+        let cid = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .expect("极大寿命造物应诞生")
+            .id;
+        assert_eq!(
+            world.entities.get(&cid).unwrap().lifespan_ticks(),
+            i32::MAX as u64,
+            "i32::MAX 寿命应无损落库（u64 无溢出）"
+        );
+        let mut time = TimeEngine::new();
+        let physics = DefaultPhysicsEngine::new();
+        let mut renderer = test_renderer();
+        let mut storage = StorageEngine::open_in_memory().unwrap();
+        let mut pending: Vec<PendingChange> = Vec::new();
+        run_ticks(&mut world, &mut time, &physics, &mut renderer, &mut storage, &mut pending, &mut map, 3);
+        assert!(
+            world.entities.get(&cid).unwrap().is_alive(),
+            "i32::MAX 寿命跑 3 拍应存活（远未到期）"
         );
     }
 

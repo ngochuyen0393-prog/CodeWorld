@@ -6423,9 +6423,10 @@ mod tests {
             30,
             "合法值 30 应透传（30 拍后世界托管消散）"
         );
-        // 0=不声明 / -5=负值：整次拒绝——返回 0 且 pending_spawns 空（不诞生
-        // 不占名额，机关枪满地永生子弹的口子焊死）
-        for bad in ["i32.const 0", "i32.const -5"] {
+        // 0=不声明 / -5=负值 / i32::MIN=最负值：整次拒绝——返回 0 且
+        // pending_spawns 空（不诞生不占名额，机关枪满地永生子弹的口子焊死；
+        // T5 t_8f9451f7 补 i32::MIN 极负案例）
+        for bad in ["i32.const 0", "i32.const -5", "i32.const -2147483648"] {
             let bad_text = spawner_velocity_wat(
                 SPAWNED_CODE,
                 "f64.const 1.0",
@@ -6451,6 +6452,24 @@ mod tests {
                 "寿命声明 {bad} 不应排队（整次拒绝，pending_spawns 空）"
             );
         }
+    }
+
+    #[test]
+    fn t1_legacy_22_param_spawn_import_rejected() {
+        // T1 零回归（R1 破坏性变更边界）：R1 前协议的旧 22 参 spawn import
+        // 签名（末位无 lifespan i32）与 host 侧 23 参 FuncType 不匹配——
+        // wasmtime 实例化期 import mismatch，旧协议模块装不进沙箱（破坏性
+        // 变更必然失败=旧 .wat 玩家升级时可见的明确报错）
+        let mgr = SandboxManager::new().unwrap();
+        let legacy = r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let result = mgr.create_sandbox(&wasm(legacy), 100_000, id(892));
+        assert!(
+            result.is_err(),
+            "旧 22 参 spawn 签名应实例化失败（import mismatch）"
+        );
     }
 
     #[test]
