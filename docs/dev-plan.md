@@ -99,7 +99,7 @@
 - 信号：冲量小刀=拍速升级前任意时点（跳跃机动需求）；碰撞响应刀=决斗制落地后（击退 payload 依赖新投递语义）。
 
 ### D-019 造物寿命参数 lifespan_ticks [✅ 已落地 2026-10-23 · D-019 任务刀 · decisions #056]（2026-10-23 看板卡 t_ce7b6a36 拍板）
-- **一行工程清单**：spawn 第 23 参 lifespan_ticks（WAT i32/Rust u64，域 [0,+] 无上限，0=永生默认=现状零回归，负值钳 0+warn）+ Entity 字段 serde default 旧快照零迁移 + import 层 clamp/透传 + expire_due_lifespans（tick b2 步，残影消散同款路径：非击杀无掠夺遗嘱不触发，session_takes 家族第三成员，EntityId 升序确定性）+ 操控定装弹/H 搅局者出厂寿命 30（哑弹安全网）+ 5 玩家/示例 .wat 迁移 23 参 + api.md/game-menu/net-protocol/newbie 教学四文档同步；弹丸建议值 10 拍。
+- **一行工程清单**：spawn 第 23 参 lifespan_ticks（WAT i32/Rust u64，~~域 [0,+]，0=永生默认，负值钳 0+warn~~ → 终态域 [1,+] 强制声明，0/负=整次拒绝出生，见下行 R1 勘误）+ Entity 字段 serde default 旧快照零迁移 + import 层校验/透传（R1 起 <1 拒绝不排队）+ expire_due_lifespans（tick b2 步，残影消散同款路径：非击杀无掠夺遗嘱不触发，session_takes 家族第三成员，EntityId 升序确定性）+ 操控定装弹/H 搅局者出厂寿命 30（哑弹安全网）+ 5 玩家/示例 .wat 迁移 23 参 + api.md/game-menu/net-protocol/newbie 教学四文档同步；弹丸建议值：子弹类 3~5 拍（秒挂钩，api.md:221；newbie 教学模板给 10 拍≈活十秒）。
 - **[R1 勘误 2026-10-24]**：土豆终审打回"不声明=永生"是洞——改强制声明，域 [1,+]（0/负=整次拒绝出生，#030 哲学），import 层拒绝+main.rs 预检二道门；存量快照 0=永生照常；上限已定案：无上限（土豆 00:59 终审）。详见 decisions #056 R1 勘误段。
 
 ### D-018 标准弹丸退役工程 [✅ 已落地 2026-10-22 · commit 9cee29b · 投掷器教学 docs/newbie-first-thrower.md]（2026-10-20 #045）
