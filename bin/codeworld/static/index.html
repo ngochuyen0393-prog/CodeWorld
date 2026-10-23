@@ -740,6 +740,27 @@
     return dx * dx + dy * dy < s * s;
   }
 
+  // 贴身判距镜像·身体感知版（FIX-2 贴身门身体化，#028 镜像铁律）：接触门度量
+  // 与身体形状一致——MELEE_REACH 本义是"接触容差"，对 AABB 身体的塔用圆心距
+  // 是判据错配（悬停塔上方贴脸：圆心距 1.58>1.5 落空，但身体贴着=实际够得着）。
+  // 分派与 crates/core/src/collision.rs melee_in_reach_bodies 同判据，改一处必须
+  // 同步另一处：
+  // - hit.kind==='creation'（static 造物=格对齐 AABB，floor 推导同
+  //   nearestEntityAtWorld 格判据）：钳制点到盒最近点距离 < r我+MELEE_REACH
+  //  （严格 <；圆心在盒内=距离 0=必然够得着）；
+  // - 其余（活动实体/dynamic 造物圆）：meleeInReach 旧语义不变（圆心距）。
+  function meleeInReachEnt(me, hit) {
+    if (hit.kind === 'creation') {
+      var mx = Math.floor(hit.x), my = Math.floor(hit.y);
+      var cx = Math.max(mx, Math.min(mx + 1, me.x));
+      var cy = Math.max(my, Math.min(my + 1, me.y));
+      var dx = me.x - cx, dy = me.y - cy;
+      var s = (me.radius || 0.5) + MELEE_REACH;
+      return dx * dx + dy * dy < s * s;
+    }
+    return meleeInReach(me.x, me.y, me.radius || 0.5, hit.x, hit.y, hit.radius || 0.5);
+  }
+
   // ---- 点击分流与远程射击（#036 期五第五刀；node 机器验证覆盖）----
 
   // 选中容差（期四第七刀）：点击类游戏标配的选中放宽——距活动实体圆心 <1.5 格
@@ -957,10 +978,9 @@
     var hit = nearestEntityAtWorld(state, wx, wy);
     if (hit) {
       var me = findControlled(state.ents);
-      var inReach = !!me && meleeInReach(
-        me.x, me.y, me.radius || 0.5,
-        hit.x, hit.y, hit.radius || 0.5
-      );
+      // FIX-2 贴身门身体化：接触门按身体形状分派（meleeInReachEnt 镜像
+      // melee_in_reach_bodies）——贴脸悬停塔上方点塔前端也判贴身走 attack
+      var inReach = !!me && meleeInReachEnt(me, hit);
       if (inReach) {
         return { kind: 'attack', msg: { type: 'attack', x: hit.x, y: hit.y }, fx: { x: hit.x, y: hit.y }, hit: hit };
       }

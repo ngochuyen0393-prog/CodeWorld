@@ -18,7 +18,10 @@ if (start < 0 || end < 0 || end <= start) {
   process.exit(2);
 }
 const src = html.slice(start, end);
-const factory = new Function(src + '\nreturn { nearestEntityAtWorld: typeof nearestEntityAtWorld !== "undefined" ? nearestEntityAtWorld : null, decideClickMessage: typeof decideClickMessage !== "undefined" ? decideClickMessage : null };');
+// FIX-2 修 3 环境修复：PURE 区 terrainFirstContact 引用的全局 terrainData 声明在
+// PURE 区外（index.html :346 IIFE 顶层 var），抽取式验证缺声明 ReferenceError——
+// 注入同款声明（null=平地/旧协议，与浏览器运行时初值一致；产品代码无罪）
+const factory = new Function('var terrainData = null;\n' + src + '\nreturn { nearestEntityAtWorld: typeof nearestEntityAtWorld !== "undefined" ? nearestEntityAtWorld : null, meleeInReach: typeof meleeInReach !== "undefined" ? meleeInReach : null, meleeInReachEnt: typeof meleeInReachEnt !== "undefined" ? meleeInReachEnt : null, decideClickMessage: typeof decideClickMessage !== "undefined" ? decideClickMessage : null };');
 const api = factory();
 
 // === 测试世界 ===
@@ -96,6 +99,32 @@ const state = {
   check('命中=shoot消息带实体快照坐标（#036 远程）',
     dec.kind === 'shoot' && dec.msg.type === 'shoot' && dec.msg.x === 10 && dec.msg.y === 10 &&
     dec.fx && dec.fx.x === 10,
+    JSON.stringify(dec));
+}
+
+// 9. FIX-2 贴身门身体化（前端镜像，实测土豆 1023 F 案复刻）：
+//    P 悬停 1×1 塔上方贴脸 @ (34.93,1.58)，塔（creation static）pos=(35,0)
+//    AABB [35,36]×[0,1]（floor 推导）。圆心距≈1.58 > 旧判距 1.5（旧镜像
+//    落空走 shoot），身体感知距离（圆到 AABB 最近点 (35,1.0)）≈0.584 < 1.0
+//    （贴身够得着走 attack）——前端分流必须与服务器 melee_in_reach_bodies
+//    同判据（#028 镜像铁律）
+{
+  const hoverState = {
+    ents: [
+      { x: 34.93, y: 1.58, radius: 0.5, kind: 'player', controlled: true, name: 'p1' },
+      { x: 35, y: 0, radius: 0.5, kind: 'creation', name: 'T', owner: 'p2' },
+    ],
+  };
+  // 点击塔身内 (35.5,0.5)：nearestEntityAtWorld 格判据命中塔
+  const hit = api.nearestEntityAtWorld(hoverState, 35.5, 0.5);
+  check('贴脸悬停点塔身内命中塔', hit && hit.name === 'T', hit ? '选中 ' + hit.name : '未命中');
+  // 旧圆心距镜像在实测场景落空的锚（判据错配证据，改后必须仍成立）：
+  const legacy = api.meleeInReach(34.93, 1.58, 0.5, 35, 0, 0.5);
+  check('旧圆心距镜像同场景落空（判据错配锚）', legacy === false, String(legacy));
+  // 分流断言：修后走 attack（红框+刀光线反馈），与服务器接触门一致
+  const dec = api.decideClickMessage(hoverState, 35.5, 0.5);
+  check('贴脸悬停塔上方点塔=attack分流（身体感知镜像）',
+    dec.kind === 'attack' && dec.msg.type === 'attack' && dec.msg.x === 35 && dec.msg.y === 0,
     JSON.stringify(dec));
 }
 

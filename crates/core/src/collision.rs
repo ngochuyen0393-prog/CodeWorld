@@ -60,6 +60,69 @@ pub fn melee_in_reach(a_pos: (f64, f64), a_r: f64, b_pos: (f64, f64), b_r: f64) 
     dx * dx + dy * dy < s * s
 }
 
+/// 贴身刀判据·身体感知版（FIX-2 贴身门身体化）：接触门度量与身体形状一致——
+/// MELEE_REACH 的本义是"接触容差"（#034 原案：臂长永不立法，长武器=造物身体），
+/// 对 AABB 身体的塔用圆心距度量是判据错配（圆心离得远但身体贴着=实际够得着）。
+/// 分派：
+/// - 圆-圆：melee_in_reach 语义不变（dist < r1+r2+MELEE_REACH 严格）；
+/// - 圆-AABB：钳制点到盒最近点距离 < r圆+MELEE_REACH（复用 clamp_point_to_aabb_dist；
+///   圆心在盒内=距离 0=必然够得着）；
+/// - AABB-AABB：区间间隙 gap（x/y 两轴间隙取 max，重叠轴算 0）< MELEE_REACH。
+///
+/// 全部严格 <（恰好等于判距=落空，与模块级严格约定一致）。
+pub fn melee_in_reach_bodies(a: &Body, b: &Body) -> bool {
+    match (a, b) {
+        (
+            Body::Circle {
+                center: ca,
+                radius: ra,
+            },
+            Body::Circle {
+                center: cb,
+                radius: rb,
+            },
+        ) => melee_in_reach(*ca, *ra, *cb, *rb),
+        (
+            Body::Circle {
+                center: c,
+                radius: r,
+            },
+            Body::Aabb { min, max },
+        )
+        | (
+            Body::Aabb { min, max },
+            Body::Circle {
+                center: c,
+                radius: r,
+            },
+        ) => {
+            let (dx, dy) = clamp_point_to_aabb_dist(*c, *min, *max);
+            let s = r + MELEE_REACH;
+            dx * dx + dy * dy < s * s
+        }
+        (Body::Aabb { min: amin, max: amax }, Body::Aabb { min: bmin, max: bmax }) => {
+            // 区间间隙：重叠=0（贴着/插着），分离=正距离；两轴取 max（任一轴离得
+            // 远就算远——对角斜离的塔不因另一轴近而误判够得着）
+            let gap_x = if amin.0 > bmax.0 {
+                amin.0 - bmax.0
+            } else if bmin.0 > amax.0 {
+                bmin.0 - amax.0
+            } else {
+                0.0
+            };
+            let gap_y = if amin.1 > bmax.1 {
+                amin.1 - bmax.1
+            } else if bmin.1 > amax.1 {
+                bmin.1 - amax.1
+            } else {
+                0.0
+            };
+            let gap = gap_x.max(gap_y);
+            gap < MELEE_REACH
+        }
+    }
+}
+
 /// 身体形状：世界里的实体要么是圆（活动实体），要么是格对齐方块（造物）
 #[derive(Debug, Clone, PartialEq)]
 pub enum Body {
@@ -702,6 +765,128 @@ mod tests {
         assert!(melee_in_reach((0.0, 0.0), 0.5, (1.0, 0.0), 0.5));
         assert!(melee_in_reach((0.0, 0.0), 2.0, (2.9, 0.0), 0.5));
         assert!(!melee_in_reach((0.0, 0.0), 2.0, (3.0, 0.0), 0.5));
+    }
+
+    // === melee_in_reach_bodies（FIX-2 贴身门身体化：接触门度量与身体形状一致）===
+    // 实测场景锚：P 悬停 1×1 塔上方贴脸（P@(34.93,1.58) r0.5，塔 AABB [35,36]×[0,1]），
+    // 圆心距 1.58 > 旧判距 1.5 落空，但身体感知距离（圆到 AABB 最近点）≈0.584 < 1.0 够得着。
+
+    #[test]
+    fn melee_bodies_circle_vs_aabb_hover_above_tower_true() {
+        // 实测复现场景：悬停在塔上方偏左，圆-AABB 最近点=(35,1.0)，
+        // 距离=√(0.07²+0.58²)≈0.584 < r0.5+MELEE_REACH0.5=1.0 → 够得着
+        let p = Body::Circle {
+            center: (34.93, 1.58),
+            radius: 0.5,
+        };
+        let tower = Body::Aabb {
+            min: (35.0, 0.0),
+            max: (36.0, 1.0),
+        };
+        assert!(melee_in_reach_bodies(&p, &tower), "贴脸悬停塔上方=身体够得着");
+        // 旧圆心距判据对同场景落空（判据错配锚：本测试驱动 bodies 版诞生）
+        assert!(!melee_in_reach((34.93, 1.58), 0.5, (35.0, 0.0), 0.5), "旧圆心距判据同场景=落空");
+    }
+
+    #[test]
+    fn melee_bodies_circle_vs_aabb_separated_far_false() {
+        // 圆-AABB 分离远距：圆在塔右侧 2 格开，最近点=(36,0.5)，距离=2.0 > 1.0 落空
+        let p = Body::Circle {
+            center: (38.0, 0.5),
+            radius: 0.5,
+        };
+        let tower = Body::Aabb {
+            min: (35.0, 0.0),
+            max: (36.0, 1.0),
+        };
+        assert!(!melee_in_reach_bodies(&p, &tower), "远处够不着塔");
+    }
+
+    #[test]
+    fn melee_bodies_circle_center_inside_aabb_true() {
+        // 圆心在盒内：钳制距离=0 < 任何正半径 → 必然够得着（盒内贴身语义）
+        let p = Body::Circle {
+            center: (35.5, 0.5),
+            radius: 0.5,
+        };
+        let tower = Body::Aabb {
+            min: (35.0, 0.0),
+            max: (36.0, 1.0),
+        };
+        assert!(melee_in_reach_bodies(&p, &tower));
+    }
+
+    #[test]
+    fn melee_bodies_aabb_vs_aabb_gap_boundary() {
+        // AABB-AABB 间隙门：x 轴间隙 0.4 < MELEE_REACH 0.5 够得着；
+        // 间隙 0.6 > 0.5 落空（严格 <，与全模块严格约定一致）
+        let a = Body::Aabb {
+            min: (0.0, 0.0),
+            max: (1.0, 1.0),
+        };
+        let near = Body::Aabb {
+            min: (1.4, 0.0),
+            max: (2.4, 1.0),
+        };
+        let far = Body::Aabb {
+            min: (1.6, 0.0),
+            max: (2.6, 1.0),
+        };
+        assert!(melee_in_reach_bodies(&a, &near), "间隙 0.4 够得着");
+        assert!(!melee_in_reach_bodies(&a, &far), "间隙 0.6 落空");
+    }
+
+    #[test]
+    fn melee_bodies_aabb_axis_gap_takes_max() {
+        // 两轴间隙取 max：x 间隙 0.3（近）但 y 间隙 0.7（远）→ 按 0.7 判落空
+        let a = Body::Aabb {
+            min: (0.0, 0.0),
+            max: (1.0, 1.0),
+        };
+        let b = Body::Aabb {
+            min: (1.3, 1.7),
+            max: (2.3, 2.7),
+        };
+        assert!(!melee_in_reach_bodies(&a, &b), "y 轴间隙 0.7 主导判距");
+        // y 间隙降到 0.3：两轴都近 → 重叠区判据 gap=0.3 < 0.5 够得着
+        let b2 = Body::Aabb {
+            min: (1.3, 1.3),
+            max: (2.3, 2.3),
+        };
+        assert!(melee_in_reach_bodies(&a, &b2), "两轴间隙都 0.3 够得着");
+    }
+
+    #[test]
+    fn melee_bodies_circle_vs_circle_legacy_semantics_unchanged() {
+        // 圆-圆走旧语义零回归锚：与 melee_in_reach 同判据（dist < r1+r2+0.5 严格）
+        let a = Body::Circle {
+            center: (0.0, 0.0),
+            radius: 0.5,
+        };
+        let b_in = Body::Circle {
+            center: (1.49, 0.0),
+            radius: 0.5,
+        };
+        let b_out = Body::Circle {
+            center: (1.5, 0.0),
+            radius: 0.5,
+        };
+        assert!(melee_in_reach_bodies(&a, &b_in), "1.49 < 1.5 够得着");
+        assert!(!melee_in_reach_bodies(&a, &b_out), "恰好 1.5=落空（严格 <）");
+    }
+
+    #[test]
+    fn melee_bodies_argument_order_symmetric() {
+        // 参数对称性：圆-AABB 与 AABB-圆同判（body_overlap 同款双序覆盖）
+        let p = Body::Circle {
+            center: (34.93, 1.58),
+            radius: 0.5,
+        };
+        let tower = Body::Aabb {
+            min: (35.0, 0.0),
+            max: (36.0, 1.0),
+        };
+        assert_eq!(melee_in_reach_bodies(&p, &tower), melee_in_reach_bodies(&tower, &p));
     }
 
     // === 弹丸身份（#034 离体之物识别：body_of 同款 code_hash 常量判据）===

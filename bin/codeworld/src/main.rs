@@ -1923,6 +1923,20 @@ fn tick_with_intents(
                                 sx + dx / d * muzzle,
                                 sy + dy / d * muzzle,
                             );
+                            // FIX-2 贴脸射击出生防呆：出膛点被身体封堵 → 不入队
+                            //（弹若入队必被 #030 出生预检拒绝=幽灵弹；前置拦截
+                            // INFO 明示，改走近战刀/挪位再射）。修 1 生效后贴脸
+                            // 目标本走 attack 分流到不了这里，此防呆兜住"目标
+                            // 在射程内但出膛线被第三方身体挡住"的剩余场景。
+                            // 不用 return：封堵拍照常走下方 still_flying 悬停
+                            // 判定（空中被封堵的射击不得触发重力接管）
+                            if muzzle_blocked(world, birth, CTRL_SHELL_RADIUS) {
+                                tracing::info!(
+                                    player = %name,
+                                    birth = ?birth,
+                                    "[ctrl] 出膛点被身体封堵，本拍不发射（贴身目标改走近战刀）"
+                                );
+                            } else {
                             let fuel_limit = sandbox_map
                                 .sandboxes
                                 .get(id)
@@ -1963,6 +1977,7 @@ fn tick_with_intents(
                                     lifespan_ticks: 30,
                                     fuel_limit,
                                 });
+                            }
                         }
                         None => {
                             tracing::info!(
@@ -3114,6 +3129,26 @@ fn shell_wat_escaped() -> String {
 ///
 /// 返回 None（无解）的路径：零距离目标（贴脸走 attack 分流不解算）/
 /// 全速度梯×全角度无一进入命中窗口（目标够不着或物理上打不准）。
+///
+/// 出膛点封堵预检（FIX-2 贴脸射击防呆）：出生点弹体圆（r=CTRL_SHELL_RADIUS）
+/// 与任意存活身体 body_overlap 预检——与 #030 process_spawns 出生预检同判据
+///（同一函数、同一存活过滤）。重叠=出膛线被身体堵死，弹若入队必在出生预检处
+/// 被拒（"日志有 Shoot 但永无弹出生"的幽灵记录），前置拦截不入队、INFO 明示。
+/// 攻击者自身无需排除：出膛点沿发射方向外推 muzzle=r_self+r弹+0.1 > r_self+r弹
+///（严格 < 重叠判据下不与攻击者圆重叠，几何自然排除）。
+pub fn muzzle_blocked(world: &WorldState, birth: (f64, f64), r: f64) -> bool {
+    use codeworld_core::collision::{body_of, body_overlap, Body};
+    let shell = Body::Circle {
+        center: birth,
+        radius: r,
+    };
+    world
+        .entities
+        .values()
+        .filter(|e| e.is_alive())
+        .any(|e| body_overlap(&shell, &body_of(e)))
+}
+
 pub fn solve_launch_vector(
     sx: f64,
     sy: f64,
@@ -3615,16 +3650,18 @@ fn deliver_attacks(
         // 【D-010 时序】击退已写速度（物理事实先落账），距离门按位置实况复核：
         // 位置当拍未动，门照常通过——"按实况落空"在下一拍兑现（目标被击飞后
         // 位移，后续刀打实况位置）。
+        // 【FIX-2 贴身门身体化】判距度量换身体感知版：MELEE_REACH 本义是"接触
+        // 容差"，对 AABB 身体的塔用圆心距是判据错配（悬停塔上方贴脸，圆心距
+        // 1.58>1.5 落空但身体贴着=实际够得着）。圆-圆语义零变（内部仍走
+        // melee_in_reach），只放宽圆-AABB/AABB-AABB 的度量错配。
         let in_reach = match (
             world.entities.get(&atk.attacker),
             world.entities.get(&target_id),
         ) {
-            (Some(attacker), Some(target)) => codeworld_core::collision::melee_in_reach(
-                attacker.pos(),
-                attacker.radius(),
-                target.pos(),
-                target.radius(),
-            ),
+            (Some(attacker), Some(target)) => {
+                use codeworld_core::collision::{body_of, melee_in_reach_bodies};
+                melee_in_reach_bodies(&body_of(attacker), &body_of(target))
+            }
             _ => false, // 双方瞬失兜底（不可能路径：存活检查在前）
         };
         if !in_reach {
@@ -11171,6 +11208,131 @@ mod tests {
         );
         assert_eq!(strikes.len(), 1, "unbound 造物出刀照常进结算");
         assert_eq!(strikes[0].target, shooter, "目标就是 bound_to 主人");
+    }
+
+    #[test]
+    fn melee_gate_body_aware_hit_tower_from_hover() {
+        // FIX-2 贴身门身体化（deliver 接触门接线锚）：P 悬停 1×1 塔上方贴脸
+        //（实测场景复刻：土豆 1023 F 案）——P@(34.93,1.58) r0.5，塔=creation static
+        // pos=(35,0.5) floor 推导 AABB [35,36]×[0,1]。圆心距 1.58 > 旧判距 1.5
+        //（旧圆心距门落空），身体感知距离（圆到 AABB 最近点）≈0.584 < 1.0（新门
+        // 够得着）→ 贴身刀命中塔。攻击点取塔体内 (35.5,0.5)（距 P 圆心≈1.22 >
+        // r0.5，不在 P 体内，find_hit_target 只命中塔）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let player = make_entity_with_sandbox(&mut world, &mut map, 1, (34.93, 1.58), PLAYER_WAT);
+        let mut tower = Entity::new(
+            EntityId(Uuid::from_u128(401)),
+            PlayerId(Uuid::from_u128(98)),
+            "creation".to_string(),
+            (35.0, 0.5),
+            Appearance::new("T".to_string(), "gray".to_string(), 1.0),
+            0,
+            1_000_000,
+        );
+        tower.set_motion(codeworld_core::entity::MOTION_STATIC);
+        let tower_id = tower.id;
+        // 塔建沙箱（真实世界塔由 process_spawns 建沙箱；无沙箱目标在 deliver
+        // 防守询问处直接作废——裸实体塔测不到接触门）。PLAYER_WAT 无 on_attack
+        // 导出=默认不拦截，strike 照常产出
+        map.create(tower_id, &wasm(PLAYER_WAT), 1_000_000).unwrap();
+        world.entities.insert(tower_id, tower);
+        let strikes = deliver_attacks(
+            &mut world,
+            &mut map,
+            &[PendingAttack::strike(player, (35.5, 0.5), vec![], 0.0)],
+            test_max_speed(),
+        );
+        assert_eq!(
+            strikes.len(),
+            1,
+            "贴身悬停塔上方出刀命中塔（身体感知接触门）"
+        );
+        assert_eq!(strikes[0].target, tower_id, "命中目标就是塔");
+    }
+
+    #[test]
+    fn melee_gate_far_tower_still_out_of_reach() {
+        // 零回归对照：远离塔（圆在塔右侧 2.5 格开）照旧落空——身体化只放宽
+        // "身体贴着但圆心距超旧判距"的场景，不放大射程
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let player = make_entity_with_sandbox(&mut world, &mut map, 1, (38.5, 0.5), PLAYER_WAT);
+        let mut tower = Entity::new(
+            EntityId(Uuid::from_u128(402)),
+            PlayerId(Uuid::from_u128(98)),
+            "creation".to_string(),
+            (35.0, 0.5),
+            Appearance::new("T".to_string(), "gray".to_string(), 1.0),
+            0,
+            1_000_000,
+        );
+        tower.set_motion(codeworld_core::entity::MOTION_STATIC);
+        world
+            .entities
+            .insert(tower.id, tower);
+        let strikes = deliver_attacks(
+            &mut world,
+            &mut map,
+            &[PendingAttack::strike(player, (35.5, 0.5), vec![], 0.0)],
+            test_max_speed(),
+        );
+        assert!(strikes.is_empty(), "远处够不着塔照旧落空");
+    }
+
+    // === FIX-2 贴脸射击出生防呆：muzzle_blocked 出膛点封堵预检 ===
+
+    fn make_static_tower(id_u: u128, pos: (f64, f64)) -> Entity {
+        let mut e = Entity::new(
+            EntityId(Uuid::from_u128(id_u)),
+            PlayerId(Uuid::from_u128(98)),
+            "creation".to_string(),
+            pos,
+            Appearance::new("T".to_string(), "gray".to_string(), 1.0),
+            0,
+            1_000_000,
+        );
+        e.set_motion(codeworld_core::entity::MOTION_STATIC);
+        e
+    }
+
+    #[test]
+    fn muzzle_blocked_by_third_party_body() {
+        // 出膛线被第三方身体堵死：塔 AABB [6,7]×[0,1]，出膛点 (5.9,0.5) r0.15
+        // 距塔最近点 0.1 < 0.15 → 封堵（该弹若出生必被 #030 预检拒绝=幽灵弹）
+        let mut world = WorldState::new();
+        world.entities.insert(EntityId(Uuid::from_u128(501)), make_static_tower(501, (6.0, 0.5)));
+        assert!(muzzle_blocked(&world, (5.9, 0.5), CTRL_SHELL_RADIUS), "出膛点在塔身内=封堵");
+    }
+
+    #[test]
+    fn muzzle_clear_when_no_body_near_birth() {
+        // 出膛线畅通：远处无身体 → 不封堵，照常入队
+        let mut world = WorldState::new();
+        world.entities.insert(EntityId(Uuid::from_u128(502)), make_static_tower(502, (6.0, 0.5)));
+        assert!(!muzzle_blocked(&world, (8.0, 0.5), CTRL_SHELL_RADIUS), "出膛点远离身体=畅通");
+    }
+
+    #[test]
+    fn muzzle_dead_body_does_not_block() {
+        // 死亡身体不封堵（与 #030 出生预检 is_alive 过滤同判据）
+        let mut world = WorldState::new();
+        let mut tower = make_static_tower(503, (6.0, 0.5));
+        tower.kill();
+        world.entities.insert(tower.id, tower);
+        assert!(!muzzle_blocked(&world, (5.9, 0.5), CTRL_SHELL_RADIUS), "死亡身体不挡炮口");
+    }
+
+    #[test]
+    fn muzzle_shooter_self_does_not_block() {
+        // 攻击者自身不误报：出膛点沿发射方向外推 muzzle=r_self+r弹+0.1 > r_self+r弹
+        //（严格 < 重叠判据下不与攻击者圆重叠）——贴脸目标封堵预检不得拦正常射击
+        let mut world = WorldState::new();
+        world.entities.insert(EntityId(Uuid::from_u128(504)), make_entity(504, (5.0, 0.5)));
+        assert!(
+            !muzzle_blocked(&world, (5.75, 0.5), CTRL_SHELL_RADIUS),
+            "外推出膛点距攻击者 0.75 > r和 0.65=畅通"
+        );
     }
     #[test]
     fn grace_owner_shell_return_strike_duds_without_self_kill() {

@@ -19,7 +19,9 @@ if (begin < 0 || end < 0 || end <= begin) {
   process.exit(2);
 }
 const src = html.slice(begin, end);
-const factory = new Function(src + '\nreturn {\n' +
+// FIX-2 修 3 环境修复：注入 PURE 区外全局 terrainData 声明（null=平地/旧协议，
+// 与浏览器运行时初值一致；产品代码无罪，详见 verify-click-tolerance.js 同注）
+const factory = new Function('var terrainData = null;\n' + src + '\nreturn {\n' +
   ['applyMoveSteps', 'worldDist2', 'reconcileDecision', 'renderSteps', 'clampCamera',
    'collectKills', 'meleeInReach', 'collectProjectileHits', 'nearestProjectileVictim',
    'findControlled', 'findDisposedPlayer', 'logoutChoiceLabel', 'disposeTag',
