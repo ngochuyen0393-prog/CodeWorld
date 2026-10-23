@@ -93,6 +93,45 @@ pub fn effective_gravity_drag(
     (gravity, drag)
 }
 
+/// 位移通道阻力增量（FIX-1 场不认人：SetPos 位移的场衰减账）
+///
+/// 返回覆盖 pos 的场的 drag_delta 代数和（净值钳 `[0, FIELD_DRAG_EFFECTIVE_MAX]`）；
+/// 无覆盖返回 `0.0`。与 [`effective_gravity_drag`] 的口径差别：**只算增量，不算
+/// 世界默认阻力（0.05）**——SetPos 位移现状从不受任何阻力（move_by 1.0 全额
+/// 到达），若把默认 0.05 也套上位移，全部行走生物步长 1.0→0.95，零回归被破坏。
+/// 故位移通道只吃"场的增量"：空清单快速路径逐位返回 0.0（无场世界零分支）；
+/// 域判定（圆心距 < radius 严格域内）/多场代数和/负 delta 抵消与 effective 口径
+/// 一致。调用方（main 的 SetPos 裁决）按 `因子 = 1 - delta/mass` 衰减位移，
+/// 因子 < 0 钳 0——delta ≥ mass 时场内寸步难行（与 apply_drag 符号翻转钳零
+/// 同一法律）。
+pub fn locomotion_drag_delta(pos: (f64, f64), fields: &[FieldEffect]) -> f64 {
+    // 无场快速路径：逐位返回 0.0（零回归锚——不允许 ×0.0 的任何浮点疑虑）
+    if fields.is_empty() {
+        return 0.0;
+    }
+    let mut delta_sum = 0.0_f64;
+    let mut covered = false;
+    for f in fields {
+        let dx = pos.0 - f.pos.0;
+        let dy = pos.1 - f.pos.1;
+        // 域判定：圆心距 < radius（严格域内，恰在圆周上不算——平方比较免开方）
+        if dx * dx + dy * dy < f.radius * f.radius {
+            covered = true;
+            delta_sum += f.drag_delta; // 阻力代数和（正负互吃，对冲场合法）
+        }
+    }
+    if !covered {
+        return 0.0;
+    }
+    // 域钳制：净 delta 钳 [0, 25]——负净值（对冲场）钳 0 即"最多抹平衰减，
+    // 不许反向加速"（位移因子永不过 1）；超 25 堆场买不到定律外胜利，钳制
+    // 常量与 effective_drag 同源（FIELD_DRAG_EFFECTIVE_MIN/MAX）
+    delta_sum.clamp(
+        codeworld_core::entity::FIELD_DRAG_EFFECTIVE_MIN,
+        codeworld_core::entity::FIELD_DRAG_EFFECTIVE_MAX,
+    )
+}
+
 /// 收集本拍场清单（登记制 tick 刷场：每拍全量重算，无 enter/exit 缓存）
 ///
 /// 口径：
@@ -310,5 +349,70 @@ mod tests {
         assert_eq!(fields[0].drag_delta, -0.5, "on_field 应答覆盖本拍 delta");
         assert_eq!(fields[1].source_id, EntityId(Uuid::from_u128(2)));
         assert_eq!(fields[1].drag_delta, 1.0, "无应答用出生声明 delta");
+    }
+
+    // === locomotion_drag_delta（FIX-1 场不认人：SetPos 位移通道的场阻力增量）===
+
+    #[test]
+    fn locomotion_no_fields_returns_zero() {
+        // 无场锚：空清单逐位返回 0.0（零回归根基——无场世界 SetPos 位移照旧
+        // 全额到达，调用方零分支）
+        assert_eq!(locomotion_drag_delta((5.0, 3.0), &[]), 0.0);
+    }
+
+    #[test]
+    fn locomotion_single_field_in_domain_returns_delta() {
+        // 单场锚：域内返回该场 drag_delta（加法式增量，不是缩放；世界默认
+        // 阻力 0.05 不进位移账——否则行走生物步长 1.0→0.95 破坏零回归）
+        let fields = [field(1, (0.0, 0.0), 10.0, 1.0, 2.0)];
+        let d = locomotion_drag_delta((3.0, 2.0), &fields);
+        assert!((d - 2.0).abs() < 1e-12, "域内应返回 drag_delta，实际 {d}");
+    }
+
+    #[test]
+    fn locomotion_pos_outside_field_returns_zero() {
+        // 域外锚：圆心距 >= radius（含恰在圆周上）返回 0.0（严格 < 判定，
+        // 与 effective_gravity_drag 同口径）
+        let fields = [field(1, (0.0, 0.0), 5.0, 1.0, 2.0)];
+        assert_eq!(
+            locomotion_drag_delta((5.0, 0.0), &fields),
+            0.0,
+            "恰在圆周上=域外"
+        );
+        assert_eq!(locomotion_drag_delta((6.0, 0.0), &fields), 0.0);
+        let inside = locomotion_drag_delta((4.999, 0.0), &fields);
+        assert!((inside - 2.0).abs() < 1e-12, "域内即生效");
+    }
+
+    #[test]
+    fn locomotion_multi_fields_algebraic_sum() {
+        // 多场代数和锚：覆盖场 delta 全部相加（账本不认老板，与 effective 口径一致）
+        let fields = [
+            field(1, (0.0, 0.0), 10.0, 1.0, 2.0),
+            field(2, (1.0, 0.0), 10.0, 1.0, 3.0),
+        ];
+        let d = locomotion_drag_delta((0.5, 0.0), &fields);
+        assert!((d - 5.0).abs() < 1e-12, "双场应代数和 5.0，实际 {d}");
+    }
+
+    #[test]
+    fn locomotion_negative_net_delta_clamps_zero() {
+        // 负净 delta 钳 0 锚：+2 与 -5 抵消后 -3 → 0（对冲场最多抹平位移衰减，
+        // 不许反向加速——位移因子永不过 1）
+        let fields = [
+            field(1, (0.0, 0.0), 10.0, 1.0, 2.0),
+            field(2, (0.0, 0.0), 10.0, 1.0, -5.0),
+        ];
+        let d = locomotion_drag_delta((0.0, 0.0), &fields);
+        assert_eq!(d, 0.0, "负净 delta 应钳 0，实际 {d}");
+    }
+
+    #[test]
+    fn locomotion_delta_over_max_clamps_25() {
+        // 域钳制锚：堆场净 delta 超 25 钳 25（定律外胜利买不到，钳制用
+        // 与 effective_drag 同源的 FIELD_DRAG_EFFECTIVE_MAX）
+        let fields = [field(1, (0.0, 0.0), 10.0, 1.0, 40.0)];
+        let d = locomotion_drag_delta((0.0, 0.0), &fields);
+        assert_eq!(d, 25.0, "delta=40 应钳 25.0，实际 {d}");
     }
 }

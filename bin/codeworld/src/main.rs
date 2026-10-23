@@ -90,8 +90,9 @@ struct EntitySandboxMap {
     /// config.field_forming_ticks 设置，默认 FIELD_FORMING_TICKS=3）
     field_forming_ticks: u64,
     /// on_field 本拍应答覆盖（D-012：场返回非 0 → 临时改写本拍 drag_delta，
-    /// 场有表达权世界有结算权）。run_player_code 阶段一写入、a1.4 collect_fields
-    /// 消费清空——不跨拍残留（每拍询问每拍应答）
+    /// 场有表达权世界有结算权）。run_player_code 阶段一写入、collect_fields
+    /// （FIX-1 后在 apply_pending_changes 之前）消费清空——不跨拍残留
+    /// （每拍询问每拍应答）
     field_delta_overrides: std::collections::HashMap<EntityId, f64>,
     /// 本拍会话级离场登记（家族三成员：登出 take #025 + 残影到期消散 #013 +
     /// 寿命到期消散 D-019）：三类 kill 都在 d 步遗嘱窗口【之前】发生且登出/残影
@@ -495,8 +496,8 @@ impl EntitySandboxMap {
 
     /// 取走本拍 on_field 应答覆盖（D-012：场有表达权世界有结算权）
     ///
-    /// 阶段一 run_player_code 逐场询问时写入；tick a1.4 collect_fields 消费后
-    /// 清空——不跨拍残留（每拍询问每拍应答）。
+    /// 阶段一 run_player_code 逐场询问时写入；tick collect_fields（FIX-1 后
+    /// 在 apply_pending_changes 之前）消费后清空——不跨拍残留（每拍询问每拍应答）。
     fn take_field_delta_overrides(&mut self) -> std::collections::HashMap<EntityId, f64> {
         std::mem::take(&mut self.field_delta_overrides)
     }
@@ -2057,9 +2058,25 @@ fn tick_with_intents(
     //      再并入产权校验通过的销毁请求（env.destroy，门二）一起应用
     pending.extend(sandbox_map.collect_pending_moves());
     process_destroys(world, sandbox_map, pending);
+    //   a1.4 力场清单收集上移（FIX-1 场不认人，D-012 登记制刷场）：从物理步前
+    //       移到 apply_pending_changes 之前——同一份 fields 既喂 SetPos 位移
+    //       衰减（场吃走路的人，土豆实测 1023）也喂物理步（域内按改后参数结算）。
+    //       成型期过滤 + on_field 应答覆盖口径不变；take 只能消费一次，消费点
+    //       随收集点一起上移（阶段一 run_player_code 在前已完成，应答已写入，
+    //       上移安全；本拍 spawn 的场源仍在成型期，收集先后不影响入账）。
+    let field_overrides = sandbox_map.take_field_delta_overrides();
+    let fields = codeworld_physics::fields::collect_fields(
+        world,
+        current_tick,
+        sandbox_map.field_forming_ticks,
+        &field_overrides,
+    );
+    if !fields.is_empty() {
+        tracing::info!(tick = current_tick, count = fields.len(), "[field] 本拍场清单收集");
+    }
     // #030：移动裁决改半径碰撞（分轴滑动），移动被挡不再产生接触对——
     // 接触语义统一为"身体相触"，由阶段二 c 步全量扫描+边沿触发裁决
-    apply_pending_changes(world, pending, control_target);
+    apply_pending_changes(world, pending, control_target, &fields);
 
     //   a0. thrust 冲量应用（D-010a 冲量小刀）：插在 apply_pending_changes 之后、
     //       physics.step 之前——冲量入速度字段（v += impulse，世界极速钳制），随后
@@ -2114,20 +2131,10 @@ fn tick_with_intents(
         process_spawn_requests(world, sandbox_map, ctrl_shells, current_tick, &creators);
     }
 
-    //   a1.4 力场清单收集（D-012 登记制刷场）：每拍全量重算覆盖关系（无 enter/
-    //       exit 缓存挂摘——0.1s 判例的实现底座就是每拍刷）。成型期过滤（诞生
-    //       N 拍内不结算物理但已可见）+ on_field 应答覆盖（场有表达权世界有
-    //       结算权）。产物喂物理步（位置重力步——【D-018】弹道已并入同一 step）。
-    let field_overrides = sandbox_map.take_field_delta_overrides();
-    let fields = codeworld_physics::fields::collect_fields(
-        world,
-        current_tick,
-        sandbox_map.field_forming_ticks,
-        &field_overrides,
-    );
-    if !fields.is_empty() {
-        tracing::info!(tick = current_tick, count = fields.len(), "[field] 本拍场清单收集");
-    }
+    //   a1.4 力场清单收集已上移到 apply_pending_changes 之前（FIX-1 场不认人：
+    //       同一份 fields 既喂 SetPos 位移衰减也喂物理步）。成型期过滤 + on_field
+    //       应答覆盖口径不变（登记制每拍全量刷，无 enter/exit 缓存）。
+    //       产物喂物理步（位置重力步——【D-018】弹道已并入同一 step）。
 
     //   a1.42 液体域清单收集（D-009 登记制刷场，照 fields 先例）：每拍全量重算
     //       覆盖关系（无 enter/exit 缓存），alive+liquid_density>0 的格对齐 AABB
@@ -2602,7 +2609,12 @@ fn apply_field_pulses(
 /// `control_target`：本拍操控目标（期四第四刀）——仅它的 SetPos 应用日志升 INFO
 /// （battle.log 可追踪玩家走位），其余实体保持 debug（A/D/S 每拍自主移动，
 /// 全升 INFO 会刷爆日志）。
-fn apply_pending_changes(world: &mut WorldState, pending: &mut Vec<PendingChange>, control_target: Option<EntityId>) {
+fn apply_pending_changes(
+    world: &mut WorldState,
+    pending: &mut Vec<PendingChange>,
+    control_target: Option<EntityId>,
+    fields: &[codeworld_physics::fields::FieldEffect],
+) {
     let mut moves: Vec<(EntityId, (f64, f64))> = Vec::new();
     for change in pending.drain(..) {
         match change {
@@ -2649,15 +2661,58 @@ fn apply_pending_changes(world: &mut WorldState, pending: &mut Vec<PendingChange
         };
         let radius = me.radius();
         let old = me.pos();
+        let mass = me.mass();
         // 落地钳制（#030）：y < radius → y = radius（脚贴地）
         let mut target = new_pos;
         if target.1 < radius {
             target.1 = radius;
         }
         // 悬停维持的零位移步跳过（不过裁决不刷日志；悬停升力由 aloft 集合承载，
-        // 不依赖本 SetPos 应用）
+        // 不依赖本 SetPos 应用；跳过分支在前——零位移不进场衰减账不刷日志）
         if target == old {
             continue;
+        }
+        // FIX-1 场不认人（D-012 bug 兑现，decisions #040 宪法原文"场内全吃"）：
+        // 位移通道吃覆盖场的阻力增量（世界默认阻力 0.05 不进位移账——SetPos
+        // 现状全额到达，套默认阻力会把全部行走生物步长 1.0→0.95 破坏零回归）。
+        // 衰减因子 = 1 - drag_delta/mass（与 apply_drag 同式只喂 delta），<0 钳 0
+        // （糖浆场寸步难行）；操控移动与 env.move_by 同路收口（#022 操控零豁免
+        // 物理），域外/负净 delta（对冲场）位移原样。
+        let drag_delta = codeworld_physics::fields::locomotion_drag_delta(old, fields);
+        if drag_delta > 0.0 {
+            let factor = (1.0 - drag_delta / mass).max(0.0);
+            target = (
+                old.0 + (target.0 - old.0) * factor,
+                old.1 + (target.1 - old.1) * factor,
+            );
+            // 衰减后再钳地：凸组合不越界，防旧坐标异常（old.y < radius 的脏位）
+            if target.1 < radius {
+                target.1 = radius;
+            }
+            // 日志分级（双审 P2 修复，与 [move] 被挡/操控先例同策略）：操控实体
+            // INFO（土豆验收要在 battle.log 看到 P 减速），其余实体 debug——
+            // 自主生物每拍都动，全 INFO 会刷爆日志（糖浆场内多生物每拍一条）
+            if control_target == Some(entity) {
+                tracing::info!(
+                    entity_id = %entity.0,
+                    from = ?old,
+                    to = ?target,
+                    drag_delta,
+                    mass,
+                    factor,
+                    "[field] 移动位移被场衰减（操控实体 INFO，其余 debug）"
+                );
+            } else {
+                tracing::debug!(
+                    entity_id = %entity.0,
+                    from = ?old,
+                    to = ?target,
+                    drag_delta,
+                    mass,
+                    factor,
+                    "[field] 移动位移被场衰减"
+                );
+            }
         }
         // 分轴滑动裁决（#030）：整步 → 滑 x → 滑 y → 原地（贴墙滑非整步作废）
         let (final_pos, slide) = if first_overlap(world, entity, target, radius).is_none() {
@@ -4900,7 +4955,7 @@ mod tests {
         let entity = make_entity(7, (3.0, 4.0));
         let id = entity.id;
         let mut pending: Vec<PendingChange> = vec![PendingChange::Spawn { entity }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert!(world.entities.contains_key(&id), "Spawn 后实体应在 world 中");
         assert_eq!(world.entities.get(&id).unwrap().pos(), (3.0, 4.0));
     }
@@ -4912,7 +4967,7 @@ mod tests {
         let id = EntityId(Uuid::from_u128(1));
         world.entities.insert(id, make_entity(1, (0.0, 0.0)));
         let mut pending: Vec<PendingChange> = vec![PendingChange::Destroy { entity: id }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert!(
             !world.entities.get(&id).unwrap().is_alive(),
             "Destroy 应标记死亡"
@@ -4929,7 +4984,7 @@ mod tests {
             entity: id,
             new_pos: (8.0, 9.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id).unwrap().pos(), (8.0, 9.0));
     }
 
@@ -4943,7 +4998,7 @@ mod tests {
             entity: id,
             new_velocity: (1.0, 2.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id).unwrap().velocity(), (1.0, 2.0));
     }
 
@@ -4960,7 +5015,7 @@ mod tests {
             },
             PendingChange::Destroy { entity: id },
         ];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert!(pending.is_empty(), "apply 后 pending 应清空");
     }
 
@@ -4981,7 +5036,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.5),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.5), "目标位被占应留原位");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 0.5), "占据者不受影响");
     }
@@ -5002,7 +5057,7 @@ mod tests {
             PendingChange::SetPos { entity: id2, new_pos: (6.0, 0.5) }, // 先入队
             PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.5) }, // 后入队
         ];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "id 小者先到先得");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (7.0, 0.5), "id 大者被挡留原位");
     }
@@ -5021,7 +5076,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.5),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "死者不挡路，移动放行");
     }
 
@@ -5040,7 +5095,7 @@ mod tests {
             PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.5) },
             PendingChange::SetPos { entity: id2, new_pos: (9.0, 0.5) },
         ];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.5), "E1 裁决时目标位仍被 E2 占 → 被挡");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (9.0, 0.5), "E2 照常搬走");
     }
@@ -5058,7 +5113,7 @@ mod tests {
             entity: id,
             new_pos: (9.0, 9.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(
             world.entities.get(&id).unwrap().pos(),
             (2.0, 3.0),
@@ -5082,7 +5137,7 @@ mod tests {
             },
             PendingChange::Destroy { entity: unknown },
         ];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert!(pending.is_empty(), "即使目标不存在，变更也应被消费清空");
         assert!(world.entities.is_empty(), "不应插入任何实体");
     }
@@ -5902,7 +5957,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 5.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(
             world.entities.get(&id1).unwrap().pos(),
             (5.0, 5.0),
@@ -5923,7 +5978,7 @@ mod tests {
             entity: id1,
             new_pos: (5.2, 5.9),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(
             world.entities.get(&id1).unwrap().pos(),
             (5.2, 5.0),
@@ -5944,7 +5999,7 @@ mod tests {
             entity: id1,
             new_pos: (5.9, 5.3),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(
             world.entities.get(&id1).unwrap().pos(),
             (5.0, 5.3),
@@ -5963,7 +6018,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "目标 (6,0) 钳到 (6,0.5)");
     }
 
@@ -5978,7 +6033,7 @@ mod tests {
             entity: id1,
             new_pos: (7.0, 5.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (7.0, 5.0));
     }
 
@@ -12950,7 +13005,7 @@ mod tests {
             1,
             "产权匹配的销毁应排队 PendingChange::Destroy"
         );
-        apply_pending_changes(&mut world, &mut pending, None);
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
         assert!(
             !world.entities.get(&creation).unwrap().is_alive(),
             "自家造物应被标记死亡"
@@ -13778,6 +13833,104 @@ mod tests {
         assert!(
             (vy_out + 9.8 * 0.95).abs() < 1e-9,
             "域外生物照常吃重力（阻力后），实际 {vy_out}"
+        );
+    }
+
+    #[test]
+    fn field_decay_shrinks_setpos_walk_in_domain_and_spares_outside() {
+        // FIX-1 场不认人（土豆实测 1023：40 倍阻力场吃弹丸不吃走路角色）：
+        // 位移通道吃覆盖场阻力增量——delta=40 钳 25、mass=50 → 因子 0.5 →
+        // 1.0 格位移衰减到 0.5；域外对照实体全额到达（装配照 13387 先例）
+        let mut world = WorldState::new();
+        let mut walker = make_entity_of_owner(1, 70, (11.0, 0.5));
+        walker.set_mass(50.0); // 因子 = 1 - 25/50 = 0.5（钳制值 25 进公式）
+        let id_walker = walker.id;
+        world.entities.insert(id_walker, walker);
+        let mut outsider = make_entity_of_owner(2, 70, (50.0, 0.5));
+        outsider.set_mass(50.0);
+        let id_out = outsider.id;
+        world.entities.insert(id_out, outsider);
+        // 场源：成型（created_tick=0，当前 10 >> 成型期 3），40 倍阻力场
+        let mut source = make_entity_of_owner(3, 70, (10.0, 0.5));
+        source.set_field_radius(3.0);
+        source.set_field_drag_delta(40.0);
+        world.entities.insert(source.id, source);
+        let map = test_sandbox_map();
+        let fields = codeworld_physics::fields::collect_fields(
+            &world,
+            10,
+            map.field_forming_ticks,
+            &map.field_delta_overrides,
+        );
+        assert_eq!(fields.len(), 1, "成型场源应入账");
+        // move_by 产物 = SetPos 排队（操控/env.move_by 同路）：各走 1.0 格
+        let mut pending: Vec<PendingChange> = vec![
+            PendingChange::SetPos {
+                entity: id_walker,
+                new_pos: (12.0, 0.5),
+            },
+            PendingChange::SetPos {
+                entity: id_out,
+                new_pos: (51.0, 0.5),
+            },
+        ];
+        apply_pending_changes(&mut world, &mut pending, None, &fields);
+        let (wx, _) = world.entities.get(&id_walker).unwrap().pos();
+        assert!(
+            (wx - 11.5).abs() < 1e-12,
+            "域内位移应衰减到 0.5 格（因子 0.5），实际 {wx}"
+        );
+        let (ox, _) = world.entities.get(&id_out).unwrap().pos();
+        assert!(
+            (ox - 51.0).abs() < 1e-12,
+            "域外位移应全额 1.0 格，实际 {ox}"
+        );
+    }
+
+    #[test]
+    fn field_decay_full_stop_when_delta_ge_mass() {
+        // 糖浆场锚：drag_delta(25) >= mass(1.0) → 因子钳 0 → 位移全灭（与
+        // apply_drag 符号翻转钳零同语义：场内寸步难行，操控零豁免 #022）
+        let mut world = WorldState::new();
+        let stuck_id = EntityId(Uuid::from_u128(1));
+        world
+            .entities
+            .insert(stuck_id, make_entity(1, (11.0, 0.5)));
+        let fields = vec![codeworld_physics::fields::FieldEffect {
+            source_id: EntityId(Uuid::from_u128(99)),
+            pos: (10.0, 0.5),
+            radius: 3.0,
+            gravity_scale: 1.0,
+            drag_delta: 25.0,
+        }];
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: stuck_id,
+            new_pos: (12.0, 0.5),
+        }];
+        apply_pending_changes(&mut world, &mut pending, None, &fields);
+        assert_eq!(
+            world.entities.get(&stuck_id).unwrap().pos(),
+            (11.0, 0.5),
+            "delta>=mass 位移应全灭（原地）"
+        );
+    }
+
+    #[test]
+    fn no_field_setpos_displacement_bit_identical() {
+        // 零回归锚：无场世界 SetPos 位移逐位不变（1.0 格 → 恰好 1.0，精确
+        // 比较）——位移通道无场时零分支零浮点扰动
+        let mut world = WorldState::new();
+        let id = EntityId(Uuid::from_u128(1));
+        world.entities.insert(id, make_entity(1, (10.0, 0.5)));
+        let mut pending: Vec<PendingChange> = vec![PendingChange::SetPos {
+            entity: id,
+            new_pos: (11.0, 0.5),
+        }];
+        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        assert_eq!(
+            world.entities.get(&id).unwrap().pos(),
+            (11.0, 0.5),
+            "无场位移应逐位等于请求值"
         );
     }
 
