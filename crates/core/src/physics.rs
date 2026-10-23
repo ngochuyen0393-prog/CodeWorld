@@ -129,6 +129,16 @@ pub struct DefaultPhysics {
     /// serde default：旧参数快照无此字段回退世界极速默认 25.0。
     #[serde(default = "default_max_speed")]
     pub max_speed: f64,
+    /// 地面弹性常数（D-010 碰撞响应刀细则③，与重力同地位的世界常数）：
+    /// 实体 vs 地面组合 = max(e_entity, ground_e)。
+    /// serde default：旧参数快照无此字段回退 0.0（撞停现状零回归）。
+    #[serde(default = "default_ground_restitution")]
+    pub ground_restitution: f64,
+    /// 地面摩擦常数（D-010 细则③）：实体 vs 地面组合 = √(f_entity × ground_f)。
+    /// 0.6=Box2D v3 新默认（组合先例调研定论，勿再查引擎手册）。
+    /// serde default：旧参数快照无此字段回退 0.6。
+    #[serde(default = "default_ground_friction")]
+    pub ground_friction: f64,
 }
 
 fn default_drag() -> f64 {
@@ -139,9 +149,18 @@ fn default_max_speed() -> f64 {
     WORLD_MAX_SPEED
 }
 
+fn default_ground_restitution() -> f64 {
+    0.0
+}
+
+fn default_ground_friction() -> f64 {
+    0.6
+}
+
 impl DefaultPhysics {
     /// 默认物理参数：gravity=-9.8, ground_y=0.0, collision_enabled=true,
-    /// max_velocity=100.0, drag=0.05, max_speed=25.0（世界极速）
+    /// max_velocity=100.0, drag=0.05, max_speed=25.0（世界极速）,
+    /// ground_e=0.0/ground_f=0.6（D-010 地面常数对，与重力同地位）
     pub fn default_values() -> Self {
         Self {
             gravity: -9.8,
@@ -150,8 +169,24 @@ impl DefaultPhysics {
             max_velocity: 100.0,
             drag_coefficient: default_drag(),
             max_speed: default_max_speed(),
+            ground_restitution: default_ground_restitution(),
+            ground_friction: default_ground_friction(),
         }
     }
+}
+
+/// 接触对弹性组合（D-010 碰撞响应刀细则①，Box2D 款）：e = max(e1, e2)
+/// ——官方理由"弹力球不需要弹力地板"，恰覆盖实体 vs 地面场景（地面 e=0 时
+/// 高弹实体照弹）。组合后才允许物理使用（声明值只是出生参数）。
+pub fn combine_restitution(e1: f64, e2: f64) -> f64 {
+    e1.max(e2)
+}
+
+/// 接触对摩擦组合（D-010 细则①）：f = √(f1 × f2) 几何平均
+/// ——"一方冰=接触即冰"（f1=1.0、f2=0.36 组合=0.6）。声明值已钳 [0,1]
+/// 故乘积非负、开方恒有限。
+pub fn combine_friction(f1: f64, f2: f64) -> f64 {
+    (f1 * f2).sqrt()
 }
 
 impl Default for DefaultPhysics {
@@ -335,6 +370,44 @@ mod tests {
         let json = r#"{"gravity":-9.8,"ground_y":0.0,"collision_enabled":true,"max_velocity":100.0,"drag_coefficient":0.05}"#;
         let back: DefaultPhysics = serde_json::from_str(json).unwrap();
         assert_eq!(back.max_speed, WORLD_MAX_SPEED, "旧快照应回退世界极速默认");
+    }
+
+    // === D-010 碰撞响应：接触对组合规则（Box2D 款）+ 地面常数 ===
+
+    #[test]
+    fn bounce_combines_max_restitution() {
+        // 组合规则（D-010 细则①，Box2D 官方理由"弹力球不需要弹力地板"）：
+        // 接触对弹性取大 e = max(e1, e2)——e1=0.8 vs e2=0.2 组合=0.8
+        assert!((combine_restitution(0.8, 0.2) - 0.8).abs() < 1e-9);
+        assert!((combine_restitution(0.2, 0.8) - 0.8).abs() < 1e-9);
+        assert!((combine_restitution(0.0, 0.0) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn friction_combines_geometric_mean() {
+        // 摩擦几何平均 f = √(f1×f2)（一方冰=接触即冰）：f1=1.0/f2=0.36 组合=0.6
+        assert!((combine_friction(1.0, 0.36) - 0.6).abs() < 1e-9);
+        assert!((combine_friction(0.36, 1.0) - 0.6).abs() < 1e-9);
+        assert!((combine_friction(0.0, 0.9) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn default_physics_ground_constants_defaults() {
+        // 创建：地面常数对 (ground_e=0.0, ground_f=0.6)——与重力同地位的世界常数
+        //（D-010 细则③；e=0 撞停现状零回归，f=0.6=Box2D v3 新默认）
+        let p = DefaultPhysics::default_values();
+        assert_eq!(p.ground_restitution, 0.0);
+        assert!((p.ground_friction - 0.6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn default_physics_ground_constants_serde_backcompat() {
+        // 边界：旧参数快照（无地面常数）反序列化回退 0.0/0.6（serde default，
+        // 存储向后兼容 drag/max_speed 同款先例）
+        let json = r#"{"gravity":-9.8,"ground_y":0.0,"collision_enabled":true,"max_velocity":100.0,"drag_coefficient":0.05,"max_speed":25.0}"#;
+        let back: DefaultPhysics = serde_json::from_str(json).unwrap();
+        assert_eq!(back.ground_restitution, 0.0, "旧快照地面 e 应回退 0");
+        assert!((back.ground_friction - 0.6).abs() < 1e-12, "旧快照地面 f 应回退 0.6");
     }
 
     // === PhysicsReason ===

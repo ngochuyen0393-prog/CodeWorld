@@ -232,6 +232,28 @@ impl Terrain {
         self.heights.len()
     }
 
+    /// 地形面法线（D-010 碰撞响应刀：触地反弹的碰撞法线，朝上单位向量）
+    ///
+    /// x 所在分段线性段的方向 = (spacing, Δh)，左手法线（朝上侧）= (-Δh, spacing)
+    /// 归一化。平地（Δh=0）恒 (0,1)。纯几何无 IO、每拍热路径：日志豁免。
+    pub fn height_normal(&self, x: f64) -> (f64, f64) {
+        let xc = x.clamp(TERRAIN_X_MIN, TERRAIN_X_MAX);
+        let f = (xc - TERRAIN_X_MIN) / TERRAIN_SPACING;
+        let n = self.heights.len();
+        // 右端点：钳到最后一段（左端点斜率），与 height() 的钳制口径一致
+        let i = (f.floor() as usize).min(n.saturating_sub(2));
+        let dh = if n >= 2 {
+            self.heights[i + 1] - self.heights[i]
+        } else {
+            0.0
+        };
+        let len = (TERRAIN_SPACING * TERRAIN_SPACING + dh * dh).sqrt();
+        if len < 1e-12 {
+            return (0.0, 1.0); // 退化兜底（spacing 常数下不可达）
+        }
+        (-dh / len, TERRAIN_SPACING / len)
+    }
+
     /// 高度数组只读快照（渲染/网络投影用；除非 X 条款：高度数组不动）
     pub fn samples(&self) -> &[f64] {
         &self.heights

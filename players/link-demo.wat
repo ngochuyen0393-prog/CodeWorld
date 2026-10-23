@@ -18,7 +18,7 @@
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
   (import "env" "command" (func $command (param i32 i32) (result i32)))
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
 
   (memory (export "memory") 1)
 
@@ -78,7 +78,9 @@
             (f64.const 0.0)                                   ;; field_drag_delta（第17参）
             (f64.const 0.0)                                   ;; liquid_density（第18参，0=非液体）
             (f64.const 0.0)                                   ;; liquid_drag（第19参，0=无阻尼）
-            (i32.const 1)))                                   ;; link（第20参，1=活链——风筝线的诞生）
+            (i32.const 1)                                     ;; link（第20参，1=活链——风筝线的诞生）
+            (f64.const 0.0)                                   ;; restitution（第21参，D-010，0=撞停默认）
+            (f64.const 0.6)))                                 ;; friction（第22参，D-010，0.6=默认）
         (i32.const 5) (call $log)                             ;; marker 5 = 放飞信号
         (global.set $kite_done (i32.const 1))
         (return)))

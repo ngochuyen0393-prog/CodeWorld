@@ -34,7 +34,7 @@
 (module
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
 
   (memory (export "memory") 1)
 
@@ -106,7 +106,9 @@
             (f64.const 0.0)                                   ;; field_drag_delta（第17参）
             (f64.const 1.0)                                   ;; liquid_density（D-009 第18参：ρ=1.0 纯水）
             (f64.const 0.35)                                  ;; liquid_drag（第19参：k=0.35，入水一拍掉 65%）
-            (i32.const 0)))                                   ;; link（D-011 第20参，0=无链放生）
+            (i32.const 0)                                     ;; link（D-011 第20参，0=无链放生）
+            (f64.const 0.0)                                   ;; restitution（D-010 第21参，0=撞停默认）
+            (f64.const 0.6)))                                 ;; friction（第22参，0.6=默认摩擦）
         (if (i32.eq (global.get $tick) (i32.const 15))
           (then
             (i32.const 5) (call $log)                         ;; marker 5 = 水坑完工信号

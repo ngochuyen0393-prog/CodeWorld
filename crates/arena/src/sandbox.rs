@@ -127,6 +127,11 @@ pub struct PendingSpawn {
     /// 链声明（D-011 spawn 第 20 参；import 层已钳制非法值为无链：
     /// 0=放生默认 / 1=活链可控+可传，binding 家族新成员）
     pub link: i32,
+    /// 弹性（D-010 spawn 第 21 参，碰撞响应出生声明家族；import 层已钳 [0,1]，
+    /// 0=撞停现状语义默认；接触对组合=Box2D 款 max/√，组合后才允许物理使用）
+    pub restitution: f64,
+    /// 摩擦（D-010 spawn 第 22 参；import 层已钳 [0,1]，0.6=Box2D v3 新默认）
+    pub friction: f64,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
 }
@@ -512,14 +517,16 @@ impl SandboxManager {
 
     /// 构造 Linker，注册系统 import 函数（env.log / env.attack_at）
     ///
-    /// env.attack_at(x, y, payload_ptr, payload_len) -> i32（架构 4.2）：
+    /// env.attack_at(x, y, payload_ptr, payload_len, force) -> i32（架构 4.2）：
     ///   - 不检查坐标有无实体（import 无 world 访问权），只把攻击请求排队到
     ///     SandboxData.pending_attacks，实际 hit/miss 在阶段二 process_attacks 判断。
     ///   - payload 从 caller 的 memory export 读取 [ptr..ptr+len]；模块未导出 memory
     ///     或 ptr<0/len<=0/越界 -> 空 payload（空 payload 由阶段二用默认击杀 WAT）。
     ///   - len 超过 MAX_PAYLOAD_LEN（1MB）直接拒绝：不入队、不拷贝内存
     ///     （防大块拷贝 + 超大模块编译阻塞 tick，编译不受 fuel 约束）。
-    ///   - 返回 1=已排队，0=拒绝（超限）。
+    ///   - force：击退力度（D-010 第 5 参，格/拍速度增量）——非有限=作废整刀、
+    ///     负值钳 0、上限钳世界极速（恰等放行）；0=不击退（零回归）。
+    ///   - 返回 1=已排队，0=拒绝（超限/force 非有限）。
     fn make_linker(engine: &Engine, max_speed: f64) -> Result<Linker<SandboxData>> {
         let mut linker = Linker::new(engine);
         // env.log(v)：玩家代码日志（v 为玩家自定义 marker，含义见各生物 WAT 注释）。
@@ -743,7 +750,7 @@ impl SandboxManager {
         linker.func_wrap(
             "env",
             "attack_at",
-            |mut caller: Caller<SandboxData>, x: f64, y: f64, ptr: i32, len: i32| -> i32 {
+            move |mut caller: Caller<SandboxData>, x: f64, y: f64, ptr: i32, len: i32, force: f64| -> i32 {
                 let attacker = caller.data().entity_id;
                 // 超限拒绝：在读 memory 之前拦下（避免无谓拷贝），返回 0 告知玩家代码
                 if len > 0 && len as usize > MAX_PAYLOAD_LEN {
@@ -755,17 +762,48 @@ impl SandboxManager {
                     );
                     return 0;
                 }
+                // D-010 击退力度（第 5 参）校验：非有限=作废整刀 warn 拒绝（与坐标
+                // NaN 同款）；有限负值钳 0（反向击退不合法）；上限钳世界极速
+                //（经装配 max_speed，恰等放行——与 spawn 出生初速同口径）。力度=
+                // 攻击者声明制（宪法 #011：世界不替你定力度），0=不击退零回归
+                let force = if !force.is_finite() {
+                    tracing::warn!(
+                        attacker = %attacker.0,
+                        force,
+                        "[attack_at] force 非有限，作废整刀拒绝入队"
+                    );
+                    return 0;
+                } else if force < 0.0 {
+                    tracing::warn!(
+                        attacker = %attacker.0,
+                        requested = force,
+                        clamped = 0.0,
+                        "[attack_at] force 为负，钳 0（不击退）"
+                    );
+                    0.0
+                } else if force > max_speed {
+                    tracing::warn!(
+                        attacker = %attacker.0,
+                        requested = force,
+                        clamped = max_speed,
+                        "[attack_at] force 超世界极速，钳制（恰等放行口径）"
+                    );
+                    max_speed
+                } else {
+                    force
+                };
                 let payload = read_payload_from_caller(&mut caller, ptr, len);
                 let payload_len = payload.len(); // 实际读取到的字节数（非调用方声称的 len）
                 caller
                     .data_mut()
                     .pending_attacks
-                    .push(PendingAttack::strike(attacker, (x, y), payload));
+                    .push(PendingAttack::strike(attacker, (x, y), payload, force));
                 tracing::info!(
                     attacker = %attacker.0,
                     x,
                     y,
                     payload_len,
+                    force,
                     "[attack_at] 攻击已排队"
                 );
                 1 // 已排队
@@ -995,7 +1033,7 @@ impl SandboxManager {
         // 阶段二拒绝以日志为准，api.md 载明）。
         // D-009：spawn 超 17 参——wasmtime 25 的 IntoFunc 宏上限 17 参
         //（Caller+17，func.rs for_each_function_signature 最后一档），func_wrap
-        // 装不下 20 个闭包参数，改走 func_new 动态注册（任意元数）。参数经
+        // 装不下 22 个闭包参数，改走 func_new 动态注册（任意元数）。参数经
         // Val::I32/F64 匹配抽取（import 签名已声明类型，运行期只会是声明类型；
         // 防御性回退 0/NAN，落在既有校验拒绝路径上，不崩世界）。
         linker.func_new(
@@ -1014,6 +1052,7 @@ impl SandboxManager {
                     wasmtime::ValType::F64, wasmtime::ValType::F64, wasmtime::ValType::F64, // field 三参（D-012）
                     wasmtime::ValType::F64, wasmtime::ValType::F64, // liquid 两参（D-009 第 18/19 参）
                     wasmtime::ValType::I32, // link（D-011 第 20 参）
+                    wasmtime::ValType::F64, wasmtime::ValType::F64, // e/f 两参（D-010 第 21/22 参）
                 ],
                 [wasmtime::ValType::I32],
             ),
@@ -1072,7 +1111,9 @@ impl SandboxManager {
                 let liquid_density = f64_at(17);
                 let liquid_drag = f64_at(18);
                 let link = i32_at(19);
-                // 校验体（20 参签名，与 func_wrap 时代闭包体逐行同代码）
+                let restitution = f64_at(20);
+                let friction = f64_at(21);
+                // 校验体（22 参签名，与 func_wrap 时代闭包体逐行同代码）
                 #[allow(clippy::too_many_arguments)]
                 let spawn_call = |caller: &mut Caller<SandboxData>,
                                   code_ptr: i32,
@@ -1094,7 +1135,9 @@ impl SandboxManager {
                                   field_drag_delta: f64,
                                   liquid_density: f64,
                                   liquid_drag: f64,
-                                  link: i32|
+                                  link: i32,
+                                  restitution: f64,
+                                  friction: f64|
                  -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
@@ -1245,6 +1288,10 @@ impl SandboxManager {
                 let liquid_drag = codeworld_core::entity::clamp_liquid_drag(liquid_drag);
                 // D-011 第 20 参链声明校验钳制（非法值钳无链，warn）
                 let link = codeworld_core::entity::clamp_link(link);
+                // D-010 第 21/22 参碰撞响应声明校验钳制（域 [0,1] 硬钳，非有限回退
+                // 默认 e=0/f=0.6，warn 带原值与钳后值——出生声明家族哲学同款）
+                let restitution = codeworld_core::entity::clamp_restitution(restitution);
+                let friction = codeworld_core::entity::clamp_friction(friction);
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
@@ -1264,6 +1311,8 @@ impl SandboxManager {
                     liquid_density,
                     liquid_drag,
                     link,
+                    restitution,
+                    friction,
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
                 caller
@@ -1288,6 +1337,8 @@ impl SandboxManager {
                         liquid_density,
                         liquid_drag,
                         link,
+                        restitution,
+                        friction,
                         fuel_limit,
                     });
                 1
@@ -1314,6 +1365,8 @@ impl SandboxManager {
                     liquid_density,
                     liquid_drag,
                     link,
+                    restitution,
+                    friction,
                 );
                 results[0] = wasmtime::Val::I32(ret);
                 Ok(())
@@ -3335,22 +3388,50 @@ mod tests {
 
     // === env.attack_at import（架构 4.2：攻击排队）===
 
-    /// 攻击方 WAT：导出 memory + on_tick 调 attack_at(5.0, 5.0, 0, 0)（空 payload）
+    /// 攻击方 WAT：导出 memory + on_tick 调 attack_at(5.0, 5.0, 0, 0, 0.0)
+    ///（空 payload；D-010 第 5 参 force=0=零击退零回归）
     const ATTACKER_WAT: &str = r#"(module
-  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
   (memory (export "memory") 1)
   (func (export "on_tick")
-    f64.const 5.0 f64.const 5.0 i32.const 0 i32.const 0 call $attack_at drop)
+    f64.const 5.0 f64.const 5.0 i32.const 0 i32.const 0 f64.const 0.0 call $attack_at drop)
   (func (export "life") (result i32) i32.const 1))"#;
 
     /// 带 payload 的攻击方 WAT：data 段写 [1,2,3,4] 到 memory[0..4]，on_tick 调
-    /// attack_at(7.0, 8.0, 0, 4)（payload_ptr=0, payload_len=4，验证从 memory 读 payload）
+    /// attack_at(7.0, 8.0, 0, 4, 0.0)（payload_ptr=0, payload_len=4，验证从 memory
+    /// 读 payload；D-010 第 5 参 force=0=零击退）
     const ATTACKER_WITH_DATA_WAT: &str = r#"(module
-  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "\01\02\03\04")
   (func (export "on_tick")
-    f64.const 7.0 f64.const 8.0 i32.const 0 i32.const 4 call $attack_at drop)
+    f64.const 7.0 f64.const 8.0 i32.const 0 i32.const 4 f64.const 0.0 call $attack_at drop)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 带击退力度的攻击方 WAT（D-010）：attack_at(5.0, 5.0, 0, 0, force=2.5)
+    const ATTACKER_FORCE_WAT: &str = r#"(module
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    f64.const 5.0 f64.const 5.0 i32.const 0 i32.const 0 f64.const 2.5 call $attack_at drop)
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 非法 force 的攻击方 WAT（D-010）：attack_at(5.0, 5.0, 0, 0, force=NaN)
+    /// ——非有限 force 应作废整刀（返回 0，不入队）
+    const ATTACKER_FORCE_NAN_WAT: &str = r#"(module
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    (drop (call $attack_at (f64.const 5.0) (f64.const 5.0) (i32.const 0) (i32.const 0) (f64.const nan))))
+  (func (export "life") (result i32) i32.const 1))"#;
+
+    /// 超限/负值 force 的攻击方 WAT（D-010）：attack_at(5.0, 5.0, 0, 0, force=99)
+    /// ——超世界极速钳 25 恰等放行口径；负值钳 0
+    const ATTACKER_FORCE_OVER_WAT: &str = r#"(module
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "on_tick")
+    (drop (call $attack_at (f64.const 5.0) (f64.const 5.0) (i32.const 0) (i32.const 0) (f64.const 99.0))))
   (func (export "life") (result i32) i32.const 1))"#;
 
     #[test]
@@ -3368,6 +3449,7 @@ mod tests {
         assert_eq!(attacks[0].attacker, attacker_id, "攻击者应为沙箱绑定的实体");
         assert_eq!(attacks[0].target_pos, (5.0, 5.0));
         assert!(attacks[0].payload.is_empty(), "空 payload（ptr=0,len=0）");
+        assert_eq!(attacks[0].force, 0.0, "D-010 force=0（零击退零回归）");
     }
 
     #[test]
@@ -3385,6 +3467,51 @@ mod tests {
         assert_eq!(
             attacks[0].payload, vec![1, 2, 3, 4],
             "应从 memory 读取 payload 字节"
+        );
+    }
+
+    // === D-010 击退 payload：attack_at 第 5 参 force（力度=攻击者声明制）===
+
+    #[test]
+    fn attack_at_force_stored_in_pending_attack() {
+        // D-010：force 第 5 参写入 PendingAttack（击退力度=攻击者声明，
+        // 世界不替你定力度——宪法 #011；阶段二 deliver 消费）
+        let mgr = SandboxManager::new().unwrap();
+        let attacker_id = id(42);
+        let mut handle = mgr
+            .create_sandbox(&wasm(ATTACKER_FORCE_WAT), 1000, attacker_id)
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        let attacks = &handle.store.data().pending_attacks;
+        assert_eq!(attacks.len(), 1);
+        assert_eq!(attacks[0].force, 2.5, "force 应原样入队（域内声明值）");
+    }
+
+    #[test]
+    fn attack_at_force_clamped_and_validated() {
+        // D-010 force 校验：NaN=非有限作废整刀（返回 0 不入队+warn）；
+        // 99 超世界极速钳 25（恰等放行口径）
+        let mgr = SandboxManager::new().unwrap();
+        let attacker_id = id(42);
+        // NaN：整刀作废
+        let mut handle = mgr
+            .create_sandbox(&wasm(ATTACKER_FORCE_NAN_WAT), 1000, attacker_id)
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert!(
+            handle.store.data().pending_attacks.is_empty(),
+            "非有限 force 应作废整刀（不入队）"
+        );
+        // 99：钳到世界极速 25
+        let mut handle = mgr
+            .create_sandbox(&wasm(ATTACKER_FORCE_OVER_WAT), 1000, attacker_id)
+            .unwrap();
+        mgr.call_on_tick(&mut handle).unwrap();
+        let attacks = &handle.store.data().pending_attacks;
+        assert_eq!(attacks.len(), 1, "超限 force 钳制后照常入队");
+        assert_eq!(
+            attacks[0].force, 25.0,
+            "force 应钳到世界极速 25（恰等放行口径）"
         );
     }
 
@@ -3515,11 +3642,11 @@ mod tests {
     /// 大内存攻击方 WAT：24 页 memory（约 1.5MB），on_tick 连调两次 attack_at——
     /// 第一次 len=上限（应排队），第二次 len=上限+1（应拒绝）
     const OVERSIZED_ATTACKER_WAT: &str = r#"(module
-  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
   (memory (export "memory") 24)
   (func (export "on_tick")
-    f64.const 1.0 f64.const 2.0 i32.const 0 i32.const 1048576 call $attack_at drop
-    f64.const 1.0 f64.const 2.0 i32.const 0 i32.const 1048577 call $attack_at drop)
+    f64.const 1.0 f64.const 2.0 i32.const 0 i32.const 1048576 f64.const 0.0 call $attack_at drop
+    f64.const 1.0 f64.const 2.0 i32.const 0 i32.const 1048577 f64.const 0.0 call $attack_at drop)
   (func (export "life") (result i32) i32.const 1))"#;
 
     // === env.get_pos import（架构 3.2：读自己坐标）===
@@ -4328,7 +4455,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -4351,6 +4478,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -4370,7 +4499,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
@@ -4395,6 +4524,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
@@ -4413,6 +4544,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
@@ -4422,9 +4555,51 @@ mod tests {
         )
     }
 
+    /// D-010 超界 e/f 的 spawn WAT（22 参）：第 21/22 参（link 之后）传 1.5/-0.3——
+    /// import 层应钳到 [0,1]（1.0/0.0）
+    fn spawner_ef_wat(code: &str, e: &str, f: &str) -> String {
+        let escaped = wat_escape(code);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const 1.0 f64.const 1.0
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    f64.const {e}
+    f64.const {f}
+    call $spawn global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = code.len(),
+            e = e,
+            f = f,
+        )
+    }
+
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
@@ -4447,6 +4622,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -4456,7 +4633,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -4480,6 +4657,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -4529,7 +4708,7 @@ mod tests {
         // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
         let wat_text = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -4552,6 +4731,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -4575,7 +4756,7 @@ mod tests {
         let escaped = wat_escape(SPAWNED_CODE);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -4598,6 +4779,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn global.set $ret)
   (global $ret (mut i32) (i32.const -1))
   (func (export "get_ret") (result i32) global.get $ret)
@@ -4664,7 +4847,7 @@ mod tests {
         let escaped = wat_escape(SPAWNED_CODE);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "W\00")
@@ -4687,6 +4870,8 @@ mod tests {
     f64.const {density}
     f64.const {drag}
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -4750,6 +4935,42 @@ mod tests {
         mgr.call_on_tick(&mut handle).unwrap();
         let spawns = &handle.store.data().pending_spawns;
         assert_eq!(spawns[0].liquid_drag, 0.0, "非有限阻尼应钳 0.0");
+    }
+
+    // === D-010 碰撞响应：spawn 第 21/22 参（restitution/friction 出生声明）===
+
+    #[test]
+    fn spawn_import_queues_restitution_friction() {
+        // spawn 第 21/22 参透传：域内值原样进 PendingSpawn（import 层钳制后存档，
+        // 阶段二 set_restitution/set_friction 直存落库）
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = spawner_ef_wat(LIFE_TRUE_WAT, "1.0", "0.35");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(831))
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns.len(), 1, "合法 e/f 请求应排队");
+        assert_eq!(spawns[0].restitution, 1.0, "第 21 参弹性应透传");
+        assert_eq!(spawns[0].friction, 0.35, "第 22 参摩擦应透传");
+    }
+
+    #[test]
+    fn spawn_restitution_friction_clamped_to_unit_interval() {
+        // spawn 第 21/22 参护栏（出生声明家族哲学：超界钳回+警告非拒绝）：
+        // 1.5 超上限钳 1.0；-0.3 负值钳 0.0
+        let mgr = SandboxManager::new().unwrap();
+        let wat_text = spawner_ef_wat(LIFE_TRUE_WAT, "1.5", "-0.3");
+        let mut handle = mgr
+            .create_sandbox(&wasm(&wat_text), 100_000, id(832))
+            .unwrap();
+        handle.store.data_mut().pos = (0.0, 0.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        let spawns = &handle.store.data().pending_spawns;
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].restitution, 1.0, "超上限 e 应钳 1.0");
+        assert_eq!(spawns[0].friction, 0.0, "负值 f 应钳 0.0");
     }
 
     #[test]
@@ -5200,7 +5421,7 @@ mod tests {
         let blob_escaped: String = blob_data.iter().map(|b| format!("\\{b:02x}")).collect();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -5224,6 +5445,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -5948,7 +6171,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -5972,6 +6195,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     {link}
+    f64.const 0.0
+    f64.const 0.6
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,

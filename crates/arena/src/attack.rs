@@ -24,6 +24,11 @@ pub struct PendingAttack {
     pub target_pos: (f64, f64),
     /// 攻击 payload：WASM 模块字节码（路线A整模块替换）。空=用 DEFAULT_KILL_WASM 默认击杀
     pub payload: Vec<u8>,
+    /// 击退力度（D-010 攻击冲量，attack_at 第 5 参，格/拍的速度增量单位）：
+    /// import 层已校验（非有限整刀作废/负值钳 0/上限钳世界极速），0=不击退
+    ///（零回归）。**mass 永不参与攻击结算**——击退是物理量走速度字段，
+    /// 换血/击杀/掠夺判定零改动（宪法铁律）。
+    pub force: f64,
 }
 
 impl PendingAttack {
@@ -31,11 +36,14 @@ impl PendingAttack {
     /// 贴身判距门只约束物理上的"够不够得着"（deliver 复核 melee_in_reach）——
     /// 接触通道的出刀由 CCD 撞体截断天然贴身，门当拍成立；grace_owner 豁免
     /// 归 deliver 现场读攻击者实体出生声明（binding/bound_to），不在刀上携带。
-    pub fn strike(attacker: EntityId, target_pos: (f64, f64), payload: Vec<u8>) -> Self {
+    /// `force`：击退力度（D-010 第 5 参，import 层已校验钳制，0=不击退——
+    /// 操控攻击/历史调用方传 0.0）。
+    pub fn strike(attacker: EntityId, target_pos: (f64, f64), payload: Vec<u8>, force: f64) -> Self {
         Self {
             attacker,
             target_pos,
             payload,
+            force,
         }
     }
 }
@@ -58,16 +66,18 @@ mod tests {
 
     #[test]
     fn pending_attack_stores_fields() {
-        // 创建：PendingAttack 字段正确存取（attacker/坐标/payload——#045 替代链：
-        // 刀只带身份/坐标/payload 三件，豁免归实体出生声明，不在刀上携带）
+        // 创建：PendingAttack 字段正确存取（attacker/坐标/payload/force——#045 替代链：
+        // 豁免归实体出生声明，不在刀上携带；D-010 force=击退力度第 4 件随刀走）
         let atk = PendingAttack::strike(
             EntityId(Uuid::from_u128(1)),
             (5.0, 5.0),
             vec![1, 2, 3],
+            2.5,
         );
         assert_eq!(atk.attacker, EntityId(Uuid::from_u128(1)));
         assert_eq!(atk.target_pos, (5.0, 5.0));
         assert_eq!(atk.payload, vec![1, 2, 3]);
+        assert_eq!(atk.force, 2.5, "D-010 击退力度应随刀入队");
     }
 
     #[test]

@@ -1953,6 +1953,10 @@ fn tick_with_intents(
                                     liquid_density: 0.0,
                                     liquid_drag: 0.0,
                                     link: 0,
+                                    // D-010 第 21/22 参：操控定装弹不带碰撞响应声明
+                                    //（默认 e=0 撞停/f=0.6——操控是驾驶不是调参）
+                                    restitution: 0.0,
+                                    friction: 0.6,
                                     fuel_limit,
                                 });
                         }
@@ -2137,10 +2141,10 @@ fn tick_with_intents(
     //      无可见目标 = 挥空不出刀（但操控仍接管了本拍）。
     let mut pending_attacks = sandbox_map.collect_pending_attacks();
     if let Some((id, input::ControlledAction::Attack(Some(tpos)))) = &action {
-        pending_attacks.push(PendingAttack::strike(*id, *tpos, Vec::new()));
+        pending_attacks.push(PendingAttack::strike(*id, *tpos, Vec::new(), 0.0));
     }
     if !pending_attacks.is_empty() {
-        process_attacks(world, sandbox_map, &pending_attacks);
+        process_attacks(world, sandbox_map, &pending_attacks, physics.params().max_speed);
     }
 
     //   a2.5 决斗会话循环（D-005 刀0）：本拍 settle 开出的会话当拍跑第 0 号窗口，
@@ -2923,6 +2927,11 @@ fn process_spawn_requests(
         // 结算，前端按快照 liquids 画矩形
         entity.set_liquid_density(req.liquid_density);
         entity.set_liquid_drag(req.liquid_drag);
+        // D-010 spawn 第 21/22 参碰撞响应两参：声明写进造物数据（import 层已钳制
+        // [0,1]，此处直存）——接触对组合=Box2D 款 max/√（组合后才允许物理使用，
+        // crumple 物理步 CCD 截断处结算）
+        entity.set_restitution(req.restitution);
+        entity.set_friction(req.friction);
         // 出生初速（spawn 第 11/12 参，D-018 一体式发射提前落地）：import 层已校验
         // （有限+模长 ≤ 世界极速），此处写进造物 velocity 字段。位置积分（造物被
         // 初速带着飞）不做——那是 D-018「通用有速度实体物理」的活；velocity 字段
@@ -3020,7 +3029,7 @@ const CTRL_SHOOT_MASS: f64 = 1.0;
 /// 先于结算=死者刀作废白打；命中→出刀→结算→消亡的完整生命周期，寿命自管
 /// 的代码版，#045 替代链：命中=接触通道代码攻）。操控定装弹与 H 搅局者共用。
 const CTRL_SHELL_WAT: &str = r#"(module
-  (import "env" "attack_at" (func $attack (param f64 f64 i32 i32) (result i32)))
+  (import "env" "attack_at" (func $attack (param f64 f64 i32 i32 f64) (result i32)))
   (memory (export "memory") 1)
   (global $fired (mut i32) (i32.const 0))
   (global $age (mut i32) (i32.const 0))
@@ -3036,7 +3045,7 @@ const CTRL_SHELL_WAT: &str = r#"(module
   (func (export "on_contact") (param f64 f64)
     (if (global.get $fired) (then (return)))
     (i32.const 1) (global.set $fired)
-    (drop (call $attack (local.get 0) (local.get 1) (i32.const 0) (i32.const 0)))))"#;
+    (drop (call $attack (local.get 0) (local.get 1) (i32.const 0) (i32.const 0) (f64.const 0.0)))))"#;
 
 /// CTRL_SHELL_WAT 内嵌转义（投掷器 data 段用）：先剥 CR（CRLF 源文件会把
 /// \r 带进 raw string——WAT 字符串禁裸 CR 同禁裸 LF）、引号转 \"、换行转 \0a
@@ -3355,8 +3364,13 @@ fn enforce_binding_deaths(world: &mut WorldState) {
 ///
 /// 攻击在阶段二处理（不实时）：玩家代码调 import 只排队，实际击杀结果下一 tick 才能感知。
 /// 收件期间（on_attack 里）新排的攻击留在防守者沙箱里，下一 tick 的 collect 才处理。
-fn process_attacks(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, attacks: &[PendingAttack]) {
-    let strikes = deliver_attacks(world, sandbox_map, attacks);
+fn process_attacks(
+    world: &mut WorldState,
+    sandbox_map: &mut EntitySandboxMap,
+    attacks: &[PendingAttack],
+    max_speed: f64,
+) {
+    let strikes = deliver_attacks(world, sandbox_map, attacks, max_speed);
     settle_attacks(world, sandbox_map, &strikes);
 }
 
@@ -3400,11 +3414,17 @@ fn find_hit_target(world: &WorldState, point: (f64, f64)) -> Option<EntityId> {
 ///   远程打击归 shoot 弹丸，attack_at 是黑神话棍法语义的贴身近战）。
 /// - 防守询问失败（如防守方 fuel 耗尽）-> 该刀作废（架构 4.2：on_attack 超时=默认行为，
 ///   life 维持原值不被覆写）。
+/// - 击退冲量（D-010 攻击冲量）：找到目标之后、距离门复核之前先施加击退速度
+///   （方向=攻击者→目标单位向量，v += force·dir，过极速钳制）——定案时序"同拍
+///   击飞先于投递→按实况落空"的兑现：击退写的是速度字段，位置下拍物理步才动，
+///   距离门按位置实况复核（位置当拍未动，门照常通过）；速度已改是物理事实，
+///   位移下一拍兑现。拍的边界不做"当拍瞬移目标"的特殊处理（拍制世界诚实形态）。
 /// - 输出全局按攻击者 EntityId 升序（结算确定序）。
 fn deliver_attacks(
-    world: &WorldState,
+    world: &mut WorldState,
     sandbox_map: &mut EntitySandboxMap,
     attacks: &[PendingAttack],
+    max_speed: f64,
 ) -> Vec<PendingStrike> {
     let mut strikes: Vec<PendingStrike> = Vec::new();
     let mut voided = 0usize; // 攻击者已死作废
@@ -3465,31 +3485,113 @@ fn deliver_attacks(
             );
             continue;
         }
+        // D-010 击退冲量（找到目标之后、距离门复核之前——投递伴生物理件先落账）：
+        // 方向=攻击者→目标单位向量，v += force·dir，过极速钳制（归一化压回方向
+        // 不变，与 field_pulse 应用同款）。悬停（aloft）交互：击退照写入速度
+        //（aloft 只是免重力，不禁速度写入）；若该实体本拍 aloft，物理步 skip 分支
+        // 会跳过积分——悬停声明优先，是已知语义不做特殊处理。
+        // 哑弹（grace_owner 豁免）在上面的 continue 已拦：豁免=整刀作废（弹没炸
+        // 就没有冲击波——击退不发生）。
+        // force=0 零回归：v += 0·dir 恒等，跳过写入（与改造前逐位一致）。
+        let (kdir, force_applied) = if atk.force > 0.0 {
+            let (apos, tpos) = (
+                world.entities.get(&atk.attacker).map(|e| e.pos()),
+                world.entities.get(&target_id).map(|e| e.pos()),
+            );
+            match (apos, tpos) {
+                (Some((ax, ay)), Some((tx, ty))) => {
+                    let dx = tx - ax;
+                    let dy = ty - ay;
+                    let dlen = (dx * dx + dy * dy).sqrt();
+                    let dir = if dlen > 1e-12 {
+                        (dx / dlen, dy / dlen)
+                    } else {
+                        (0.0, 1.0) // 重合坐标兜底（同点出刀，方向退化取竖直）
+                    };
+                    let impulse = (atk.force * dir.0, atk.force * dir.1);
+                    let applied = if let Some(t) = world.entities.get_mut(&target_id) {
+                        let old = t.velocity();
+                        let summed = (old.0 + impulse.0, old.1 + impulse.1);
+                        // 过极速钳制（归一化压回，方向不变）
+                        let speed2 = summed.0 * summed.0 + summed.1 * summed.1;
+                        let new_v = if speed2 > max_speed * max_speed {
+                            let scale = max_speed / speed2.sqrt();
+                            (summed.0 * scale, summed.1 * scale)
+                        } else {
+                            summed
+                        };
+                        t.set_velocity(new_v);
+                        new_v
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    (Some(dir), Some(applied))
+                }
+                _ => (None, None), // 攻击者瞬失兜底（不可能路径：攻击者已活检查在前）
+            }
+        } else {
+            (None, None) // force=0：不击退（零回归，跳过写入）
+        };
         // 接触门（#034 贴身刀语义）：点找得到目标，但够不着 = 落空。
         // 严格 <（恰好等于判距=落空，collision.rs melee_in_reach 测试锚定）。
         // 【D-018b】contact_exempt 字段退役：#045 替代链下命中=接触通道代码攻
         //（CCD 撞体截断停点天然贴身），出刀走的就是接触门本身，无需豁免标记。
-        let attacker = &world.entities[&atk.attacker];
-        let target = &world.entities[&target_id];
-        let in_reach = codeworld_core::collision::melee_in_reach(
-            attacker.pos(),
-            attacker.radius(),
-            target.pos(),
-            target.radius(),
-        );
+        // 【D-010 时序】击退已写速度（物理事实先落账），距离门按位置实况复核：
+        // 位置当拍未动，门照常通过——"按实况落空"在下一拍兑现（目标被击飞后
+        // 位移，后续刀打实况位置）。
+        let in_reach = match (
+            world.entities.get(&atk.attacker),
+            world.entities.get(&target_id),
+        ) {
+            (Some(attacker), Some(target)) => codeworld_core::collision::melee_in_reach(
+                attacker.pos(),
+                attacker.radius(),
+                target.pos(),
+                target.radius(),
+            ),
+            _ => false, // 双方瞬失兜底（不可能路径：存活检查在前）
+        };
         if !in_reach {
             out_of_reach += 1;
-            let (ax, ay) = attacker.pos();
-            let (tx, ty) = target.pos();
+            let (ax, ay) = world
+                .entities
+                .get(&atk.attacker)
+                .map(|e| e.pos())
+                .unwrap_or((0.0, 0.0));
+            let (tx, ty) = world
+                .entities
+                .get(&target_id)
+                .map(|e| e.pos())
+                .unwrap_or((0.0, 0.0));
             let dist = ((ax - tx).powi(2) + (ay - ty).powi(2)).sqrt();
+            let reach = world
+                .entities
+                .get(&atk.attacker)
+                .zip(world.entities.get(&target_id))
+                .map(|(a, t)| a.radius() + t.radius())
+                .unwrap_or(0.0)
+                + codeworld_core::collision::MELEE_REACH;
             tracing::info!(
                 attacker = %atk.attacker.0,
                 target = %target_id.0,
                 dist,
-                reach = attacker.radius() + target.radius() + codeworld_core::collision::MELEE_REACH,
+                reach,
                 "[deliver_attacks] 攻击落空（距离不足：非贴身够不着——远程打击=spawn 造物弹带出生初速，模板见 docs/newbie-first-thrower.md）"
             );
             continue;
+        }
+        // [knockback] INFO（任务书数据流两端日志：击退事实带方向/力度/击退后速度/
+        // 距离门结果——门通过=已投递，门失败=击退已生效但刀落空）
+        if let (Some(dir), Some(applied)) = (kdir, force_applied) {
+            tracing::info!(
+                attacker = %atk.attacker.0,
+                target = %target_id.0,
+                force = atk.force,
+                dir = ?dir,
+                to_vel = ?applied,
+                in_reach,
+                "[knockback] 击退已施加（D-010：速度当拍落账，位移下拍物理步兑现）"
+            );
         }
         // 参战记录-目标（#013）：被攻击即参战（含被拦截的收件）
         sandbox_map.players.record_combat_id(target_id, world.tick());
@@ -4212,7 +4314,7 @@ const ATTACKER_WAT: &str = r#"(module
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
   (import "env" "scan" (func $scan (param i32 i32) (result i32)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
-  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
   (memory (export "memory") 1)
   (func (export "on_tick")
     (local $mx f64) (local $my f64) (local $ex f64) (local $ey f64)
@@ -4239,7 +4341,7 @@ const ATTACKER_WAT: &str = r#"(module
       (then
         (call $log (i32.const 2))
         (drop (call $attack_at (local.get $ex) (local.get $ey)
-                               (i32.const 0) (i32.const 0)))
+                               (i32.const 0) (i32.const 0) (f64.const 0.0)))
         (return)))
     ;; 5. 未进范围：每 tick 归一化方向走 1.0 步
     (call $log (i32.const 3))
@@ -4267,7 +4369,7 @@ fn defender_wat(shield: i32) -> String {
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
   (import "env" "scan" (func $scan (param i32 i32) (result i32)))
-  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
   (import "env" "probe" (func $probe (param f64 f64 i32 i32 i32 i32) (result i32)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
   (memory (export "memory") 1)
@@ -4320,7 +4422,7 @@ fn defender_wat(shield: i32) -> String {
             (drop (call $probe (f64.load (i32.const 0)) (f64.load (i32.const 8))
                                (i32.const 16) (i32.const 0) (i32.const 32) (i32.const 64)))
             (drop (call $attack_at (f64.load (i32.const 0)) (f64.load (i32.const 8))
-                                   (i32.const 0) (i32.const 0)))))
+                                   (i32.const 0) (i32.const 0) (f64.const 0.0)))))
         (return)))
     ;; 未贴身：每拍向敌人挪一步（#034 接近逻辑，归一化方向走 1.0）
     (drop (call $move_by
@@ -4364,8 +4466,8 @@ fn hunter_wat() -> String {
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
   (import "env" "scan" (func $scan (param i32 i32) (result i32)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
-  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 4096) "{shell_escaped}\00")
   (data (i32.const 16384) ".\00")
@@ -4432,14 +4534,16 @@ fn hunter_wat() -> String {
           (f64.const 0.0)
           (f64.const 0.0)
           (f64.const 0.0)
-          (i32.const 0)))
+          (i32.const 0)
+          (f64.const 0.0)
+          (f64.const 0.6)))
         (return)))
     ;; 3. 贴身机会刀（dist <= 1.0 在贴身判距内；投机者不追击肉搏）
     (if (f64.le (local.get $dist) (f64.const 1.0))
       (then
         (call $log (i32.const 5))
         (drop (call $attack_at (local.get $ex) (local.get $ey)
-                               (i32.const 0) (i32.const 0)))
+                               (i32.const 0) (i32.const 0) (f64.const 0.0)))
         (return)))
     ;; 4. 观望：原地小幅游走（偶数 tick +0.5，奇数 tick -0.5）
     (call $log (i32.const 4))
@@ -4590,6 +4694,11 @@ mod tests {
     /// 测试用沙箱映射表
     fn test_sandbox_map() -> EntitySandboxMap {
         EntitySandboxMap::new().unwrap()
+    }
+
+    /// 测试用世界极速（process_attacks 击退钳制参数；与默认装配同源）
+    fn test_max_speed() -> f64 {
+        codeworld_core::physics::DefaultPhysics::default_values().max_speed
     }
 
     /// 测试用无界视口：覆盖全地图，等价旧"上帝视角"语义——既有测试不关心视口过滤，
@@ -5265,7 +5374,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "W\00")
@@ -5288,6 +5397,8 @@ mod tests {
     f64.const {density}
     f64.const {drag}
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -6154,8 +6265,8 @@ mod tests {
         assert!(map.players.dispose.has("p1"), "前置：处于处置等待");
         // 攻击者对 P 出空 payload 刀（默认击杀，#031 点命中制：打 P 坐标；#034 贴身 1.0）
         let attacker = make_entity_with_sandbox(&mut world, &mut map, 7, (31.0, 0.5), PLAYER_WAT);
-        let attacks = vec![PendingAttack::strike(attacker, (30.0, 0.5), vec![])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (30.0, 0.5), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(
             !world.entities.get(&pid).unwrap().is_alive(),
             "等待期角色可被击杀（不无敌）"
@@ -7165,8 +7276,8 @@ mod tests {
             let handle = map.sandboxes.get_mut(&a).unwrap();
             handle.store.data_mut().api_calls.push("sentinel".to_string());
         }
-        let attacks = vec![PendingAttack::strike(b, (0.0, 0.0), vec![9])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(b, (0.0, 0.0), vec![9], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(world.entities.get(&a).unwrap().is_alive(), "防守失败 -> 刀作废，A 应存活");
         // D-017：防守失败作废的刀不进命中事件广播
         assert!(map.attack_events.is_empty(), "刀作废不应记命中事件");
@@ -7225,15 +7336,15 @@ mod tests {
             make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.5), TARGET_WAT);
         // 击晕 payload：life()=true（换血成功但目标不死）
         let stun = wasm(&ver_module(111));
-        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.5), stun)];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.5), stun, 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(world.entities.get(&target).unwrap().is_alive(), "击晕：目标存活");
         assert_eq!(map.attack_events.len(), 1, "击晕也算命中，应记事件");
         assert_eq!(map.attack_events[0].target_pos, (5.0, 0.5), "目标位置=实况坐标");
         // 攻击点击坐标 ≠ 目标身体中心时，事件仍记实况坐标（D-017：位置是选槽依据）
         map.attack_events.clear(); // 模拟 tick ①0（下一拍缓冲清空）
-        let attacks2 = vec![PendingAttack::strike(attacker, (5.2, 0.9), wasm(&kill_ver_module(222)))];
-        process_attacks(&mut world, &mut map, &attacks2);
+        let attacks2 = vec![PendingAttack::strike(attacker, (5.2, 0.9), wasm(&kill_ver_module(222)), 0.0)];
+        process_attacks(&mut world, &mut map, &attacks2, test_max_speed());
         assert_eq!(map.attack_events.len(), 1, "第二刀（击杀）也记事件");
         assert_eq!(
             map.attack_events[0].target_pos, (5.0, 0.5),
@@ -7252,22 +7363,93 @@ mod tests {
         let target =
             make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), TARGET_WAT);
         // 攻击者先死：刀入队后攻击者被标记死亡
-        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![])];
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![], 0.0)];
         world.entities.get_mut(&attacker).unwrap().kill();
-        process_attacks(&mut world, &mut map, &attacks);
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(map.attack_events.is_empty(), "死者之刀作废，不记事件");
         // 目标先死：结算前目标已死（deliver 仍找到目标但 settle 跳过）——构造：
         // 目标已被上一刀击杀标记死亡，第二刀投递时 find_hit_target 过滤死者
         // -> 落空路径，同样不记事件
         world.entities.get_mut(&target).unwrap().kill();
-        let attacks2 = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![])];
+        let attacks2 = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![], 0.0)];
         // 攻击者复活回来出第二刀（kill 标记不可逆，用新攻击者）
         let attacker2 =
             make_entity_with_sandbox(&mut world, &mut map, 3, (4.5, 0.0), PLAYER_WAT);
-        let attacks3 = vec![PendingAttack::strike(attacker2, (5.0, 0.0), vec![])];
-        process_attacks(&mut world, &mut map, &attacks2);
-        process_attacks(&mut world, &mut map, &attacks3);
+        let attacks3 = vec![PendingAttack::strike(attacker2, (5.0, 0.0), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks2, test_max_speed());
+        process_attacks(&mut world, &mut map, &attacks3, test_max_speed());
         assert!(map.attack_events.is_empty(), "目标已死，刀落空不记事件");
+    }
+
+    // === D-010 击退 payload：攻击冲量（attack_at 第 5 参 force，deliver 阶段应用）===
+
+    #[test]
+    fn knockback_force_pushes_target_along_attack_direction() {
+        // D-010：击退=攻击投递的伴生物理件——attacker 在目标左侧出刀 force=5：
+        // 目标速度 += (5,0)（方向=攻击者→目标单位向量，v += force·dir）。
+        // 力出自己身（宪法 #011）：击退不是独立 push 接口，是刀的伴生物理件；
+        // mass 永不参与（物理量走速度字段，换血/击杀判定零改动）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let attacker =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.5), PLAYER_WAT);
+        let target =
+            make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.5), TARGET_WAT);
+        // 击晕 payload：目标存活可读速度
+        let stun = wasm(&ver_module(111));
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.5), stun, 5.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
+        let tv = world.entities.get(&target).unwrap().velocity();
+        assert!(
+            (tv.0 - 5.0).abs() < 1e-9 && (tv.1 - 0.0).abs() < 1e-9,
+            "目标应被击退 +(5,0)（攻击来向），实际 {tv:?}"
+        );
+        let _ = attacker;
+    }
+
+    #[test]
+    fn knockback_speed_written_same_tick_strike_delivered_by_position_fact() {
+        // D-010 拍的边界（定案细则）：击退写的是速度字段，位置下拍物理步才动
+        // ——距离门按位置实况复核（位置当拍未动，门照常通过）；速度已改是
+        // 物理事实，位移下一拍兑现。锚定：force>0 时目标速度当拍已改 + 刀照常
+        // 投递成功（attack_events 有记录=收件+结算全链路走通）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let attacker =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.5), PLAYER_WAT);
+        let target =
+            make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.5), TARGET_WAT);
+        let stun = wasm(&ver_module(111));
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.5), stun, 3.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
+        // 速度当拍已改（物理事实先落账）
+        let tv = world.entities.get(&target).unwrap().velocity();
+        assert!(
+            (tv.0 - 3.0).abs() < 1e-9,
+            "击退速度应当拍写入（位移下拍兑现），实际 {tv:?}"
+        );
+        // 刀按位置实况照常投递（击退不挡投递）
+        assert_eq!(map.attack_events.len(), 1, "击退不中断投递（位置门当拍照常通过）");
+        assert!(world.entities.get(&target).unwrap().is_alive(), "击晕目标存活");
+    }
+
+    #[test]
+    fn zero_force_attack_zero_regression() {
+        // D-010 零回归锚：force=0 的攻击目标速度零变化，全链路行为与改造前一致
+        //（操控刀/老代码 5 参传 0 的语义=不击退）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let attacker =
+            make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.5), PLAYER_WAT);
+        let target =
+            make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.5), TARGET_WAT);
+        let stun = wasm(&ver_module(111));
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.5), stun, 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
+        let tv = world.entities.get(&target).unwrap().velocity();
+        assert_eq!(tv, (0.0, 0.0), "force=0 目标速度零变化（零回归）");
+        assert_eq!(map.attack_events.len(), 1, "force=0 投递照常（全链路与改造前一致）");
+        assert!(world.entities.get(&target).unwrap().is_alive(), "击晕目标存活");
     }
 
     #[test]
@@ -7278,8 +7460,8 @@ mod tests {
         let mut map = test_sandbox_map();
         let attacker =
             make_entity_with_sandbox(&mut world, &mut map, 1, (0.0, 0.0), PLAYER_WAT);
-        let attacks = vec![PendingAttack::strike(attacker, (99.0, 99.0), vec![])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (99.0, 99.0), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert_eq!(world.entities.len(), 1, "落空不应移除实体");
         assert!(world.entities.contains_key(&attacker));
         assert!(map.attack_events.is_empty(), "落空不应记命中事件");
@@ -7296,8 +7478,8 @@ mod tests {
         let target =
             make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), TARGET_WAT);
         assert_eq!(world.entities.get(&attacker).unwrap().survival.points(), 3);
-        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         // D-017 协议小刀：结算成功（击杀）写一条命中事件——攻方/目标/结算时刻坐标
         assert_eq!(map.attack_events.len(), 1, "击杀应记一条命中事件");
         let ev = &map.attack_events[0];
@@ -7329,8 +7511,8 @@ mod tests {
             make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.0), PLAYER_WAT);
         let target =
             make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), DEFENDED_TARGET_WAT);
-        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(world.entities.get(&target).unwrap().is_alive(), "拦截后目标应存活");
         // D-017：被拦截的刀不进命中事件广播（拦截=防守成功，世界不替攻方宣布"打中了"）
         assert!(map.attack_events.is_empty(), "拦截不应记命中事件");
@@ -7354,8 +7536,8 @@ mod tests {
         let attacker =
             make_entity_with_sandbox(&mut world, &mut map, 1, (5.0, 0.0), TARGET_WAT);
         // attacker 攻击自己所在坐标 -> target_id == attacker
-        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(
             !world.entities.get(&attacker).unwrap().is_alive(),
             "自攻自应击杀自己"
@@ -7379,10 +7561,10 @@ mod tests {
         let a = make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.0), PLAYER_WAT);
         let b = make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), TARGET_WAT);
         let attacks = vec![
-            PendingAttack::strike(a, (5.0, 0.0), vec![]), // A -> B：默认击杀（贴身 1.0）
-            PendingAttack::strike(b, (4.0, 0.0), vec![]), // B -> A：默认击杀（B 死后应作废）
+            PendingAttack::strike(a, (5.0, 0.0), vec![], 0.0), // A -> B：默认击杀（贴身 1.0）
+            PendingAttack::strike(b, (4.0, 0.0), vec![], 0.0), // B -> A：默认击杀（B 死后应作废）
         ];
-        process_attacks(&mut world, &mut map, &attacks);
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(!world.entities.get(&b).unwrap().is_alive(), "B 应被 A 击杀");
         assert!(world.entities.get(&a).unwrap().is_alive(), "B 死后其刀应作废，A 应存活");
         assert_eq!(
@@ -7403,8 +7585,8 @@ mod tests {
         let dead = make_entity_with_sandbox(&mut world, &mut map, 21, (5.0, 0.0), TARGET_WAT);
         // 攻击者在排队后死亡（模拟阶段一 life()=false / Destroy）
         world.entities.get_mut(&dead).unwrap().kill();
-        let attacks = vec![PendingAttack::strike(dead, (0.0, 0.0), vec![])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(dead, (0.0, 0.0), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert_eq!(call_i32_export(&mut map, &a, "get_count"), 0, "死者攻击不应触发防守方 on_attack");
         assert!(world.entities.get(&a).unwrap().is_alive(), "防守方应完好");
     }
@@ -7419,10 +7601,10 @@ mod tests {
         let b = make_entity_with_sandbox(&mut world, &mut map, 31, (1.0, 0.0), PLAYER_WAT);
         let c = make_entity_with_sandbox(&mut world, &mut map, 32, (0.0, 1.0), PLAYER_WAT);
         let attacks = vec![
-            PendingAttack::strike(b, (0.0, 0.0), vec![9]),
-            PendingAttack::strike(c, (0.0, 0.0), vec![9]),
+            PendingAttack::strike(b, (0.0, 0.0), vec![9], 0.0),
+            PendingAttack::strike(c, (0.0, 0.0), vec![9], 0.0),
         ];
-        process_attacks(&mut world, &mut map, &attacks);
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert_eq!(call_i32_export(&mut map, &a, "get_count"), 2, "A 的 on_attack 应被调两次");
         assert_eq!(call_i32_export(&mut map, &a, "get_ver"), 111, "两刀全拦 -> A 仍是原版代码");
         assert!(world.entities.get(&a).unwrap().is_alive(), "A 应完好");
@@ -7441,10 +7623,10 @@ mod tests {
         let c = make_entity_with_sandbox(&mut world, &mut map, 32, (0.0, 1.0), PLAYER_WAT);
         let c_payload = wasm(&ver_module(3001));
         let attacks = vec![
-            PendingAttack::strike(b, (0.0, 0.0), vec![1, 1, 1, 1]),
-            PendingAttack::strike(c, (0.0, 0.0), c_payload),
+            PendingAttack::strike(b, (0.0, 0.0), vec![1, 1, 1, 1], 0.0),
+            PendingAttack::strike(c, (0.0, 0.0), c_payload, 0.0),
         ];
-        process_attacks(&mut world, &mut map, &attacks);
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         // 决斗会话已开（C 的游魂登陆 A 的内存），A 的代码保持原版（换血退役）
         assert_eq!(map.duel_sessions.len(), 1, "未拦截的非空 payload 开一条会话");
         assert_eq!(map.duel_sessions[0].attacker, c, "会话攻方=C");
@@ -7470,10 +7652,10 @@ mod tests {
         let b = make_entity_with_sandbox(&mut world, &mut map, 31, (1.0, 0.0), PLAYER_WAT);
         let c = make_entity_with_sandbox(&mut world, &mut map, 32, (0.0, 1.0), PLAYER_WAT);
         let attacks = vec![
-            PendingAttack::strike(c, (0.0, 0.0), wasm(&ver_module(3001))),
-            PendingAttack::strike(b, (0.0, 0.0), wasm(&ver_module(2001))),
+            PendingAttack::strike(c, (0.0, 0.0), wasm(&ver_module(3001)), 0.0),
+            PendingAttack::strike(b, (0.0, 0.0), wasm(&ver_module(2001)), 0.0),
         ];
-        process_attacks(&mut world, &mut map, &attacks);
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert_eq!(map.duel_sessions.len(), 2, "两条会话并存（九B：网吧不是擂台）");
         assert_eq!(map.duel_sessions[0].attacker, b, "结算按攻击者 id 升序：B(31) 先开");
         assert_eq!(map.duel_sessions[1].attacker, c, "C(32) 后开");
@@ -7501,10 +7683,10 @@ mod tests {
         let b = make_entity_with_sandbox(&mut world, &mut map, 31, (1.0, 0.0), PLAYER_WAT);
         let c = make_entity_with_sandbox(&mut world, &mut map, 32, (0.0, 1.0), PLAYER_WAT);
         let attacks = vec![
-            PendingAttack::strike(c, (0.0, 0.0), wasm(&ver_module(3001))),
-            PendingAttack::strike(b, (0.0, 0.0), vec![]),
+            PendingAttack::strike(c, (0.0, 0.0), wasm(&ver_module(3001)), 0.0),
+            PendingAttack::strike(b, (0.0, 0.0), vec![], 0.0),
         ];
-        process_attacks(&mut world, &mut map, &attacks);
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(!world.entities.get(&a).unwrap().is_alive(), "B 的裸奔刀应击杀");
         // 结算按攻击者 id 升序：B(31) 的击杀刀先执行，A 已死 -> C(32) 的刀跳过（不开会话）
         assert!(map.duel_sessions.is_empty(), "目标已死，C 的游魂刀不开会话");
@@ -7529,9 +7711,9 @@ mod tests {
         let a = make_entity_with_sandbox(&mut world, &mut map, 40, (0.0, 0.0), COUNTER_ALWAYS_INTERCEPT_WAT);
         let b = make_entity_with_sandbox(&mut world, &mut map, 41, (1.0, 0.0), PLAYER_WAT);
         let attacks = vec![
-            PendingAttack::strike(b, (0.0, 0.0), vec![9]),
+            PendingAttack::strike(b, (0.0, 0.0), vec![9], 0.0),
         ];
-        process_attacks(&mut world, &mut map, &attacks);
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert_eq!(call_i32_export(&mut map, &a, "get_count"), 1);
         let handle = map.sandboxes.get(&a).unwrap();
         let remaining = handle.store.get_fuel().unwrap();
@@ -7575,8 +7757,8 @@ mod tests {
         let mut map = test_sandbox_map();
         let attacker = make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.0), PLAYER_WAT);
         let target = make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), DUEL_TARGET_WAT);
-        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(
             !world.entities.get(&target).unwrap().is_alive(),
             "裸奔特例：目标被击杀（死亡标记，与旧换血等价）"
@@ -7611,8 +7793,9 @@ mod tests {
             attacker_id,
             (5.0, 0.0),
             wasm(DUEL_GHOST_STAY_WAT),
+            0.0,
         )];
-        process_attacks(&mut world, &mut map, &attacks);
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(
             world.entities.get(&target).unwrap().is_alive(),
             "开会话不击杀（换血退役：非空 payload = 游魂登陆）"
@@ -7665,8 +7848,9 @@ mod tests {
             attacker,
             (5.0, 0.0),
             wasm(DUEL_GHOST_STAY_WAT),
+            0.0,
         )];
-        process_attacks(&mut world, &mut map, &attacks);
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert_eq!(map.duel_sessions.len(), 1, "前置：会话已开");
         map.duel_sessions[0].fuel_stake = map.duel_step_fuel - 1;
         let defender_fuel_before = map.sandboxes.get(&target).unwrap().store.get_fuel().unwrap();
@@ -7691,8 +7875,8 @@ mod tests {
         let mut map = test_sandbox_map();
         let attacker = make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.0), PLAYER_WAT);
         let target = make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), DUEL_TARGET_WAT);
-        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![0xDE, 0xAD, 0xBE, 0xEF])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), vec![0xDE, 0xAD, 0xBE, 0xEF], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert_eq!(
             map.duel_sessions.len(), 1,
             "垃圾 payload 也先开会话（崩溃是第一窗的机械事实）"
@@ -7722,8 +7906,8 @@ mod tests {
         let attacker = make_entity_with_sandbox(&mut world, &mut map, 1, (4.0, 0.0), PLAYER_WAT);
         let target = make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.0), DUEL_TARGET_WAT);
         // 攻方先死：会话开着，攻方被 kill 标记（d 步清理在后，会话循环先行检查）
-        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), wasm(DUEL_GHOST_STAY_WAT))];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.0), wasm(DUEL_GHOST_STAY_WAT), 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert_eq!(map.duel_sessions.len(), 1, "前置：会话已开");
         world.entities.get_mut(&attacker).unwrap().kill();
         step_duel_sessions(&world, &mut map);
@@ -7732,10 +7916,10 @@ mod tests {
         // 守方被另一刀击杀：第三者裸奔刀 -> 换血收尾照常 -> 会话随守方死亡关闭
         let attacker2 = make_entity_with_sandbox(&mut world, &mut map, 3, (4.5, 0.0), PLAYER_WAT);
         let killer = make_entity_with_sandbox(&mut world, &mut map, 4, (6.0, 0.0), PLAYER_WAT);
-        let attacks2 = vec![PendingAttack::strike(attacker2, (5.0, 0.0), wasm(DUEL_GHOST_STAY_WAT))];
-        process_attacks(&mut world, &mut map, &attacks2);
+        let attacks2 = vec![PendingAttack::strike(attacker2, (5.0, 0.0), wasm(DUEL_GHOST_STAY_WAT), 0.0)];
+        process_attacks(&mut world, &mut map, &attacks2, test_max_speed());
         assert_eq!(map.duel_sessions.len(), 1, "前置：新会话已开");
-        process_attacks(&mut world, &mut map, &[PendingAttack::strike(killer, (5.0, 0.0), vec![])]);
+        process_attacks(&mut world, &mut map, &[PendingAttack::strike(killer, (5.0, 0.0), vec![], 0.0)], test_max_speed());
         assert!(
             !world.entities.get(&target).unwrap().is_alive(),
             "前置：守方已被裸奔刀击杀"
@@ -7757,9 +7941,10 @@ mod tests {
             &mut world,
             &mut map,
             &[
-                PendingAttack::strike(b, (5.0, 0.0), wasm(DUEL_GHOST_STAY_WAT)),
-                PendingAttack::strike(c, (5.0, 0.0), wasm(DUEL_GHOST_STAY_WAT)),
+                PendingAttack::strike(b, (5.0, 0.0), wasm(DUEL_GHOST_STAY_WAT), 0.0),
+                PendingAttack::strike(c, (5.0, 0.0), wasm(DUEL_GHOST_STAY_WAT), 0.0),
             ],
+            test_max_speed(),
         );
         assert_eq!(map.duel_sessions.len(), 2, "同一守方两会话并存（九B：网吧不是擂台）");
         let stake0 = map.duel_sessions[0].fuel_stake;
@@ -7815,10 +8000,10 @@ mod tests {
     /// 攻击方 WAT：导出 memory + on_tick 调 env.attack_at(5.0, 0.0, 0, 0)（空 payload 默认击杀）
     /// 命名注意：与顶层生物 ATTACKER_WAT 区分，防模块内同名遮蔽（踩坑实录见 .cc-bugs）
     const PIPELINE_ATTACKER_WAT: &str = r#"(module
-  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
   (memory (export "memory") 1)
   (func (export "on_tick")
-    f64.const 5.0 f64.const 0.0 i32.const 0 i32.const 0 call $attack_at drop)
+    f64.const 5.0 f64.const 0.0 i32.const 0 i32.const 0 f64.const 0.0 call $attack_at drop)
   (func (export "life") (result i32) i32.const 1))"#;
 
     // === find_nearest_enemy（感知规则：scan 的数据源）===
@@ -8205,8 +8390,8 @@ mod tests {
         let spy = make_entity_with_sandbox(&mut world, &mut map, 7, (25.0, 12.0), SPY_WAT);
         // #034 贴身刀：出刀者须与 S 相触（dist 0.9 < r+r+0.5）——远距刀已物理落空
         let d = make_entity_with_sandbox(&mut world, &mut map, 2, (25.9, 12.0), PLAYER_WAT);
-        let attacks = vec![PendingAttack::strike(d, (25.0, 12.0), vec![])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(d, (25.0, 12.0), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(
             world.entities.get(&spy).unwrap().is_alive(),
             "首刀应被替身盾拦截（S 存活，盾 3→2）"
@@ -8229,10 +8414,10 @@ mod tests {
         // #034 贴身刀：出刀者贴身 S（dist 0.9）才砍得着
         let d = make_entity_with_sandbox(&mut world, &mut map, 2, (25.9, 12.0), PLAYER_WAT);
         let blade_at_spy = |attacker: EntityId| {
-            vec![PendingAttack::strike(attacker, (25.0, 12.0), vec![])]
+            vec![PendingAttack::strike(attacker, (25.0, 12.0), vec![], 0.0)]
         };
         for round in 1..=3 {
-            process_attacks(&mut world, &mut map, &blade_at_spy(d));
+            process_attacks(&mut world, &mut map, &blade_at_spy(d), test_max_speed());
             assert!(
                 world.entities.get(&spy).unwrap().is_alive(),
                 "第 {round} 刀应被替身盾拦截，S 存活"
@@ -8260,7 +8445,7 @@ mod tests {
             "3 次拦截应发 3 个替身 marker（battle.log 台词触发源）"
         );
         // 第 4 刀：盾尽放行（on_attack 返回 0），正常结算击杀
-        process_attacks(&mut world, &mut map, &blade_at_spy(d));
+        process_attacks(&mut world, &mut map, &blade_at_spy(d), test_max_speed());
         assert!(
             !world.entities.get(&spy).unwrap().is_alive(),
             "盾尽后第 4 刀应击杀 S（回到脆皮）"
@@ -9145,6 +9330,8 @@ mod tests {
             liquid_density: 0.0,
             liquid_drag: 0.0,
             link,
+            restitution: 0.0,
+            friction: 0.6,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(world, map, vec![req], 1, &[]);
@@ -10088,7 +10275,7 @@ mod tests {
         let shell_escaped = shell_wat_escaped();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (import "env" "log" (func $log (param i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
@@ -10120,7 +10307,9 @@ mod tests {
           (f64.const 0.0)
           (f64.const 0.0)
           (f64.const 0.0)
-          (i32.const 0))))))
+          (i32.const 0)
+          (f64.const 0.0)
+          (f64.const 0.6))))))
   (func (export "life") (result i32) i32.const 1))"#,
             shell_len = CTRL_SHELL_WAT.len(),
         )
@@ -10237,8 +10426,8 @@ mod tests {
         let mut map = test_sandbox_map();
         let attacker = make_entity_with_sandbox(&mut world, &mut map, 1, (0.0, 0.5), PLAYER_WAT);
         let target = make_entity_with_sandbox(&mut world, &mut map, 2, (5.0, 0.5), TARGET_WAT);
-        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.5), vec![])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (5.0, 0.5), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(world.entities.get(&target).unwrap().is_alive(), "够不着=落空");
         assert_eq!(
             world.entities.get(&attacker).unwrap().survival.points(),
@@ -10254,8 +10443,8 @@ mod tests {
         let mut map = test_sandbox_map();
         let attacker = make_entity_with_sandbox(&mut world, &mut map, 1, (0.0, 0.5), PLAYER_WAT);
         let target = make_entity_with_sandbox(&mut world, &mut map, 2, (1.5, 0.5), TARGET_WAT);
-        let attacks = vec![PendingAttack::strike(attacker, (1.5, 0.5), vec![])];
-        process_attacks(&mut world, &mut map, &attacks);
+        let attacks = vec![PendingAttack::strike(attacker, (1.5, 0.5), vec![], 0.0)];
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(
             world.entities.get(&target).unwrap().is_alive(),
             "恰好判距=落空（严格 <）"
@@ -10764,9 +10953,10 @@ mod tests {
         let shell_id = shell.id;
         world.entities.insert(shell_id, shell);
         let strikes = deliver_attacks(
-            &world,
+            &mut world,
             &mut map,
-            &[PendingAttack::strike(shell_id, (5.0, 0.5), vec![])],
+            &[PendingAttack::strike(shell_id, (5.0, 0.5), vec![], 0.0)],
+            test_max_speed(),
         );
         assert!(strikes.is_empty(), "grace 造物出刀不结算 bound_to 主人（哑弹）");
         assert!(world.entities.get(&shooter).unwrap().is_alive());
@@ -10785,9 +10975,10 @@ mod tests {
         let shell_id = shell.id;
         world.entities.insert(shell_id, shell);
         let strikes = deliver_attacks(
-            &world,
+            &mut world,
             &mut map,
-            &[PendingAttack::strike(shell_id, (5.0, 0.5), vec![])],
+            &[PendingAttack::strike(shell_id, (5.0, 0.5), vec![], 0.0)],
+            test_max_speed(),
         );
         assert_eq!(strikes.len(), 1, "unbound 造物出刀照常进结算");
         assert_eq!(strikes[0].target, shooter, "目标就是 bound_to 主人");
@@ -10825,6 +11016,8 @@ mod tests {
             liquid_density: 0.0,
             liquid_drag: 0.0,
             link: 0,
+            restitution: 0.0,
+            friction: 0.6,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
@@ -10885,6 +11078,8 @@ mod tests {
             liquid_density: 0.0,
             liquid_drag: 0.0,
             link: 0,
+            restitution: 0.0,
+            friction: 0.6,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
@@ -11288,7 +11483,7 @@ mod tests {
         let attacks = map.collect_pending_attacks();
         assert_eq!(attacks.len(), 1, "H 应排 1 刀");
         // 阶段二：两阶段结算（victim 无防守 -> 被击杀 + H 掠夺）
-        process_attacks(&mut world, &mut map, &attacks);
+        process_attacks(&mut world, &mut map, &attacks, test_max_speed());
         assert!(
             !world.entities.get(&victim).unwrap().is_alive(),
             "H 的刀应击杀第三方"
@@ -11639,7 +11834,8 @@ mod tests {
         process_attacks(
             &mut world,
             &mut map,
-            &[PendingAttack::strike(enemy, (30.0, 0.0), stun)],
+            &[PendingAttack::strike(enemy, (30.0, 0.0), stun, 0.0)],
+            test_max_speed(),
         );
         assert!(world.entities.get(&pid).unwrap().is_alive(), "击晕刀不应击杀");
         std::fs::remove_file(dir.join("example.wat")).unwrap();
@@ -11682,7 +11878,8 @@ mod tests {
         process_attacks(
             &mut world,
             &mut map,
-            &[PendingAttack::strike(enemy, (30.0, 0.5), vec![])],
+            &[PendingAttack::strike(enemy, (30.0, 0.5), vec![], 0.0)],
+            test_max_speed(),
         );
         assert!(
             !world.entities.get(&pid).unwrap().is_alive(),
@@ -11721,7 +11918,8 @@ mod tests {
         process_attacks(
             &mut world,
             &mut map,
-            &[PendingAttack::strike(pid, (99.0, 99.0), vec![])],
+            &[PendingAttack::strike(pid, (99.0, 99.0), vec![], 0.0)],
+            test_max_speed(),
         );
         assert!(world.entities.get(&pid).unwrap().is_alive(), "落空刀不伤人");
         std::fs::remove_file(dir.join("example.wat")).unwrap();
@@ -11762,7 +11960,8 @@ mod tests {
         process_attacks(
             &mut world,
             &mut map,
-            &[PendingAttack::strike(enemy, (30.0, 0.5), stun)],
+            &[PendingAttack::strike(enemy, (30.0, 0.5), stun, 0.0)],
+            test_max_speed(),
         );
         // D-005 刀0：残影不执行玩家代码（含 on_attack 防守）——恒拦截防线被跳过，
         // 刀直接命中=开决斗会话（残影躯壳=无人操控的空城，游魂打的就是空城；
@@ -11860,7 +12059,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -11883,6 +12082,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -12080,6 +12281,8 @@ mod tests {
                 liquid_density: 0.0,
                 liquid_drag: 0.0,
                 link: 0,
+                restitution: 0.0,
+                friction: 0.6,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 7);
@@ -12119,7 +12322,7 @@ mod tests {
         let escaped = wat_escape(creation_code);
         let spawner = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
@@ -12141,6 +12344,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -12344,6 +12549,8 @@ mod tests {
                 liquid_density: 0.0,
                 liquid_drag: 0.0,
                 link: 0,
+                restitution: 0.0,
+                friction: 0.6,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -12583,7 +12790,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -12613,6 +12820,8 @@ mod tests {
         (f64.const 0.0)
         (f64.const 0.0)
         (i32.const 0)
+        (f64.const 0.0)
+        (f64.const 0.6)
         (call $spawn)
         (drop))))
   (func (export "life") (result i32) i32.const 1))"#,
@@ -12709,7 +12918,7 @@ mod tests {
         let escaped = wat_escape(relic_code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "R\00")
@@ -12733,6 +12942,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn drop))"#,
             escaped = escaped,
             len = relic_code.len(),
@@ -12758,7 +12969,7 @@ mod tests {
         let shell_escaped = shell_wat_escaped();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{shell_escaped}\00")
   (data (i32.const 16384) "*\00")
@@ -12785,6 +12996,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn drop))"#,
             shell_len = CTRL_SHELL_WAT.len(),
         )
@@ -12792,11 +13005,11 @@ mod tests {
 
     /// 遗嘱攻击模块：life=0 + on_death 排队 attack_at（死人不出刀：队列应丢弃）
     const DYING_WILL_ATTACK_WAT: &str = r#"(module
-  (import "env" "attack_at" (func $attack (param f64 f64 i32 i32) (result i32)))
+  (import "env" "attack_at" (func $attack (param f64 f64 i32 i32 f64) (result i32)))
   (memory (export "memory") 1)
   (func (export "life") (result i32) i32.const 0)
   (func (export "on_death")
-    f64.const 3.0 f64.const 0.5 i32.const 0 i32.const 0
+    f64.const 3.0 f64.const 0.5 i32.const 0 i32.const 0 f64.const 0.0
     call $attack drop))"#;
 
     /// 拦截计数防守模块（遗嘱攻击丢弃的观测点：on_attack 被问过才计数）
@@ -13100,7 +13313,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "F\00")
@@ -13123,6 +13336,8 @@ mod tests {
     f64.const 0.0
     f64.const 0.0
     i32.const 0
+    f64.const 0.0
+    f64.const 0.6
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,

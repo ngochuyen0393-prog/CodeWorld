@@ -16,13 +16,13 @@
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
   (import "env" "scan" (func $scan (param i32 i32) (result i32)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
-  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32) (result i32)))
+  (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
   (import "env" "spawn" (func $spawn
-    (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32)
+    (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64)
     (result i32)))
   (memory (export "memory") 1)
   ;; ↓↓↓ 改这里 1：子弹代码（data 段 [4096..)，别与 scan 缓冲 [0..16) 重叠）
-  (data (i32.const 4096) "(module\0a  (import \"env\" \"attack_at\" (func $attack (param f64 f64 i32 i32) (result i32)))\0a  (memory (export \"memory\") 1)\0a  (global $fired (mut i32) (i32.const 0))\0a  (global $age (mut i32) (i32.const 0))\0a  (func (export \"life\") (result i32)\0a    (if (global.get $fired)\0a      (then\0a        (global.set $age (i32.add (global.get $age) (i32.const 1)))\0a        (if (i32.ge_u (global.get $age) (i32.const 2))\0a          (then (i32.const 0) (return)))))\0a    (i32.const 1))\0a  (func (export \"on_contact\") (param f64 f64)\0a    (if (global.get $fired) (then (return)))\0a    (i32.const 1) (global.set $fired)\0a    (drop (call $attack (local.get 0) (local.get 1) (i32.const 0) (i32.const 0)))))\00")
+  (data (i32.const 4096) "(module\0a  (import \"env\" \"attack_at\" (func $attack (param f64 f64 i32 i32 f64) (result i32)))\0a  (memory (export \"memory\") 1)\0a  (global $fired (mut i32) (i32.const 0))\0a  (global $age (mut i32) (i32.const 0))\0a  (func (export \"life\") (result i32)\0a    (if (global.get $fired)\0a      (then\0a        (global.set $age (i32.add (global.get $age) (i32.const 1)))\0a        (if (i32.ge_u (global.get $age) (i32.const 2))\0a          (then (i32.const 0) (return)))))\0a    (i32.const 1))\0a  (func (export \"on_contact\") (param f64 f64)\0a    (if (global.get $fired) (then (return)))\0a    (i32.const 1) (global.set $fired)\0a    (drop (call $attack (local.get 0) (local.get 1) (i32.const 0) (i32.const 0) (f64.const 0.0)))))\00")
   ;; ↓↓↓ 改这里 2：子弹字形与颜色（data 段 [16384]/[16448]）
   (data (i32.const 16384) ".\00")
   (data (i32.const 16448) "yellow\00")
@@ -54,7 +54,7 @@
         ;; ↓↓↓ 改这里 3：子弹长度 = data 段 [4096] 解码后的准确字节数（转义还原成原文再数，见 §4 坑 1）
         (drop (call $spawn
           (i32.const 4096)          ;; 1  code_ptr：子弹代码指针
-          (i32.const 676)           ;; 2  code_len：子弹代码字节数（数准！截断/超长都编译失败；见 §4 坑 1。本值=上方示例解码后实测，自己改了代码要重数）
+          (i32.const 696)           ;; 2  code_len：子弹代码字节数（数准！截断/超长都编译失败；见 §4 坑 1。本值=上方示例解码后实测，自己改了代码要重数）
           (f64.add (local.get $mx) (f64.mul (local.get $ux) (f64.const 0.75)))  ;; 3  x：出生点（沿发射方向外推出膛，见 §三）
           (f64.add (local.get $my) (f64.mul (local.get $uy) (f64.const 0.75)))  ;; 4  y
           (i32.const 16384)         ;; 5  glyph_ptr：字形指针
@@ -71,14 +71,16 @@
           (f64.const 0.0)           ;; 17 field_drag_delta（0=不改写阻力）
           (f64.const 0.0)           ;; 18 liquid_density（0=非液体默认）
           (f64.const 0.0)           ;; 19 liquid_drag（0=无水中阻尼）
-          (i32.const 0)))           ;; 20 link（D-011，0=无链放生；1=活链可控+可传）
+          (i32.const 0)             ;; 20 link（D-011，0=无链放生；1=活链可控+可传）
+          (f64.const 0.0)           ;; 21 restitution（D-010，0=撞停默认）
+          (f64.const 0.6)))         ;; 22 friction（D-010，0.6=默认摩擦）
         (return)))
     ;; 贴身机会刀（投掷器也能近战）
     (if (f64.le (local.get $dist) (f64.const 1.0))
       (then
         (call $log (i32.const 5))
         (drop (call $attack_at (local.get $ex) (local.get $ey)
-                               (i32.const 0) (i32.const 0)))
+                               (i32.const 0) (i32.const 0) (f64.const 0.0)))
         (return)))
     ;; 观望游走（自己写自己的性格）
     (call $log (i32.const 4))
@@ -123,7 +125,7 @@
 
 ## 四、常见坑
 
-1. **子弹代码字节数数错** → `spawn` 编译失败，弹不出生（世界日志有 `[process_spawns] 造物 WAT 编译失败`）。要数的是**解码后**的字节数：世界从内存读到的是转义还原后的原文——`\0a` 解回一个换行、`\"` 解回一个引号（各算 1 字节），结尾 `\00` 是 NUL 哨兵不算。把 data 段转义文本当字面数（本模板字面 719）或把哨兵算进去（677）都错，正确值 = **676**（模板原文长度）。别目测，写段小脚本把 data 段文本先解码再数（转义规则：`\"`→引号、`\\`→反斜杠、`\hh` 两位十六进制→对应字节）。
+1. **子弹代码字节数数错** → `spawn` 编译失败，弹不出生（世界日志有 `[process_spawns] 造物 WAT 编译失败`）。要数的是**解码后**的字节数：世界从内存读到的是转义还原后的原文——`\0a` 解回一个换行、`\"` 解回一个引号（各算 1 字节），结尾 `\00` 是 NUL 哨兵不算。把 data 段转义文本当字面数（本模板字面 739）或把哨兵算进去（697）都错，正确值 = **696**（模板原文长度）。别目测，写段小脚本把 data 段文本先解码再数（转义规则：`\"`→引号、`\\`→反斜杠、`\hh` 两位十六进制→对应字节）。
 2. **忘写 `motion=1`** → 子弹是 static 桩，出生即钉死。
 3. **忘写出生点外推** → spawn 撞自己身体被拒（日志 `出生点与现有身体重叠`）。
 4. **scan 缓冲 [0..16) 与子弹代码 data 段重叠** → 子弹代码被坐标覆盖，编译失败。子弹代码放 [4096..)。

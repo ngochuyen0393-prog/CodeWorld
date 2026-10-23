@@ -164,6 +164,20 @@ pub struct Entity {
     #[serde(default)]
     liquid_drag: f64,
 
+    // 碰撞响应出生声明家族（D-010 碰撞响应刀：spawn 第 21/22 参——与 radius/
+    // mass/binding/motion/field/liquid 同门，世界只认数字不认名字：钢珠/黏土/
+    // 冰面/橡胶是玩家黑话）。e=弹性（撞=动量交换的程度）/f=摩擦（切向衰减）。
+    // 组合规则（接触对）= Box2D 款：e=max(e1,e2) / f=√(f1×f2)，组合后才允许
+    // 物理使用（crates/core/src/physics.rs combine_restitution/combine_friction）。
+    // 弹性（出生声明第 21 参，域 [0,1]，0=撞停现状语义）：
+    /// serde default：旧快照无此字段时回退 0.0=撞停（存储向后兼容）
+    #[serde(default = "default_restitution")]
+    restitution: f64,
+    // 摩擦（出生声明第 22 参，域 [0,1]，0.6=Box2D v3 新默认"比冰滑比橡胶涩"）：
+    /// serde default：旧快照无此字段时回退 0.6（存储向后兼容）
+    #[serde(default = "default_friction")]
+    friction: f64,
+
     // 链账本（D-011 世界内链路段：link=binding 家族新成员，decisions.md #038
     // 通道公理世界内段）。活链造物指向母体——与 bound_to 同款形态（Option<EntityId>
     // 实体字段）、同款快照待遇。链管通信（契约管生死，两轴正交自由组合）：
@@ -240,6 +254,16 @@ fn default_field_drag_delta() -> f64 {
     0.0
 }
 
+/// 弹性默认值（D-010：新实体与旧快照回退共用 0.0=撞停现状语义）
+fn default_restitution() -> f64 {
+    0.0
+}
+
+/// 摩擦默认值（D-010：新实体与旧快照回退共用 0.6=Box2D v3 新默认）
+fn default_friction() -> f64 {
+    0.6
+}
+
 /// 液体密度合法上限（D-009：域 [0.0, 5.0]——0=非液体默认，5=岩浆级上限。
 /// 参照系=水 1.0 无量纲，油 0.75/蜂蜜 1.4/岩浆 2.5 都是玩家黑话非内置清单）
 pub const LIQUID_DENSITY_MAX: f64 = 5.0;
@@ -247,6 +271,39 @@ pub const LIQUID_DENSITY_MAX: f64 = 5.0;
 /// 水中阻尼声明合法上限（D-009：域 [0.0, 5.0]——声明域宽松、结算域收紧：
 /// k>1 的声明合法但有效保留系数按 1 结算，不许凭空加速）
 pub const LIQUID_DRAG_MAX: f64 = 5.0;
+
+/// 弹性校验钳制（spawn 第 21 参口径，D-010 碰撞响应刀）：域 [0.0, 1.0] 硬钳，
+/// 非有限值回退默认 0.0（撞停现状语义）并 warn（带原值与钳后值，与 mass 的
+/// "超界警告并钳制"同款措辞风格——出生声明家族哲学：超界钳回+警告非拒绝）
+pub fn clamp_restitution(v: f64) -> f64 {
+    const DEFAULT: f64 = 0.0;
+    if !v.is_finite() {
+        tracing::warn!(value = v, clamped = DEFAULT, "[restitution] 非有限值，回退默认 0.0（撞停）");
+        return DEFAULT;
+    }
+    if !(0.0..=1.0).contains(&v) {
+        let clamped = v.clamp(0.0, 1.0);
+        tracing::warn!(value = v, clamped, "[restitution] 超出域 [0,1]，钳制");
+        return clamped;
+    }
+    v
+}
+
+/// 摩擦校验钳制（spawn 第 22 参口径，D-010 碰撞响应刀）：域 [0.0, 1.0] 硬钳，
+/// 非有限值回退默认 0.6（Box2D v3 新默认）并 warn（带原值与钳后值，同款措辞）
+pub fn clamp_friction(v: f64) -> f64 {
+    const DEFAULT: f64 = 0.6;
+    if !v.is_finite() {
+        tracing::warn!(value = v, clamped = DEFAULT, "[friction] 非有限值，回退默认 0.6");
+        return DEFAULT;
+    }
+    if !(0.0..=1.0).contains(&v) {
+        let clamped = v.clamp(0.0, 1.0);
+        tracing::warn!(value = v, clamped, "[friction] 超出域 [0,1]，钳制");
+        return clamped;
+    }
+    v
+}
 
 /// 液体密度校验钳制（spawn 第 18 参口径）：域 [0.0, 5.0]，负值/非有限钳 0
 /// （非液体最保守回退）并 warn，超上限钳 5.0——出生声明家族哲学：超界钳回+
@@ -449,6 +506,8 @@ impl Entity {
             field_drag_delta: default_field_drag_delta(),
             liquid_density: 0.0,
             liquid_drag: 0.0,
+            restitution: default_restitution(),
+            friction: default_friction(),
             link_to: None,
             storage: Vec::new(),
             appearance,
@@ -593,6 +652,26 @@ impl Entity {
     /// 设置水中阻尼（import 层已 clamp_liquid_drag，此处直存）
     pub fn set_liquid_drag(&mut self, liquid_drag: f64) {
         self.liquid_drag = liquid_drag;
+    }
+
+    /// 弹性（D-010 出生声明第 21 参：0=撞停现状语义，域 [0,1]）
+    pub fn restitution(&self) -> f64 {
+        self.restitution
+    }
+
+    /// 设置弹性（import 层已 clamp_restitution，此处直存）
+    pub fn set_restitution(&mut self, restitution: f64) {
+        self.restitution = restitution;
+    }
+
+    /// 摩擦（D-010 出生声明第 22 参：0.6=Box2D v3 新默认，域 [0,1]）
+    pub fn friction(&self) -> f64 {
+        self.friction
+    }
+
+    /// 设置摩擦（import 层已 clamp_friction，此处直存）
+    pub fn set_friction(&mut self, friction: f64) {
+        self.friction = friction;
     }
 
     /// 活链母体（D-011：None=无链放生，Some=活链可控+可传）
@@ -1346,5 +1425,52 @@ mod tests {
         let json = serde_json::to_string(&obj).unwrap();
         let back: Entity = serde_json::from_str(&json).unwrap();
         assert!(back.storage().is_empty(), "旧快照应回退空存储块");
+    }
+
+    // === D-010 碰撞响应：出生声明第 21/22 参（restitution/friction）===
+
+    #[test]
+    fn entity_restitution_friction_setters_and_roundtrip() {
+        // 创建/读写：第 21/22 参 setter 直存（import 层已钳制，照 liquid 直存模式）
+        // + 序列化往返保留（快照存档不断档）
+        let mut e = sample_entity();
+        e.set_restitution(0.8);
+        e.set_friction(0.2);
+        assert_eq!(e.restitution(), 0.8);
+        assert_eq!(e.friction(), 0.2);
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.restitution(), 0.8);
+        assert_eq!(back.friction(), 0.2);
+    }
+
+    #[test]
+    fn restitution_defaults_zero_six_on_old_snapshot() {
+        // 边界：旧快照（无 e/f 字段）反序列化回退 e=0/f=0.6（serde default，
+        // 存储向后兼容 radius/mass/field/liquid 同款先例；e=0=撞停现状语义
+        // 零回归，f=0.6=Box2D v3 新默认）
+        let mut obj: serde_json::Value = serde_json::to_value(sample_entity()).unwrap();
+        obj.as_object_mut().unwrap().remove("restitution");
+        obj.as_object_mut().unwrap().remove("friction");
+        let json = serde_json::to_string(&obj).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.restitution(), 0.0, "旧快照 e 应回退 0（撞停现状）");
+        assert_eq!(back.friction(), 0.6, "旧快照 f 应回退 0.6");
+    }
+
+    #[test]
+    fn clamp_restitution_friction_domain_unit_interval() {
+        // 出生声明家族哲学：超界钳回+警告非拒绝（域 [0,1] 硬钳）；非有限值
+        // 回退默认（e=0.0 / f=0.6）——与 mass/radius 钳制同款措辞风格
+        assert_eq!(clamp_restitution(1.5), 1.0);
+        assert_eq!(clamp_restitution(-0.3), 0.0);
+        assert_eq!(clamp_restitution(f64::NAN), 0.0);
+        assert_eq!(clamp_restitution(f64::INFINITY), 0.0);
+        assert_eq!(clamp_restitution(0.7), 0.7);
+        assert_eq!(clamp_friction(1.5), 1.0);
+        assert_eq!(clamp_friction(-0.3), 0.0);
+        assert_eq!(clamp_friction(f64::NAN), 0.6);
+        assert_eq!(clamp_friction(f64::NEG_INFINITY), 0.6);
+        assert!((clamp_friction(0.4) - 0.4).abs() < 1e-12);
     }
 }

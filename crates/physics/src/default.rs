@@ -8,10 +8,36 @@
 
 use codeworld_core::collision::{body_of, body_overlap, body_touching, creation_aabb, Body};
 use codeworld_core::entity::{Entity, EntityId};
-use codeworld_core::physics::{DefaultPhysics, PhysicsChange, PhysicsReason};
+use codeworld_core::physics::{
+    combine_friction, combine_restitution, DefaultPhysics, PhysicsChange, PhysicsReason,
+};
 use codeworld_core::terrain::{TERRAIN_SPACING, TERRAIN_X_MIN};
 use codeworld_core::world::WorldState;
 use std::collections::{HashMap, HashSet};
+
+/// 低速闸阈值（D-010 碰撞响应刀细则④）：碰撞对相对法向速度低于此值（格/拍）
+/// 按非弹性处理（e 生效值=0）——Box2D restitutionThreshold 1m/s / Unity
+/// bounceThreshold 2 的拍制换算；慢拍（1拍/秒）下低速微弹=逐拍抖动，防抖必需。
+/// 随世界常数批次重标定（不自动公式耦合）。
+pub const RESTITUTION_LOW_SPEED: f64 = 1.0;
+
+/// D-010 碰撞响应：碰撞瞬间一次性动量交换（#021 切割声明——撞完就分，非持续推挤）
+///
+/// 法向反弹 `v_n' = -e·v_n` + 切向摩擦 `v_t' = v_t·max(0, 1-f)`（简化库仑模型，
+/// 组合后使用；组合前各分量已钳 [0,1] 故天然非负）——速度=法向+切向重组。
+/// 反弹只改速度字段（位移下一拍物理步兑现——拍制世界的诚实形态：本拍停住，
+/// 下拍弹走），停点/位置逻辑完全不动。
+/// 调用方负责低速闸与"每对每拍一弹"闸（e 传 0 即非弹性，纯摩擦仍生效）。
+fn bounce_response(vel: (f64, f64), normal: (f64, f64), e: f64, f: f64) -> (f64, f64) {
+    let v_n = vel.0 * normal.0 + vel.1 * normal.1;
+    let v_t = (vel.0 - v_n * normal.0, vel.1 - v_n * normal.1);
+    let vn2 = -e * v_n;
+    let keep = (1.0 - f).max(0.0);
+    (
+        vn2 * normal.0 + v_t.0 * keep,
+        vn2 * normal.1 + v_t.1 * keep,
+    )
+}
 
 use crate::fields::{effective_gravity_drag, FieldEffect};
 use crate::liquid::{LiquidDomain, liquid_effect};
@@ -349,6 +375,9 @@ impl DefaultPhysicsEngine {
         liquids: &[LiquidDomain],
     ) -> Vec<PhysicsChange> {
         let mut changes = Vec::new();
+        // 每对每拍一弹闸（D-010 细则⑤）：本拍已结算接触的无序对集合（按
+        // (min_id, max_id) 键）——同对二次接触按非弹性处理
+        let mut bounced_pairs: HashSet<(EntityId, EntityId)> = HashSet::new();
         // 实体 id 升序（裁决确定序）
         let mut ids: Vec<EntityId> = world.entities.keys().copied().collect();
         ids.sort_by_key(|id| id.0);
@@ -359,7 +388,7 @@ impl DefaultPhysicsEngine {
             // 一切有速度实体同管线：velocity≠0 走冲量路径（弹道物理），v≡0 走
             // 落点制。弹丸的"不可被锁定/不可被撞/不参与接触"语义保留在各自
             // 消费点（find_hit_target/detect_touching/CCD 目标过滤）
-            let (alive, aloft_skip, is_creation, is_dyn_creation, before, me_r, me_mass, me_vel) = {
+            let (alive, aloft_skip, is_creation, is_dyn_creation, before, me_r, me_mass, me_vel, me_e, me_f) = {
                 let Some(entity) = world.entities.get(&id) else {
                     continue;
                 };
@@ -372,6 +401,8 @@ impl DefaultPhysicsEngine {
                     entity.radius(),
                     entity.mass(),
                     entity.velocity(),
+                    entity.restitution(),
+                    entity.friction(),
                 )
             };
             if !alive {
@@ -510,19 +541,47 @@ impl DefaultPhysicsEngine {
                 };
                 if let Some(hit_ground) = truncated {
                     if hit_ground {
-                        // 触地截断：落点=路径与地形面的交点（弹心贴面），速度清零
+                        // 触地截断：落点=路径与地形面的交点（弹心贴面）。D-010 碰撞
+                        // 响应：撞=动量交换——法向反弹（e=组合(实体,地面)）+切向摩擦
+                        //（组合后使用）；位置停点逻辑完全不动（弹开发生在下一拍的
+                        // 速度里——拍制世界的诚实形态：本拍停住，下拍弹走）。
                         let gt = swept_ground.expect("hit_ground=true 时必有触地 t");
                         let land_x = before.0 + (after.0 - before.0) * gt;
                         let land = (land_x, world.terrain.height(land_x) + me_r);
-                        tracing::debug!(
-                            entity_id = %id.0,
-                            pos = ?land,
-                            "[step] CCD 触地截断（贴地形面，速度清零）"
-                        );
-                        (land, Some((0.0, 0.0)))
+                        // n=地形面法线（D-010：触地=地形面法线，朝上）
+                        let n = world.terrain.height_normal(land_x);
+                        let e = combine_restitution(me_e, self.params.ground_restitution);
+                        let f = combine_friction(me_f, self.params.ground_friction);
+                        // 低速闸：地面静止，相对法向速度=入射法向分量
+                        let v_n = vel.0 * n.0 + vel.1 * n.1;
+                        let e_eff = if v_n.abs() < RESTITUTION_LOW_SPEED { 0.0 } else { e };
+                        let bounced = bounce_response(vel, n, e_eff, f);
+                        if e_eff > 0.0 {
+                            tracing::info!(
+                                entity_id = %id.0,
+                                ground = true,
+                                e = e_eff,
+                                f,
+                                v_n,
+                                to_vel = ?bounced,
+                                "[bounce] 触地反弹（D-010：法向反弹+切向摩擦，位移下拍兑现）"
+                            );
+                        } else {
+                            tracing::debug!(
+                                entity_id = %id.0,
+                                ground = true,
+                                e = e_eff,
+                                f,
+                                "[step] CCD 触地截断（低速闸/零弹性：法向清零+切向摩擦）"
+                            );
+                        }
+                        (land, Some(bounced))
                     } else {
-                        // 撞体截断：位移停在首触点（恰好相切），速度清零——
-                        // 接触通道据此感知（结算归 on_contact 代码攻，本步不动目标）。
+                        // 撞体截断：位移停在首触点（恰好相切），接触交接触通道结算
+                        //（on_contact 代码攻）。D-010 碰撞响应：撞=动量交换——撞者
+                        // 速度法向反弹+切向摩擦；【单写者原则】只改自己的速度，不动
+                        // 目标——目标在自己拍的 CCD 里处理自己的碰撞（实体按 id 升序
+                        // 定序，每个动体一轮冲量路径；本步代写目标速度会双写冲突）。
                         // t 推进 1cm 等效量：首触点数学上=恰相切（距目标圆心=r 和），
                         // 但浮点下停点恰在 detect_touching 的 ≤ 边界上（实测恰等
                         // 0.6500 时判不到——边界值浮点向上漂 1 ULP 即漏）。沿路径
@@ -547,27 +606,102 @@ impl DefaultPhysicsEngine {
                             before.0 + (after.0 - before.0) * bt,
                             before.1 + (after.1 - before.1) * bt,
                         );
-                        tracing::debug!(
-                            entity_id = %id.0,
-                            target = %tid.0,
-                            pos = ?stop,
-                            "[step] CCD 撞体截断（速度清零，接触交接触通道结算）"
-                        );
-                        (stop, Some((0.0, 0.0)))
+                        // D-010 撞体反弹：n=两圆心连线单位向量（MVP 口径——AABB 造物
+                        // 的圆心=pos，面法线级反弹归 D-008 形状物理包）；组合=Box2D 款
+                        let (t_e, t_f, n) = match world.entities.get(&tid) {
+                            Some(t) => {
+                                let (tx, ty) = t.pos();
+                                let dx = tx - before.0;
+                                let dy = ty - before.1;
+                                let dlen = (dx * dx + dy * dy).sqrt();
+                                let n = if dlen > 1e-12 {
+                                    (dx / dlen, dy / dlen)
+                                } else {
+                                    (0.0, 1.0)
+                                };
+                                (t.restitution(), t.friction(), n)
+                            }
+                            None => (0.0, 0.6, (0.0, 1.0)), // 目标瞬失兜底（不可能路径）
+                        };
+                        // 每对每拍一弹闸（D-010 细则⑤）：同拍内同一对实体只结算一次
+                        // 接触——已弹过的对按非弹性（e 生效=0，摩擦照常）。本拍先到者
+                        // （id 升序定序）吃弹性，后到者非弹性清零；防将来的多次接触源
+                        let pair = if id.0 < tid.0 { (id, tid) } else { (tid, id) };
+                        let pair_hit = !bounced_pairs.insert(pair);
+                        let e = if pair_hit {
+                            0.0
+                        } else {
+                            combine_restitution(me_e, t_e)
+                        };
+                        let f = combine_friction(me_f, t_f);
+                        // 低速闸：相对法向速度（目标速度参与——相向/同向影响入射强度；
+                        // 目标速度取结算时刻实况，#044：定序已锁 id 升序，同状态同结算）
+                        let (tvx, tvy) = world
+                            .entities
+                            .get(&tid)
+                            .map(|t| t.velocity())
+                            .unwrap_or((0.0, 0.0));
+                        let rel_n = (vel.0 - tvx) * n.0 + (vel.1 - tvy) * n.1;
+                        let e_eff = if rel_n.abs() < RESTITUTION_LOW_SPEED { 0.0 } else { e };
+                        let bounced = bounce_response(vel, n, e_eff, f);
+                        if e_eff > 0.0 {
+                            tracing::info!(
+                                entity_id = %id.0,
+                                target_id = %tid.0,
+                                e = e_eff,
+                                f,
+                                rel_n,
+                                to_vel = ?bounced,
+                                "[bounce] 撞体反弹（D-010：只改自己速度，目标下拍自理；位移下拍兑现）"
+                            );
+                        } else {
+                            tracing::debug!(
+                                entity_id = %id.0,
+                                target = %tid.0,
+                                pos = ?stop,
+                                e = e_eff,
+                                f,
+                                "[step] CCD 撞体截断（低速闸/零弹性/同对已弹：法向清零+切向摩擦，接触交接触通道结算）"
+                            );
+                        }
+                        (stop, Some(bounced))
                     }
                 } else {
                     // 落地解析（脚下高度核复用 circle_landing_y 的几何）：位移后不高于
-                    // 脚下高度即落地——贴面 + 速度全清零（vy 清零规则：落地时清、空中
-                    // 不清；水平分量一并清——贴地滑行白拿位移不合法，想平移走 move_by）
+                    // 脚下高度即落地——贴面 + D-010 语义升级：法向清零+切向×(1-f)
+                    //（旧口径速度全清零是因为"落地=贴面"；摩擦的正确语义=滑动衰减，
+                    // 默认 f=0.6 时落地水平分量×0.4 逐拍衰减，贴地滑行数拍内自停）。
+                    // n=地形面法线（落地解析落点即贴面点）；e=组合(实体,地面)，
+                    // 低速闸天然把慢速落地吞成非弹性（v_n<1 时 e=0=现状清零语义）。
                     let surface = self.circle_landing_surface(world, id, after.0, me_r, after.1);
                     if after.1 <= surface {
-                        tracing::debug!(
-                            entity_id = %id.0,
-                            from = ?before,
-                            to = ?(after.0, surface),
-                            "[step] 冲量路径落地贴面（速度清零）"
-                        );
-                        ((after.0, surface), Some((0.0, 0.0)))
+                        let n = world.terrain.height_normal(after.0);
+                        let e = combine_restitution(me_e, self.params.ground_restitution);
+                        let f = combine_friction(me_f, self.params.ground_friction);
+                        let v_n = vel.0 * n.0 + vel.1 * n.1;
+                        let e_eff = if v_n.abs() < RESTITUTION_LOW_SPEED { 0.0 } else { e };
+                        let bounced = bounce_response(vel, n, e_eff, f);
+                        if e_eff > 0.0 {
+                            tracing::info!(
+                                entity_id = %id.0,
+                                ground = true,
+                                e = e_eff,
+                                f,
+                                v_n,
+                                to_vel = ?bounced,
+                                "[bounce] 落地反弹（D-010：法向反弹+切向摩擦）"
+                            );
+                        } else {
+                            tracing::debug!(
+                                entity_id = %id.0,
+                                from = ?before,
+                                to = ?(after.0, surface),
+                                e = e_eff,
+                                f,
+                                "[step] 冲量路径落地贴面（低速闸/零弹性：法向清零+切向摩擦）"
+                            );
+                        }
+                        ((after.0, surface), Some(bounced))
                     } else {
                         (after, Some(vel))
                     }
@@ -728,6 +862,9 @@ mod tests {
             max_velocity: 50.0,
             drag_coefficient: 0.1,
             max_speed: 25.0,
+            // D-010：地面常数对继承默认（e=0/f=0.6——本测试只断言 gravity/
+            // max_velocity，地面常数不被覆盖即与默认逐位一致）
+            ..DefaultPhysics::default_values()
         };
         let engine = DefaultPhysicsEngine::new_with_params(p);
         assert_eq!(engine.params().gravity, -5.0);
@@ -1248,9 +1385,11 @@ mod tests {
 
     #[test]
     fn ballistic_shell_lands_and_stops() {
-        // 造物弹落地 = CCD 触地截断（落点贴地形面 ground+r）+ 速度清零。
-        // 与退役弹丸的"Landed 事件+消亡"不同：造物弹是造物，落地停驻是物理事实，
-        // 消亡归寿命自管（代码自杀/燃料尽，#045 替代链）
+        // 造物弹落地 = CCD 触地截断（落点贴地形面 ground+r）。
+        // 【D-010 语义升级】落地速度语义从"全清零"升级为"法向清零+切向×(1-f)"
+        //（默认 f=0.6：切向=水平分量 ×0.4——摩擦的正确语义，旧全清零是因为
+        // "落地=贴面"时代没有摩擦概念）。与退役弹丸的"Landed 事件+消亡"不同：
+        // 造物弹是造物，落地停驻是物理事实，消亡归寿命自管（代码自杀/燃料尽）
         let engine = DefaultPhysicsEngine::new();
         let mut world = WorldState::new();
         let p = make_shell(1, (3.0, 0.2), (1.0, 0.0), 0.15, 1.0);
@@ -1262,7 +1401,12 @@ mod tests {
             (shell.pos().1 - 0.15).abs() < 1e-9,
             "落点应贴地面半径线 y=0.15，实际 {shell:?}"
         );
-        assert_eq!(shell.velocity(), (0.0, 0.0), "触地截断速度清零");
+        // D-010：积分后 vx=0.95（阻力后）→切向×(1-0.6)=0.38；vy 法向清零
+        assert!(
+            (shell.velocity().0 - 0.38).abs() < 1e-9 && shell.velocity().1 == 0.0,
+            "触地截断=法向清零+切向×0.4（D-010 摩擦语义），实际 {:?}",
+            shell.velocity()
+        );
         assert!(shell.is_alive(), "造物弹落地停驻不消亡（寿命自管）");
     }
 
@@ -1296,7 +1440,28 @@ mod tests {
             "撞体截断先于触地（未落地面线），实际 {:?}",
             shell.pos()
         );
-        assert_eq!(shell.velocity(), (0.0, 0.0), "撞体截断速度清零");
+        // 【D-010 语义升级】撞体截断速度从"全清零"升级为"法向清零+切向×(1-f)"
+        //（默认 e=0/f=0.6 组合=非弹性+摩擦）：斜入射（vel(20,4)）在**入射连线
+        // 法向 n**（=目标圆心-弹起点，反弹分解用的几何）上的分量清零，切向分量
+        // ×0.4 保留——单写者原则：只改撞者，目标自理
+        {
+            let (bx, by) = (0.0, 0.65); // 弹起点（n_impl 的入射几何，非截断后停点）
+            let dx = tx - bx;
+            let dy = ty - by;
+            let dl = (dx * dx + dy * dy).sqrt();
+            let (nx, ny) = (dx / dl, dy / dl);
+            let (vx, vy) = shell.velocity();
+            let v_n = vx * nx + vy * ny;
+            assert!(
+                v_n.abs() < 1e-6,
+                "撞体截断法向分量应清零（D-010 e=0 组合），实际 {v_n}"
+            );
+            let speed = (vx * vx + vy * vy).sqrt();
+            assert!(
+                speed > 0.0,
+                "撞体截断切向应剩摩擦衰减分量（D-010 ×0.4），实际 {speed}"
+            );
+        }
         assert!(shell.is_alive(), "造物弹撞体停驻不消亡（结算归接触通道）");
         assert!(world.entities.get(&tid).unwrap().is_alive(), "物理步不动目标");
     }
@@ -1321,6 +1486,7 @@ mod tests {
             max_velocity: 100.0,
             drag_coefficient: 0.05,
             max_speed: 25.0,
+            ..codeworld_core::physics::DefaultPhysics::default_values() // D-010 地面常数继承默认
         });
         let mut world = WorldState::new();
         let target = make_entity(2, 10.0, 0.5, 0);
@@ -1398,7 +1564,11 @@ mod tests {
         for _ in 0..60 {
             engine.step(&mut world, &HashSet::new(), &[]);
             let shell = world.entities.get(&pid).unwrap();
-            if shell.velocity() == (0.0, 0.0) {
+            // D-010 摩擦语义：落地后切向速度 ×(1-f) 逐拍衰减（0.4^n），f64 精确
+            // 零判定永不成立（0.4^n 无精确零点）——停驻判定改近似阈值（模长<1e-9
+            // 即物理停驻；60 拍内 0.4^20≈1e-8 量级，判据可达）
+            let (vx, vy) = shell.velocity();
+            if vx * vx + vy * vy < 1e-18 {
                 range = Some(shell.pos().0 - x0);
                 break;
             }
@@ -1573,7 +1743,13 @@ mod tests {
         engine.step(&mut world, &HashSet::new(), &[]);
         let shell = world.entities.get(&pid).unwrap();
         assert!(near(shell.pos(), (8.5, 0.15)), "落点应为地面交点 (8.5,0.15)，实际 {:?}", shell.pos());
-        assert_eq!(shell.velocity(), (0.0, 0.0), "触地截断速度清零");
+        // 【D-010 语义升级】触地截断：法向清零（e=0 默认组合，|v_n|=2>1 过低速闸
+        // 但零弹性不反弹）+切向×(1-0.6)（vx 20→8）——摩擦语义非全清零
+        assert!(
+            near(shell.velocity(), (8.0, 0.0)),
+            "触地截断=法向清零+切向×0.4（D-010），实际 {:?}",
+            shell.velocity()
+        );
         assert!(shell.is_alive(), "造物弹落地停驻（尸体坐标=落点，异态不留世界）");
     }
 
@@ -1613,6 +1789,9 @@ mod tests {
     // 红线=绝不用墙钟/CPU/帧率选 N。CCD 扫掠并入 step 冲量路径后，锚形态不变：
     // 同状态两跑 step 末态逐位一致。
 
+    /// 第一拍末态快照（确定性自检用：id + 坐标 + 速度）
+    type MidState = Vec<(u128, (f64, f64), (f64, f64))>;
+
     #[test]
     fn ballistic_step_same_state_same_result() {
         // #044 纯函数锚：同一初始状态（实体集合+速度+造物弹 CCD 截断混合场景）
@@ -1620,7 +1799,7 @@ mod tests {
         // 场景：一条平射造物弹撞中途目标（CCD 撞体截断）+ 一条上抛造物弹落地
         //（CCD 触地截断），覆盖两个截断分支。
         let engine = DefaultPhysicsEngine::new();
-        let run_world = || -> (Vec<_>, WorldState) {
+        let run_world = || -> (Vec<_>, WorldState, MidState) {
             let mut world = WorldState::new();
             for (id, pos, vel) in [
                 (1u128, (0.0, 20.0), (12.0, 0.0)),  // 平射→路径扫过 (5.85,17.67) 目标
@@ -1633,13 +1812,22 @@ mod tests {
                 let t = make_entity(id, pos.0, pos.1, 0);
                 world.entities.insert(t.id, t);
             }
-            // 两拍：弹1 t1 撞体截断；弹2 t2 触地截断（t1 尚在升弧）
+            // 两拍：弹1 t1 撞体截断；弹2 t2 触地截断（t1 尚在升弧）。
+            // D-010 自检取第一拍末态（截断事实在 t1——t2 后重力重新加速，
+            // 末态速度不再是截断语义的观测点）
             let mut changes = engine.step(&mut world, &HashSet::new(), &[]);
+            let mid: MidState = [1u128, 2u128]
+                .iter()
+                .map(|&id| {
+                    let e = world.entities.get(&EntityId(Uuid::from_u128(id))).unwrap();
+                    (id, e.pos(), e.velocity())
+                })
+                .collect();
             changes.extend(engine.step(&mut world, &HashSet::new(), &[]));
-            (changes, world)
+            (changes, world, mid)
         };
-        let (ch_a, wa) = run_world();
-        let (ch_b, wb) = run_world();
+        let (ch_a, wa, mid_a) = run_world();
+        let (ch_b, wb, mid_b) = run_world();
         // PhysicsChange 未实现 PartialEq：比较变更条数 + 目标/位置逐位（等价口径）
         assert_eq!(ch_a.len(), ch_b.len(), "同状态必然同变更条数（#044）");
         for (ca, cb) in ch_a.iter().zip(ch_b.iter()) {
@@ -1654,14 +1842,24 @@ mod tests {
             assert_eq!(a.pos(), b.pos(), "坐标必须逐位一致（#044）");
             assert_eq!(a.velocity(), b.velocity(), "速度必须逐位一致（#044）");
         }
-        // 场景自检：两条造物弹都应被截断（速度清零），锚不空转
-        for id in [1u128, 2u128] {
-            let sid = EntityId(Uuid::from_u128(id));
-            assert_eq!(
-                wa.entities.get(&sid).unwrap().velocity(),
-                (0.0, 0.0),
-                "造物弹 {id} 应被 CCD 截断（撞体/触地其一）"
+        // 场景自检（锚不空转）：第一拍末态——
+        // 【D-010 语义升级】弹1 撞体截断：停点落目标接触窗口 + 速度法向清零+
+        // 切向×0.4（迎头入射法向占主导→显著降速 <初速 60%）；弹2 t1 尚在升弧
+        // 未截断（速度≈重力积分后的 (2.85, 5.7)，不做速度断言）
+        {
+            let s1 = mid_a.iter().find(|(id, _, _)| *id == 1).unwrap();
+            let (_, p1, v1) = s1;
+            let dist = ((p1.0 - 5.85).powi(2) + (p1.1 - 17.67).powi(2)).sqrt();
+            assert!(
+                dist <= 0.65 + 1e-6,
+                "弹1 第一拍应撞体截断停在接触窗口，实际距离 {dist} @ {p1:?}"
             );
+            let speed1 = (v1.0 * v1.0 + v1.1 * v1.1).sqrt();
+            assert!(
+                speed1 < 12.0 * 0.6,
+                "弹1 截断拍应法向清零+切向摩擦显著降速（D-010），实际 {speed1}"
+            );
+            assert_eq!(mid_a, mid_b, "第一拍末态两跑逐位一致（#044）");
         }
     }
 
@@ -1875,22 +2073,21 @@ mod tests {
         let pid = p.id;
         let r = p.radius();
         world.entities.insert(pid, p);
-        let mut landed = None;
-        for _ in 0..30 {
-            engine.step(&mut world, &HashSet::new(), &[]);
-            let shell = world.entities.get(&pid).unwrap();
-            if shell.velocity() == (0.0, 0.0) {
-                landed = Some(shell.pos());
-                break;
-            }
-        }
-        let (lx, ly) = landed.expect("30 拍内必撞坡停驻");
+        // 【D-010 语义升级】撞坡停驻 → 撞坡截断+切向摩擦：截断拍停点仍贴地形面
+        //（停点逻辑不动），但切向速度 ×(1-f) 保留——斜坡上速度非零的实体会沿坡
+        // 稳态滑行（重力沿坡分量每拍重新加速 vs 摩擦×0.4 衰减，动摩擦模型无静摩
+        // 擦：球在坡上会滚下来，物理涌现；贴坡静止实体 vel=0 走落点制不动=零回归）。
+        // 本测试锚定第一拍的截断事实：位置贴坡+未过峰（原"永久停驻"语义随摩擦
+        // 立法退役）
+        engine.step(&mut world, &HashSet::new(), &[]);
+        let shell = world.entities.get(&pid).unwrap();
+        let (lx, ly) = shell.pos();
         let ground = world.terrain.height(lx);
         assert!(
             (ly - ground - r).abs() < 1e-6,
-            "停点弹心应贴地形面（ground+{r}），实际 ({lx},{ly}) ground={ground}"
+            "截断点弹心应贴地形面（ground+{r}），实际 ({lx},{ly}) ground={ground}"
         );
-        assert!(lx < peak_x + 1.0, "应在山坡上停驻（未过峰），实际 lx={lx}");
+        assert!(lx < peak_x + 1.0, "应在山坡上截断（未过峰），实际 lx={lx}");
     }
 
     #[test]
@@ -2535,5 +2732,216 @@ mod tests {
         let m = std::f64::consts::PI * 0.25; // ρ物=1.0
         let e = liquid_effect((5.0, 3.0), 0.5, m, (0.0, 0.0), (-9.8, 0.05), &liquids);
         assert!((e.g_final - 0.0).abs() < 1e-12, "等密度全浸应悬浮");
+    }
+
+    // === D-010 碰撞响应刀：撞=动量交换（法向反弹+切向摩擦+低速闸+每对每拍一弹）===
+    //
+    // 测试用无重力无阻力引擎隔离干扰（gravity=0/drag=0 先例
+    // shell_at_exact_max_speed_untouched）；数字全手算（容差 1e-6 分量近似断言）。
+
+    /// 无重力无阻力引擎（D-010 反弹测试隔离干扰：重力会拉速度、阻力会衰减，
+    /// 纯几何反弹需要定律恒等）
+    fn bounce_engine() -> DefaultPhysicsEngine {
+        DefaultPhysicsEngine::new_with_params(DefaultPhysics {
+            gravity: 0.0,
+            drag_coefficient: 0.0,
+            ..DefaultPhysics::default_values()
+        })
+    }
+
+    #[test]
+    fn high_speed_bounce_reflects_normal() {
+        // 两实体相向运动（A→右 10，B→左 1），e=max(0.5,0.5)=0.5、f=√(0.25)=0.5，
+        // 相对法向速度 11>1 过低速闸：撞者 A 的速度=法向反弹 -0.5×10=-5 +
+        // 切向摩擦 ×0.5（vy 3→1.5）——撞者单侧反射，目标 B 不由本步代写
+        //（目标在自己拍的 CCD 里处理自己的碰撞；同对已入"每对每拍一弹"闸，
+        // B 的二次接触按非弹性清零——闸语义见
+        // same_pair_bounces_once_per_tick_second_contact_inelastic）
+        let engine = bounce_engine();
+        let mut world = WorldState::new();
+        let mut a = make_shell(1, (5.0, 5.0), (10.0, 3.0), 0.5, 1.0);
+        a.set_restitution(0.5);
+        a.set_friction(0.5);
+        let mut b = make_shell(2, (8.0, 5.0), (-1.0, 0.0), 0.5, 1.0);
+        b.set_restitution(0.5);
+        b.set_friction(0.5);
+        let (aid, bid) = (a.id, b.id);
+        world.entities.insert(aid, a);
+        world.entities.insert(bid, b);
+        engine.step(&mut world, &HashSet::new(), &[]);
+        let a = world.entities.get(&aid).unwrap();
+        // n=(1,0)（A→B 两圆心连线）：v_n=10 → -0.5×10=-5；v_t=(0,3)→×(1-0.5)=(0,1.5)
+        assert!(
+            (a.velocity().0 - (-5.0)).abs() < 1e-6 && (a.velocity().1 - 1.5).abs() < 1e-6,
+            "撞者 A 应法向反弹 -5 + 切向×0.5=1.5，实际 {:?}",
+            a.velocity()
+        );
+        // 停点：斜线路径首触（与 B 圆心距离恰 r 和 1.0）+1cm 推进→距 B 圆心
+        // ≈0.995（1cm 推进语义）；停点逻辑与 D-018b 前逐位一致（D-010 不动位置）
+        let (sx, sy) = a.pos();
+        let dist_to_b = ((sx - 8.0).powi(2) + (sy - 5.0).powi(2)).sqrt();
+        assert!(
+            dist_to_b > 0.98 && dist_to_b < 1.01,
+            "A 应停在接触窗口（r 和 1.0 的 1cm 推进语义），实际距离 {dist_to_b} @ {:?}",
+            a.pos()
+        );
+        // B：同对已弹过（闸）→e 生效=0（摩擦照常）；A 停点与 B 起点距 0.995<1.0
+        // 起步即接触（t=0 截断）——n 为 A 停点/B 起点连线斜方向（反弹入射几何），
+        // B 初速 (-1,0) 的法向分量清零、切向分量 ×(1-0.5) 摩擦衰减
+        let b = world.entities.get(&bid).unwrap();
+        let (ax, ay) = a.pos();
+        let (bx, by) = (8.0, 5.0); // B 结算输入的起点（n 用 before 几何，非截断后停点）
+        let (dx, dy) = (ax - bx, ay - by);
+        let dl = (dx * dx + dy * dy).sqrt();
+        let bvn = b.velocity().0 * (dx / dl) + b.velocity().1 * (dy / dl);
+        assert!(
+            bvn.abs() < 1e-6,
+            "同对二次接触不二次反弹（每对每拍一弹闸）：B 法向分量应清零，实际 {bvn}"
+        );
+        let bspeed = (b.velocity().0 * b.velocity().0 + b.velocity().1 * b.velocity().1).sqrt();
+        assert!(
+            bspeed > 0.1 && bspeed < 0.6,
+            "B 切向应剩摩擦衰减分量（×0.5，模长 ≈0.343），实际 {bspeed}"
+        );
+    }
+
+    #[test]
+    fn low_speed_collision_treated_as_inelastic() {
+        // 低速闸（RESTITUTION_LOW_SPEED=1.0）：相对法向速度 0.9<1 时即使 e=0.9
+        // 也按非弹性处理（法向清零）——拍制世界防低速微弹逐拍抖动
+        let engine = bounce_engine();
+        let mut world = WorldState::new();
+        let mut a = make_shell(1, (5.0, 5.0), (0.8, 0.0), 0.5, 1.0);
+        a.set_restitution(0.9);
+        let mut b = make_shell(2, (5.6, 5.0), (-0.1, 0.0), 0.5, 1.0);
+        b.set_restitution(0.9);
+        let (aid, bid) = (a.id, b.id);
+        world.entities.insert(aid, a);
+        world.entities.insert(bid, b);
+        engine.step(&mut world, &HashSet::new(), &[]);
+        let a = world.entities.get(&aid).unwrap();
+        // 起步即接触（距 0.6<1.0）→t=0 截断；相对法向 0.9<1 → e 生效=0 → v_n'=0，
+        // 纯法向入射无切向 → 速度清零（e=0.9 的反弹被闸吞掉）
+        assert_eq!(
+            a.velocity(),
+            (0.0, 0.0),
+            "低速相对法向速度<1 应按非弹性（不反弹），实际 {:?}",
+            a.velocity()
+        );
+    }
+
+    #[test]
+    fn ground_bounce_uses_ground_constants() {
+        // 实体 e=0.6 落地（ground_e=0.0）：组合 max=0.6，垂直速度 -10 反弹 ×(-0.6)
+        // →+6（高速入射前提：|v_n|=10>1 过低速闸）——地面常数对与实体声明组合
+        //（Box2D"弹力球不需要弹力地板"的实体 vs 地面应用）
+        let engine = bounce_engine();
+        let mut world = WorldState::new();
+        let mut a = make_shell(1, (50.0, 5.0), (0.0, -10.0), 0.15, 1.0);
+        a.set_restitution(0.6);
+        let aid = a.id;
+        world.entities.insert(aid, a);
+        engine.step(&mut world, &HashSet::new(), &[]);
+        let a = world.entities.get(&aid).unwrap();
+        assert!(
+            (a.pos().1 - 0.15).abs() < 1e-9,
+            "应停在地面半径线 y=0.15，实际 {:?}",
+            a.pos()
+        );
+        assert!(
+            (a.velocity().0 - 0.0).abs() < 1e-6 && (a.velocity().1 - 6.0).abs() < 1e-6,
+            "垂直速度应反弹 ×(-0.6)=+6（ground_e=0 组合 max=0.6），实际 {:?}",
+            a.velocity()
+        );
+    }
+
+    #[test]
+    fn same_pair_bounces_once_per_tick_second_contact_inelastic() {
+        // 每对每拍一弹闸（D-010 细则⑤）：同拍内同一对实体（无序对键）只施加一次
+        // 弹性冲量——闸防的是将来的多次接触源；本拍 A 反弹入闸后 B 的二次接触
+        // 按非弹性处理（法向清零+切向×(1-f)）
+        let engine = bounce_engine();
+        let mut world = WorldState::new();
+        let mut a = make_shell(1, (5.0, 5.0), (10.0, 0.0), 0.5, 1.0);
+        a.set_restitution(0.8);
+        a.set_friction(0.5);
+        let mut b = make_shell(2, (8.0, 5.0), (-10.0, 0.0), 0.5, 1.0);
+        b.set_restitution(0.8);
+        b.set_friction(0.5);
+        let (aid, bid) = (a.id, b.id);
+        world.entities.insert(aid, a);
+        world.entities.insert(bid, b);
+        engine.step(&mut world, &HashSet::new(), &[]);
+        let a = world.entities.get(&aid).unwrap();
+        let b = world.entities.get(&bid).unwrap();
+        // A 先结算（id 升序）：反弹 -0.8×10=-8 入闸
+        assert!(
+            (a.velocity().0 - (-8.0)).abs() < 1e-6,
+            "A 应反弹 ×(-0.8)，实际 {:?}",
+            a.velocity()
+        );
+        // B 二次接触（同对已在闸）：非弹性——相对法向速度 20>1 但闸吞掉 e，
+        // 纯法向入射 → 速度清零（不许同拍二弹）
+        assert_eq!(
+            b.velocity(),
+            (0.0, 0.0),
+            "同对同拍二次接触应按非弹性（闸），实际 {:?}",
+            b.velocity()
+        );
+    }
+
+    #[test]
+    fn same_state_same_impulse_result() {
+        // #044 确定性锚（D-010 冲量路径形态，照 ballistic_step_same_state_same_result
+        // 先例）：碰撞反弹场景（撞体+触地双分支）深拷贝世界跑两遍物理步——末态
+        //（坐标/速度/存亡）逐位一致。反弹公式只读仿真状态（#044 子步宪法）。
+        let engine = bounce_engine();
+        let run_world = || -> WorldState {
+            let mut world = WorldState::new();
+            for (id, pos, vel, e, f) in [
+                (1u128, (5.0, 5.0), (10.0, 3.0), 0.5, 0.5),
+                (2u128, (8.0, 5.0), (-1.0, 0.0), 0.5, 0.5),
+                (3u128, (50.0, 5.0), (0.0, -10.0), 0.6, 0.6),
+            ] {
+                let mut s = make_shell(id, pos, vel, 0.5, 1.0);
+                s.set_restitution(e);
+                s.set_friction(f);
+                world.entities.insert(s.id, s);
+            }
+            // 一拍：弹1 撞体反弹；弹3 触地反弹（反弹位移下一拍兑现，两拍会飞离
+            // 停点——单拍锚定反弹瞬间的诚实形态）
+            engine.step(&mut world, &HashSet::new(), &[]);
+            world
+        };
+        let wa = run_world();
+        let wb = run_world();
+        let mut ids: Vec<EntityId> = wa.entities.keys().copied().collect();
+        ids.sort_by_key(|i| i.0);
+        for id in ids {
+            let (a, b) = (wa.entities.get(&id).unwrap(), wb.entities.get(&id).unwrap());
+            assert_eq!(a.is_alive(), b.is_alive(), "存亡必须一致");
+            assert_eq!(a.pos(), b.pos(), "坐标必须逐位一致（#044）");
+            assert_eq!(a.velocity(), b.velocity(), "速度必须逐位一致（#044）");
+        }
+        // 场景自检：撞体/触地反弹都真实发生（锚不空转）
+        let s1 = wa
+            .entities
+            .get(&EntityId(Uuid::from_u128(1)))
+            .unwrap();
+        assert!(
+            s1.velocity().0 < 0.0,
+            "弹1 应撞体反弹（vx 反向），实际 {:?}",
+            s1.velocity()
+        );
+        let s3 = wa
+            .entities
+            .get(&EntityId(Uuid::from_u128(3)))
+            .unwrap();
+        assert!(
+            s3.velocity().1 > 0.0 && (s3.pos().1 - 0.5).abs() < 1e-9,
+            "弹3 应触地反弹停在半径线（r=0.5），实际 {:?} @ {:?}",
+            s3.velocity(),
+            s3.pos()
+        );
     }
 }
