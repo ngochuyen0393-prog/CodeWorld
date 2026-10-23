@@ -93,10 +93,11 @@ struct EntitySandboxMap {
     /// 场有表达权世界有结算权）。run_player_code 阶段一写入、a1.4 collect_fields
     /// 消费清空——不跨拍残留（每拍询问每拍应答）
     field_delta_overrides: std::collections::HashMap<EntityId, f64>,
-    /// 本拍会话级离场登记（登出 take #025 + 残影到期消散 #013）：两类 kill 都在
-    /// d 步遗嘱窗口【之前】发生且都会清掉自己的目录记录（remove_online/ghosts.remove），
-    /// d 步 is_ghost 判不到"刚消散的残影"——故在 kill 处直接挂号，遗嘱窗口据此
-    /// 跳过 on_death（会话级离场非死亡谢幕）并消费清空
+    /// 本拍会话级离场登记（家族三成员：登出 take #025 + 残影到期消散 #013 +
+    /// 寿命到期消散 D-019）：三类 kill 都在 d 步遗嘱窗口【之前】发生且登出/残影
+    /// 都会清掉自己的目录记录（remove_online/ghosts.remove），d 步 is_ghost 判不
+    /// 到"刚消散的残影"——故在 kill 处直接挂号，遗嘱窗口据此跳过 on_death
+    /// （会话级离场非死亡谢幕）并消费清空
     session_takes: std::collections::HashSet<EntityId>,
     /// 点击走位停滞检测窗口（期四第七刀）：目标变更即重开窗，测"当前目标"的
     /// 走位进度；2 拍净位移 < 0.01 = 贴障蹭动/全挡，视为到达清目标
@@ -4862,7 +4863,7 @@ mod tests {
         let entity = make_entity(7, (3.0, 4.0));
         let id = entity.id;
         let mut pending: Vec<PendingChange> = vec![PendingChange::Spawn { entity }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert!(world.entities.contains_key(&id), "Spawn 后实体应在 world 中");
         assert_eq!(world.entities.get(&id).unwrap().pos(), (3.0, 4.0));
     }
@@ -4874,7 +4875,7 @@ mod tests {
         let id = EntityId(Uuid::from_u128(1));
         world.entities.insert(id, make_entity(1, (0.0, 0.0)));
         let mut pending: Vec<PendingChange> = vec![PendingChange::Destroy { entity: id }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert!(
             !world.entities.get(&id).unwrap().is_alive(),
             "Destroy 应标记死亡"
@@ -4891,7 +4892,7 @@ mod tests {
             entity: id,
             new_pos: (8.0, 9.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id).unwrap().pos(), (8.0, 9.0));
     }
 
@@ -4905,7 +4906,7 @@ mod tests {
             entity: id,
             new_velocity: (1.0, 2.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id).unwrap().velocity(), (1.0, 2.0));
     }
 
@@ -4922,7 +4923,7 @@ mod tests {
             },
             PendingChange::Destroy { entity: id },
         ];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert!(pending.is_empty(), "apply 后 pending 应清空");
     }
 
@@ -4943,7 +4944,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.5),
         }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.5), "目标位被占应留原位");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (6.0, 0.5), "占据者不受影响");
     }
@@ -4964,7 +4965,7 @@ mod tests {
             PendingChange::SetPos { entity: id2, new_pos: (6.0, 0.5) }, // 先入队
             PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.5) }, // 后入队
         ];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "id 小者先到先得");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (7.0, 0.5), "id 大者被挡留原位");
     }
@@ -4983,7 +4984,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.5),
         }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "死者不挡路，移动放行");
     }
 
@@ -5002,7 +5003,7 @@ mod tests {
             PendingChange::SetPos { entity: id1, new_pos: (6.0, 0.5) },
             PendingChange::SetPos { entity: id2, new_pos: (9.0, 0.5) },
         ];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (5.0, 0.5), "E1 裁决时目标位仍被 E2 占 → 被挡");
         assert_eq!(world.entities.get(&id2).unwrap().pos(), (9.0, 0.5), "E2 照常搬走");
     }
@@ -5020,7 +5021,7 @@ mod tests {
             entity: id,
             new_pos: (9.0, 9.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(
             world.entities.get(&id).unwrap().pos(),
             (2.0, 3.0),
@@ -5044,7 +5045,7 @@ mod tests {
             },
             PendingChange::Destroy { entity: unknown },
         ];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert!(pending.is_empty(), "即使目标不存在，变更也应被消费清空");
         assert!(world.entities.is_empty(), "不应插入任何实体");
     }
@@ -5864,7 +5865,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 5.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(
             world.entities.get(&id1).unwrap().pos(),
             (5.0, 5.0),
@@ -5885,7 +5886,7 @@ mod tests {
             entity: id1,
             new_pos: (5.2, 5.9),
         }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(
             world.entities.get(&id1).unwrap().pos(),
             (5.2, 5.0),
@@ -5906,7 +5907,7 @@ mod tests {
             entity: id1,
             new_pos: (5.9, 5.3),
         }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(
             world.entities.get(&id1).unwrap().pos(),
             (5.0, 5.3),
@@ -5925,7 +5926,7 @@ mod tests {
             entity: id1,
             new_pos: (6.0, 0.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (6.0, 0.5), "目标 (6,0) 钳到 (6,0.5)");
     }
 
@@ -5940,7 +5941,7 @@ mod tests {
             entity: id1,
             new_pos: (7.0, 5.0),
         }];
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert_eq!(world.entities.get(&id1).unwrap().pos(), (7.0, 5.0));
     }
 
@@ -12787,7 +12788,7 @@ mod tests {
             1,
             "产权匹配的销毁应排队 PendingChange::Destroy"
         );
-        apply_pending_changes(&mut world, &mut pending, None, &[]);
+        apply_pending_changes(&mut world, &mut pending, None);
         assert!(
             !world.entities.get(&creation).unwrap().is_alive(),
             "自家造物应被标记死亡"
