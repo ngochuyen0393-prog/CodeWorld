@@ -229,6 +229,24 @@
 - **编译失败**：造物 WAT 编不合法 → 该次作废 + 警告，世界不崩。
 - **出生点身体重叠**（decisions.md #030 半径物理，取代 #021 一格一物）：造物身体与任何存活实体身体（圆/方块）重叠 → 该次 spawn 失败，造物不诞生、不占世界名额，下一拍可重试。**身体判据按 motion 分流**：static=出生格对齐 1×1 AABB；dynamic=声明 `radius` 的圆。
 
+**拒绝原因码表**（D-020a）：import 层当场拒绝（返回 0，你自己就知道）与阶段二作废（见上，返回值已是 1，原因走**玩家事件流** `spawn_rejected` 事件的 `reason` 字段）共用一张码表：
+
+| 码 | 人话 |
+|---|---|
+| `RATE_LIMITED` | 本拍已经排过一次了（每实体每拍 1 次） |
+| `BAD_PARAMS` | 参数非法（代码长度/非 UTF-8/初速超极速等） |
+| `BAD_GLYPH` | 字形必须是恰好 1 个字符 |
+| `BAD_COLOR` | 颜色非空字符串才收 |
+| `BAD_BLOB` | 出生数据包超 64KB（不裁剪，整次拒绝） |
+| `BIRTHPLACE_OCCUPIED` | 出生点被占（事件带坐标与占用者，下拍可重试） |
+| `OUT_OF_RANGE` | 出生点超出你 ±10 格 |
+| `UNDERGROUND` | 出生点钻地（y < ground(x)） |
+| `NON_FINITE` | 坐标或初速是 NaN/无穷 |
+| `LIFESPAN_INVALID` | 寿命声明 <1（D-019 R1 强制声明，0/负=整次拒绝） |
+| `CREATOR_DEAD` | 创造者已死，请求作废 |
+| `WORLD_FULL` | 世界实体上限（默认 64）已满 |
+| `COMPILE_FAILED` | 造物 WAT 编不合法（事件带 ≤200 字符语法错摘要） |
+
 造物属性（框架定，改不了）：owner 继承你的 owner（**产权链**，见 `destroy`）；fuel 配额继承你；出生即存活。
 
 ```wat
@@ -617,6 +635,48 @@
 - **护栏**：PNG ≤2MB；边长 ≤1024px；解码失败/连通性校验失败（断件图、全空图）拒绝。HTTP 恒 200，成败看 body `{"ok":true,"asset_id":"av_..."}` / `{"ok":false,"reason":"oversize|oversize_dim|decode_failed|isolate_fail|bad_json"}`。
 - **产物**：`asset_id`（`av_`+16hex）进全局镜像仓；原图 `GET /assets/{asset_id}.png` 直取；128×128 布尔掩码随 WS 首帧 `avatar_assets` 消息下发。同图 sha256 去重（同图全局一份）。
 - **掩码=判定**（#041 三位一体）：>50% 不透明算实心；连通性校验防断件；渲染与物理同源。当前版本：上传的图经前端按实体 radius 贴图渲染（皮渲染）；"生图即角色"的出生装戴声明（spawn 参数化挂资产）是后续刀——现阶段收图/仓/配额/随行换血管线已就位。
+
+## 五点九、玩家事件流（D-020a）——控制台的数据源，你的内存里有什么你才看得到什么
+
+WS 快照顶层新增**增量事件通道** `player_events`（事件是新闻不是档案：只随当拍快照发一次，不跨拍滞留）+ `events_cursor`（世界单调递增事件号游标）。每条事件：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `seq` | u64 | 世界单调递增事件号（断线对账游标） |
+| `tick` | u64 | 事件发生拍 |
+| `entity_id` | string | 事件主体实体 UUID（与 entities.id 同格式；compile_failed 无主体=空串） |
+| `kind` | string | `spawn_rejected` / `compile_failed` / `runtime_error` / `born` / `died` / `player_log` |
+| payload | 按 kind | 结构化字段（见下表） |
+
+**六类事件**（全部是既有日志点的结构化投影，零新立法）：
+
+| kind | 触发 | payload |
+|---|---|---|
+| `spawn_rejected` | 阶段二作废（造物没诞出来，返回值已是 1 的那些——import 层当场拒绝玩家已自知，**不进事件流**） | `reason`（原因码，见 spawn 节码表）、`x`,`y`（出生点）、`code_hint`（仅 COMPILE_FAILED，WAT 语法错摘要 ≤200 字符） |
+| `compile_failed` | 玩家进场编译失败（整个玩家没进场） | `name`（玩家名）、`error`（≤200 字符） |
+| `runtime_error` | 造物/玩家代码运行错（on_tick 或 life 抛 Err） | `which`（"on_tick"/"life"）、`error`（≤200 字符）、`died`（life 失败=true，实体已标记死亡） |
+| `born` | 造物诞生 | `x`,`y`、`glyph`、`lifespan_ticks` |
+| `died` | 实体死亡（四种） | `cause`（"killed"被击杀/"life_false"代码自杀/"lifespan_expired"寿命到期/"runtime"运行错死）、`killer`（仅 killed，击杀者实体 UUID，其余 null） |
+| `player_log` | 你的造物调 `env.log(marker)` | `marker`（i64，同字幕 marker 源） |
+
+**可见性铁律（decisions #054 同族）——服务端过滤后再广播**：每条事件在服务器算"归属玩家"（事件主体是玩家本体→归属自己；造物→沿产权链归属其主人）；快照按**操控连接的玩家**过滤后广播——你的控制台只收到你的造物/你自己的事件，没接触过的敌人事件不可见。无操控连接（观战/无人）时只发无主的 `compile_failed`，其余不发——**宁缺勿泄：拿不准归属的一律不发**。
+
+**断线补拉口径（MVP 二选一选了 B）**：断线即丢，不回放。前端按 `events_cursor` 与本地已收 `seq` 的差估算丢失数，断线横幅提示"断线期间约 N 条事件未收到"（环形缓冲回放=A 档，将来带宽富余再议）。
+
+## 五点十、技能栏（D-020a）——驾驶舱快捷键，不是新原语
+
+浏览器操控层便利映射：数字键 `1-4` 或点面板技能格 = 替操控玩家 spawn 一个预置造物。**模板能力全部来自已开放的 spawn 参数（零新原语）**——玩家代码等价物=自己调 spawn；模板 WAT 全文可查可抄：`GET /skills/{thrower|sword|shield|scout}.wat`。
+
+| 槽位 | 名字 | 造物 | 要点 |
+|---|---|---|---|
+| 1 | 投掷器 | dynamic 弹（glyph `o`） | 出生初速向东，寿命 10 拍（打不中自己收场） |
+| 2 | 飞剑 | dynamic 弹（glyph `+`） | 出生初速斜射带击退，寿命 15 拍 |
+| 3 | 护盾场 | static 场塔（glyph `#`） | 力场半径 4 / 阻力改写 +5，寿命 10000 拍 |
+| 4 | 侦察弹 | dynamic 侦察（glyph `^`） | 慢速平飞 + 每拍 `log` 心跳（player_log 事件可见），寿命 30 拍 |
+
+- **出生点**=操控实体东侧身位偏移（半径+0.7 格，贴身可出）；**限流**：每实体每拍 1 发，同拍连按只发第一发，再按报 `RATE_LIMITED`。
+- **失败闭环**：技能 spawn 被拒（出生点被占/世界满等）走 `spawn_rejected` 事件回报面板黄字——按键有回音。
+- 上行消息：`{"type":"skill","slot":N}`（N=1..4；非法槽位服务器丢弃）。每个模板必须带合法 `lifespan_ticks` 声明（D-019 R1 强制）。
 
 ## 六、路线图（将开放的接口）
 

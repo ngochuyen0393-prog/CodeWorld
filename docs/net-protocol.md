@@ -25,7 +25,9 @@
   "viewport": {"x0": -50.0, "y0": -25.0, "w": 100.0, "h": 50.0},
   "entities": [ ... ],
   "attacks": [ {"attacker": "uuid", "target": "uuid", "x": 15.0, "y": 0.5} ],
-  "fields": [ {"x": 15.0, "y": 0.5, "radius": 3.0, "formed": true} ]
+  "fields": [ {"x": 15.0, "y": 0.5, "radius": 3.0, "formed": true} ],
+  "player_events": [ {"seq": 7, "tick": 42, "entity_id": "uuid", "kind": "born", "x": 40.0, "y": 0.0, "glyph": "塔", "lifespan_ticks": 10000} ],
+  "events_cursor": 7
 }
 ```
 
@@ -37,6 +39,8 @@
 | `entities` | array | 全部存活实体的快照（含残影），按 `id` 字典序**稳定排列** |
 | `attacks` | array | **本拍攻击命中事件**（v2.0，D-017）：结算成功的刀的三件套，空数组恒有 |
 | `fields` | array | **力场环投影**（v2.3，D-012 可视铁律）：每条=场源坐标+场域半径+成型态；空数组恒有。`formed=false`=成型中（前端画虚线环，给进攻方反应窗），`true`=已成型（实线环）。场源造物本体照常在 entities 里，fields 层只画"可见气流环"（半透明描边，温迪气流环范本） |
+| `player_events` | array | **本拍玩家事件**（v2.5，D-020a，见 §3.3）：增量事件流（新闻不是档案，只随当拍快照发一次），**已按操控玩家过滤**（可见性铁律：只发归属=操控玩家的事件 + 无主 compile_failed；空数组恒有） |
+| `events_cursor` | u64 | **事件游标**（v2.5，D-020a）：世界已发出的最大 `seq`。断线对账用：前端以 `events_cursor − 本地已收 seq` 估算断线期间丢失的事件数（MVP 断线即丢不回放，见 §3.3 补拉口径） |
 
 ## 3. 实体字段
 
@@ -54,6 +58,21 @@
 | `wait_left` | u64 | 仅 `disposition="dispose_wait"` | 处置等待剩余拍数（每拍 -1，到 0 即被服务器默认带走）——前端画"处置等待中 NN 拍"抢救倒计时 |
 | `owner` | string | 仅 creation/creation_dynamic | 创造者 PlayerId 的 UUID 字符串（产权链 #015） |
 | `asset_ids` | string[] | **恒有（v2.4 起，#051 皮入沙箱）** | 沙箱装戴清单指纹（asset_id 列表，`av_`+16hex）；空盒=空数组恒有（前端零可选分支，同 attacks/fields 先例）。**快照只带指纹不带货**——前端首见按 id 走 `GET /assets/avatars/{id}.png` 取图入缓存（已见 id 复用缓存，同图全局一份）；取图失败/未加载 → 回落默认身体圆+glyph 渲染（VRChat 替身兜底），前端零阻塞。见 §9.4 |
+| `born_tick` | u64 | **恒有（v2.5 起，D-020a）** | 出生拍（created_tick）——控制台造物列表算剩余寿命用 |
+| `lifespan_ticks` | u64 | **恒有（v2.5 起，D-020a）** | 声明寿命（spawn 第 23 参落库值；0=永生，仅存量快照实体）——剩余 = lifespan − (当前拍 − born)，剩 ≤10 拍前端黄色警示 |
+
+### 3.3 玩家事件字段（v2.5，D-020a）
+
+顶层 `player_events` 数组，每条 = 本拍发生的、**归属操控玩家**（或无主 compile_failed）的一条事件。事件是新闻不是档案：只随当拍快照发一次，不跨拍滞留、无观众丢弃。**服务端过滤后再广播**（decisions #054 可见性同族）：归属=事件主体沿产权链（本体 code_hash 即在线玩家名 / 造物沿 bound_to 找主人）解析到的玩家名；拿不准归属的一律不发（宁缺勿泄）。六类 kind 与 payload 见 api.md「五点九、玩家事件流」；公共字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `seq` | u64 | 世界单调递增事件号（EntitySandboxMap 计数器；断线对账游标） |
+| `tick` | u64 | 事件发生拍 |
+| `entity_id` | string | 事件主体实体 UUID（compile_failed 无主体=空串） |
+| `kind` | string | `spawn_rejected` / `compile_failed` / `runtime_error` / `born` / `died` / `player_log` |
+
+**断线补拉口径（MVP 选 B）**：断线即丢不回放；前端按 `events_cursor − 本地已收 seq` 估算丢失数，断线横幅提示"断线期间约 N 条事件未收到"。（A 档=服务端环形缓冲 256 条重连首帧回放，将来带宽富余再议——服务端不做每连接游标账本。）
 
 npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSON 干净）；v1.1 起 `name` 全实体恒有（第二刀悬浮提示需要 npc 的代码身份）。
 
@@ -120,9 +139,9 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 | WS 线程异常/端口占用 | warn 一次，终端世界照常运行（线程隔离） |
 | （预留，未实现）`{"type":"shutdown"}` | **v1.9 注记**：WS 关世界接口预留——世界关闭的正规路径 MVP 只做终端 Q 二段确认（#036）；若将来开放，仅本机 localhost 操控连接允许，服务器存档+退出全体。本版收到 `{"type":"shutdown"}` 按未知 type 丢弃 |
 
-## 6. 上行意图协议（v1.2 新增，#027；v1.7 增 logout，#025；v1.9 增 shoot，#036）
+## 6. 上行意图协议（v1.2 新增，#027；v1.7 增 logout，#025；v1.9 增 shoot，#036；v2.5 增 skill，D-020a）
 
-客户端 → 服务器 JSON 文本消息，五型。坐标一律**世界坐标**（快照 viewport 域内）。
+客户端 → 服务器 JSON 文本消息，六型。坐标一律**世界坐标**（快照 viewport 域内）。
 
 ### 6.1 消息格式
 
@@ -132,6 +151,7 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 {"type": "shoot", "x": 15.0, "y": 0.0}       // 点击远处敌人 → 操控射击（v1.9，#036；#045 起弹=定装 spawn 造物弹，见 6.2 与版本史退役口径）
 {"type": "stop"}                              // 清除走位目标，站住
 {"type": "logout", "disposition": "stay_auto"} // 登出处置三选一（v1.7，#025）
+{"type": "skill", "slot": 1}                  // 技能栏（v2.5，D-020a）：slot=1..4，替操控玩家 spawn 预置模板造物
 ```
 
 ### 6.2 语义（服务器裁决，薄客户端 #026）
@@ -143,6 +163,7 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 | `shoot` | **操控射击（v1.9，#036；#045 弹丸退役后世界侧换载具）**：操控目标向目标方向发射一发**定装造物弹**——世界不再配发弹丸身体（#045 修路不跑车），改为解算器 `solve_launch_vector` 解出初速后 **spawn 一个 dynamic 造物**（小圆点 0.15/同款质量/unbound），出生点沿发射方向外推出膛，命中归接触通道（on_contact 代码攻）。初速解算=速度梯搜索（基准 12 封顶 22）+真实物理步序逐拍模拟（重力→阻力→极速钳→中点位移），无解不发射（服务器侧不发射+INFO，前端同判据不发消息）。**自定义弹道**：env.shoot 已随 #045 退役——玩家代码用 spawn 第 11/12 参出生初速自己拼（教学模板 docs/newbie-first-thrower.md）。**每拍 1 发限流沿用**（同拍多次点击后到覆盖先到，恰 1 发）。**与 move 并存**（边走边射）：shoot 不清除走位目标，射击拍不移动、下拍恢复走位；悬空射击照常免重力（升力独立） |
 | `stop` | 清除走位目标站住（#025 操控独占的"我不动"）。**v1.4 起：stop 在空中 = 悬停不坠**（stop 语义是"停止移动"不是"坠落"；悬停锚点改写为脚下坐标，要落地玩家点地面）。前端由右键（contextmenu）或 S 键产生 |
 | `logout` | **主动登出三选一**（v1.7，#025 下线处置权；仅操控连接生效，观战连接照旧丢弃）：`disposition` 取 `take`（带走：角色立即移除，文件锚保留，重连认领=重新进场重生）/ `stay_auto`（停留+自主接管：on_tick 恢复，角色自己活，重连=接管者被顶掉）/ `stay_ai`（停留+AI 待接入：站桩等外部 AI，端点协议是 #014 未来端点本刀不实现）。服务器收即释放操控令牌、连接降级观战（快照照收）；**处置中的玩家不被 me 声明重认领**——抢回操控必须走重连认领（操控权=me 声明+连接在，#024 精神） |
+| `skill` | **技能栏**（v2.5，D-020a）：`slot`=1..4，替操控玩家排一个 spawn（世界侧预置模板：投掷器/飞剑/护盾场/侦察弹，模板能力全部来自已开放 spawn 参数零新原语，全文可抄 `GET /skills/*.wat`）。出生点=操控实体东侧身位偏移；**每实体每拍 1 发**（同拍连按只发第一发，再按报 RATE_LIMITED 事件）；失败走 spawn_rejected 事件回报面板（闭环）。非法槽位（0/5+/缺参）解析层拒绝丢弃。模板清单见 api.md「五点十、技能栏」 |
 
 ### 6.3 冲突与状态规则
 
@@ -325,6 +346,14 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
   服务端 INFO 日志"[lifespan] 寿命到期消散"）。**R1 勘误（2026-10-24）**：
   寿命改为强制声明，域 [1,+]——0（不声明）/负值=整次拒绝出生（spawn 返回 0），
   不声明不再默认永生
+- **玩家事件流+技能栏（v2.5，D-020a，2026-10-24；t_06b4efc6）**：快照顶层新增
+  `player_events`（增量事件，六类：spawn_rejected/compile_failed/runtime_error/
+  born/died/player_log——全部是既有日志点的结构化投影零新立法）与 `events_cursor`
+  （seq 游标）；entities 每实体加 `born_tick`/`lifespan_ticks`（恒有）；上行新增
+  `{"type":"skill","slot":1..4}`（技能栏 spawn 预置模板，每实体每拍 1 发）。事件
+  **服务端按操控玩家过滤后广播**（可见性铁律 decisions #054 同族：宁缺勿泄）；
+  断线补拉 MVP 选 B（断线即丢，前端按游标差估丢失数，无 missed_events 帧——A 档
+  环形缓冲回放留待带宽富余再议）
 - 预留演进（不在本版实现）：
   - delta 快照 / 二进制编码（实体数增长或拍频提高后再做）
   - 多操控连接 / 连接身份与 me 声明合并（认证化）

@@ -36,6 +36,10 @@ pub enum Intent {
     WsShoot { x: f64, y: f64 },
     /// 停止（#027 右键/浏览器 S 键：清除点击走位目标，站住不动）
     Stop,
+    /// 技能栏（D-020a，t_06b4efc6）：数字键 1-4/面板技能格——替操控玩家 spawn
+    /// 世界预置模板造物（UI 便利非新原语）。不走单行动槽（spawn 与走位/攻击并存），
+    /// tick 侧旁路收集；非法槽位解析层拒绝
+    Skill { slot: u8 },
     /// 登出处置（#025 期五第一刀：WS logout 上行经同一意图单入口入队，tick 侧
     /// 先分流给处置状态机，不进 route_intents；路由分支是漏分流的防御性兜底）
     Logout { choice: crate::dispose::LogoutChoice },
@@ -213,6 +217,11 @@ pub fn route_intents(
                 }
             }
             Intent::Quit => {}
+            Intent::Skill { .. } => {
+                // 防御性兜底：Skill 在 tick 侧已旁路收集（不走单行动槽——spawn 与
+                // 走位/攻击并存），不应到达路由
+                tracing::debug!("[input] Skill 意图漏分流到路由，忽略（技能 spawn 走 tick 旁路）");
+            }
             Intent::Logout { .. } => {
                 // 防御性兜底：Logout 在 tick 侧已分流给处置状态机，不应到达路由
                 tracing::debug!("[input] Logout 意图漏分流到路由，忽略（处置归 dispose 状态机）");

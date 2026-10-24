@@ -53,6 +53,9 @@ pub(crate) enum ClientMessage {
     /// 远程射击（#036 期五第五刀）：点击远处敌人——前端只发目标坐标，
     /// 弹道参数服务器侧定装（驾驶档）
     Shoot { x: f64, y: f64 },
+    /// 技能栏（v2.5，D-020a，t_06b4efc6）：slot=1..4，替操控玩家 spawn 预置
+    /// 模板造物（UI 便利非新原语）；非法槽位解析层拒绝
+    Skill { slot: u8 },
     Stop,
     /// 登出处置三选一（#025）：take/stay_auto/stay_ai；仅操控连接生效，
     /// 处置由 tick 侧状态机落地（本层只转发意图+释放令牌）
@@ -70,10 +73,16 @@ pub(crate) fn parse_client_message(text: &str) -> Result<ClientMessage, String> 
     let coords_ok = match &msg {
         ClientMessage::Move { x, y } | ClientMessage::Attack { x, y } => finite(*x) && finite(*y),
         ClientMessage::Shoot { x, y } => finite(*x) && finite(*y),
-        ClientMessage::Stop | ClientMessage::Logout { .. } => true,
+        ClientMessage::Stop | ClientMessage::Logout { .. } | ClientMessage::Skill { .. } => true,
     };
     if !coords_ok {
         return Err("坐标非有限值（NaN/无穷）".to_string());
+    }
+    // 技能槽位域校验（v2.5，D-020a）：1..=4 之外拒绝（0/5/99 等非法值丢弃）
+    if let ClientMessage::Skill { slot } = &msg {
+        if *slot < 1 || *slot > crate::skills::SKILL_SLOT_COUNT {
+            return Err(format!("技能槽位非法（{slot}，合法域 1..=4）"));
+        }
     }
     Ok(msg)
 }
@@ -105,6 +114,13 @@ pub(crate) struct WorldSnapshot {
     /// 空数组=无水世界，前端零可选分支）；颜色=密度映射是前端装饰非世界事实
     /// （玩家造 ρ=0.8 的"蓝油"世界不拦不判）
     pub liquids: Vec<LiquidSnapshot>,
+    /// 本拍玩家事件（v2.5，D-020a）：增量事件流（新闻不是档案，只随当拍快照发
+    /// 一次），已按操控玩家过滤（可见性铁律 decisions #054 同族：宁缺勿泄）；
+    /// 空数组恒有（前端零可选分支）
+    pub player_events: Vec<crate::events::PlayerEvent>,
+    /// 事件游标（v2.5，D-020a）：世界已发出的最大 seq。断线对账用：前端以
+    /// cursor − 本地已收 seq 估算断线期间丢失的事件数（MVP 断线即丢不回放）
+    pub events_cursor: u64,
 }
 
 /// 单个水域矩形投影（D-009：液体造物格对齐 AABB 转矩形 + 密度）
@@ -196,6 +212,10 @@ pub(crate) struct EntitySnapshot {
     /// 快照只带指纹不带货——前端首见按 id 走 /assets HTTP 取图（世界只搬运
     /// 不理解，修路不跑车）
     pub asset_ids: Vec<String>,
+    /// 出生拍（v2.5，D-020a）：控制台造物列表算剩余寿命用（剩余=lifespan−(tick−born)）
+    pub born_tick: u64,
+    /// 声明寿命（v2.5，D-020a）：spawn 第 23 参落库值；0=永生（仅存量快照实体）
+    pub lifespan_ticks: u64,
 }
 
 /// kind 判定（纯映射，任务书定案）：开局四生物=npc；creation=造物（static 钉死）；
@@ -224,6 +244,10 @@ fn entity_kind(code_hash: &str, entity_id: EntityId, players: &PlayerDirectory, 
 
 /// 组装世界快照（每拍一帧全量投影；实体按 id 字典序稳定排列，前端逐帧 diff 依赖帧序稳定）
 /// attack_events（v2.0，D-017）：本拍结算成功的攻击命中事件，随快照广播
+/// player_events/events_cursor（v2.5，D-020a）：本拍玩家事件（调用方已按操控玩家过滤）
+/// clippy too_many_arguments 豁免（9/7）：参数组与 push_snapshot 一一对应（8 参系
+/// 先例同款——结构体化反而多一层拆装）
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_snapshot(
     world: &WorldState,
     caption: &str,
@@ -232,6 +256,8 @@ pub(crate) fn build_snapshot(
     controlled: Option<EntityId>,
     attack_events: &[crate::AttackEventRecord],
     field_forming_ticks: u64,
+    player_events: Vec<crate::events::PlayerEvent>,
+    events_cursor: u64,
 ) -> WorldSnapshot {
     let (min_x, max_x) = viewport.world_x_range();
     let (min_y, max_y) = viewport.world_y_range();
@@ -260,6 +286,8 @@ pub(crate) fn build_snapshot(
                 disposition: disposed.map(|s| s.wire_name()),
                 wait_left: disposed.and_then(|s| s.wait_left(now)),
                 asset_ids: e.assets.clone(),
+                born_tick: e.created_tick,
+                lifespan_ticks: e.lifespan_ticks(),
             }
         })
         .collect();
@@ -346,6 +374,8 @@ pub(crate) fn build_snapshot(
         terrain,
         fields,
         liquids,
+        player_events,
+        events_cursor,
     }
 }
 
@@ -653,6 +683,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                         Ok(ClientMessage::Shoot { x, y }) => {
                             state.intents.send(crate::input::Intent::WsShoot { x, y });
                         }
+                        Ok(ClientMessage::Skill { slot }) => {
+                            // 技能栏（v2.5，D-020a）：槽位已在解析层校验（1..=4），
+                            // 这里只转发意图——spawn 语义在 tick 侧旁路落地
+                            state.intents.send(crate::input::Intent::Skill { slot });
+                        }
                         Ok(ClientMessage::Stop) => {
                             state.intents.send(crate::input::Intent::Stop);
                         }
@@ -693,8 +728,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
 
 /// tick 侧推送（std 主循环每拍调用）：无观众不组装（零客户端零开销），
 /// 序列化成功推广播通道；无接收者 send 报错属正常（忽略）。
-/// 8 参系快照契约全量投影（tick/caption/viewport/players/controlled/attacks/
-/// forming_ticks）——clippy too_many_arguments 豁免：参数组与 build_snapshot
+/// 9 参系快照契约全量投影（tick/caption/viewport/players/controlled/attacks/
+/// forming_ticks/events）——clippy too_many_arguments 豁免：参数组与 build_snapshot
 /// 一一对应，结构体化反而多一层拆装
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push_snapshot(
@@ -706,11 +741,26 @@ pub(crate) fn push_snapshot(
     controlled: Option<EntityId>,
     attack_events: &[crate::AttackEventRecord],
     field_forming_ticks: u64,
+    events: &mut crate::events::EventSink,
 ) {
     if tx.receiver_count() == 0 {
         return;
     }
-    let snapshot = build_snapshot(world, caption, viewport, players, controlled, attack_events, field_forming_ticks);
+    // D-020a：事件帧排干 + 可见性过滤（宁缺勿泄）——操控玩家名沿 controlled
+    // 实体 code_hash 解析；无操控/观战帧只发无主 compile_failed
+    let controller = crate::events::controller_name(world, players, controlled);
+    let (player_events, events_cursor) = events.take_frame(controller.as_deref());
+    let snapshot = build_snapshot(
+        world,
+        caption,
+        viewport,
+        players,
+        controlled,
+        attack_events,
+        field_forming_ticks,
+        player_events,
+        events_cursor,
+    );
     match serde_json::to_string(&snapshot) {
         Ok(json) => {
             if tx.send(json).is_err() {
@@ -764,7 +814,7 @@ mod tests {
         players: &PlayerDirectory,
         controlled: Option<EntityId>,
     ) -> serde_json::Value {
-        let snap = build_snapshot(world, "cap", &default_viewport(), players, controlled, &[], 3);
+        let snap = build_snapshot(world, "cap", &default_viewport(), players, controlled, &[], 3, Vec::new(), 0);
         serde_json::to_value(&snap).expect("快照应可序列化")
     }
 
@@ -784,7 +834,7 @@ mod tests {
             target: t,
             target_pos: (1.0, 2.0),
         }];
-        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &events, 3);
+        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &events, 3, Vec::new(), 0);
         let json = serde_json::to_value(&snap).expect("快照应可序列化");
         let atk = &json["attacks"];
         assert_eq!(atk.as_array().map(Vec::len), Some(1), "恰一条命中事件");
@@ -801,13 +851,70 @@ mod tests {
         let mut world = WorldState::new();
         put_entity(&mut world, "attacker", "A", "red", (0.0, 0.0));
         let dir = PlayerDirectory::disabled();
-        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &[], 3);
+        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &[], 3, Vec::new(), 0);
         let json = serde_json::to_value(&snap).expect("快照应可序列化");
         assert_eq!(
             json["attacks"].as_array().map(Vec::len),
             Some(0),
             "attacks 空数组恒有"
         );
+    }
+
+    // === v2.5 玩家事件流 + 技能栏（D-020a，t_06b4efc6）===
+
+    #[test]
+    fn t20_skill_message_parses_valid_slots_and_rejects_bad() {
+        // 上行解析锚：skill 消息 slot=1..4 合法；0/5/99/缺参拒绝（解析层丢弃，
+        // Err 带原因）。serde tag lowercase（wire 形如 {"type":"skill","slot":2}）
+        for slot in 1u8..=4 {
+            let msg = parse_client_message(&format!(r#"{{"type":"skill","slot":{slot}}}"#))
+                .unwrap_or_else(|e| panic!("slot {slot} 应合法：{e}"));
+            assert_eq!(msg, ClientMessage::Skill { slot }, "slot {slot} 解析保真");
+        }
+        for bad in [0u8, 5, 99] {
+            let err = parse_client_message(&format!(r#"{{"type":"skill","slot":{bad}}}"#))
+                .expect_err("非法槽位应拒绝");
+            assert!(err.contains("槽位非法"), "拒绝原因应明示槽位域：{err}");
+        }
+        assert!(
+            parse_client_message(r#"{"type":"skill"}"#).is_err(),
+            "缺 slot 字段应拒绝"
+        );
+    }
+
+    #[test]
+    fn t20_snapshot_carries_player_events_cursor_and_lifespan_fields() {
+        // 快照锚（v2.5）：player_events/events_cursor 顶层恒有；实体带
+        // born_tick/lifespan_ticks（控制台造物列表算剩余寿命用）；事件 JSON
+        // 形状 kind 标签在（前端按 kind 分色）
+        let mut world = WorldState::new();
+        let (eid, _) = put_entity(&mut world, "creation", "T", "cyan", (5.0, 0.0));
+        world
+            .entities
+            .get_mut(&eid)
+            .unwrap()
+            .set_lifespan_ticks(30);
+        let dir = PlayerDirectory::disabled();
+        let mut sink = crate::events::EventSink::new();
+        sink.emit_unowned(
+            world.tick(),
+            crate::events::EventBody::CompileFailed {
+                name: "badwat".into(),
+                error: "unexpected token".into(),
+            },
+        );
+        let (events, cursor) = sink.take_frame(None);
+        assert_eq!(cursor, 1, "一事件后游标=1");
+        let snap = build_snapshot(&world, "cap", &default_viewport(), &dir, None, &[], 3, events, cursor);
+        let json = serde_json::to_value(&snap).expect("快照应可序列化");
+        let ev = json["player_events"].as_array().expect("player_events 恒有");
+        assert_eq!(ev.len(), 1, "一帧一事件");
+        assert_eq!(ev[0]["kind"], "compile_failed", "kind 标签=协议字段");
+        assert_eq!(ev[0]["name"], "badwat");
+        assert_eq!(json["events_cursor"], 1, "游标随帧走");
+        let ent = &json["entities"][0];
+        assert_eq!(ent["born_tick"], 0, "born_tick 恒有（new 世界出生拍 0）");
+        assert_eq!(ent["lifespan_ticks"], 30, "lifespan_ticks 恒有（声明落库值）");
     }
 
     // === v2.4 资产指纹（#051 皮入沙箱：快照只带 asset_id 不带货）===
@@ -1003,10 +1110,11 @@ mod tests {
         let mut world = WorldState::new();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
+        let mut sink = crate::events::EventSink::new();
         world.advance_tick();
-        push_snapshot(&tx, &world, "c1", &vp, &dir, None, &[], 3);
+        push_snapshot(&tx, &world, "c1", &vp, &dir, None, &[], 3, &mut sink);
         world.advance_tick();
-        push_snapshot(&tx, &world, "c2", &vp, &dir, None, &[], 3);
+        push_snapshot(&tx, &world, "c2", &vp, &dir, None, &[], 3, &mut sink);
         let f1: serde_json::Value =
             serde_json::from_str(&tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("第一帧应在 2s 内到达").unwrap()).unwrap();
         let f2: serde_json::Value =
@@ -1024,7 +1132,8 @@ mod tests {
         let world = WorldState::new();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        push_snapshot(&tx, &world, "c", &vp, &dir, None, &[], 3);
+        let mut sink = crate::events::EventSink::new();
+        push_snapshot(&tx, &world, "c", &vp, &dir, None, &[], 3, &mut sink);
         assert_eq!(tx.receiver_count(), 0, "无观众场景保持零接收者");
     }
 
@@ -1338,7 +1447,8 @@ mod tests {
         world.advance_tick();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        push_snapshot(&tx, &world, "after-assets", &vp, &dir, None, &[], 3);
+        let mut sink = crate::events::EventSink::new();
+        push_snapshot(&tx, &world, "after-assets", &vp, &dir, None, &[], 3, &mut sink);
         let snap: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         assert_eq!(snap["caption"], "after-assets", "资产消息先于快照帧");
         shutdown_tx.send(()).ok();
@@ -1607,10 +1717,11 @@ mod tests {
         let mut world = WorldState::new();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
+        let mut sink = crate::events::EventSink::new();
         world.advance_tick();
-        push_snapshot(&tx, &world, "f1", &vp, &dir, None, &[], 3);
+        push_snapshot(&tx, &world, "f1", &vp, &dir, None, &[], 3, &mut sink);
         world.advance_tick();
-        push_snapshot(&tx, &world, "f2", &vp, &dir, None, &[], 3);
+        push_snapshot(&tx, &world, "f2", &vp, &dir, None, &[], 3, &mut sink);
 
         let frame1: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         let frame2: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
@@ -1630,7 +1741,8 @@ mod tests {
         let mut client2 = connect_client(addr).await;
         consume_avatar_assets(&mut client2).await;
         world.advance_tick();
-        push_snapshot(&tx, &world, "f3", &vp, &dir, None, &[], 3);
+        let mut sink = crate::events::EventSink::new();
+        push_snapshot(&tx, &world, "f3", &vp, &dir, None, &[], 3, &mut sink);
         let frame3: serde_json::Value = serde_json::from_str(&next_text(&mut client2).await).unwrap();
         assert_eq!(frame3["tick"], 3, "断开后新客户端照常收帧");
 
@@ -1690,7 +1802,8 @@ mod tests {
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
         world.advance_tick();
-        push_snapshot(&tx, &world, "shared", &vp, &dir, None, &[], 3);
+        let mut sink = crate::events::EventSink::new();
+        push_snapshot(&tx, &world, "shared", &vp, &dir, None, &[], 3, &mut sink);
 
         let f1: serde_json::Value = serde_json::from_str(&next_text(&mut c1).await).unwrap();
         let f2: serde_json::Value = serde_json::from_str(&next_text(&mut c2).await).unwrap();
@@ -2032,7 +2145,8 @@ mod tests {
         world.advance_tick();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        push_snapshot(&tx, &world, "after-logout", &vp, &dir, None, &[], 3);
+        let mut sink = crate::events::EventSink::new();
+        push_snapshot(&tx, &world, "after-logout", &vp, &dir, None, &[], 3, &mut sink);
         let frame: serde_json::Value = serde_json::from_str(&next_text(&mut c1).await).unwrap();
         assert_eq!(frame["caption"], "after-logout", "登出连接下行快照照收（观战）");
 

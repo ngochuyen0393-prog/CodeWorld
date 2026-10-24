@@ -219,6 +219,55 @@
   }
   #threeCanvas.interactive { pointer-events: auto; cursor: grab; }
   #threeCanvas.interactive:active { cursor: grabbing; }
+
+  /* ===== D-020a 指挥中心·信息面板（照 D020控制台原型观感：dark/#30363d/四色消息） ===== */
+  #console {
+    position: fixed; top: 0; right: 0; bottom: 0; width: 400px; z-index: 40;
+    background: #0d1117; border-left: 1px solid #30363d;
+    display: flex; flex-direction: column; font-family: "Segoe UI","Microsoft YaHei",sans-serif;
+    transition: width .15s ease;
+  }
+  #console.collapsed { width: 28px; cursor: pointer; }
+  #console.collapsed .chead, #console.collapsed .cfilters,
+  #console.collapsed .cunits, #console.collapsed .cstream,
+  #console.collapsed .cskills { display: none; }
+  #consoleTab { position: absolute; top: 8px; left: 6px; color: #58a6ff; font-size: 14px; cursor: pointer; user-select: none; z-index: 2; }
+  .chead { padding: 10px 12px 10px 26px; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .chead .dot { width: 10px; height: 10px; border-radius: 50%; background: #3fb950; }
+  .chead .dot.bad { background: #f85149; } .chead .dot.wait { background: #d29922; }
+  .chead b { font-size: 14px; color: #e6edf3; }
+  .chead .tick { margin-left: auto; color: #8b949e; font-size: 12px; font-family: Consolas,monospace; }
+  .cfilters { display: flex; gap: 6px; padding: 8px 12px; border-bottom: 1px solid #21262d; font-size: 12px; flex-shrink: 0; }
+  .f { padding: 3px 10px; border-radius: 10px; cursor: pointer; user-select: none; color: #484f58; text-decoration: line-through; }
+  .f.on { text-decoration: none; background: #21262d; color: #e6edf3; }
+  .f.error.on { color: #f85149; } .f.warn.on { color: #e3b341; } .f.info.on { color: #8b949e; } .f.log.on { color: #e6edf3; }
+  .callbtn { margin-left: auto; color: #58a6ff; cursor: pointer; user-select: none; }
+  .cunits { border-bottom: 1px solid #21262d; max-height: 150px; overflow: auto; flex-shrink: 0; }
+  .unit { display: flex; align-items: center; gap: 8px; padding: 6px 12px; font-size: 13px; cursor: pointer; border-left: 2px solid transparent; color: #e6edf3; }
+  .unit:hover { background: #161b22; }
+  .unit.sel { background: #161b22; border-left-color: #58a6ff; }
+  .unit .glyph { width: 22px; height: 22px; border-radius: 5px; background: #21262d; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 13px; flex-shrink: 0; }
+  .unit .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .unit .badge { background: #f85149; color: #fff; border-radius: 8px; padding: 0 6px; font-size: 11px; }
+  .unit .life { color: #8b949e; font-size: 11px; font-family: Consolas,monospace; }
+  .unit .life.low { color: #e3b341; }
+  .cstream { flex: 1; overflow: auto; padding: 8px 0; font-family: Consolas,"Courier New",monospace; font-size: 12px; }
+  .row { display: flex; gap: 8px; padding: 3px 12px; line-height: 1.5; cursor: pointer; }
+  .row:hover { background: #161b22; }
+  .row .tk { color: #484f58; flex-shrink: 0; }
+  .row .src { color: #79c0ff; flex-shrink: 0; max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row.err .msg { color: #f85149; } .row.warn .msg { color: #e3b341; }
+  .row.info .msg { color: #8b949e; } .row.log .msg { color: #e6edf3; }
+  .fold { padding: 3px 12px; color: #8b949e; font-size: 11px; cursor: pointer; }
+  .fold:hover { color: #e6edf3; }
+  .cempty { color: #484f58; padding: 10px 12px; font-size: 12px; }
+  .cskills { border-top: 1px solid #30363d; padding: 8px 12px; display: flex; gap: 8px; flex-shrink: 0; }
+  .skill { flex: 1; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3;
+           padding: 6px 4px; text-align: center; cursor: pointer; user-select: none; font-size: 12px; }
+  .skill:hover { border-color: #58a6ff; }
+  .skill.cool { opacity: 0.4; pointer-events: none; }
+  .skill .sg { font-size: 16px; font-weight: bold; color: #58a6ff; }
+  .skill .sk { color: #484f58; font-size: 10px; }
 </style>
 </head>
 <body>
@@ -271,6 +320,21 @@
   <button id="matBtn" type="button" hidden>材质</button>
   <button id="logoutBtn" type="button">登出</button>
   <span id="mouse">x=- , y=-</span>
+</div>
+<!-- D-020a 指挥中心·信息面板：四色消息 + 造物分组 + 技能栏（Tab 收起） -->
+<div id="console" class="collapsed">
+  <span id="consoleTab" title="Tab 展开/收起">⌘</span>
+  <div class="chead">
+    <span class="dot wait" id="cDot"></span><b>我的控制台</b>
+    <span class="tick" id="cHead">tick - · 连接中</span>
+  </div>
+  <div class="cfilters">
+    <span class="f error on" data-f="error">✕ 错误</span><span class="f warn on" data-f="warn">⚠ 被拒/警告</span><span class="f info on" data-f="info">◦ 生命周期</span><span class="f log on" data-f="log">› 我的输出</span>
+    <span class="callbtn" id="cAll">只看全部</span>
+  </div>
+  <div class="cunits" id="cUnits"></div>
+  <div class="cstream" id="cStream"><div class="cempty">等待事件……（spawn 被拒/诞生/运行错都在这里）</div></div>
+  <div class="cskills" id="cSkills"></div>
 </div>
 <script>
 (function () {
@@ -435,6 +499,8 @@
     tickEl.textContent = String(snap.tick);
     cntEl.textContent = String(snap.entities.length);
     itvEl.textContent = avgInterval === null ? '-' : String(Math.round(avgInterval));
+    // D-020a 指挥中心：玩家事件流 + 造物列表 + 技能栏头（字段缺席=旧协议，容忍）
+    consoleOnSnapshot(snap, ents);
   }
 
   // ---- D-017 资产调试面板：avatar_assets 消息 -> 离屏掩码图 + 状态行 + URL 日志 ----
@@ -1879,6 +1945,254 @@
 
   connect();
   requestAnimationFrame(loop);
+
+  // ===== D-020a 指挥中心·信息面板（t_06b4efc6）：四色消息 + 造物分组 + 技能栏 =====
+  // 数据源：快照 player_events（增量，服务端已按操控玩家过滤）+ entities 派生
+  // 造物列表；断线对账按 events_cursor − 本地已收 seq 估丢失数（协议 v2.5 B 档）。
+  // 面板是纯消费者：未知字段容忍、事件缺失静默（旧协议前端不炸）
+  var consoleEl = document.getElementById('console');
+  var consoleTabEl = document.getElementById('consoleTab');
+  var cDotEl = document.getElementById('cDot');
+  var cHeadEl = document.getElementById('cHead');
+  var cUnitsEl = document.getElementById('cUnits');
+  var cStreamEl = document.getElementById('cStream');
+  var cSkillsEl = document.getElementById('cSkills');
+  var cAllEl = document.getElementById('cAll');
+  // 原因码 -> 人话（与 api.md 码表同源；服务端 reason 字段 SCREAMING_SNAKE）
+  var REASON_TEXT = {
+    RATE_LIMITED: '本拍已经排过一次了',
+    BAD_PARAMS: '参数非法',
+    BAD_GLYPH: '字形必须是恰好 1 个字符',
+    BAD_COLOR: '颜色为空',
+    BAD_BLOB: '出生数据包超 64KB',
+    BIRTHPLACE_OCCUPIED: '出生点被占',
+    OUT_OF_RANGE: '出生点超出 ±10 格',
+    UNDERGROUND: '出生点钻地',
+    NON_FINITE: '坐标或初速是 NaN/无穷',
+    LIFESPAN_INVALID: '寿命声明非法（<1）',
+    CREATOR_DEAD: '创造者已死，请求作废',
+    WORLD_FULL: '世界实体上限已满',
+    COMPILE_FAILED: '造物 WAT 编不合法'
+  };
+  var SKILL_LABELS = [
+    { slot: 1, glyph: 'o', name: '投掷器' },
+    { slot: 2, glyph: '+', name: '飞剑' },
+    { slot: 3, glyph: '#', name: '护盾场' },
+    { slot: 4, glyph: '^', name: '侦察弹' }
+  ];
+  var cFilters = { error: true, warn: true, info: true, log: true };
+  var cRows = [];            // 消息行 [{cls,tk,src,msg,fold}]（fold=重复折叠锚）
+  var cRowsMax = 300;        // 流上限（防长跑刷 DOM；旧的从头部剔）
+  var cSelected = null;      // 只看该造物（entity id）；null=全部
+  var cLastSeq = null;       // 本地已收最大 seq（断线对账游标）
+  var cLostShown = false;    // 断线丢失横幅只报一次（重连后归零重计）
+  var cSkillCool = {};       // 技能格按下冷却 {slot: untilTs}（本拍 1 发的客户端观感）
+  var cUnitErr = {};         // 造物未读错误角标 {entityId: count}
+
+  function consoleToggle() {
+    consoleEl.classList.toggle('collapsed');
+  }
+  consoleTabEl.addEventListener('click', consoleToggle);
+  consoleEl.addEventListener('click', function (ev) {
+    // 收起态整条都是开关（窄条点哪都展开）
+    if (consoleEl.classList.contains('collapsed') && ev.target !== consoleTabEl) consoleToggle();
+  });
+  window.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Tab') {
+      ev.preventDefault();
+      consoleToggle();
+      return;
+    }
+    // 技能快捷键：数字键 1-4（操控输入不经过这里——世界侧按键语义不变）
+    if (ev.key >= '1' && ev.key <= '4') {
+      consoleSendSkill(Number(ev.key));
+    }
+  });
+
+  function consoleSendSkill(slot) {
+    var now = performance.now();
+    if ((cSkillCool[slot] || 0) > now) return; // 冷却格：本拍一发的客户端观感
+    cSkillCool[slot] = now + 1000;
+    sendMsg({ type: 'skill', slot: slot });
+    consoleRenderSkills();
+  }
+
+  function consoleRenderSkills() {
+    var now = performance.now();
+    var html = '';
+    for (var i = 0; i < SKILL_LABELS.length; i++) {
+      var s = SKILL_LABELS[i];
+      var cool = (cSkillCool[s.slot] || 0) > now ? ' cool' : '';
+      html += '<div class="skill' + cool + '" data-slot="' + s.slot + '" title="数字键 ' + s.slot + '">' +
+        '<div class="sg">' + s.glyph + '</div><div>' + s.name + '</div><div class="sk">键 ' + s.slot + '</div></div>';
+    }
+    cSkillsEl.innerHTML = html;
+    Array.prototype.forEach.call(cSkillsEl.querySelectorAll('.skill'), function (el) {
+      el.addEventListener('click', function () {
+        consoleSendSkill(Number(el.getAttribute('data-slot')));
+      });
+    });
+  }
+  consoleRenderSkills();
+  setInterval(consoleRenderSkills, 500); // 冷却解除重绘（0.5s 粒度足够观感）
+
+  // 事件 -> 行分类（四色：err/warn/info/log）
+  function consoleClassify(ev) {
+    var b = ev || {};
+    switch (b.kind) {
+      case 'spawn_rejected':
+        if (b.reason === 'COMPILE_FAILED') {
+          return { cls: 'err', msg: 'spawn 被拒：' + (REASON_TEXT[b.reason] || b.reason) + (b.code_hint ? '——' + b.code_hint : '') };
+        }
+        return { cls: 'warn', msg: 'spawn 被拒：' + (REASON_TEXT[b.reason] || b.reason) +
+          (b.x !== undefined ? ' (' + b.x + ',' + b.y + ')' : '') + '（' + (b.reason || '?') + '）' };
+      case 'compile_failed':
+        return { cls: 'err', msg: '玩家 ' + (b.name || '?') + ' 进场编译失败：' + (b.error || '') };
+      case 'runtime_error':
+        return { cls: 'err', msg: '运行时错误（' + (b.which || '?') + (b.died ? '，已标记死亡' : '，继续跑') + '）：' + (b.error || '') };
+      case 'born':
+        return { cls: 'info', msg: '诞生 (' + b.x + ',' + b.y + ') · 声明寿命 ' + b.lifespan_ticks + ' 拍' };
+      case 'died':
+        return { cls: 'info', msg: b.cause === 'killed' ? '被击杀（凶手 ' + (b.killer || '?') + '）'
+          : b.cause === 'life_false' ? '代码自杀（life=false）'
+          : b.cause === 'lifespan_expired' ? '寿命到期消散（非击杀无掠夺）'
+          : '运行错死亡' };
+      case 'player_log':
+        return { cls: 'log', msg: 'log: marker ' + b.marker };
+      default:
+        return null; // 未知 kind 容忍跳过（协议前向兼容）
+    }
+  }
+
+  // 每帧事件入口（onMessage 调）：入行 + 折叠 + 断线对账 + 头部状态
+  function consoleOnSnapshot(snap, ents) {
+    // 头部：tick + 连接状态（复用 connState）
+    cHeadEl.textContent = 'tick ' + snap.tick + ' · ' +
+      (connState === 'ok' ? '已连接' : connState === 'bad' ? '已断线' : '连接中');
+    cDotEl.className = 'dot ' + (connState === 'ok' ? '' : connState);
+    // 断线对账（B 档）：cursor 与本地已收 seq 的差=丢失估算
+    var cursor = snap.events_cursor;
+    if (typeof cursor === 'number') {
+      var evs = Array.isArray(snap.player_events) ? snap.player_events : [];
+      if (cLastSeq !== null) {
+        var gap = cursor - cLastSeq - evs.length;
+        if (gap > 0 && !cLostShown) {
+          cLostShown = true;
+          dcBannerTextEl.textContent = '断线期间约 ' + gap + ' 条事件未收到（对账游标 ' + cLastSeq + '→' + cursor + '）';
+          dcBannerEl.hidden = false;
+          setTimeout(function () { dcBannerEl.hidden = true; cLostShown = false; }, 6000);
+        }
+      }
+      for (var i = 0; i < evs.length; i++) {
+        if (typeof evs[i].seq === 'number') cLastSeq = Math.max(cLastSeq || 0, evs[i].seq);
+      }
+      if (evs.length === 0) cLastSeq = Math.max(cLastSeq || 0, cursor);
+    }
+    // 事件入流（折叠：同 src+kind+reason 连续报聚一条 fold 行）
+    var evs2 = Array.isArray(snap.player_events) ? snap.player_events : [];
+    for (var j = 0; j < evs2.length; j++) {
+      var ev = evs2[j];
+      var c = consoleClassify(ev);
+      if (!c) continue;
+      var srcName = consoleNameOf(ents, ev.entity_id) || (ev.entity_id ? ev.entity_id.slice(0, 8) : '世界');
+      var last = cRows.length ? cRows[cRows.length - 1] : null;
+      if (last && last.foldKey && last.foldKey === ev.entity_id + '|' + ev.kind + '|' + (ev.reason || '')) {
+        last.foldCount++;
+        last.foldTo = ev.tick;
+      } else {
+        cRows.push({ cls: c.cls, tk: ev.tick, src: srcName, msg: c.msg,
+          foldKey: ev.entity_id + '|' + ev.kind + '|' + (ev.reason || ''), foldCount: 0, foldFrom: ev.tick, foldTo: ev.tick,
+          entityId: ev.entity_id });
+      }
+      if ((c.cls === 'err' || c.cls === 'warn') && ev.entity_id) {
+        cUnitErr[ev.entity_id] = (cUnitErr[ev.entity_id] || 0) + 1;
+      }
+    }
+    while (cRows.length > cRowsMax) cRows.shift();
+    consoleRenderStream();
+    consoleRenderUnits(ents, snap.tick);
+  }
+
+  // 实体名解析（造物名=glyph+序号在渲染时补；玩家/已知实体=name）
+  function consoleNameOf(ents, id) {
+    if (!id) return null;
+    var e = ents.get(id);
+    if (!e) return null;
+    if (e.kind === 'creation' || e.kind === 'creation_dynamic') return null; // 造物名在 units 里编号，流里用 glyph
+    return e.name || id.slice(0, 8);
+  }
+
+  function consoleRenderStream() {
+    var html = '';
+    var shown = 0;
+    for (var i = 0; i < cRows.length; i++) {
+      var r = cRows[i];
+      if (cSelected && r.entityId !== cSelected) continue;
+      if (!cFilters[r.cls]) continue;
+      shown++;
+      html += '<div class="row ' + r.cls + '" data-i="' + i + '"><span class="tk">t' + r.tk + '</span>' +
+        '<span class="src">[' + r.src + ']</span><span class="msg">' + escapeHtml(r.msg) + '</span></div>';
+      if (r.foldCount > 0) {
+        html += '<div class="fold" data-fold="' + i + '">▸ 又 ' + r.foldCount + ' 次（t' + r.foldFrom + '–t' + r.foldTo + '）——点击展开</div>';
+      }
+    }
+    if (!shown) {
+      html = '<div class="cempty">' + (cSelected ? '该造物暂无消息' : '等待事件……（spawn 被拒/诞生/运行错都在这里）') + '</div>';
+    }
+    cStreamEl.innerHTML = html;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // 造物分组列表（从 entities 派生：我的=owner 指向操控实体）
+  function consoleRenderUnits(ents, tick) {
+    var me = findControlled(ents);
+    var myId = me ? me.id : null;
+    var mine = [];
+    ents.forEach(function (e) {
+      if ((e.kind === 'creation' || e.kind === 'creation_dynamic') && myId && e.owner === myId) {
+        mine.push(e);
+      }
+    });
+    mine.sort(function (a, b) { return a.id < b.id ? -1 : 1; });
+    // 同 glyph 计数命名（哨塔-01 风格）
+    var counters = {};
+    var html = '<div class="unit' + (cSelected === null ? ' sel' : '') + '" data-id=""><span class="glyph" style="color:#58a6ff">全</span><span class="nm">全部</span></div>';
+    for (var i = 0; i < mine.length; i++) {
+      var e = mine[i];
+      counters[e.glyph] = (counters[e.glyph] || 0) + 1;
+      var nm = '造物-' + e.glyph + '-' + String(counters[e.glyph]).padStart(2, '0');
+      var life;
+      var lifeSpan = e.lifespan_ticks;
+      if (!lifeSpan) {
+        life = '寿命 —';
+      } else {
+        var remain = lifeSpan - (tick - (e.born_tick || 0));
+        life = '剩 ' + Math.max(0, remain) + ' 拍';
+      }
+      var low = lifeSpan && (lifeSpan - (tick - (e.born_tick || 0))) <= 10 ? ' low' : '';
+      var badge = cUnitErr[e.id] ? '<span class="badge">' + cUnitErr[e.id] + '</span>' : '';
+      html += '<div class="unit' + (cSelected === e.id ? ' sel' : '') + '" data-id="' + e.id + '">' +
+        '<span class="glyph" style="color:' + (e.color || '#8b949e') + '">' + e.glyph + '</span>' +
+        '<span class="nm">' + nm + '</span>' + badge +
+        '<span class="life' + low + '">' + life + '</span></div>';
+    }
+    if (!mine.length) {
+      html += '<div class="unit"><span class="glyph">-</span><span class="nm" style="color:#484f58">尚无我的造物（按 1-4 试试技能栏）</span></div>';
+    }
+    cUnitsEl.innerHTML = html;
+    Array.prototype.forEach.call(cUnitsEl.querySelectorAll('.unit'), function (el) {
+      el.addEventListener('click', function () {
+        var id = el.getAttribute('data-id');
+        cSelected = id || null;
+        if (cSelected === null) cUnitErr = {}; // 回"全部"清角标
+        consoleRenderUnits(ents, tick);
+        consoleRenderStream();
+      });
+    });
+  }
 })();
 </script>
 <!-- D-004b Three.js 3D 层：module 脚本（defer 语义，DOM 就绪后执行；与上方经典
