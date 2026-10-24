@@ -728,9 +728,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
 
 /// tick 侧推送（std 主循环每拍调用）：无观众不组装（零客户端零开销），
 /// 序列化成功推广播通道；无接收者 send 报错属正常（忽略）。
-/// 9 参系快照契约全量投影（tick/caption/viewport/players/controlled/attacks/
-/// forming_ticks/events）——clippy too_many_arguments 豁免：参数组与 build_snapshot
-/// 一一对应，结构体化反而多一层拆装
+/// player_events/events_cursor（v2.5，D-020a）由调用点先排干传入（与
+/// attack_events 同款"不管有没有观众都取走"——事件不跨拍滞留防无头世界
+/// 缓冲无界增长；无观众=取走即丢，事件是新闻不是档案）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push_snapshot(
     tx: &broadcast::Sender<String>,
@@ -741,15 +741,12 @@ pub(crate) fn push_snapshot(
     controlled: Option<EntityId>,
     attack_events: &[crate::AttackEventRecord],
     field_forming_ticks: u64,
-    events: &mut crate::events::EventSink,
+    player_events: Vec<crate::events::PlayerEvent>,
+    events_cursor: u64,
 ) {
     if tx.receiver_count() == 0 {
         return;
     }
-    // D-020a：事件帧排干 + 可见性过滤（宁缺勿泄）——操控玩家名沿 controlled
-    // 实体 code_hash 解析；无操控/观战帧只发无主 compile_failed
-    let controller = crate::events::controller_name(world, players, controlled);
-    let (player_events, events_cursor) = events.take_frame(controller.as_deref());
     let snapshot = build_snapshot(
         world,
         caption,
@@ -1110,11 +1107,10 @@ mod tests {
         let mut world = WorldState::new();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        let mut sink = crate::events::EventSink::new();
         world.advance_tick();
-        push_snapshot(&tx, &world, "c1", &vp, &dir, None, &[], 3, &mut sink);
+        push_snapshot(&tx, &world, "c1", &vp, &dir, None, &[], 3, Vec::new(), 0);
         world.advance_tick();
-        push_snapshot(&tx, &world, "c2", &vp, &dir, None, &[], 3, &mut sink);
+        push_snapshot(&tx, &world, "c2", &vp, &dir, None, &[], 3, Vec::new(), 0);
         let f1: serde_json::Value =
             serde_json::from_str(&tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.expect("第一帧应在 2s 内到达").unwrap()).unwrap();
         let f2: serde_json::Value =
@@ -1132,8 +1128,7 @@ mod tests {
         let world = WorldState::new();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        let mut sink = crate::events::EventSink::new();
-        push_snapshot(&tx, &world, "c", &vp, &dir, None, &[], 3, &mut sink);
+        push_snapshot(&tx, &world, "c", &vp, &dir, None, &[], 3, Vec::new(), 0);
         assert_eq!(tx.receiver_count(), 0, "无观众场景保持零接收者");
     }
 
@@ -1447,8 +1442,7 @@ mod tests {
         world.advance_tick();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        let mut sink = crate::events::EventSink::new();
-        push_snapshot(&tx, &world, "after-assets", &vp, &dir, None, &[], 3, &mut sink);
+        push_snapshot(&tx, &world, "after-assets", &vp, &dir, None, &[], 3, Vec::new(), 0);
         let snap: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         assert_eq!(snap["caption"], "after-assets", "资产消息先于快照帧");
         shutdown_tx.send(()).ok();
@@ -1717,11 +1711,10 @@ mod tests {
         let mut world = WorldState::new();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        let mut sink = crate::events::EventSink::new();
         world.advance_tick();
-        push_snapshot(&tx, &world, "f1", &vp, &dir, None, &[], 3, &mut sink);
+        push_snapshot(&tx, &world, "f1", &vp, &dir, None, &[], 3, Vec::new(), 0);
         world.advance_tick();
-        push_snapshot(&tx, &world, "f2", &vp, &dir, None, &[], 3, &mut sink);
+        push_snapshot(&tx, &world, "f2", &vp, &dir, None, &[], 3, Vec::new(), 0);
 
         let frame1: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
         let frame2: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
@@ -1741,8 +1734,7 @@ mod tests {
         let mut client2 = connect_client(addr).await;
         consume_avatar_assets(&mut client2).await;
         world.advance_tick();
-        let mut sink = crate::events::EventSink::new();
-        push_snapshot(&tx, &world, "f3", &vp, &dir, None, &[], 3, &mut sink);
+        push_snapshot(&tx, &world, "f3", &vp, &dir, None, &[], 3, Vec::new(), 0);
         let frame3: serde_json::Value = serde_json::from_str(&next_text(&mut client2).await).unwrap();
         assert_eq!(frame3["tick"], 3, "断开后新客户端照常收帧");
 
@@ -1802,8 +1794,7 @@ mod tests {
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
         world.advance_tick();
-        let mut sink = crate::events::EventSink::new();
-        push_snapshot(&tx, &world, "shared", &vp, &dir, None, &[], 3, &mut sink);
+        push_snapshot(&tx, &world, "shared", &vp, &dir, None, &[], 3, Vec::new(), 0);
 
         let f1: serde_json::Value = serde_json::from_str(&next_text(&mut c1).await).unwrap();
         let f2: serde_json::Value = serde_json::from_str(&next_text(&mut c2).await).unwrap();
@@ -2145,8 +2136,7 @@ mod tests {
         world.advance_tick();
         let dir = PlayerDirectory::disabled();
         let vp = default_viewport();
-        let mut sink = crate::events::EventSink::new();
-        push_snapshot(&tx, &world, "after-logout", &vp, &dir, None, &[], 3, &mut sink);
+        push_snapshot(&tx, &world, "after-logout", &vp, &dir, None, &[], 3, Vec::new(), 0);
         let frame: serde_json::Value = serde_json::from_str(&next_text(&mut c1).await).unwrap();
         assert_eq!(frame["caption"], "after-logout", "登出连接下行快照照收（观战）");
 

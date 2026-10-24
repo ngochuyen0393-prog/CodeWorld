@@ -1640,6 +1640,14 @@ fn main() -> Result<()> {
             // 随快照一起广播——不管有没有观众都取走（无观众=丢弃，事件不跨拍滞留；
             // tick 下一拍的 ①0 清空是双保险）
             let attack_events = std::mem::take(&mut sandbox_map.attack_events);
+            // D-020a：事件帧排干 + 可见性过滤在调用点（与 attack_events 同款
+            // "无观众也取走"——事件不跨拍滞留，防无头世界缓冲无界增长）。
+            // 操控玩家名沿 controlled 实体 code_hash 解析；无操控/观战帧只发
+            // 无主 compile_failed（宁缺勿泄）
+            let controller =
+                crate::events::controller_name(&world, &sandbox_map.players, renderer.controlled());
+            let (player_events, events_cursor) =
+                sandbox_map.events.take_frame(controller.as_deref());
             net::push_snapshot(
                 &handle.snapshots,
                 &world,
@@ -1649,7 +1657,8 @@ fn main() -> Result<()> {
                 renderer.controlled(),
                 &attack_events,
                 sandbox_map.field_forming_ticks,
-                &mut sandbox_map.events,
+                player_events,
+                events_cursor,
             );
         }
         std::thread::sleep(config.tick_interval());
