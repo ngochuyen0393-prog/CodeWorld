@@ -1664,6 +1664,15 @@ fn main() -> Result<()> {
                 player_events,
                 events_cursor,
             );
+        } else {
+            // D-020a 确认审 NEW-P2：WS 禁用（CODEWORLD_WS_PORT=0 纯终端模式）时
+            // 事件照常排干丢弃——新闻不是档案，防无头长跑世界 pending 无界增长
+            let controller = crate::events::controller_name(
+                &world,
+                &sandbox_map.players,
+                renderer.controlled(),
+            );
+            let _ = sandbox_map.events.take_frame(controller.as_deref());
         }
         std::thread::sleep(config.tick_interval());
     }
