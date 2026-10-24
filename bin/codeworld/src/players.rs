@@ -171,6 +171,13 @@ impl PlayerDirectory {
         self.online.contains_key(name)
     }
 
+    /// 在线玩家实体判定（id 键控）：免疫 code_hash 撞名——玩家可命名
+    /// "creation.wat"/"attacker.wat" 进场，事件归属只认实体 id 不认代码
+    /// 身份字符串（D-020a 双审 P0 修复：字符串判归属=身份碰撞绕穿可见性）
+    pub(crate) fn is_online_entity(&self, id: &EntityId) -> bool {
+        self.online.values().any(|v| v == id)
+    }
+
     /// 玩家名是否在编译失败黑名单中
     pub(crate) fn is_failed(&self, name: &str) -> bool {
         self.failed.contains(name)

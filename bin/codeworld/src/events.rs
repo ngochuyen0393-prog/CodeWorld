@@ -107,21 +107,24 @@ impl EventSink {
         self.next_seq - 1
     }
 
-    /// 归属解析（纯函数）：主体 code_hash 是在线玩家名 → 归属自己；
-    /// 否则沿产权链（bound_to=创造者）找主人；拿不准 = None（宁缺勿泄）
+    /// 归属解析（纯函数，D-020a 双审 P0 修复后口径）：**只认实体 id 不认
+    /// code_hash 字符串**——玩家可命名 creation.wat/attacker.wat 进场，字符串
+    /// 判归属=身份碰撞绕穿可见性铁律。链路：主体 owner（玩家=自有实体 id/
+    /// 造物=创造者实体 id，进场产权根修复后统一形态）→ owner 实体是在线玩家
+    /// → 归属其名；owner 不可达时 bound_to 兜底一跳；全不通 = None（宁缺勿泄）
     fn resolve_owner(
         world: &WorldState,
         players: &PlayerDirectory,
         subject: EntityId,
     ) -> Option<String> {
         let e = world.entities.get(&subject)?;
-        if players.is_online(&e.code_hash) {
-            return Some(e.code_hash.clone());
+        let root = world.entities.get(&EntityId(e.owner.0))?;
+        if players.is_online_entity(&root.id) {
+            return Some(root.code_hash.clone());
         }
-        let creator = world.entities.get(&e.bound_to()?)?;
-        players
-            .is_online(&creator.code_hash)
-            .then(|| creator.code_hash.clone())
+        // 兜底：owner 不可达（旧存档实体/测试直构随机 owner）走 bound_to 一跳
+        let bound = world.entities.get(&e.bound_to()?)?;
+        players.is_online_entity(&bound.id).then(|| bound.code_hash.clone())
     }
 
     /// 有主事件入汇（归属拿不准也照收——过滤在 take_frame 统一做，

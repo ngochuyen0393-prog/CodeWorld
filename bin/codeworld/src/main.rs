@@ -1319,9 +1319,13 @@ impl EntitySandboxMap {
         };
         let join_index = self.players.next_join_index();
         let entity_id = EntityId::new();
+        // 产权根=自有（D-020a 双审 P0 修复）：玩家本体 owner=自身 EntityId——
+        // 造物继承后 creation.owner 恒=创造者实体 id，前端造物列表/事件归属
+        // 按实体 id 键控解析（旧值 PlayerId::new() 是与本体无关的随机数，
+        // 产权链在协议面不可达；存档恢复的旧玩家实体无沙箱不产事件，不受影响）
         let entity = Entity::new(
             entity_id,
-            PlayerId::new(),
+            PlayerId(entity_id.0),
             name.to_string(), // 玩家名 = code_hash 身份承载（同 A/D/H/S 模式）
             (players::spawn_x_for(join_index), 0.0),
             Appearance::new(
@@ -2055,6 +2059,20 @@ fn tick_with_intents(
                                     "[ctrl] 出膛点被身体封堵，本拍不发射（贴身目标改走近战刀）"
                                 );
                             } else {
+                            // D-020a 每实体每拍 1 发跨通道互斥：本拍技能栏已排过
+                            // spawn（skill_spawns 收集在拍首先于 route）→ 本拍
+                            // 不再发定装弹（反向查队列——skill 侧查 ctrl_shell 是
+                            // 死代码，此处时序上 skill 已入队可查）
+                            if sandbox_map
+                                .skill_spawns
+                                .iter()
+                                .any(|s| s.creator == *id)
+                            {
+                                tracing::info!(
+                                    player = %name,
+                                    "[ctrl] 本拍已按技能 spawn，定装弹让位（每实体每拍 1 发）"
+                                );
+                            } else {
                             let fuel_limit = sandbox_map
                                 .sandboxes
                                 .get(id)
@@ -2095,6 +2113,7 @@ fn tick_with_intents(
                                     lifespan_ticks: 30,
                                     fuel_limit,
                                 });
+                            }
                             }
                         }
                         None => {
@@ -3322,7 +3341,9 @@ fn handle_skill_intents(
             tracing::warn!(slot, name = def.name, "[skill] 模板未装配（缺文件/编译失败），忽略");
             continue;
         };
-        // 每实体每拍 1 发：本拍已排过技能弹（或操控定装弹）再按 = RATE_LIMITED
+        // 每实体每拍 1 发：本拍已排过技能弹再按 = RATE_LIMITED。（与操控定装弹
+        // 的跨通道互斥在 Shoot 分支反向查 skill_spawns——skill 收集在拍首，射击
+        // 路由在其后，此处查 ctrl_shell 恒空是死代码，已删）
         let (px, py) = match world.entities.get(&creator) {
             Some(e) => e.pos(),
             None => continue, // 操控实体本拍刚死：静默丢（下一拍 control_target 自然消失）
@@ -3330,11 +3351,7 @@ fn handle_skill_intents(
         let already = sandbox_map
             .skill_spawns
             .iter()
-            .any(|s| s.creator == creator)
-            || sandbox_map
-                .ctrl_shell_spawns
-                .iter()
-                .any(|s| s.creator == creator);
+            .any(|s| s.creator == creator);
         if already {
             tracing::info!(slot, name = def.name, "[skill] 本拍已 spawn 过，限流拒绝");
             crate::events::EventSink::emit(
@@ -12138,6 +12155,68 @@ mod tests {
             other => panic!("应为 player_log，实为 {other:?}"),
         }
         assert_eq!(log.entity_id, world.entities.values().find(|e| e.code_hash == "creation").map(|e| e.id.0.to_string()).unwrap_or_default(), "主体=造物");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t20_owner_root_links_creation_to_creator_entity() {
+        // 产权根锚（双审 P0 修复）：玩家本体 owner=自身 EntityId（产权根=自有）；
+        // 造物 owner=创造者实体 id——前端造物列表 owner==controlled id 匹配与
+        // 事件归属 owner 链的协议基础。旧值 PlayerId::new() 是无关随机数，
+        // 产权链在协议面不可达（前端"我的造物"恒空的根因）
+        let dir = temp_players_dir("t20-owner-root");
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let alice = t20_make_online_player(&dir, &mut map, &mut world, "alice");
+        {
+            let e = world.entities.get(&alice).unwrap();
+            assert_eq!(e.owner.0, e.id.0, "玩家本体 owner=自身实体 id（产权根=自有）");
+        }
+        let mut req = lifespan_spawn_request(alice, 10);
+        req.pos = (20.0, 0.0);
+        process_spawn_requests(&mut world, &mut map, vec![req], 1, &[]);
+        let creation = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .unwrap();
+        assert_eq!(
+            creation.owner.0,
+            alice.0,
+            "造物 owner=创造者实体 id（产权链实体级可达，快照 owner 字段可 join）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t20_name_collision_cannot_hijack_attribution() {
+        // 撞名免疫（双审 P0 修复回归锚）：玩家命名 creation.wat 进场后，
+        // 不得接管全世界造物事件（旧 code_hash 字符串判归属的绕穿路径）——
+        // alice 的造物 born 事件只进 alice 帧，"creation"玩家帧恒空
+        let dir = temp_players_dir("t20-collision");
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let alice = t20_make_online_player(&dir, &mut map, &mut world, "alice");
+        // 撞名玩家进场（名字=造物 code_hash 字面量）
+        std::fs::write(dir.join("creation.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        assert!(map.spawn_player(&mut world, "creation", 1), "撞名玩家应进场");
+        assert!(map.players.is_online("creation"), "撞名玩家在线（旧判据会误归属的前提）");
+        // alice 造物 born
+        let mut req = lifespan_spawn_request(alice, 10);
+        req.pos = (20.0, 0.0);
+        process_spawn_requests(&mut world, &mut map, vec![req], 1, &[]);
+        let (alice_frame, _) = map.events.take_frame(Some("alice"));
+        assert_eq!(
+            alice_frame.iter().filter(|e| matches!(e.body, crate::events::EventBody::Born { .. })).count(),
+            1,
+            "born 事件只归 alice"
+        );
+        // 撞名玩家帧恒空（事件不是它的）
+        let (collision_frame, _) = map.events.take_frame(Some("creation"));
+        assert!(
+            collision_frame.is_empty(),
+            "撞名玩家不得接管他人造物事件（实体 id 键控归属）"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

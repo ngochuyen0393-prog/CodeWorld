@@ -238,7 +238,7 @@
 | `BAD_GLYPH` | 字形必须是恰好 1 个字符 |
 | `BAD_COLOR` | 颜色非空字符串才收 |
 | `BAD_BLOB` | 出生数据包超 64KB（不裁剪，整次拒绝） |
-| `BIRTHPLACE_OCCUPIED` | 出生点被占（事件带坐标与占用者，下拍可重试） |
+| `BIRTHPLACE_OCCUPIED` | 出生点被占（事件带出生点坐标，占用者见服务端日志；下拍可重试） |
 | `OUT_OF_RANGE` | 出生点超出你 ±10 格 |
 | `UNDERGROUND` | 出生点钻地（y < ground(x)） |
 | `NON_FINITE` | 坐标或初速是 NaN/无穷 |

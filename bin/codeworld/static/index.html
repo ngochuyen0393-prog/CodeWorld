@@ -1980,12 +1980,13 @@
     { slot: 3, glyph: '#', name: '护盾场' },
     { slot: 4, glyph: '^', name: '侦察弹' }
   ];
-  var cFilters = { error: true, warn: true, info: true, log: true };
+  var cFilters = { error: true, warn: true, info: false, log: true }; // info=生命周期灰字默认折叠（按开关展开）
   var cRows = [];            // 消息行 [{cls,tk,src,msg,fold}]（fold=重复折叠锚）
   var cRowsMax = 300;        // 流上限（防长跑刷 DOM；旧的从头部剔）
   var cSelected = null;      // 只看该造物（entity id）；null=全部
   var cLastSeq = null;       // 本地已收最大 seq（断线对账游标）
   var cLostShown = false;    // 断线丢失横幅只报一次（重连后归零重计）
+  var cWasDisconnected = false; // 断线沿标记：对账只在重连后首帧做（稳态 gap=被过滤的他人事件，非丢失）
   var cSkillCool = {};       // 技能格按下冷却 {slot: untilTs}（本拍 1 发的客户端观感）
   var cUnitErr = {};         // 造物未读错误角标 {entityId: count}
 
@@ -1996,6 +1997,23 @@
   consoleEl.addEventListener('click', function (ev) {
     // 收起态整条都是开关（窄条点哪都展开）
     if (consoleEl.classList.contains('collapsed') && ev.target !== consoleTabEl) consoleToggle();
+  });
+  // 四色过滤开关（双审 P1 死 UI 修复）：点切 on/off 并重渲染流
+  Array.prototype.forEach.call(document.querySelectorAll('.cfilters .f'), function (el) {
+    el.addEventListener('click', function () {
+      var key = el.getAttribute('data-f');
+      if (!key || !(key in cFilters)) return;
+      cFilters[key] = !cFilters[key];
+      el.classList.toggle('on', cFilters[key]);
+      consoleRenderStream();
+    });
+  });
+  // "只看全部"：清选中造物 + 清未读角标
+  cAllEl.addEventListener('click', function () {
+    cSelected = null;
+    cUnitErr = {};
+    consoleRenderUnits(lastRawEnts || new Map(), lastRawTick || 0);
+    consoleRenderStream();
   });
   window.addEventListener('keydown', function (ev) {
     if (ev.key === 'Tab') {
@@ -2070,18 +2088,23 @@
     cHeadEl.textContent = 'tick ' + snap.tick + ' · ' +
       (connState === 'ok' ? '已连接' : connState === 'bad' ? '已断线' : '连接中');
     cDotEl.className = 'dot ' + (connState === 'ok' ? '' : connState);
-    // 断线对账（B 档）：cursor 与本地已收 seq 的差=丢失估算
+    // 断线对账（B 档）：只在断线→重连沿做一次——events_cursor 是世界级 seq
+    //（含被可见性过滤掉的他人事件），稳态下 cursor−本地seq 恒大于 0，
+    // 不是丢失；只有跨断线的差值才真实
     var cursor = snap.events_cursor;
     if (typeof cursor === 'number') {
       var evs = Array.isArray(snap.player_events) ? snap.player_events : [];
-      if (cLastSeq !== null) {
-        var gap = cursor - cLastSeq - evs.length;
+      if (connState === 'bad') {
+        cWasDisconnected = true;
+      } else if (cWasDisconnected && cLastSeq !== null) {
+        var gap = Math.max(0, cursor - cLastSeq - evs.length);
         if (gap > 0 && !cLostShown) {
           cLostShown = true;
           dcBannerTextEl.textContent = '断线期间约 ' + gap + ' 条事件未收到（对账游标 ' + cLastSeq + '→' + cursor + '）';
           dcBannerEl.hidden = false;
           setTimeout(function () { dcBannerEl.hidden = true; cLostShown = false; }, 6000);
         }
+        cWasDisconnected = false; // 每次断线沿只对账一次
       }
       for (var i = 0; i < evs.length; i++) {
         if (typeof evs[i].seq === 'number') cLastSeq = Math.max(cLastSeq || 0, evs[i].seq);
@@ -2133,7 +2156,7 @@
       html += '<div class="row ' + r.cls + '" data-i="' + i + '"><span class="tk">t' + r.tk + '</span>' +
         '<span class="src">[' + r.src + ']</span><span class="msg">' + escapeHtml(r.msg) + '</span></div>';
       if (r.foldCount > 0) {
-        html += '<div class="fold" data-fold="' + i + '">▸ 又 ' + r.foldCount + ' 次（t' + r.foldFrom + '–t' + r.foldTo + '）——点击展开</div>';
+        html += '<div class="fold">▸ 又 ' + r.foldCount + ' 次（t' + r.foldFrom + '–t' + r.foldTo + '，同因聚合）</div>';
       }
     }
     if (!shown) {
