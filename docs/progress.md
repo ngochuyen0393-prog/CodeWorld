@@ -2,6 +2,12 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
+## 现在（2026-10-28 Defold 引擎工程地图落地，待土豆验收）
+
+- 完成：docs/engine-map.md（t_f5646e6d，commit e3ef594）——game-menu.md 的姊妹篇"引擎工程器官"视角总索引。三层结构：①engine/ 32 楼层清单（六组分类：骨架 2/零件库 1/表现层 9/输入 2/逻辑物理 3/地基后勤 15，每组一句话职能）②~145 个要害器官四栏表（文件｜功能一句话｜对应 CodeWorld 哪个 crate/宪法条款｜状态记号）③每楼三行账（文件总数/已标数/胶水与资源归堆）+ 顶层"四机器分工"节（editor(Clojure)/engine(C++)/Bob(Java)/external 借件清单）+ "未定性"诚实名单 + 读码锚点速查表（11 锚点行号亲核）。
+- 活法合规：全量过筛（find 每楼文件数+构成四堆定性）、拿不准读头部、禁止 1.3 万文件通读——实测三规律：测试占半壁（engine 楼 575/718 是 test）/借件藏楼里（dlib 名义 1518 文件真自写 165）/平台胶水成灾（crash 楼 27 核心文件 19 个是平台变体）。
+- 验证：全部精确路径 100% 存在（脚本全量反查 Defold 源码树）；表格分隔行连续性零违例；三行账与 find 实测逐楼对得上；官方锚点 11 处（StepFrame:1956/Step:2417/组件注册:234/StepWorld2D:439/PHYSICS_FUNCTIONS:2145 等）逐行核过。发现并利用官方文档金矿 engine/docs/ 19 篇（CODE_STRUCTURE/ENGINE_LIFECYCLE/DESIGN_PHILOSOPHY/RENDERER_FRAME 已精读引用）。
+
 ## 现在（2026-10-24 D-020a 指挥中心·信息面板 落地+双审收口，待土豆终审）
 
 - 完成：D-020a（t_06b4efc6）——协议 v2.5 `player_events` 增量事件通道（六类：spawn_rejected/compile_failed/runtime_error/born/died/player_log，全为既有日志点结构化投影零新立法）+ `events_cursor` 游标（断线补拉 B 档：断线即丢按游标差估算横幅）+ entities 加 born_tick/lifespan_ticks；可见性铁律服务端过滤后广播（decisions #054 同族，宁缺勿泄）；spawn 拒绝原因码表 13 码集中定义进 api.md；前端右侧 400px 可收起控制台面板（四色消息/造物分组列表+剩余寿命黄警/点选单看+全部聚合/重复折叠"又N次"/四色过滤开关/断线对账横幅）+ 技能栏四格（数字键 1-4=spawn 预置模板投掷器/飞剑/护盾场/侦察弹，UI 便利映射零新原语，失败走事件流黄字闭环）。原型=D:/工具箱/D020控制台原型.html。
