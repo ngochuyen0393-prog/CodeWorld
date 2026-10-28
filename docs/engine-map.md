@@ -19,7 +19,7 @@
 
 **借件规模对比**（external 实测）：harfbuzz 48MB + skribidi 52MB（双语文字整形，比自写引擎总量还大）、basisu 13MB（纹理万能压缩）、opus 7.5MB（音频 codec）、bullet3d 5.8MB（3D 物理）、glfw 2.9MB（窗口）、box2d 2.9MB + box2d_v2 816K（两代 2D 物理）。
 
-**engine/ 内部还藏两层借件**（不在 external/ 里）：dlib/src/mbedtls 1028 文件（TLS 加密库，占 dlib 楼 2/3）、dlib/ext/jetty 83 文件（Java http 服务器，编辑器远程构建用）、physics/box2d（v2+v3 两代源码 vendored 进楼）、script/luasocket 42 文件 + luacjson 5 + bitop 2（Lua 生态件）、profiler/remotery 10（帧分析器）。**借的比自写的多**——32 楼名义 13379 文件，刨掉 test/借件/生成资源，真·自写核心约 1500 文件。
+**engine/ 内部还藏两层借件**（不在 external/ 里）：dlib/src/mbedtls 1028 文件（TLS 加密库，占 dlib 楼 src 的 3/4）、dlib/ext/jetty 84 文件（含 javax.servlet jar，Java http 服务器，编辑器远程构建用）、script/luasocket 36 文件 + luacjson 5 + bitop 2 + lib/js 1（Lua 生态件）、profiler/remotery 10（帧分析器）。**借的比自写的多**——engine/ 32 楼合计 5370 文件（全仓 13379 另含 editor 3024/Bob 504/external 借件），刨掉 test 2915、借件（mbedtls 1028/jetty 84/lua 55/luasocket 36…）、dmsdk 公开头与出厂资源，真·自写核心约 850 文件。
 
 ---
 
@@ -46,7 +46,7 @@
 |---|---|
 | **render** | 高层渲染：材质/渲染命令缓冲/渲染脚本（render script 也是 Lua）/视锥剔除/合批 |
 | **graphics** | 图形 API 适配层：顶点缓冲/shader，下面焊 6 个平台后端（opengl/vulkan/metal/dx12/webgpu/null） |
-| **font** | 文字全家桶：TTF 解析/SDF 字形/字形缓存/harfbuzz 复杂排版/双向文字，22 个 Java 文件给编辑器侧用 |
+| **font** | 文字全家桶：TTF 解析/SDF 字形/字形缓存/harfbuzz 复杂排版/双向文字，23 个 Java 文件（22 实现+1 测试）给编辑器侧用 |
 | **gui** | 屏幕空间 UI 系统（2D 界面部件，gui.cpp 单文件 5153 行巨石） |
 | **particle** | 粒子模拟器（被 comp_particlefx 调用的纯模拟库，4 个源文件，61 个测试全是黄金数据） |
 | **sound** | 软件混音：DSP + 4 种解码器（opus/vorbis/tremolo/wav）+ 6 平台音频设备（openal/wasapi/opensl/avaudio/js/null） |
@@ -86,7 +86,7 @@
 | **sdk** | SDK 打包测试：生成 sdk.h 总头文件并验证全部 dmsdk 头能编过 |
 | **testmain** | 单元测试主Harness：全部楼的 test_*.cpp 链进这一个 main |
 | **tools** | 小工具集：编辑器启动器 launcher（.exe）/鼠标捕获 4 平台/gdc 符号导出器/纹理转换 |
-| **docs** | 官方内部文档 19 篇（架构金矿，本文多处引用） |
+| **docs** | 官方内部文档 13 篇 md + 3 个 py 文档生成器（架构金矿，本文多处引用） |
 | **rig** | 骨骼动画运行时：模型+骨架姿态解算（被 model/spine 部件用；编在表现层组但按依赖属底层件） |
 
 ---
@@ -98,7 +98,7 @@
 
 ### A. 骨架组
 
-#### engine 楼（718 文件：575 test + 103 builtins 出厂资源 + 5 出厂配置 + 25 核心源码）
+#### engine 楼（718 文件：test 575 + content 出厂 108【builtins 103+材质 3+game.project/profiler.html 2】+ src 非测试 27【cpp/h 23+.mm/.hpp/.rc/.ico 4】+ 其他 8【darwin 2+scripts 2+proto 1+楼根 3】）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -111,7 +111,7 @@
 | `engine/src/physics_debug_render.cpp` | 物理调试画线（碰撞框可视化） | render crate 调试层 | 🔬 |
 | `engine/content/builtins/` | 出厂自带资源 103 件（默认材质/logo/gltf 原型/connect 集合）+ game.project 等 5 件出厂配置 | **反面教材对照**：咱宪法禁止世界自带内容（#011 同族讨论，官方示例走玩家身份进场） | 📦 |
 
-#### gameobject 楼（349 文件：311 test + 34 核心 + 3 proto）
+#### gameobject 楼（349 文件：test 311 + src 非测试 28 + dmsdk 公开头 6 + proto 3 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -126,7 +126,7 @@
 
 ### B. 零件库
 
-#### gamesys 楼（1235 文件：991 test + 225 核心 + 15 proto）
+#### gamesys 楼（1235 文件：test 991 + src 非测试 226【核心 187+java 1+dmsdk 38】+ proto 15 + 出厂材质 2 + CMakeLists 1）
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
 | `gamesys/src/gamesys/gamesys.cpp:234` | **组件注册总表**（REGISTER_COMPONENT_TYPE 宏×13，官方注释明说优先级逐个 +100 均匀排班） | 组件优先级=拍内执行顺序的立法现场；咱对照=两阶段管线的行业实证 | 📌 |
@@ -147,7 +147,7 @@
 
 ### C. 表现层组
 
-#### render 楼（43 文件：30 核心 + 6 test + 5 proto）
+#### render 楼（43 文件：核心 30 + test 6 + proto 5 + dmsdk 1 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -160,7 +160,7 @@
 | `render/src/render/debug_renderer.cpp` | 调试画线 | render crate 调试层 | 🔬 |
 | `render/proto/render/`（5 个 ddf） | material/render/compute/font/render_target 格式 | — | 📦 |
 
-#### graphics 楼（97 文件：45 核心 cpp/h 含 6 后端 + 42 test）
+#### graphics 楼（97 文件：核心 48（六后端在内）+ test 42 + dmsdk 5 + proto 1 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -174,7 +174,7 @@
 | `graphics/src/null/` | 空后端（无头跑测试用） | 咱权威进程天然"null 渲染"——**分离式架构白送它专门造一层** | 📦 |
 | `graphics/src/transcoder/` | 纹理转码（basisu 运行时解码） | — | 📦 |
 
-#### font 楼（552 文件：484 test + 40 核心 + 22 Java + 1 proto）
+#### font 楼（552 文件：test 484【src/test 483+Java 侧 1】+ 核心 37【src 顶 23+render 8+truetype 2+harfbuzz 适配 2+fontc 2】+ Java 22 + dmsdk 3 + 出厂 shader 2 + scripts 1 + proto 1 + CMakeLists/README 2）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -189,7 +189,7 @@
 | `font/src/java/`（22 个） | Java 侧字形栅格化（Bob/编辑器用） | — | 📦 |
 | `font/proto/font/glyphbank_ddf.proto` | 字形库格式 | — | 📦 |
 
-#### gui 楼（18 文件：7 核心 + 10 test）
+#### gui 楼（18 文件：核心 6 + test 10 + dmsdk 1 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -197,7 +197,7 @@
 | `gui/src/gui_script.cpp` | UI 脚本（gui 也有自己的 Lua 环境） | 每类实体独立脚本环境的思想近亲 | 🔬 |
 | `gui/src/gui_null.cpp` | 无头 UI（测试用） | — | 📦 |
 
-#### particle 楼（67 文件：4 核心 + 61 test）
+#### particle 楼（67 文件：核心 4 + test 61 + proto 1 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -206,7 +206,7 @@
 | `particle/proto/particle/particle_ddf.proto` | 粒子格式 | — | 📦 |
 | `particle/src/test/`（61 个） | 黄金数据测试（粒子轨迹采样比对） | 确定性测试锚的同行写法 | 🧪 |
 
-#### sound 楼（72 文件：29 核心 + 38 test + 3 胶水）
+#### sound 楼（72 文件：核心 31 + test 38 + dmsdk 1 + CMakeLists 1 + README 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -216,7 +216,7 @@
 | `sound/src/devices/`（6 个） | 音频输出设备六平台：openal/wasapi/opensl/avaudio(js 之外各平台原生)/js/null | 设备适配层的多平台胶水样本 | 📦 |
 | `sound/src/stb_vorbis/` | vorbis 解码 vendored | — | 📦 |
 
-#### shaderc 楼（27 文件：10 核心 + 13 test）
+#### shaderc 楼（27 文件：shaderc 核心 7 + Java 桥 2 + jni 桥 2 + standalone 独立版 2 + test 13 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -226,7 +226,7 @@
 | `shaderc/src/shaderc_hlsl.cpp` | HLSL 直出路径 | — | 🔬 |
 | `shaderc/src/standalone/` | 独立命令行版（不进引擎） | — | 📦 |
 
-#### modelc 楼（33 文件：9 核心 + 20 test + 3 胶水）
+#### modelc 楼（33 文件：核心 10 + test 20 + scripts 1 + CMakeLists 1 + README 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -235,7 +235,7 @@
 | `modelc/src/modelimporter_debug.cpp` | 调试导出（人读中间格式） | — | 🔬 |
 | `modelc/src/jni/` + `modelc/src/java/` | Java 桥（给 Bob 调） | — | 📦 |
 
-#### texc 楼（19 文件：11 核心 + 5 test + 2 胶水）
+#### texc 楼（19 文件：核心 12 + test 5 + scripts 1 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -244,7 +244,7 @@
 | `texc/src/texc_enc_basis.cpp` | Basis Universal（一次压缩全平台） | — | 📦 |
 | `texc/src/texc_buffer.cpp` | 像素缓冲操作 | — | 🔬 |
 
-#### rig 楼（9 文件：5 核心 + 2 test）
+#### rig 楼（9 文件：核心 4 + test 2 + dmsdk 1 + proto 1 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -254,7 +254,7 @@
 
 ### D. 输入组
 
-#### hid 楼（17 文件：13 核心 + 3 test）
+#### hid 楼（17 文件：核心 11（含 darwin .mm 与 glfw/sdl 映射头）+ test 3【src 2+根 test_app_hid.sh 1】+ dmsdk 2 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -264,7 +264,7 @@
 | `hid/src/darwin/gamepad_darwin.mm` | mac 专用手柄驱动 | 平台胶水样本 | 📦 |
 | `hid/src/hid_guid.cpp` | 设备 GUID 映射 | — | 🔬 |
 
-#### input 楼（12 文件：3 核心 + 7 test + 1 proto）
+#### input 楼（12 文件：核心 3 + test 7 + proto 1 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -273,7 +273,7 @@
 
 ### E. 逻辑/物理组（咱沙箱的亲戚）
 
-#### script 楼（143 文件：77 核心【含借件 49】+ 58 test）
+#### script 楼（143 文件：test 58【src/test 57+楼根 py 1】+ 核心 38【src 34+ddf 4】+ 借件 44【luasocket 36+luacjson 5+bitop 2+lib/js 1】+ dmsdk 1 + CMakeLists/README 2）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -283,11 +283,11 @@
 | `script/src/script_sys.cpp` | sys 模块（系统信息/重启/保存） | — | 🔬 |
 | `script/src/script_timer.cpp` | 计时器（拍数换算的样本） | 每拍计时器 | 🔬 |
 | `script/src/script_html5.cpp` | 浏览器特化（js 桥） | 浏览器层交互参照 | 🔬 |
-| `script/src/luasocket/`（42 文件） | Lua 网络库 vendored（tcp/udp/select） | — | 📦 |
+| `script/src/luasocket/`（36 文件） | Lua 网络库 vendored（tcp/udp/select） | — | 📦 |
 | `script/src/luacjson/` + `script/src/bitop/` | JSON 解析+位运算 vendored | — | 📦 |
 | `script/src/script_zlib.cpp` | 压缩暴露 | — | 🔬 |
 
-#### lua 楼（83 文件：60 核心 + 5 test + 6 胶水）
+#### lua 楼（83 文件：Lua 原版 55 + doc_h 9 + lua_asan 1 + dmsdk 4 + cs 绑定 5 + test 5 + scripts 2 + CMakeLists/sdk_gen 2）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -296,20 +296,20 @@
 | `lua/src/*.doc_h`（9 个） | 各标准库的文档注释（生成官方手册用） | **手册即代码**（doc_h 与源码同库）——api.md 生成思路参照 | 📦 |
 | `lua/src/lua_asan.cpp` | AddressSanitizer 内存消毒挂钩 | 测试基建 | 🔬 |
 
-#### physics 楼（24 文件：19 核心 + 4 test）
+#### physics 楼（24 文件：源码 18【box2d 适配 4+box2d_defold 适配 4+3D 适配 5+前端/公共 5】+ test 4 + dmsdk 1 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
 | `physics/src/physics/physics.cpp` | 2D/3D 统一前端：上下文创建/Step 分发 | physics crate 门面同构；**咱单物理 vs 它双物理按需选** | 🔬 |
 | `physics/src/physics/box2d_defold/box2d_defold_physics.cpp` | **2D 物理心跳 StepWorld2D:439**（三步：UpdateKinematic 游戏侧→物理侧同步→World.Step 联立解算→写回——**双账本每帧对账两次**） | 咱单一真相源=架构更干净（已定论勿翻案）；此处是对照弹药 | 📌 |
 | `physics/src/physics/box2d_defold/box2d_defold_debug_draw.cpp` | 物理调试画线 | — | 🔬 |
-| `physics/src/physics/box2d/` | **Box2D v2+v3 两代源码 vendored**（2.9MB+816K，编进楼） | Box2D 60Hz 功力不适配拍制世界（调研定论勿再查）；内嵌稳定老物理不追新的活例 | 📦 |
+| `physics/src/physics/box2d/` + `box2d_defold/` | **两套 Box2D 适配层**（各 4 文件；Box2D 本体在 external/——box2d 2.9MB+box2d_v2 816K，楼内只是 include 桥，非 vendored 源码） | Box2D 60Hz 功力不适配拍制世界（调研定论勿再查）；内嵌稳定老物理不追新的活例 | 📦 |
 | `physics/src/physics/physics_3d.cpp` | Bullet 3D 适配（Bullet 本体在 external/） | 3D 时代参照 | 🔬 |
 | `physics/src/physics/physics_common.cpp` | 2D/3D 共用（接触回调矩阵等） | — | 🔬 |
 
 ### F. 地基/后勤组
 
-#### dlib 楼（1518 文件：mbedtls 借件 1028 + 自写 165 + dmsdk 48 + jetty 83 + easing 图 41 + test 116）
+#### dlib 楼（1518 文件：mbedtls 借件 1028 + test 116 + 自写核心 167【dlib/ 170 去 testutil 3】+ testutil 3 + dmsdk 48 + zip/stb/cs 等借件胶水 14 + doc 图片 41 + jetty 84【含 servlet jar】+ scripts 10 + bin/include/proto/楼根 7）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -326,7 +326,7 @@
 | `dlib/src/dlib/memprofile.cpp` + `dlib/bin/memprofile.sh` | 内存剖析（启动内存快照） | — | 🔬 |
 | `dlib/src/mbedtls/`（1028 文件） | TLS 加密库 vendored（https 通道的底座） | 远程推送时代的件，现在不需要 | 📦 |
 
-#### ddf 楼（37 文件：17 核心 + 8 test + 6 胶水）
+#### ddf 楼（37 文件：核心 19【C++ 16+自举 proto 3】+ ddfc 编译器 5【py+cxx/bat+java/bat】+ test 8 + dmsdk 1 + doc 1 + 楼根 3【CMakeLists/TODO/.pydevproject】）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -335,7 +335,7 @@
 | `ddf/src/ddf/ddf_message.cpp` | DDF 消息封装 | — | 🔬 |
 | `ddf/src/ddf/*.proto`（3 个：math/struct/extensions） | ddf 自己的元格式（math/struct/extensions） | — | 📦 |
 
-#### resource 楼（89 文件：48 核心 + 36 test + 3 proto）
+#### resource 楼（89 文件：核心 46 + test 36 + dmsdk 3 + proto 2 + CMakeLists/sdk_gen 2）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -348,7 +348,7 @@
 | `resource/src/resource_archive.cpp` | 打包档案（.darc 格式，docs/ARCHIVE_FORMAT.md 有格式文档） | — | 🔬 |
 | `resource/proto/resource/liveupdate_ddf.proto` | 热更新清单格式 | — | 📦 |
 
-#### platform 楼（28 文件：22 核心 + 5 test）
+#### platform 楼（28 文件：核心 21（glfw 五平台变体在内）+ test 5 + dmsdk 1 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -357,7 +357,7 @@
 | `platform/src/platform_window_*.h`（7 个平台头） | android/ios/linux/osx/win32/opengl/vulkan 各自的窗口接口 | — | 📦 |
 | `platform/src/platform_window_null.cpp` | 无头窗口（CI 测试用） | 咱天然无头 | 📦 |
 
-#### profiler 楼（31 文件：21 核心 + 3 test）
+#### profiler 楼（31 文件：核心 17 + remotery 借件 10 + test 3 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -367,7 +367,7 @@
 | `profiler/src/profiler_render.cpp` | 屏上 HUD（画帧率/内存条） | 指挥中心渲染参照 | 🔬 |
 | `profiler/src/profiler_proc_utils.cpp` | 进程数据采集（CPU/内存占用） | — | 🔬 |
 
-#### crash 楼（35 文件：27 核心 + 7 test）
+#### crash 楼（35 文件：核心 27（其中十九个平台变体）+ test 7 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -377,7 +377,7 @@
 | `crash/src/load_addrs_*.cpp`（4 平台） | 模块加载地址（符号还原用） | — | 📦 |
 | `crash/src/script_crash.cpp` | Lua 侧崩溃信息暴露 | — | 🔬 |
 
-#### liveupdate 楼（13 文件：5 核心 + 7 test）
+#### liveupdate 楼（13 文件：核心 5 + test 7 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -385,7 +385,7 @@
 | `liveupdate/src/script_liveupdate.cpp` | Lua API（lua_ref 打包） | — | 🔬 |
 | `engine/docs/LIVEUPDATE.md` | 官方热更新文档 | 立法前必读 | ✅ |
 
-#### record 楼（9 文件：4 核心 + 3 test）
+#### record 楼（9 文件：核心 4 + test 3 + CMakeLists/.gitignore 2）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -393,7 +393,7 @@
 | `record/src/record/record_common.cpp` | 公共（参数校验） | — | 🔬 |
 | `record/src/record/record_null.cpp` | 空实现 | — | 📦 |
 
-#### extension 楼（19 文件：8 核心 + 6 test + 3 胶水）
+#### extension 楼（19 文件：核心 8 + dmsdk 3 + test 6 + CMakeLists/sdk_gen 2）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -401,26 +401,26 @@
 | `extension/src/extension_android.cpp` / `_ios.cpp` | 移动端 JNI/生命周期适配 | — | 📦 |
 | `extension/src/dmsdk/extension/extension.hpp` | 注册宏（DM_EXTENSION_…） | — | 📦 |
 
-#### jni 楼（14 文件：2 核心 + 5 胶水 + 5 test）
+#### jni 楼（14 文件：核心 2 + scripts 生成器 5 + test 5 + CMakeLists/.gitignore 2）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
 | `jni/src/jni/jni_util.cpp` | Java↔C++ 绑定工具 | 咱无 Java 层 | 🔬 |
 | `jni/scripts/gen_java.py` | **生成 Java 绑定的代码**（自动化胶水） | 代码生成手法第二例 | 🔬 |
 
-#### sdk 楼（9 文件：1 核心 + 5 test + 2 胶水）
+#### sdk 楼（9 文件：核心 2【sdk.h+dmsdk.csproj】+ test 5 + CMakeLists/README 2）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
 | `sdk/src/dmsdk/sdk.h` | 生成的 dmsdk 总头（把全部公开头串起来验证能编过） | **公开 API 面=要验证的合同**；咱 api.md 的编译级对应物 | 🔬 |
 
-#### testmain 楼（6 文件：全 test）
+#### testmain 楼（6 文件：Harness 3【testmain/app/testmain.h】+ src/test 2【自测试+CMakeLists】+ 楼根 CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
 | `testmain/src/common/testmain.cpp` | 单测总 Harness：全楼 test_*.cpp 链这一个 main | cargo test 白送——**Rust 工具链优势的具象** | 🔬 |
 
-#### tools 楼（19 文件：12 核心 + 3 test + 2 胶水）
+#### tools 楼（19 文件：核心 14（launcher 的 .rc/.ico 在内）+ scripts 1 + test 3 + CMakeLists 1）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -429,7 +429,7 @@
 | `tools/src/gdc/main.cpp` | 符号导出器（dmExportedSymbols） | — | 🔬 |
 | `tools/src/texconvert/main.cpp` | 纹理转换 CLI | — | 📦 |
 
-#### docs 楼（25 文件：19 篇文档 + 4 测试资源）
+#### docs 楼（25 文件：md 文档 13 + py 5【生成器 3+测试 2】+ lua 注解 yaml 1 + testdata 4 + CMakeLists/.gitignore 2）
 
 | 文件 | 功能 | 对应 CodeWorld | 状态 |
 |---|---|---|---|
@@ -447,46 +447,47 @@
 
 ## 3. 每楼三行账（实测对账表）
 
-格式：文件总数 ｜ 已标数（本文第二层覆盖）｜ 胶水与资源归堆。
+格式：文件总数 ｜ 已标数（核心中已进第二层表的数目）｜ 全量分账。
+口径（find 可复现）：test=路径含 test 的文件；proto=楼/proto 目录；dmsdk=src/dmsdk 公开头；借件=vendored 第三方；核心=src 非测试非 dmsdk 的源码；CMakeLists/README/sdk_gen/.gitignore 等楼根构建件单列。**每行分项相加=总数**（2026-10-28 逐楼 find 实测闭合，R1 审查后全量重跑）。
 
 | 楼 | 总数 | 已标 | 归堆账（非核心文件去向） |
 |---|---|---|---|
-| engine | 718 | 8 | test 575 + builtins 出厂资源 103 |
-| gameobject | 349 | 8 | test 311 + proto 3 |
-| gamesys | 1235 | 15 | test 991 + proto 15 |
-| dlib | 1518 | 12 | mbedtls 借件 1028 + jetty 借件 83 + test 116 + dmsdk 公开头 48 + easing 图片 41 |
-| script | 143 | 9 | test 58 + luasocket 借件 42 + luacjson 5 + bitop 2 |
-| lua | 83 | 4 | test 5 + doc_h 文档注释 9 + cs/dmsdk 胶水 14 |
-| physics | 24 | 6 | test 4 + box2d vendored 源码（楼内借件） |
-| render | 43 | 8 | test 6 + proto 5 |
-| graphics | 97 | 9 | test 42（六后端平台变体归借件堆） |
-| font | 552 | 10 | test 484（测试字体资源堆，全库最大测试楼）+ java 22 |
-| gui | 18 | 3 | test 10 |
-| particle | 67 | 4 | test 61（黄金轨迹数据） |
-| sound | 72 | 5 | test 38 + stb_vorbis 借件 2 |
-| shaderc | 27 | 5 | test 13 |
-| modelc | 33 | 4 | test 20 + java/jni 胶水 4 |
-| texc | 19 | 4 | test 5 |
-| rig | 9 | 3 | test 2 |
-| hid | 17 | 5 | test 3 |
-| input | 12 | 2 | test 7 |
-| resource | 89 | 8 | test 36 |
-| ddf | 37 | 4 | test 8 + 胶水 6 |
-| platform | 28 | 4 | test 5（glfw 五平台变体归借件堆） |
-| profiler | 31 | 5 | test 3 + remotery 借件 10 |
-| crash | 35 | 5 | test 7（backtrace 七变体×信号五平台全归平台胶水堆） |
-| liveupdate | 13 | 3 | test 7 |
-| record | 9 | 3 | test 3 |
-| extension | 19 | 4 | test 6 + cs 胶水 3 |
-| jni | 14 | 2 | test 5 + py 胶水 5 |
-| sdk | 9 | 2 | test 5 |
-| testmain | 6 | 1 | 全楼皆 test（总 Harness 本身） |
-| tools | 19 | 5 | test 3（.rc/.ico 资源归胶水堆） |
-| docs | 25 | 9 | 全楼皆文档（test 6 为文档生成器测试） |
+| engine | 718 | 8 | test 575 + content 出厂 108【builtins 103+材质 3+配置 2】+ src 核心 27 + 其他 8【darwin 2+scripts 2+proto 1+楼根 3】 |
+| gameobject | 349 | 8 | test 311 + src 核心 28 + dmsdk 6 + proto 3 + CMakeLists 1 |
+| gamesys | 1235 | 15 | test 991 + src 非测试 226【核心 187+java 1+dmsdk 38】+ proto 15 + 出厂材质 2 + CMakeLists 1 |
+| dlib | 1518 | 12 | mbedtls 1028 + test 116 + 自写核心 167 + testutil 3 + dmsdk 48 + zip/stb/cs 等借件胶水 14 + doc 图片 41 + jetty 84【含 servlet jar】+ scripts 10 + bin/include/proto/楼根 7 |
+| script | 143 | 9 | test 58 + 核心 38【src 34+ddf 4】+ 借件 44【luasocket 36+luacjson 5+bitop 2+lib/js 1】+ dmsdk 1 + CMakeLists/README 2 |
+| lua | 83 | 4 | Lua 原版 55 + doc_h 9 + lua_asan 1 + dmsdk 4 + cs 5 + test 5 + scripts 2 + CMakeLists/sdk_gen 2 |
+| physics | 24 | 6 | 源码 18【两套适配 8——本体在 external/ 非楼内】+ test 4 + dmsdk 1 + CMakeLists 1 |
+| render | 43 | 8 | 核心 30 + test 6 + proto 5 + dmsdk 1 + CMakeLists 1 |
+| graphics | 97 | 9 | 核心 48（六后端在内）+ test 42 + dmsdk 5 + proto 1 + CMakeLists 1 |
+| font | 552 | 10 | test 484 + 核心 37 + Java 22 + dmsdk 3 + 出厂 shader 2 + scripts 1 + proto 1 + CMakeLists/README 2 |
+| gui | 18 | 3 | 核心 6 + test 10 + dmsdk 1 + CMakeLists 1 |
+| particle | 67 | 4 | 核心 4 + test 61（黄金轨迹数据）+ proto 1 + CMakeLists 1 |
+| sound | 72 | 5 | 核心 31（stb_vorbis 在内）+ test 38 + dmsdk 1 + CMakeLists/README 2 |
+| shaderc | 27 | 5 | shaderc 核心 7 + Java 桥 2 + jni 桥 2 + standalone 2 + test 13 + CMakeLists 1 |
+| modelc | 33 | 4 | 核心 10（java/jni 桥在内）+ test 20 + scripts 1 + CMakeLists/README 2 |
+| texc | 19 | 4 | 核心 12 + test 5 + scripts 1 + CMakeLists 1 |
+| rig | 9 | 3 | 核心 4 + test 2 + dmsdk 1 + proto 1 + CMakeLists 1 |
+| hid | 17 | 5 | 核心 11 + test 3【src 2+根 .sh 1】+ dmsdk 2 + CMakeLists 1 |
+| input | 12 | 2 | 核心 3 + test 7 + proto 1 + CMakeLists 1 |
+| resource | 89 | 8 | 核心 46 + test 36 + dmsdk 3 + proto 2 + CMakeLists/sdk_gen 2 |
+| ddf | 37 | 4 | 核心 19【C++ 16+proto 3】+ ddfc 编译器 5 + test 8 + dmsdk 1 + doc 1 + 楼根 3 |
+| platform | 28 | 4 | 核心 21（glfw 五平台在内）+ test 5 + dmsdk 1 + CMakeLists 1 |
+| profiler | 31 | 5 | 核心 17【src 顶 14+basic 1+js 2】+ remotery 借件 10 + test 3 + CMakeLists 1 |
+| crash | 35 | 5 | 核心 27（其中 backtrace 七变体+信号策略+地址采集共十九个平台变体）+ test 7 + CMakeLists 1 |
+| liveupdate | 13 | 3 | 核心 5 + test 7 + CMakeLists 1 |
+| record | 9 | 3 | 核心 4 + test 3 + CMakeLists/.gitignore 2 |
+| extension | 19 | 4 | 核心 8（cs 胶水在内）+ dmsdk 3 + test 6 + CMakeLists/sdk_gen 2 |
+| jni | 14 | 2 | 核心 2 + scripts 生成器 5（gen_java.py 等）+ test 5 + CMakeLists/.gitignore 2 |
+| sdk | 9 | 2 | 核心 2【sdk.h+dmsdk.csproj】+ test 5 + CMakeLists/README 2 |
+| testmain | 6 | 1 | Harness 3 + src/test 2（自测试+CMakeLists）+ 楼根 CMakeLists 1 |
+| tools | 19 | 5 | 核心 14（.rc/.ico 在内）+ scripts 1 + test 3 + CMakeLists 1 |
+| docs | 25 | 9 | md 13 + py 5【生成器 3+测试 2】+ lua 注解 yaml 1 + testdata 4 + CMakeLists/.gitignore 2 |
 
 **三处规律**（土豆问"这楼怎么这么多文件"时的标准答案）：
-1. **测试占半壁**：engine 575/718、gamesys 991/1235、font 484/552——文件数唬人，真核心极小（engine 楼核心只有 25 个 cpp/h）。
-2. **借件藏在楼里**：dlib 名义 1518 文件，真自写只有 165——"标准库地基层 2/3 是别人的"。
+1. **测试占半壁**：engine 575/718、gamesys 991/1235、font 484/552——文件数唬人，真核心极小（engine 楼 src 非测试只有 27 文件，cpp/h 23）。
+2. **借件藏在楼里**：dlib 名义 1518 文件，真自写核心 167（dlib/ 目录 170 去 testutil 3）——"标准库地基层 2/3 是别人的"。
 3. **平台胶水成灾**：crash 楼 27 个核心文件里 backtrace×7+信号策略×5+地址×4+文件×3=19 个是平台变体——跨平台真实成本（咱单浏览器平台不背）。
 
 ---
@@ -498,14 +499,14 @@
 - `dlib/src/mbedtls/` 1028 文件——TLS 库内部结构未看（也不需要看）
 - `gamesys/src/gamesys/test/` 991 文件——各部件测试的覆盖面未盘点
 - `engine/src/test/` 575 文件——同上
-- `font/src/java/` 22 个——Java 侧字形栅格化的具体分工未读
+- `font/src/java/` 23 个（22 实现+1 测试）——Java 侧字形栅格化的具体分工未读
 - `graphics/src/` 六后端（opengl/vulkan/metal/dx12/webgpu/null）——只确认存在与文件数，后端内部实现一行没读
 - `physics/src/physics/box2d/`——Box2D v2/v3 vendored 源码未读（60Hz 不适配已定论，无需深读）
 - `editor/` 3024 文件——只读了 README_SYSTEMS_OVERVIEW.md 一篇（编辑器单独成节时再深挖）
 - `com.dynamo.cr/` 504 文件——Bob 构建器内部未读
 - `script/src/luasocket/` 42 文件——vendored 未读
 - 各楼 `res_*.cpp` 的具体格式字段——只确认"一类型一文件"，字段未对
-- `engine/docs/` 中 ARCHIVE_FORMAT/FONTS_AND_TEXT/INPUT_SYSTEM/NATIVE_EXTENSIONS/DEBUG_PORTS 五篇——确认存在与标题，未全文读
+- `engine/docs/` 中 ARCHIVE_FORMAT/ATLAS_FORMAT/CODE_STYLE/DEBUG_PORTS_AND_SERVICES/FONTS_AND_TEXT/INPUT_SYSTEM/NATIVE_EXTENSIONS/README 八篇——确认存在与标题，未全文读
 
 ---
 
