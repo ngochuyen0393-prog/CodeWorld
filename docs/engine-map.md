@@ -1,6 +1,6 @@
 # Defold 引擎工程地图（engine-map.md）
 
-> 姊妹篇：[game-menu.md](game-menu.md) 是"游戏设计系统"视角（12 章 121 条，策划官）；本篇是"引擎工程器官"视角（32 楼 ~219 个要害器官，工程官）。参照物 = 本地 Defold 1.14.0 源码（D:\Defold\defold-1.14.0\，13379 文件，Defold 宽松许可证，可读可学不可整段搬进闭源产品）。
+> 姊妹篇：[game-menu.md](game-menu.md) 是"游戏设计系统"视角（12 章 121 条，策划官）；本篇是"引擎工程器官"视角（32 楼 176 个要害器官，工程官）。参照物 = 本地 Defold 1.14.0 源码（D:\Defold\defold-1.14.0\，13379 文件，Defold 宽松许可证，可读可学不可整段搬进闭源产品）。
 > 用法：土豆点名"X 怎么实现的"→ 先查本表定位文件，再带行号进源码；每楼三行账管"这楼多大、多少已标、多少是借的"。
 > 全部行号/文件数为 2026-10-28 实测（1.14.0 tag）。
 
@@ -73,7 +73,7 @@
 
 | 楼 | 一句话职能 |
 |---|---|
-| **dlib** | 标准库地基：容器/哈希/socket/线程/压缩/日志/HTTP/加密（内藏 mbedtls 1028 文件+jetty 83） |
+| **dlib** | 标准库地基：容器/哈希/socket/线程/压缩/日志/HTTP/加密（内藏 mbedtls 1028 文件+jetty 84【含 servlet jar】） |
 | **ddf** | 自研数据格式（Defold Data Format）：protobuf 瘦身版，引擎所有文件格式的底座 |
 | **resource** | 资源系统：工厂/引用计数/7 种加载源（file/http/zip/archive…）/异步加载队列 |
 | **platform** | 窗口抽象：glfw3 五平台变体 + 各平台窗口头，把"开窗口"从引擎里隔离出去 |
@@ -478,11 +478,11 @@
 | crash | 35 | 5 | 核心 27（其中 backtrace 七变体+信号策略+地址采集共十九个平台变体）+ test 7 + CMakeLists 1 |
 | liveupdate | 13 | 3 | 核心 5 + test 7 + CMakeLists 1 |
 | record | 9 | 3 | 核心 4 + test 3 + CMakeLists/.gitignore 2 |
-| extension | 19 | 4 | 核心 8（cs 胶水在内）+ dmsdk 3 + test 6 + CMakeLists/sdk_gen 2 |
+| extension | 19 | 3 | 核心 8（cs 胶水在内）+ dmsdk 3 + test 6 + CMakeLists/sdk_gen 2 |
 | jni | 14 | 2 | 核心 2 + scripts 生成器 5（gen_java.py 等）+ test 5 + CMakeLists/.gitignore 2 |
-| sdk | 9 | 2 | 核心 2【sdk.h+dmsdk.csproj】+ test 5 + CMakeLists/README 2 |
+| sdk | 9 | 1 | 核心 2【sdk.h+dmsdk.csproj】+ test 5 + CMakeLists/README 2 |
 | testmain | 6 | 1 | Harness 3 + src/test 2（自测试+CMakeLists）+ 楼根 CMakeLists 1 |
-| tools | 19 | 5 | 核心 14（.rc/.ico 在内）+ scripts 1 + test 3 + CMakeLists 1 |
+| tools | 19 | 4 | 核心 14（.rc/.ico 在内）+ scripts 1 + test 3 + CMakeLists 1 |
 | docs | 25 | 9 | md 13 + py 5【生成器 3+测试 2】+ lua 注解 yaml 1 + testdata 4 + CMakeLists/.gitignore 2 |
 
 **三处规律**（土豆问"这楼怎么这么多文件"时的标准答案）：
@@ -501,10 +501,10 @@
 - `engine/src/test/` 575 文件——同上
 - `font/src/java/` 23 个（22 实现+1 测试）——Java 侧字形栅格化的具体分工未读
 - `graphics/src/` 六后端（opengl/vulkan/metal/dx12/webgpu/null）——只确认存在与文件数，后端内部实现一行没读
-- `physics/src/physics/box2d/`——Box2D v2/v3 vendored 源码未读（60Hz 不适配已定论，无需深读）
+- `physics/src/physics/box2d/` 与 `box2d_defold/`——各 4 文件的 2D 适配层（Box2D v2/v3 本体在 external/ 不在楼内）——60Hz 不适配已定论，无需深读
 - `editor/` 3024 文件——只读了 README_SYSTEMS_OVERVIEW.md 一篇（编辑器单独成节时再深挖）
 - `com.dynamo.cr/` 504 文件——Bob 构建器内部未读
-- `script/src/luasocket/` 42 文件——vendored 未读
+- `script/src/luasocket/` 36 文件——vendored 未读
 - 各楼 `res_*.cpp` 的具体格式字段——只确认"一类型一文件"，字段未对
 - `engine/docs/` 中 ARCHIVE_FORMAT/ATLAS_FORMAT/CODE_STYLE/DEBUG_PORTS_AND_SERVICES/FONTS_AND_TEXT/INPUT_SYSTEM/NATIVE_EXTENSIONS/README 八篇——确认存在与标题，未全文读
 
