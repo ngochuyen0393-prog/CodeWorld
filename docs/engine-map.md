@@ -38,7 +38,7 @@
 
 | 楼 | 一句话职能 |
 |---|---|
-| **gamesys** | 零件总库：sprite/碰撞/factory/label/particlefx/model/gui 等全部部件 + 20 个 Lua 模块 + 15 种资源格式，引擎里最大的一坨自写代码 |
+| **gamesys** | 零件总库：16 部件（sprite/碰撞/factory/label/particlefx/model/gui/sound/tilegrid/light/mesh…见 §B 展开）+ 20 个 Lua 模块（physics/http/factory/image/buffer…见 §B 全名单）+ 43 个资源加载器 + 15 种内容格式，引擎里最大的一坨自写代码 |
 
 ### C. 表现层组（9 楼）——咱剥给浏览器的那部分
 
@@ -140,10 +140,43 @@
 | `components/comp_particlefx.cpp` | 粒子部件（联动 particle 楼） | 特效归玩家自绘渲染 | 🔬 |
 | `components/comp_model.cpp` | 3D 模型部件（联动 rig/modelc） | 将来 3D 时代的参照 | 🔬 |
 | `components/comp_gui.cpp` | UI 部件（联动 gui 楼，屏幕空间） | UI 归浏览器 | 🔬 |
+| `components/comp_sound.cpp` | 声音部件（联动 sound 楼：播放/声道） | 音频插座未立（menu 9 章 ⬜） | 🔬 |
+| `components/comp_tilegrid.cpp` | 瓦片地图部件（联动 tile 格式：拼地砖/地形） | 地形时代参照（D-016 地形起伏同族） | 🔬 |
+| `components/comp_light.cpp` | 光源部件（2D 光照） | 前端光照归浏览器 | 🔬 |
+| `components/comp_mesh.cpp` | 自定义网格部件（自定义顶点形状） | 形状物理包时代参照（D-008） | 🔬 |
+
+**部件合计 16 个**（另 comp_model_null/comp_model_pbr 为 3D 模型两变体、comp_private 为共享工具）：sprite / collision_object / factory / collection_factory / collection_proxy / camera / label / particlefx / model(+2 变体) / gui / sound / tilegrid / light / mesh。
 | `gamesys/src/gamesys/scripts/script_physics.cpp:2145` | **Lua 物理白名单注册表**（PHYSICS_FUNCTIONS[]：raycast/create_joint/apply_force…每个 API 一行注册） | **能力接口=白名单注册表非牢房**的行业实现；咱 api.md 注册器的同构物 | 📌 |
-| `scripts/`（其余 19 个 script_*.cpp） | 每 Lua 模块一文件：http/image/sprite/label/sound/tilemap/window/factory/collectionproxy… | 咱 API 面板的"每能力一个模块"组织法同构 | 🔬 |
-| `resources/`（顶层 39 个 res_*.cpp，含子目录共 43） | 资源类型加载器（res_sprite/res_gui/res_font…一类型一文件，CODE_STRUCTURE 官方命名约定） | storage crate 加载器层 | 🔬 |
-| `gamesys/proto/gamesys/`（15 个 ddf） | 全部内容格式：sprite/atlas/label/camera/physics/tile/gui/sound… | 快照 schema；**"每种内容一个 proto"=格式即接口** | 📦 |
+
+**Lua 模块合计 20 个**（scripts/ 下逐个数出，每模块=给 Lua 开的一组能力）：
+
+| # | 模块 | 给 Lua 的能力 | 咱的亲戚 |
+|---|---|---|---|
+| 1 | script_physics | 物理全套（raycast/关节/力/重力） | 物理原语 import |
+| 2 | script_factory | 运行时造对象 | spawn |
+| 3 | script_collection_factory | 整棵实体树量产 | spawn 组 |
+| 4 | script_collectionproxy | 子世界加载控制 | — |
+| 5 | script_sprite | 播放/翻转精灵图 | 表现类能力 |
+| 6 | script_label | 动态改文字 | 表现类能力 |
+| 7 | script_sound | 播声音 | 音频插座（未立） |
+| 8 | script_particlefx | 播特效 | 玩家自绘 |
+| 9 | script_tilemap | 改地砖 | 地形时代 |
+| 10 | script_http | 发 HTTP 请求 | **外接算力桥直系亲戚** |
+| 11 | script_http_js | http 的浏览器特化版 | — |
+| 12 | script_image | 加载/处理图片 | 皮入沙箱（#051）参照 |
+| 13 | script_buffer | 二进制数据块读写 | 出生数据包 blob 参照 |
+| 14 | script_font | 字体操作 | — |
+| 15 | script_material | 换材质 | 材质库（#d3d） |
+| 16 | script_model | 3D 模型操作 | 3D 时代 |
+| 17 | script_resource | 资源通用操作/热更 | storage crate |
+| 18 | script_sys_gamesys | 系统杂项（重启/帧计数） | — |
+| 19 | script_window | 窗口操作 | 浏览器白送 |
+| 20 | script_compute | GPU 计算着色器 | — |
+
+对照要义：**Defold 给 Lua 开 20 组"操作引擎"能力；咱给玩家开 30+ import，多出的楼层是"沙箱身份/账本/通道"（它无此概念）——两张货架并排=游戏脚本环境 vs 居民世界的规格差异**。
+
+| `resources/`（43 个 res_*.cpp 全名单） | 资源类型加载器，一类型一文件（CODE_STRUCTURE 官方命名约定）：animationset / buffer / camera / collection_factory / collection_proxy / collision_object（+box2d/bullet3d 变体 2）/ compute / convex_shape（+变体 2）/ data / display_profiles / factory / font / gamepad_map / glyph_bank / gui / gui_script / input_binding / label / light / material / mesh / meshset / model（+null 变体）/ particlefx / render_prototype / render_script / render_target / rig_scene（+null 变体）/ shader_program / skeleton / sound / sound_data / sprite / texture / textureset / tilegrid / ttf | storage crate 加载器层 | 🔬 |
+| `gamesys/proto/gamesys/`（15 个 .proto 全名单） | 全部内容格式：atlas / buffer / camera / collectionproxy / data / gamesys（总配置）/ gui / label / mesh / model / physics / sound / sprite / texture_set / tile——**你填的每个参数（摩擦/弹性/类型）在 physics_ddf.proto 里都有对应字段** | 快照 schema；**"每种内容一个 proto"=格式即接口** | 📦 |
 
 ### C. 表现层组
 
