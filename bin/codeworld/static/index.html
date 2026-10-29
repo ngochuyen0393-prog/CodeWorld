@@ -2144,6 +2144,8 @@
   var createTpl = 'blank';       // 选中模板 id（默认第一张）
   var createBusy = false;        // 决策/淡出中（防双发）
   var createDone = false;        // 本会话已创建（player_joined 置位；面板永不再弹）
+  var createBusyTimer = null;    // busy 兜底解锁（R1 复审：任何路径漏回执
+                                 // 也不许永久锁死——15s 无回执自动解锁重试）
   var bornTimer = null;
 
   // 拒绝码 -> 人话（与服务器 onboarding.rs / api.md 码表同源）
@@ -2166,14 +2168,18 @@
     });
   });
 
-  // 本地起名校验（与服务器 sanitize_name 同规则——双门同锁，前端先拦省往返）
+  // 本地起名校验（与服务器 sanitize_name 同规则：字母/数字/_/-，非 ASCII
+  // 必须是"字母"（\p{L}）——中文/日文等真字母放行，全角数字/标点/emoji 拒绝。
+  // R1 复审缺口：旧规则任意非 ASCII 全放行，与后端 is_alphabetic 不一致，
+  // 中文 IME 下全角标点/全角数字高频误输入，放行后被后端静默丢弃=面板卡死。
+  // 现两端同锁+服务器拒绝全部走事件回执（改法 B），漂移也不再挂死）
   function createNameOk(name) {
     var t = name.trim();
     if (!t) return '名字不能为空';
     if ([].slice.call(t).length > 24) return '名字太长（最多 24 个字符）';
     for (var i = 0; i < t.length; i++) {
       var c = t[i];
-      var ok = /[A-Za-z0-9_\-]/.test(c) || /[\u0080-\uffff]/.test(c);
+      var ok = /[A-Za-z0-9_\-]/.test(c) || /\p{L}/u.test(c);
       if (!ok) return '名字只能用字母、数字、中文、_ 和 -';
     }
     return null;
@@ -2189,7 +2195,18 @@
     createGoEl.disabled = true;
     sendMsg({ type: 'create_player', name: name.trim(), template: createTpl });
     // 意图已上行：等服务器回执（player_joined=成功收面板；create_player_rejected=
-    // 红字+解锁重试）。不本地乐观收面板——世界说了才算（诚实 UI）
+    // 红字+解锁重试）。不本地乐观收面板——世界说了才算（诚实 UI）。
+    // busy 兜底（R1 复审）：15s 无任何回执自动解锁——防未知路径漏事件把
+    // 面板永久锁死（回执事件 handler 会清这个 timer）
+    if (createBusyTimer) clearTimeout(createBusyTimer);
+    createBusyTimer = setTimeout(function () {
+      if (createBusy && !createDone) {
+        createBusy = false;
+        createGoEl.disabled = false;
+        createErrEl.textContent = '服务器没有回应，再试一次';
+        createNameEl.focus();
+      }
+    }, 15000);
   }
 
   createGoEl.addEventListener('click', createSend);
@@ -2218,6 +2235,7 @@
     if (ev.kind === 'player_joined') {
       createDone = true;
       createBusy = false;
+      if (createBusyTimer) { clearTimeout(createBusyTimer); createBusyTimer = null; }
       createGoEl.disabled = false;
       // 决策即关门（0.25s 淡出，弹窗铁律）
       createPanelEl.classList.add('closing');
@@ -2229,6 +2247,7 @@
       bornTimer = setTimeout(function () { bornBannerEl.hidden = true; }, 5000);
     } else if (ev.kind === 'create_player_rejected') {
       createBusy = false;
+      if (createBusyTimer) { clearTimeout(createBusyTimer); createBusyTimer = null; }
       createGoEl.disabled = false;
       createErrEl.textContent = CREATE_REJECT_TEXT[ev.reason] || ev.reason || '被拒';
       createNameEl.focus();

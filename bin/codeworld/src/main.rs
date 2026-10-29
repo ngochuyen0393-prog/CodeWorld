@@ -1815,7 +1815,8 @@ fn tick_with_intents(
     let mut ctrl_intents: Vec<input::Intent> = Vec::with_capacity(intents.len());
     for it in intents {
         // D-021b CreatePlayer 分流（同 Logout 模式：会话动作不走操控路由）；
-        // Copy 已退役：clone 入 ctrl 队，CreatePlayer 原地消费（String 载荷不复制两次）
+        // Copy 已退役：clone 入 ctrl 队，CreatePlayer 原地消费（String 载荷不复制
+        // 两次）。名字校验在此后的 process_create_player（唯一的名字闸门）
         if let input::Intent::CreatePlayer { name, template } = it {
             process_create_player(sandbox_map, world, name, template, current_tick);
             continue;
@@ -3375,7 +3376,8 @@ fn process_create_player(
     template_id: &str,
     current_tick: u64,
 ) {
-    // 1. 起名校验（与 net.rs 解析层同一实现——双门同锁）
+    // 1. 起名校验（唯一的名字闸门——R1 复审改法 B：解析层不校验名字，
+    //    拒绝全部在此结构化回执，任何拒绝都有事件=前端 busy 锁永不悬空）
     let name = match crate::onboarding::sanitize_name(raw_name) {
         Ok(n) => n,
         Err(reason) => {
@@ -6911,6 +6913,60 @@ mod tests {
             )),
             "NAME_TAKEN 事件应发出：{bodies:?}"
         );
+    }
+
+    #[test]
+    fn create_player_bad_name_rejected_with_event_not_silent() {
+        // R1 复审改法 B 的 tick 侧锚：名字格式拒绝（空/危险字符/超长）全部
+        // 在 tick 侧 process_create_player 落地=结构化 create_player_rejected
+        // 事件回执——任何拒绝都有回执，前端 busy 锁永不悬空（解析层已不放
+        // 此类校验：Err 分支=静默丢弃无回执，会挂死面板）。
+        for (raw, want_reason) in [
+            ("", "NAME_EMPTY"),
+            ("   ", "NAME_EMPTY"),
+            ("a/b", "NAME_BAD_CHAR"),
+            ("a.wat", "NAME_BAD_CHAR"),
+            ("..", "NAME_BAD_CHAR"),
+            ("乔丹·科比", "NAME_BAD_CHAR"), // U+00B7 间隔号：前端旧规则曾放行（复缺口例）
+            ("１２３", "NAME_BAD_CHAR"),     // 全角数字 Nd：同上
+            ("a".repeat(25).as_str(), "NAME_TOO_LONG"),
+        ] {
+            let (mut world, mut map, dir) = onboarding_stage();
+            let intents = vec![input::Intent::CreatePlayer {
+                name: raw.to_string(),
+                template: "blank".to_string(),
+            }];
+            tick_with_intents(
+                &mut world,
+                &mut TimeEngine::new(),
+                &DefaultPhysicsEngine::new(),
+                &mut test_renderer(),
+                &mut StorageEngine::open_in_memory().unwrap(),
+                &mut Vec::new(),
+                &mut map,
+                &intents,
+            );
+            assert!(
+                !map.players.is_online(raw.trim()),
+                "非法名字不得进场：{raw:?}"
+            );
+            let wat_dir = dir.join(format!("{}.wat", sanitize_probe_name(raw)));
+            assert!(!wat_dir.exists(), "非法名字不得落文件：{raw:?}");
+            let bodies = next_unowned_frame(&mut map);
+            assert!(
+                bodies.iter().any(|b| matches!(
+                    b,
+                    crate::events::EventBody::CreatePlayerRejected { reason } if *reason == want_reason
+                )),
+                "应发 {want_reason} 事件（raw={raw:?}）：{bodies:?}"
+            );
+        }
+    }
+
+    /// 测试辅助：与 sanitize_name 同源的落盘名（危险字符的名字根本走不到
+    /// 落盘——这里只为拼出"本应落盘的路径"做不存在断言，安全子集即可）
+    fn sanitize_probe_name(raw: &str) -> String {
+        raw.trim().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').collect()
     }
 
     #[test]

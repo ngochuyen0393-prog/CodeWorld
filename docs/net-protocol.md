@@ -165,7 +165,7 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 | `stop` | 清除走位目标站住（#025 操控独占的"我不动"）。**v1.4 起：stop 在空中 = 悬停不坠**（stop 语义是"停止移动"不是"坠落"；悬停锚点改写为脚下坐标，要落地玩家点地面）。前端由右键（contextmenu）或 S 键产生 |
 | `logout` | **主动登出三选一**（v1.7，#025 下线处置权；仅操控连接生效，观战连接照旧丢弃）：`disposition` 取 `take`（带走：角色立即移除，文件锚保留，重连认领=重新进场重生）/ `stay_auto`（停留+自主接管：on_tick 恢复，角色自己活，重连=接管者被顶掉）/ `stay_ai`（停留+AI 待接入：站桩等外部 AI，端点协议是 #014 未来端点本刀不实现）。服务器收即释放操控令牌、连接降级观战（快照照收）；**处置中的玩家不被 me 声明重认领**——抢回操控必须走重连认领（操控权=me 声明+连接在，#024 精神） |
 | `skill` | **技能栏**（v2.5，D-020a）：`slot`=1..4，替操控玩家排一个 spawn（世界侧预置模板：投掷器/飞剑/护盾场/侦察弹，模板能力全部来自已开放 spawn 参数零新原语，全文可抄 `GET /skills/*.wat`）。出生点=操控实体东侧身位偏移；**每实体每拍 1 发**（同拍连按只发第一发，再按报 RATE_LIMITED 事件）；失败走 spawn_rejected 事件回报面板（闭环）。非法槽位（0/5+/缺参）解析层拒绝丢弃。模板清单见 api.md「五点十、技能栏」 |
-| `create_player` | **进场仪式**（v2.6，D-021b）：`name`+`template`（blank/grazer/hunter 三选）→ 服务器写 `players/<name>.wat`（内容=模板全文，`GET /templates/<id>.wat` 同源）→ **当拍进场**（不等目录轮询）→ 写 `players/me.txt`（操控接管；`CODEWORLD_ME` 显式设置时不覆盖）。回执走 player_events 公共新闻：成功=`player_joined {name}`（面板收起+出生横幅），失败=`create_player_rejected {reason}`（NAME_EMPTY/NAME_TOO_LONG/NAME_BAD_CHAR/NAME_TAKEN/TEMPLATE_MISSING/IO_ERROR，红字回执）。名字基础格式解析层拒绝；同名/模板缺失等业务拒绝走事件。仅操控连接生效（观战连接丢弃）。**首启归档**：空世界模式+空玩家目录启动时旧 db 挪 `archive/`（启动瞬间做——sqlite 句柄锁 db，进程内挪不动；create_player 链路永不碰 db）。详见 api.md「进场仪式」节 |
+| `create_player` | **进场仪式**（v2.6，D-021b）：`name`+`template`（blank/grazer/hunter 三选）→ 服务器写 `players/<name>.wat`（内容=模板全文，`GET /templates/<id>.wat` 同源）→ **当拍进场**（不等目录轮询）→ 写 `players/me.txt`（操控接管；`CODEWORLD_ME` 显式设置时不覆盖）。回执走 player_events 公共新闻：成功=`player_joined {name}`（面板收起+出生横幅），失败=`create_player_rejected {reason}`（NAME_EMPTY/NAME_TOO_LONG/NAME_BAD_CHAR/NAME_TAKEN/TEMPLATE_MISSING/IO_ERROR，红字回执）。名字校验的权威闸门在服务器 tick 侧（R1 复审改法 B：解析层不做名字校验——Err 分支=静默丢弃无回执，前端 busy 锁会挂死；全部拒绝统一走事件回执，含格式类 NAME_* 三码）。仅操控连接生效（观战连接丢弃）。**首启归档**：空世界模式+空玩家目录启动时旧 db 挪 `archive/`（启动瞬间做——sqlite 句柄锁 db，进程内挪不动；create_player 链路永不碰 db）。详见 api.md「进场仪式」节 |
 
 ### 6.3 冲突与状态规则
 
@@ -362,7 +362,9 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
   同源伺服）→ 当拍进场 → 写 me.txt（操控接管）。player_events 新增两类**无主公共新闻**：
   `player_joined {name}`（成功——面板收起+出生横幅）与 `create_player_rejected {reason}`
   （六码：NAME_EMPTY/NAME_TOO_LONG/NAME_BAD_CHAR/NAME_TAKEN/TEMPLATE_MISSING/IO_ERROR）。
-  名字格式解析层双门（前端同规则先拦）；仅操控连接生效。配套**首启归档**（非协议变更）：
+  名字校验全在 tick 侧（R1 复审改法 B：解析层不做名字校验——Err 分支=静默
+  丢弃无回执，前端 busy 锁会挂死；含格式类的全部拒绝统一走
+  create_player_rejected 事件回执，前后端口径漂移也不再挂死）；仅操控连接生效。配套**首启归档**（非协议变更）：
   空世界模式+空玩家目录启动时旧 db 挪 archive/（启动瞬间 StorageEngine::open 之前——
   Windows 下 sqlite 句柄锁 db 进程内 rename 必失败 os error 32，实测改启动时归档；
   create_player 链路永不碰 db）

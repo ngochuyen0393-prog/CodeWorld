@@ -195,3 +195,12 @@
 - api.md 开局四生物段更新（定位说明+四开关+空世界示例）；start.bat 未动（默认剧本保留）
 - workspace 1216 passed / 0 failed / 2 ignored（亲跑）；clippy 干净；冒烟双证（EMPTY_WORLD=1 空世界 log 出现无登场；不设 env 四生物照旧+开局布阵）
 - TDD：config 8 测试 + main 5 测试先 RED（亲见编译失败：no field/签名不符）后 GREEN
+
+## 2026-10-30 D-021b R1 复审修复：起名校验统一收口 tick 侧（改法 B+A）
+
+- 缺陷（R1 复审抓）：前后端起名规则不一致（前端任意非 ASCII 放行 vs 后端只收字母），后端解析层拒绝走 Err 分支=静默丢弃无事件回执 → 前端 createBusy 永不解锁，面板永久卡死（中文 IME 全角标点/全角数字高频触发）
+- 改法 B（结构性根治）：net.rs 解析层删 create_player 名字校验——全部拒绝（含 NAME_EMPTY/TOO_LONG/BAD_CHAR 格式类）统一走 tick 侧 process_create_player 的 create_player_rejected 结构化事件回执，busy 锁永不悬空；协议形状（serde 必填字段）仍归解析层
+- 改法 A（前端对齐，顺带做）：createNameOk 非 ASCII 判定改 \p{L}u 正则（与后端 is_alphabetic 同锁：真字母放行，全角数字/标点/emoji 拒绝）+ busy 15s 兜底解锁（任何路径漏回执也不再永久锁死）
+- 测试：t21 改向锚新契约（危险名解析层放行+缺字段仍拒）；main 新增 create_player_bad_name_rejected_with_event_not_silent（8 例含三缺口名逐例断言事件回执+零落盘）；onboarding 死代码 NameReject::text() 删除（解析层退役后失调用方）
+- 验证：cargo 1229/0/2 全绿（+1）；clippy 新增 0；前端 JS 编译过+createNameOk 13 例 PASS（磁盘实况提取执行）；A 轨机证 smoke-r1fix.js 全过（三缺口名 NAME_BAD_CHAR 回执/合法中文名出生主链无回归/缺字段静默丢弃对照）
+- 文档：api.md 起名规则句 + net-protocol.md 表格行与 v2.6 变更记录同步（解析层不拦名字、权威闸门在 tick 侧）

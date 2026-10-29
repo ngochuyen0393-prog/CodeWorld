@@ -65,7 +65,9 @@ pub(crate) enum ClientMessage {
     },
     /// 创建角色（D-021b 进场仪式）：name+template（blank/grazer/hunter）→
     /// 服务器写 players/<name>.wat 当拍进场；回执走 player_events
-    /// （player_joined / create_player_rejected，公共新闻）
+    /// （player_joined / create_player_rejected，公共新闻）。
+    /// 名字校验全在 tick 侧（R1 复审改法 B：解析层拒绝=静默丢弃无回执，
+    /// 前端 busy 锁会挂死——任何拒绝都必须有事件回执）
     #[serde(rename = "create_player")]
     CreatePlayer { name: String, template: String },
 }
@@ -79,8 +81,8 @@ pub(crate) fn parse_client_message(text: &str) -> Result<ClientMessage, String> 
         ClientMessage::Move { x, y } | ClientMessage::Attack { x, y } => finite(*x) && finite(*y),
         ClientMessage::Shoot { x, y } => finite(*x) && finite(*y),
         ClientMessage::Stop | ClientMessage::Logout { .. } | ClientMessage::Skill { .. } => true,
-        // D-021b：名字基础校验在解析层（空/超长/危险字符当场拒绝——省一次
-        // 往返；同名/模板缺失等业务拒绝走 tick 侧结构化事件回执）
+        // D-021b：CreatePlayer 意图直通 tick 侧（名字校验在 tick 侧
+        // process_create_player——R1 复审改法 B，拒绝全部走事件回执）
         ClientMessage::CreatePlayer { .. } => true,
     };
     if !coords_ok {
@@ -92,13 +94,12 @@ pub(crate) fn parse_client_message(text: &str) -> Result<ClientMessage, String> 
             return Err(format!("技能槽位非法（{slot}，合法域 1..=4）"));
         }
     }
-    // create_player 解析层校验（D-021b）：名字格式当场拒绝；模板 id 只查表
-    // （不在表=业务拒绝走事件回执——解析层不重复业务规则）
-    if let ClientMessage::CreatePlayer { name, .. } = &msg {
-        if let Err(reason) = crate::onboarding::sanitize_name(name) {
-            return Err(format!("起名被拒（{}）", reason.text()));
-        }
-    }
+    // create_player（D-021b）：解析层不做名字校验——R1 复审改法 B：名字校验
+    // 若放解析层，拒绝走 Err 分支=静默丢弃（无事件回执），前端 busy 锁永久
+    // 挂起（前后端口径漂移时即触发）。所有名字拒绝（含 NAME_EMPTY/
+    // TOO_LONG/BAD_CHAR）统一走 tick 侧 process_create_player 的结构化
+    // create_player_rejected 事件回执——任何拒绝都有回执，busy 锁永不悬空。
+    // 解析层只保留协议形状（serde 必填字段）。
     Ok(msg)
 }
 
@@ -720,8 +721,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                             controller = false;
                         }
                         Ok(ClientMessage::CreatePlayer { name, template }) => {
-                            // D-021b 进场仪式：名字格式已在解析层校验，这里只转发
-                            // 意图（业务拒绝=同名/模板缺失走 player_events 回执面板）
+                            // D-021b 进场仪式：名字校验全在 tick 侧（R1 复审
+                            // 改法 B——解析层拒绝=静默丢弃无回执，busy 锁会
+                            // 挂死；拒绝一律走 create_player_rejected 事件）
                             tracing::info!(
                                 name = %name,
                                 template = %template,
@@ -925,22 +927,28 @@ mod tests {
 
     #[test]
     fn t21_create_player_rejects_bad_names_at_parse_layer() {
-        // 解析层双门之一：名字格式（空/超长/危险字符）当场拒绝——前端已先拦，
-        // 这里兜直连 WS 的原始客户端
-        for bad in [
+        // R1 复审改法 B 后的解析层语义：名字格式**不再**在解析层拒绝——
+        // 解析层 Err 分支=静默丢弃（无事件回执），前端 busy 锁会挂死。
+        // 全部名字拒绝（含格式类）统一走 tick 侧 create_player_rejected
+        // 事件（见 main.rs create_player_* 测试与 onboarding::sanitize_name）。
+        // 本测锚定新契约：危险名字在解析层**放行**（回执归 tick 侧）。
+        for tricky in [
             r#"{"type":"create_player","name":"","template":"blank"}"#,
             r#"{"type":"create_player","name":"   ","template":"blank"}"#,
             r#"{"type":"create_player","name":"a/b","template":"blank"}"#,
             r#"{"type":"create_player","name":"a.wat","template":"blank"}"#,
             r#"{"type":"create_player","name":"..","template":"blank"}"#,
+            r#"{"type":"create_player","name":"乔丹·科比","template":"blank"}"#,
+            r#"{"type":"create_player","name":"１２３","template":"blank"}"#,
         ] {
             assert!(
-                parse_client_message(bad).is_err(),
-                "危险名字应解析层拒绝：{bad}"
+                parse_client_message(tricky).is_ok(),
+                "解析层应放行（拒绝归 tick 侧事件回执）：{tricky}"
             );
         }
-        // 缺字段拒绝（serde 必填）
+        // 缺字段拒绝（serde 必填）——协议形状错误仍归解析层
         assert!(parse_client_message(r#"{"type":"create_player","name":"ok"}"#).is_err());
+        assert!(parse_client_message(r#"{"type":"create_player"}"#).is_err());
     }
 
     #[test]

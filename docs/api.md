@@ -531,7 +531,7 @@
   - `grazer` 吃草彷徨者——scan 找最近者，6 格内逃跑、安全时向东散步（marker 1=散步 2=逃跑）；
   - `hunter` 小猎手——scan 锁最近活物直线逼近，贴身 1.5 格出空 payload 击杀刀（marker 0=待机 2=出刀 3=追击）。
   模板=官方示例内容**以玩家身份进场**的最小实现（#011）：它是你自己代码的起点，不是世界预设生物。
-- **起名规则**（前后端同一道门）：trim 后 1..=24 字符，只许字母/数字/中文/`_`/`-`（拒绝路径分隔符、点号、空白——文件名安全）。拒绝码：`NAME_EMPTY` / `NAME_TOO_LONG` / `NAME_BAD_CHAR` / `NAME_TAKEN`（同名已存在，换一个）/ `TEMPLATE_MISSING` / `IO_ERROR`，经 `create_player_rejected` 事件红字回执面板。
+- **起名规则**（前后端同一道门，前端先拦省往返）：trim 后 1..=24 字符，只许字母/数字/中文/`_`/`-`（拒绝路径分隔符、点号、空白——文件名安全）。**所有拒绝（含格式类）都经 `create_player_rejected` 事件红字回执**——解析层不拦名字（静默丢弃会让面板失去回执卡死）；名字校验的权威闸门在服务器 tick 侧。拒绝码：`NAME_EMPTY` / `NAME_TOO_LONG` / `NAME_BAD_CHAR` / `NAME_TAKEN`（同名已存在，换一个）/ `TEMPLATE_MISSING` / `IO_ERROR`，经 `create_player_rejected` 事件红字回执面板。
 - **首建归档**：空世界模式（`CODEWORLD_EMPTY_WORLD=1`）启动且 `players/` 目录里还没有任何 `.wat` 时，若旧 `codeworld.db` 存在（上一局世界的快照），**启动瞬间**自动挪去 `archive/codeworld.db.<时间戳>.db`——新玩家从干净世界开始（归档可找回，不删；SQLite 句柄锁着 db，进程运行中挪不动，所以归档发生在开库之前的启动瞬间）。玩家目录里已有 `.wat` 的常规启动照常恢复旧世界。
 - `CODEWORLD_ME` 环境变量显式设置时不覆盖 me 声明（开发者优先）；面板是浏览器玩家的 me 通道。
 - 想换代码：改 `players/<名字>.wat` 后**删文件重放**（MVP 无热更新，见上）。改文件=改命运，这是你作为玩家的第一个杠杆。

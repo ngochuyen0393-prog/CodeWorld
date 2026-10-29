@@ -89,14 +89,8 @@ impl NameReject {
             Self::BadChar => "NAME_BAD_CHAR",
         }
     }
-    /// 人话提示（前端兜底文案；正常走前端本地同款校验，此为服务器侧回执）
-    pub(crate) fn text(self) -> &'static str {
-        match self {
-            Self::Empty => "名字不能为空",
-            Self::TooLong => "名字太长（最多 24 个字符）",
-            Self::BadChar => "名字只能用字母、数字、中文、_ 和 -",
-        }
-    }
+    // 人话提示在前端 CREATE_REJECT_TEXT（api.md 码表同源）；服务器侧回执只发
+    // wire 码——R1 改法 B 后解析层不再调用本地人话（原 text() 成死代码已删）
 }
 
 /// 旧档归档（D-021b 验收补充）：把 db 挪去 <db 同目录>/archive/<原名>.<时间戳>.db。
