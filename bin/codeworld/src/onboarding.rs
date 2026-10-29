@@ -14,6 +14,11 @@
 
 use std::path::{Path, PathBuf};
 
+use codeworld_core::world::WorldState;
+
+use crate::net::{RosterEntry, ROSTER_OFFLINE_COLOR};
+use crate::players::{glyph_for, PlayerDirectory};
+
 /// 新手模板定义（静态表；WAT 源在 static/templates/<file>，启动读入装配）。
 /// 面板显示名/副标题/预览字形在前端 index.html 静态写死（渲染是浏览器的家）；
 /// 服务器侧只需 id 与文件名的映射
@@ -202,9 +207,49 @@ pub(crate) fn load_templates_from_static(static_dir: &Path) -> TemplateBook {
     TemplateBook::load(&static_dir.join(TEMPLATES_DIR_NAME))
 }
 
+/// 角色列表组装（D-021d 登录/选角页）：players/*.wat 全量投影为下行条目
+/// （纯函数，main 每拍刷新写共享槽——players 目录小，1Hz 全量重建白菜价）。
+/// - online 条目：在线表 name→EntityId→世界里活实体查实际 glyph/color
+/// - 离线条目：glyph=名字首字符大写（既有 glyph_for），color=中性灰
+///   （颜色依赖出生序号，离线时不可知，灰=诚实）
+/// - 排序：scan_dir 已按名排序，保持确定性；目录不可读=空列表（不拖垮世界）
+pub(crate) fn build_roster(
+    players: &PlayerDirectory,
+    world: &WorldState,
+) -> Vec<RosterEntry> {
+    let stems = match players.scan_dir() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "[onboarding] 角色列表目录扫描失败（本轮发空列表）");
+            return Vec::new();
+        }
+    };
+    stems
+        .into_iter()
+        .map(|name| match players
+            .online_entity(&name)
+            .and_then(|id| world.entities.get(&id))
+        {
+            Some(e) => RosterEntry {
+                name,
+                glyph: e.appearance.glyph.clone(),
+                color: e.appearance.color.clone(),
+                online: true,
+            },
+            None => RosterEntry {
+                glyph: glyph_for(&name),
+                color: ROSTER_OFFLINE_COLOR.to_string(),
+                name,
+                online: false,
+            },
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codeworld_core::entity::{Appearance, Entity, EntityId, PlayerId};
 
     #[test]
     fn sanitize_accepts_normal_names() {
@@ -270,6 +315,105 @@ mod tests {
         );
         // 不存在的 db：no-op
         assert!(archive_old_world(&db_str).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // === D-021d 登录/选角页：角色列表（player_roster 下行数据源）===
+
+    /// roster 测试台：临时玩家目录 + .wat 文件清单（与 players.rs temp_dir 同款）
+    fn roster_dir(tag: &str, names: &[&str]) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "cw-onboard-roster-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for n in names {
+            std::fs::write(d.join(format!("{n}.wat")), "(module)").unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn build_roster_lists_all_wat_files_sorted() {
+        // 规则（D-021d）：角色列表 = players/*.wat 全量（旧角色照样列出——登录页
+        // 是"每次登录都有"的选角页，与世界里有无玩家/在场与否无关）；按名字
+        // 排序（scan_dir 已排序，保持确定性）；非 .wat 文件不列
+        let dir = roster_dir("sorted", &["b", "a"]);
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        std::fs::write(dir.join("_tpl.wat.txt"), "x").unwrap();
+        let players = PlayerDirectory::new(&dir);
+        let world = WorldState::new();
+        let roster = build_roster(&players, &world);
+        let names: Vec<&str> = roster.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"], "全量列出且按名字排序");
+        assert!(roster.iter().all(|e| !e.online), "无在线登记=全部离线");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_roster_online_entries_carry_live_appearance() {
+        // 规则：online=true 条目 glyph/color 取世界里活实体实际值（在线表 name
+        // → EntityId → world.entities 查 appearance）；online=false（离线/被带走/
+        // 残影）：glyph=glyph_for(name)（首字符大写），color=中性灰 #8b949e
+        //（颜色依赖出生序号，离线时不可知，灰=诚实）
+        let dir = roster_dir("appear", &["a", "土豆"]);
+        let mut players = PlayerDirectory::new(&dir);
+        let mut world = WorldState::new();
+        let id = EntityId::new();
+        world.entities.insert(
+            id,
+            Entity::new(
+                id,
+                PlayerId(id.0),
+                "土豆".to_string(),
+                (30.0, 0.5),
+                Appearance::new("土".to_string(), "green".to_string(), 1.0),
+                0,
+                1000,
+            ),
+        );
+        players.register_online("土豆", id);
+        let roster = build_roster(&players, &world);
+        let on = roster.iter().find(|e| e.name == "土豆").expect("在线条目在列");
+        assert!(on.online, "在场登记=online");
+        assert_eq!(on.glyph, "土", "glyph=活实体实际值");
+        assert_eq!(on.color, "green", "color=活实体实际值");
+        let off = roster.iter().find(|e| e.name == "a").expect("离线条目也在列");
+        assert!(!off.online);
+        assert_eq!(off.glyph, "A", "离线 glyph=名字首字符大写");
+        assert_eq!(off.color, "#8b949e", "离线 color=中性灰（出生序号不可知）");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_roster_online_without_world_entity_falls_back_gray() {
+        // 防御：在线表登记了但世界里查不到实体（异常时序）——按离线灰兜底，
+        // 不 panic 不发空条目
+        let dir = roster_dir("ghost", &["lonely"]);
+        let mut players = PlayerDirectory::new(&dir);
+        let world = WorldState::new();
+        players.register_online("lonely", EntityId::new());
+        let roster = build_roster(&players, &world);
+        assert_eq!(roster.len(), 1);
+        assert!(!roster[0].online, "查不到实体按离线兜底");
+        assert_eq!(roster[0].color, "#8b949e");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_roster_empty_dir_is_empty_list() {
+        // 规则：空目录/目录不存在 = 空列表（前端显示"还没有角色"），
+        // 目录不存在时 scan_dir 自动创建（与门一语义一致）
+        let dir = roster_dir("empty", &[]);
+        let players = PlayerDirectory::new(&dir);
+        let world = WorldState::new();
+        let roster = build_roster(&players, &world);
+        assert!(roster.is_empty(), "空目录=空列表");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

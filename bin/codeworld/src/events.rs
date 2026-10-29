@@ -90,6 +90,12 @@ pub(crate) enum EventBody {
     PlayerJoined { name: String },
     /// create_player 被拒（D-021b）：无主公共新闻（结构化原因码回执面板红字）
     CreatePlayerRejected { reason: &'static str },
+    /// 选角成功（D-021d 登录/选角页）：无主公共新闻——前端收到才断开重连
+    /// （防早关丢消息；重连=第一连接重新认领操控令牌）
+    PlayerSelected { name: String },
+    /// select_player 被拒（D-021d）：无主公共新闻（结构化原因码回执登录页红字：
+    /// NAME_UNKNOWN=players/ 无此角色 / ME_ENV_LOCKED=CODEWORLD_ME 已锁定 / IO_ERROR）
+    SelectPlayerRejected { reason: &'static str },
 }
 
 /// 事件汇：世界单调 seq 计数器 + 本拍待发缓冲（挂在 EntitySandboxMap 上，
@@ -186,12 +192,16 @@ impl EventSink {
             .filter(|ev| match (&ev.owner_name, controller) {
                 (Some(owner), Some(name)) => owner == name,
                 // 无主事件：只放行公共新闻（compile_failed / player_joined /
-                // create_player_rejected——D-021b 进场仪式回执走同一条公共信道）
+                // create_player_rejected——D-021b 进场仪式回执走同一条公共信道；
+                // player_selected / select_player_rejected——D-021d 登录/选角页
+                // 回执同族）
                 (None, _) => matches!(
                     ev.body,
                     EventBody::CompileFailed { .. }
                         | EventBody::PlayerJoined { .. }
                         | EventBody::CreatePlayerRejected { .. }
+                        | EventBody::PlayerSelected { .. }
+                        | EventBody::SelectPlayerRejected { .. }
                 ),
                 // 有主事件但无操控连接：不发（宁缺勿泄）
                 (Some(_), None) => false,
@@ -295,6 +305,27 @@ mod tests {
         );
         let (ctrl_frame, _) = sink.take_frame(Some("alice"));
         assert_eq!(ctrl_frame.len(), 1, "有操控：compile_failed（无主）照样可见");
+    }
+
+    #[test]
+    fn t21d_unowned_select_events_are_public_news() {
+        // D-021d：player_selected / select_player_rejected 是无主公共新闻
+        //（登录/选角页的回执信道，与 player_joined/create_player_rejected 同族）
+        // ——无操控连接也放行（宁缺勿泄只对"有主"事件生效）
+        let mut sink = EventSink::new();
+        push_with_owner(&mut sink, None, EventBody::PlayerSelected { name: "tudou".into() });
+        push_with_owner(&mut sink, None, EventBody::SelectPlayerRejected { reason: "NAME_UNKNOWN" });
+        let (frame, _) = sink.take_frame(None);
+        assert_eq!(frame.len(), 2, "无操控：两个选角事件都放行");
+        assert!(matches!(frame[0].body, EventBody::PlayerSelected { .. }));
+        assert!(matches!(frame[1].body, EventBody::SelectPlayerRejected { .. }));
+        // 协议形状锚：kind 标签进 JSON（前端按 kind 分流回执）
+        let json = serde_json::to_string(&frame[0]).unwrap();
+        assert!(json.contains("\"kind\":\"player_selected\""), "{json}");
+        assert!(json.contains("\"name\":\"tudou\""), "{json}");
+        let json = serde_json::to_string(&frame[1]).unwrap();
+        assert!(json.contains("\"kind\":\"select_player_rejected\""), "{json}");
+        assert!(json.contains("\"reason\":\"NAME_UNKNOWN\""), "{json}");
     }
 
     #[test]

@@ -35,6 +35,21 @@ use self::avatars::{AvatarRegistry, UploadInput};
 /// 快照广播通道容量（未消费帧积压上限；慢客户端丢旧帧即可，快照有"后值覆盖"语义）
 pub(crate) const SNAPSHOT_CHANNEL_CAP: usize = 16;
 
+/// 角色列表条目（D-021d 登录/选角页下行 player_roster 帧的数组元素）：
+/// name=players/<name>.wat 的角色名；online=true 条目 glyph/color 取世界里
+/// 活实体实际值，online=false（离线/被带走/残影）glyph=名字首字符大写、
+/// color=中性灰 #8b949e（颜色依赖出生序号，离线时不可知，灰=诚实）
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RosterEntry {
+    pub name: String,
+    pub glyph: String,
+    pub color: String,
+    pub online: bool,
+}
+
+/// 离线角色的中性灰（D-021d：出生序号不可知时的诚实外观；前端色块圆片用它）
+pub(crate) const ROSTER_OFFLINE_COLOR: &str = "#8b949e";
+
 /// 头像资产目录（相对工作目录，与 STATIC_DIR 同基准——start.bat 已 cd 到项目根）。
 /// git 不入库（.gitignore），上传即写盘，启动扫目录重建登记表
 pub(crate) const AVATARS_DIR: &str = "assets/avatars";
@@ -70,6 +85,11 @@ pub(crate) enum ClientMessage {
     /// 前端 busy 锁会挂死——任何拒绝都必须有事件回执）
     #[serde(rename = "create_player")]
     CreatePlayer { name: String, template: String },
+    /// 选角（D-021d 登录/选角页 v2.7）：以 players/ 既有角色进场（等价 me.txt
+    /// 声明该名字）。名字校验全在 tick 侧 process_select_player（拒绝走
+    /// select_player_rejected 事件回执——R1 改法 B 同款）
+    #[serde(rename = "select_player")]
+    SelectPlayer { name: String },
 }
 
 /// 上行文本 -> 客户端消息（纯函数；Err 带原因供 warn 丢弃，不 panic 不部分接受）
@@ -83,7 +103,8 @@ pub(crate) fn parse_client_message(text: &str) -> Result<ClientMessage, String> 
         ClientMessage::Stop | ClientMessage::Logout { .. } | ClientMessage::Skill { .. } => true,
         // D-021b：CreatePlayer 意图直通 tick 侧（名字校验在 tick 侧
         // process_create_player——R1 复审改法 B，拒绝全部走事件回执）
-        ClientMessage::CreatePlayer { .. } => true,
+        // D-021d：SelectPlayer 同款（名字校验归 tick 侧 process_select_player）
+        ClientMessage::CreatePlayer { .. } | ClientMessage::SelectPlayer { .. } => true,
     };
     if !coords_ok {
         return Err("坐标非有限值（NaN/无穷）".to_string());
@@ -400,6 +421,7 @@ pub(crate) const STATIC_DIR: &str = "bin/codeworld/static";
 
 /// WS 服务器共享状态：快照广播 + 上行意图队列 + 操控连接令牌（#027 单连接假设）
 /// + 头像资产登记表（D-017：上传路由写入 / ws 连接建立时全量下发）
+/// + 角色列表共享槽（D-021d：主循环每拍重建 / ws 连接建立时全量下发）
 pub(crate) struct WsState {
     pub(crate) snapshots: broadcast::Sender<String>,
     /// 与终端键盘共享的意图队列生产端（单入口双来源，input.rs 路由不区分来源）
@@ -409,13 +431,19 @@ pub(crate) struct WsState {
     pub(crate) ctrl_taken: Arc<AtomicBool>,
     /// 头像资产登记表（D-017 资产层：上传落盘+内存索引，掩码连接建立时下发）
     pub(crate) avatars: Arc<AvatarRegistry>,
+    /// 角色列表共享槽（D-021d 登录/选角页）：主循环每拍 build_roster 重建，
+    /// ws 连接建立时全量下发。std Mutex 足够（读写都是瞬时快照）
+    pub(crate) roster: Arc<std::sync::Mutex<Vec<RosterEntry>>>,
 }
 
-/// 主循环持有的 WS 句柄：快照推送端 + 操控令牌观测（#025 期五第一刀）。
-/// 主循环每拍读 ctrl_taken 做翻转沿检测（Claimed/Released），作为处置状态机触发源。
+/// 主循环持有的 WS 句柄：快照推送端、操控令牌观测（#025 期五第一刀）与
+/// 角色列表槽写入端（D-021d）。主循环每拍读 ctrl_taken 做翻转沿检测
+///（Claimed/Released），作为处置状态机触发源；每拍重建角色列表写共享槽。
 pub(crate) struct WsHandle {
     pub(crate) snapshots: broadcast::Sender<String>,
     pub(crate) ctrl_taken: Arc<AtomicBool>,
+    /// 角色列表共享槽（D-021d）：主循环每拍写入，ws 线程连接建立时读取下发
+    pub(crate) roster: Arc<std::sync::Mutex<Vec<RosterEntry>>>,
 }
 
 /// 操控连接令牌翻转事件（主循环每拍沿检测；WS 禁用时恒 None）——
@@ -438,15 +466,21 @@ pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Optio
     let port = config.ws_port;
     // 头像资产登记表（D-017）：启动扫目录重建（坏文件 warn 跳过不拖垮世界）
     let avatars = Arc::new(AvatarRegistry::load(Path::new(AVATARS_DIR)));
+    // 角色列表共享槽（D-021d）：初值空表，main 装配后立即种子一次
+    //（load_players_initial 在 net::init 之前完成——见 main()），此后每拍刷新
+    let roster: Arc<std::sync::Mutex<Vec<RosterEntry>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let state = Arc::new(WsState {
         snapshots: tx.clone(),
         intents,
         ctrl_taken: Arc::new(AtomicBool::new(false)),
         avatars,
+        roster: roster.clone(),
     });
     let handle = WsHandle {
         snapshots: tx,
         ctrl_taken: state.ctrl_taken.clone(),
+        roster,
     };
     let spawned = std::thread::Builder::new()
         .name("ws-server".to_string())
@@ -581,6 +615,17 @@ fn avatar_assets_json(registry: &AvatarRegistry) -> String {
         .unwrap_or_else(|_| r#"{"type":"avatar_assets","assets":[]}"#.to_string())
 }
 
+/// 组装 player_roster 消息 JSON（D-021d 登录/选角页：共享槽全量快照；连接建立
+/// 时一次性主动下发，characters 数组恒有——零角色=空数组，前端不必判消息缺失）
+fn roster_json(roster: &std::sync::Mutex<Vec<RosterEntry>>) -> String {
+    let list = roster
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    serde_json::to_string(&serde_json::json!({ "type": "player_roster", "characters": list }))
+        .unwrap_or_else(|_| r#"{"type":"player_roster","characters":[]}"#.to_string())
+}
+
 /// POST /upload/avatar（D-017）：multipart/form-data 收 PNG 角色图。
 /// 字段：file=PNG 字节（必填）/ name=角色名（必填）/ height_world=世界高度格数
 /// （选填默认 2.0，域钳制 0.05..=25.0）。HTTP 恒 200，成败看 JSON ok 字段；
@@ -667,6 +712,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     if sender.send(Message::Text(assets_json)).await.is_err() {
         tracing::debug!("[ws] avatar_assets 首帧发送失败（连接已断，走常规清理）");
     }
+    // D-021d：资产后紧接着发 player_roster（角色列表，登录页数据源；一次性
+    // 全量主动下发，与 avatar_assets 同款时机）。内容=下发时点状态，允许陈旧
+    //（前端不做实时刷新）；发送失败=连接已断，循环首拍自然 break 走清理
+    let roster_json = roster_json(&state.roster);
+    if sender.send(Message::Text(roster_json)).await.is_err() {
+        tracing::debug!("[ws] player_roster 发送失败（连接已断，走常规清理）");
+    }
     loop {
         tokio::select! {
             recv = rx.recv() => match recv {
@@ -685,51 +737,66 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                     let _ = sender.send(Message::Pong(payload)).await;
                 }
                 Some(Ok(Message::Text(text))) => {
-                    if !controller {
-                        tracing::warn!("[ws] 观战连接的上行消息已丢弃（单连接假设：非操控端）");
-                        continue;
-                    }
                     match parse_client_message(&text) {
-                        Ok(ClientMessage::Move { x, y }) => {
-                            state.intents.send(crate::input::Intent::WsMove { x, y });
-                        }
-                        Ok(ClientMessage::Attack { x, y }) => {
-                            state.intents.send(crate::input::Intent::WsAttack { x, y });
-                        }
-                        Ok(ClientMessage::Shoot { x, y }) => {
-                            state.intents.send(crate::input::Intent::WsShoot { x, y });
-                        }
-                        Ok(ClientMessage::Skill { slot }) => {
-                            // 技能栏（v2.5，D-020a）：槽位已在解析层校验（1..=4），
-                            // 这里只转发意图——spawn 语义在 tick 侧旁路落地
-                            state.intents.send(crate::input::Intent::Skill { slot });
-                        }
-                        Ok(ClientMessage::Stop) => {
-                            state.intents.send(crate::input::Intent::Stop);
-                        }
-                        Ok(ClientMessage::Logout { choice }) => {
-                            // #025 登出处置：意图入共享队列（与键盘/鼠标单入口），
-                            // 处置三选一由 tick 侧状态机落地；本层只做令牌语义——
-                            // 主动登出=立即释放操控令牌（重连的第一个连接重新认领），
-                            // 本连接降级观战：下行快照继续（登出后世界还能看），上行丢弃
-                            tracing::info!(
-                                choice = choice.wire_name(),
-                                "[dispose] WS 收到登出消息（令牌释放，连接降级观战）"
-                            );
-                            state.intents.send(crate::input::Intent::Logout { choice });
-                            state.ctrl_taken.store(false, Ordering::SeqCst);
-                            controller = false;
-                        }
+                        // D-021d（v2.7）：会话动作任意连接生效——登出后的浏览器
+                        // 是观战连接，登录/选角/新建必须能用（登录页=观战连接的
+                        // 进场通道）。落地全在 tick 侧（名字拒绝走事件回执，
+                        // R1 改法 B 同款），本层只转发意图
                         Ok(ClientMessage::CreatePlayer { name, template }) => {
-                            // D-021b 进场仪式：名字校验全在 tick 侧（R1 复审
-                            // 改法 B——解析层拒绝=静默丢弃无回执，busy 锁会
-                            // 挂死；拒绝一律走 create_player_rejected 事件）
                             tracing::info!(
                                 name = %name,
                                 template = %template,
-                                "[onboarding] WS 收到创建角色消息"
+                                "[onboarding] WS 收到创建角色消息（任意连接生效）"
                             );
                             state.intents.send(crate::input::Intent::CreatePlayer { name, template });
+                        }
+                        Ok(ClientMessage::SelectPlayer { name }) => {
+                            tracing::info!(
+                                name = %name,
+                                "[onboarding] WS 收到选角消息（任意连接生效）"
+                            );
+                            state.intents.send(crate::input::Intent::SelectPlayer { name });
+                        }
+                        Ok(other) => {
+                            // 其余上行仅操控连接生效（单连接假设 #027：非操控端丢弃）
+                            if !controller {
+                                tracing::warn!("[ws] 观战连接的上行消息已丢弃（单连接假设：非操控端）");
+                                continue;
+                            }
+                            match other {
+                                ClientMessage::Move { x, y } => {
+                                    state.intents.send(crate::input::Intent::WsMove { x, y });
+                                }
+                                ClientMessage::Attack { x, y } => {
+                                    state.intents.send(crate::input::Intent::WsAttack { x, y });
+                                }
+                                ClientMessage::Shoot { x, y } => {
+                                    state.intents.send(crate::input::Intent::WsShoot { x, y });
+                                }
+                                ClientMessage::Skill { slot } => {
+                                    // 技能栏（v2.5，D-020a）：槽位已在解析层校验（1..=4），
+                                    // 这里只转发意图——spawn 语义在 tick 侧旁路落地
+                                    state.intents.send(crate::input::Intent::Skill { slot });
+                                }
+                                ClientMessage::Stop => {
+                                    state.intents.send(crate::input::Intent::Stop);
+                                }
+                                ClientMessage::Logout { choice } => {
+                                    // #025 登出处置：意图入共享队列（与键盘/鼠标单入口），
+                                    // 处置三选一由 tick 侧状态机落地；本层只做令牌语义——
+                                    // 主动登出=立即释放操控令牌（重连的第一个连接重新认领），
+                                    // 本连接降级观战：下行快照继续（登出后世界还能看），上行丢弃
+                                    tracing::info!(
+                                        choice = choice.wire_name(),
+                                        "[dispose] WS 收到登出消息（令牌释放，连接降级观战）"
+                                    );
+                                    state.intents.send(crate::input::Intent::Logout { choice });
+                                    state.ctrl_taken.store(false, Ordering::SeqCst);
+                                    controller = false;
+                                }
+                                // 会话动作已在上面分流（任意连接生效），此处不可达
+                                ClientMessage::CreatePlayer { .. } | ClientMessage::SelectPlayer { .. } => {}
+                            }
                         }
                         Err(reason) => {
                             tracing::warn!(raw = %text, reason, "[ws] 非法上行消息丢弃");
@@ -1221,12 +1288,13 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<std::io::Result<()>>,
     ) {
-        let (addr, tx, queue, shutdown_tx, server, _avatars) =
+        let (addr, tx, queue, shutdown_tx, server, _avatars, _roster) =
             start_test_server_with_avatars(static_dir, &temp_assets_dir("shared")).await;
         (addr, tx, queue, shutdown_tx, server)
     }
 
-    /// 带资产目录的测试服务器（D-017 上传通道测试用：注册表目录可指定可检查）
+    /// 带资产目录的测试服务器（D-017 上传通道测试用：注册表目录可指定可检查；
+    /// D-021d 起第 7 个返回值=角色列表共享槽，连接建立前可预置条目）
     #[allow(clippy::type_complexity)]
     async fn start_test_server_with_avatars(
         static_dir: std::path::PathBuf,
@@ -1238,6 +1306,7 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<std::io::Result<()>>,
         Arc<avatars::AvatarRegistry>,
+        Arc<std::sync::Mutex<Vec<RosterEntry>>>,
     ) {
         let (tx, _) = broadcast::channel::<String>(SNAPSHOT_CHANNEL_CAP);
         let (intents_tx, intents_rx) = crate::input::intent_channel();
@@ -1245,11 +1314,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let avatars = Arc::new(avatars::AvatarRegistry::load(avatars_dir));
+        let roster = Arc::new(std::sync::Mutex::new(Vec::new()));
         let state = Arc::new(WsState {
             snapshots: tx.clone(),
             intents: intents_tx,
             ctrl_taken: Arc::new(AtomicBool::new(false)),
             avatars: avatars.clone(),
+            roster: roster.clone(),
         });
         let handle = tokio::spawn(async move {
             serve(
@@ -1262,7 +1333,7 @@ mod tests {
             )
             .await
         });
-        (addr, tx, intents_rx, shutdown_tx, handle, avatars)
+        (addr, tx, intents_rx, shutdown_tx, handle, avatars, roster)
     }
 
     /// 临时资产目录（D-017 测试用；路径带进程号防并行撞）
@@ -1354,7 +1425,7 @@ mod tests {
         // PNG+元数据落盘 + 登记表在册 + GET /assets/avatars/{id}.png 原图可取
         let static_dir = temp_static_dir("av-up");
         let avatars_dir = temp_assets_dir("av-up");
-        let (addr, _tx, _queue, shutdown_tx, server, reg) =
+        let (addr, _tx, _queue, shutdown_tx, server, reg, _roster) =
             start_test_server_with_avatars(static_dir, &avatars_dir).await;
         let png = solid_test_png(64, 64, 255);
         let body = multipart_body(
@@ -1400,7 +1471,7 @@ mod tests {
         // 规则：断件图（两个大连通域）-> {ok:false, reason:"isolate_fail"}
         let static_dir = temp_static_dir("av-iso");
         let avatars_dir = temp_assets_dir("av-iso");
-        let (addr, _tx, _queue, shutdown_tx, server, reg) =
+        let (addr, _tx, _queue, shutdown_tx, server, reg, _roster) =
             start_test_server_with_avatars(static_dir, &avatars_dir).await;
         // 上下两半实心 = 两个巨型连通域
         let mut px = vec![0u8; 128 * 128 * 4];
@@ -1446,7 +1517,7 @@ mod tests {
         // 规则：> 2MB -> oversize；坏字节 -> decode_failed（护栏逐级生效）
         let static_dir = temp_static_dir("av-guard");
         let avatars_dir = temp_assets_dir("av-guard");
-        let (addr, _tx, _queue, shutdown_tx, server, _reg) =
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster) =
             start_test_server_with_avatars(static_dir, &avatars_dir).await;
         let big = vec![0xABu8; avatars::MAX_AVATAR_PNG_BYTES + 1];
         for (payload, expect) in [
@@ -1477,7 +1548,7 @@ mod tests {
         // 先于任何快照帧；mask=128x128=16384 项 0/1；url 可直取原图
         let static_dir = temp_static_dir("av-ws");
         let avatars_dir = temp_assets_dir("av-ws");
-        let (addr, tx, _queue, shutdown_tx, server, reg) =
+        let (addr, tx, _queue, shutdown_tx, server, reg, _roster) =
             start_test_server_with_avatars(static_dir, &avatars_dir).await;
         // 先上传一张（直接走登记表，上传路由已有独立测试）
         let png = solid_test_png(64, 64, 255);
@@ -1509,7 +1580,9 @@ mod tests {
             mask.iter().all(|v| v == 0 || v == 1),
             "掩码值恒 0/1"
         );
-        // 资产消息是首帧：之后照常收快照（推送一帧验证次序）
+        // D-021d：资产后紧跟 player_roster（消费掉），之后照常收快照（推送一帧验证次序）
+        let roster: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(roster["type"], "player_roster", "资产后恒为角色列表：{roster}");
         let mut world = WorldState::new();
         world.advance_tick();
         let dir = PlayerDirectory::disabled();
@@ -1526,7 +1599,7 @@ mod tests {
         // 规则：零资产也发（assets:[] 恒有）——前端不必判消息缺失
         let static_dir = temp_static_dir("av-empty");
         let avatars_dir = temp_assets_dir("av-empty");
-        let (addr, _tx, _queue, shutdown_tx, server, _reg) =
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster) =
             start_test_server_with_avatars(static_dir, &avatars_dir).await;
         let mut client = connect_client(addr).await;
         let frame: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
@@ -1752,11 +1825,15 @@ mod tests {
         }
     }
 
-    /// 读掉连接首帧 avatar_assets（v2.2 起连接首帧恒为资产消息；快照类测试先消费它）
+    /// 读掉连接首帧 avatar_assets（v2.2 起连接首帧恒为资产消息；快照类测试先消费它）。
+    /// D-021d 起资产后紧跟 player_roster（角色列表）——一并消费（快照类测试不关心它；
+    /// roster 本身的断言见 ws_connection_receives_player_roster_after_avatar_assets）
     async fn consume_avatar_assets(ws: &mut ClientWs) -> serde_json::Value {
         let v: serde_json::Value =
             serde_json::from_str(&next_text(ws).await).expect("首帧应为合法 JSON");
         assert_eq!(v["type"], "avatar_assets", "首帧恒为 avatar_assets：{v}");
+        let r: serde_json::Value = serde_json::from_str(&next_text(ws).await).expect("次帧应为合法 JSON");
+        assert_eq!(r["type"], "player_roster", "资产后恒为 player_roster：{r}");
         v
     }
 
@@ -2218,9 +2295,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_player_message_queues_intent_from_controller_socket() {
-        // D-021b 进场仪式 WS 端到端：操控连接发 create_player -> CreatePlayer
-        // 意图入共享队列（名字+模板原样转发；落地在 tick 侧 process_create_player，
-        // 单元测试已覆盖）；观战连接发 create_player 同样被丢弃（单连接假设）
+        // D-021b 进场仪式 WS 端到端 + D-021d v2.7 放开：会话动作
+        //（create_player/select_player）**任意连接都入队**——登出后的浏览器是
+        // 观战连接，登录/选角必须能用（旧断言"观战连接发 create_player 被丢弃"
+        // 已随 v2.7 反向：观战连接的会话动作照常转发，落地拒绝归 tick 侧事件）
         let static_dir = temp_static_dir("onboard");
         let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
         let mut c1 = connect_client(addr).await;
@@ -2238,15 +2316,83 @@ mod tests {
             },
             "创建意图经单入口入共享队列（中文名原样）"
         );
-        // 观战连接（c1 占着操控权，c2=观战）发 create_player：丢弃
+        // 观战连接（c1 占着操控权，c2=观战）：create_player 与 select_player
+        // 都入队（v2.7 会话动作任意连接生效）
         let mut c2 = connect_client(addr).await;
         c2.send(tokio_tungstenite::tungstenite::Message::Text(
             r#"{"type":"create_player","name":"ghost","template":"blank"}"#.to_string(),
         ))
         .await
         .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(queue.drain().is_empty(), "观战连接的创建请求被丢弃");
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::CreatePlayer {
+                name: "ghost".to_string(),
+                template: "blank".to_string(),
+            },
+            "观战连接的创建请求也入队（v2.7）"
+        );
+        c2.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"select_player","name":"土豆"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::SelectPlayer {
+                name: "土豆".to_string(),
+            },
+            "观战连接的选角请求也入队（v2.7：登出后选角通道）"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn t21d_select_player_message_parses_name() {
+        // 契约（v2.7）：{"type":"select_player","name":..}；名字校验全在 tick 侧
+        // process_select_player（R1 改法 B 同款——解析层拒绝=静默丢弃无回执）
+        let msg = parse_client_message(r#"{"type":"select_player","name":"土豆"}"#)
+            .expect("合法选角应放行");
+        assert_eq!(
+            msg,
+            ClientMessage::SelectPlayer {
+                name: "土豆".to_string(),
+            },
+            "名字原样携带（含中文）"
+        );
+        // 缺字段拒绝（serde 必填——协议形状归解析层）
+        assert!(parse_client_message(r#"{"type":"select_player"}"#).is_err());
+        // 危险名字解析层放行（拒绝归 tick 侧事件回执）
+        assert!(parse_client_message(r#"{"type":"select_player","name":""}"#).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ws_connection_receives_player_roster_after_avatar_assets() {
+        // 契约（v2.7）：连接建立后先 avatar_assets 再 player_roster（角色列表，
+        // 登录页数据源）；characters 数组恒有，条目四字段 name/glyph/color/online
+        let static_dir = temp_static_dir("roster");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, roster_slot) =
+            start_test_server_with_avatars(static_dir, &temp_assets_dir("roster")).await;
+        // 连接建立前预置一条角色（读槽发生在连接时，预置时机无竞态）
+        *roster_slot.lock().unwrap() = vec![RosterEntry {
+            name: "土豆".to_string(),
+            glyph: "土".to_string(),
+            color: "green".to_string(),
+            online: true,
+        }];
+        let mut client = connect_client(addr).await;
+        let assets: serde_json::Value =
+            serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(assets["type"], "avatar_assets", "首帧=资产消息");
+        let roster: serde_json::Value = serde_json::from_str(&next_text(&mut client).await).unwrap();
+        assert_eq!(roster["type"], "player_roster", "次帧=角色列表");
+        let chars = roster["characters"].as_array().expect("characters 数组恒有");
+        assert_eq!(chars.len(), 1, "共享槽预置了一条角色");
+        assert_eq!(chars[0]["name"], "土豆");
+        assert_eq!(chars[0]["glyph"], "土");
+        assert_eq!(chars[0]["color"], "green");
+        assert_eq!(chars[0]["online"], true);
         shutdown_tx.send(()).ok();
         let _ = server.await;
     }

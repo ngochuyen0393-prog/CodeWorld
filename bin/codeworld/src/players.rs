@@ -171,6 +171,11 @@ impl PlayerDirectory {
         self.online.contains_key(name)
     }
 
+    /// 玩家名的在场实体（D-021d 角色列表：online 条目查世界里活实体外观用）
+    pub(crate) fn online_entity(&self, name: &str) -> Option<EntityId> {
+        self.online.get(name).copied()
+    }
+
     /// 在线玩家实体判定（id 键控）：免疫 code_hash 撞名——玩家可命名
     /// "creation.wat"/"attacker.wat" 进场，事件归属只认实体 id 不认代码
     /// 身份字符串（D-020a 双审 P0 修复：字符串判归属=身份碰撞绕穿可见性）
@@ -328,6 +333,12 @@ impl PlayerDirectory {
     /// 黑名单解除：文件消失（被删除）的名字从黑名单移除（删了重放可重试）
     pub(crate) fn clear_failed_not_in(&mut self, stems: &[String]) {
         self.failed.retain(|n| stems.contains(n));
+    }
+
+    /// 单名解除黑名单（D-021d 选角）：显式选择=允许重试一次，失败会重新拉黑
+    /// 不刷屏；与 clear_failed_not_in 正交（选角只动被选的那一个）
+    pub(crate) fn clear_failed(&mut self, name: &str) {
+        self.failed.remove(name);
     }
 }
 
@@ -543,6 +554,31 @@ mod tests {
     }
 
     // === 开关语义 ===
+
+    #[test]
+    fn clear_failed_releases_single_name_only() {
+        // 规则（D-021d 选角）：显式选择=单名解除黑名单（允许重试一次，失败会
+        // 重新拉黑不刷屏）；黑名单里别的名字不受牵连（与 clear_failed_not_in
+        // 的"按目录清单清理"正交——选角只动被选的那一个）
+        let mut dir = PlayerDirectory::new("unused");
+        dir.mark_failed("broken");
+        dir.mark_failed("other");
+        dir.clear_failed("broken");
+        assert!(!dir.is_failed("broken"), "被选名字黑名单解除");
+        assert!(dir.is_failed("other"), "别的名字黑名单不牵连");
+    }
+
+    #[test]
+    fn online_entity_returns_registered_id_by_name() {
+        // 规则（D-021d 角色列表）：名字 -> 在场实体 ID（在线表键控；未登记/
+        // 已下线名字返回 None）——build_roster 据此查世界里活实体外观
+        let mut dir = PlayerDirectory::new("unused");
+        assert!(dir.online_entity("pioneer").is_none(), "未登记=None");
+        dir.register_online("pioneer", eid(7));
+        assert_eq!(dir.online_entity("pioneer"), Some(eid(7)), "登记后返回实体 ID");
+        let _ = dir.note_offline("pioneer", 0);
+        assert!(dir.online_entity("pioneer").is_none(), "下线后摘除");
+    }
 
     #[test]
     fn disabled_directory_is_not_enabled() {

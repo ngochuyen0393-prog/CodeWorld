@@ -48,6 +48,10 @@ pub enum Intent {
     /// id → 服务器写 players/<name>.wat + 首建归档旧档 + me 声明接管；
     /// 落地在 main.rs process_create_player（不走 route_intents——不是操控动作）
     CreatePlayer { name: String, template: String },
+    /// 选角（D-021d 登录/选角页：浏览器角色列表点选上行）。名字 → 覆写 me.txt
+    /// （等价 me 声明）+ 清 absent/处置/黑名单 + player_selected 事件；
+    /// 落地在 main.rs process_select_player（不走 route_intents——不是操控动作）
+    SelectPlayer { name: String },
 }
 
 /// 按键 -> 意图映射全表（纯函数；crossterm KeyEvent 可在测试中直接构造）
@@ -235,6 +239,11 @@ pub fn route_intents(
                 // 防御性兜底：CreatePlayer 在 tick 侧已分流（D-021b 进场仪式），
                 // 不应到达路由
                 tracing::debug!("[input] CreatePlayer 意图漏分流到路由，忽略");
+            }
+            Intent::SelectPlayer { .. } => {
+                // 防御性兜底：SelectPlayer 在 tick 侧已分流（D-021d 登录/选角页），
+                // 不应到达路由
+                tracing::debug!("[input] SelectPlayer 意图漏分流到路由，忽略");
             }
         }
     }

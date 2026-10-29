@@ -13,6 +13,10 @@ if not exist my-world.db (
 )
 del /q my-world.db-journal my-world.db-wal my-world.db-shm 2>nul
 
+rem D-021d: old players stay in players\ on purpose - the login page lists
+rem every character (players\*.wat) so you can re-enter any of them.
+rem No more auto-archiving (it hid characters the roster would show anyway).
+
 rem block: an old world process locks codeworld.exe and breaks the build below
 tasklist /FI "IMAGENAME eq codeworld.exe" 2>nul | find /I "codeworld.exe" >nul && (
     echo [start-new.bat] OLD WORLD IS STILL RUNNING - close it first ^(press q in its window^),
@@ -34,8 +38,8 @@ echo.
 echo [start-new.bat] ================================================
 echo [start-new.bat]  NEW PLAYER MODE
 echo [start-new.bat]  1. open http://localhost:8080 in your browser
-echo [start-new.bat]  2. create your character (name + starter template)
-echo [start-new.bat]  3. your creature is born - you control it
+echo [start-new.bat]  2. pick a character on the login page (or create a new one)
+echo [start-new.bat]  3. you are in - your creature is on screen
 echo [start-new.bat]  your code lives at players/YOURNAME.wat
 echo [start-new.bat]  (edit that file = edit your creature's behavior)
 echo [start-new.bat] ================================================

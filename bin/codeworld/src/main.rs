@@ -1632,6 +1632,14 @@ fn main() -> Result<()> {
     // 端口 0 = 禁用（返回 None，tick 循环走零开销分支）；WS 线程挂掉不影响主循环。
     // #027：第三刀起 WS 线程同时是上行意图入口（转发进共享 intent_sink）
     let ws_snapshots = net::init(&config, intent_sink);
+    // D-021d：角色列表共享槽种子一次（load_players_initial 已完成——此刻目录与
+    // 在场状态就绪；此后每拍刷新，这里只是补上"首拍前浏览器就连上"的窗口）
+    if let Some(handle) = &ws_snapshots {
+        *handle
+            .roster
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = onboarding::build_roster(&sandbox_map.players, &world);
+    }
 
     tracing::info!("tick 循环开始（WASD/方向键操控，空格攻击，q=终端客户端退出，Q+Q=关闭世界）");
     // #025：操控令牌上拍值（翻转沿检测；WS 禁用时恒 false，处置永不触发）
@@ -1667,6 +1675,13 @@ fn main() -> Result<()> {
         // 期四第一刀：每拍快照推 WS（渲染步骤旁组装；禁用时 None 完全跳过——不组装不发；
         // 无浏览器连接时 push_snapshot 内部跳过组装，同样零开销）
         if let Some(handle) = &ws_snapshots {
+            // D-021d：每拍重建角色列表写共享槽（players 目录小，1Hz 全量重建
+            // 白菜价；纯终端模式 ws_snapshots=None 自然跳过）。ws 线程只在连接
+            // 建立时读槽下发——下发时点状态，允许陈旧（前端不做实时刷新）
+            *handle
+                .roster
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = onboarding::build_roster(&sandbox_map.players, &world);
             // D-017 协议小刀：本拍攻击命中事件（攻方/目标ID/目标位置）take 出来
             // 随快照一起广播——不管有没有观众都取走（无观众=丢弃，事件不跨拍滞留；
             // tick 下一拍的 ①0 清空是双保险）
@@ -1819,6 +1834,16 @@ fn tick_with_intents(
         // 两次）。名字校验在此后的 process_create_player（唯一的名字闸门）
         if let input::Intent::CreatePlayer { name, template } = it {
             process_create_player(sandbox_map, world, name, template, current_tick);
+            continue;
+        }
+        // D-021d SelectPlayer 分流（同 CreatePlayer 模式）：env_me_set 由调用方
+        // 传入（std::env::var 语义与 read_me_declaration 同口径——trim 后非空才
+        // 算 env 锁定），process_select_player 保持纯函数可测
+        if let input::Intent::SelectPlayer { name } = it {
+            let env_me_set = std::env::var("CODEWORLD_ME")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            process_select_player(sandbox_map, name, current_tick, env_me_set);
             continue;
         }
         if let input::Intent::Logout { choice } = it {
@@ -3448,6 +3473,68 @@ fn process_create_player(
         let _ = std::fs::remove_file(&wat_path);
         tracing::warn!(player = %name, "[onboarding] 进场失败，已回滚玩家文件（重新起名再试）");
     }
+}
+
+/// select_player 落地（D-021d 登录/选角页）：以 players/ 既有角色进场
+///（等价 me.txt 声明该名字——文件锚=身份，文件在=角色在）。
+/// 拒绝路径全部结构化事件回执（R1 复审铁律同 create_player：busy 锁永不悬空）：
+/// NAME_UNKNOWN（players/ 无此角色）/ ME_ENV_LOCKED（CODEWORLD_ME 已锁定）/
+/// IO_ERROR（me.txt 写入失败）。
+/// 成功：覆写 me.txt 为单行新名字（#024 契约同 create_player）+ 清三样会话级
+/// 状态（absent 离场标记=重连扫描即重生 / 处置状态=接管者被顶掉 / 编译失败
+/// 黑名单=显式选择允许重试一次，失败会重新拉黑不刷屏）+ player_selected 公共
+/// 事件（前端收到才断开重连——重连=第一连接重新认领操控令牌，既有 Claimed
+/// 边沿逻辑收敛，无新立法）。
+fn process_select_player(
+    sandbox_map: &mut EntitySandboxMap,
+    name: &str,
+    current_tick: u64,
+    env_me_set: bool,
+) {
+    // 1. 名字必须在 players/ 目录有 .wat（文件锚=身份）
+    let wat_path = sandbox_map.players.dir().join(format!("{name}.wat"));
+    if !wat_path.exists() {
+        tracing::info!(player = %name, "[onboarding] 选角被拒（players/ 无此角色）");
+        sandbox_map.events.emit_unowned(
+            current_tick,
+            crate::events::EventBody::SelectPlayerRejected { reason: "NAME_UNKNOWN" },
+        );
+        return;
+    }
+    // 2. CODEWORLD_ME 环境变量已设：env 锁定优先于一切 me 声明（诚实拒绝，
+    //    不悄悄忽略选择；语义与 read_me_declaration 的"trim 后非空才生效"同口径）
+    if env_me_set {
+        tracing::info!(player = %name, "[onboarding] 选角被拒（CODEWORLD_ME 已锁定操控）");
+        sandbox_map.events.emit_unowned(
+            current_tick,
+            crate::events::EventBody::SelectPlayerRejected { reason: "ME_ENV_LOCKED" },
+        );
+        return;
+    }
+    // 3. 覆写 me.txt 为单行新名字（#024 契约：一行玩家名；覆盖写防旧内容残留）
+    let me_path = sandbox_map.players.dir().join("me.txt");
+    if let Err(e) = std::fs::write(&me_path, format!("{name}\n")) {
+        tracing::warn!(path = %me_path.display(), error = %e, "[onboarding] me.txt 写入失败（选角不生效）");
+        sandbox_map.events.emit_unowned(
+            current_tick,
+            crate::events::EventBody::SelectPlayerRejected { reason: "IO_ERROR" },
+        );
+        return;
+    }
+    // 4. 清三样会话级状态：absent（登出带走后选角=重新进场）/ 处置状态
+    //    （接管者被顶掉，操控独占恢复）/ 黑名单（显式选择=允许重试一次）
+    if sandbox_map.players.clear_absent(name) {
+        tracing::info!(player = %name, "[onboarding] 选角解除离场标记（重新进场）");
+    }
+    if sandbox_map.players.dispose.clear_all(name).is_some() {
+        tracing::info!(player = %name, "[onboarding] 选角取消处置（接管者被顶掉，操控独占恢复）");
+    }
+    sandbox_map.players.clear_failed(name);
+    sandbox_map.events.emit_unowned(
+        current_tick,
+        crate::events::EventBody::PlayerSelected { name: name.to_string() },
+    );
+    tracing::info!(player = %name, tick = current_tick, "[onboarding] 选角完成：me 声明已写入（前端重连认领操控）");
 }
 
 /// 技能栏意图落地（D-020a，t_06b4efc6）：Skill 意图 -> 预置模板造物请求排队。
@@ -7031,6 +7118,102 @@ mod tests {
         assert!(!db_dir.join("archive").exists(), "进程内不建 archive");
         assert!(map.players.is_online("xinren"), "创建照常成功");
         let _ = dir;
+    }
+
+    // === D-021d 登录/选角页（select_player 落地）===
+
+    #[test]
+    fn select_player_known_name_writes_me_and_emits_event() {
+        // 主链（D-021d）：SelectPlayer 意图 -> 覆写 me.txt 单行名字（#024 契约，
+        // 等价 me 声明）-> 清 absent/处置/黑名单三样会话级状态 -> player_selected
+        // 公共事件（前端收到才断开重连，防早关丢消息）
+        let (mut world, mut map, dir) = onboarding_stage();
+        std::fs::write(dir.join("tudou.wat"), "(module)").unwrap();
+        // 预置三样会话级状态（登出带走/被接管者顶替/编译失败）——选角应全清
+        map.players.mark_absent("tudou");
+        map.players
+            .dispose
+            .apply("tudou", dispose::DisposeState::Wait { deadline_tick: 999 });
+        map.players.mark_failed("tudou");
+        let intents = vec![input::Intent::SelectPlayer {
+            name: "tudou".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("me.txt")).unwrap().trim(),
+            "tudou",
+            "me.txt 覆写为单行新名字（#024 契约同 create_player）"
+        );
+        assert!(!map.players.is_absent("tudou"), "absent 已清（下拍扫描重生角色）");
+        assert!(!map.players.dispose.has("tudou"), "处置状态已清（接管者被顶掉）");
+        assert!(!map.players.is_failed("tudou"), "黑名单已清（显式选择=允许重试）");
+        let bodies = next_unowned_frame(&mut map);
+        assert!(
+            bodies.iter().any(|b| matches!(
+                b,
+                crate::events::EventBody::PlayerSelected { name } if name == "tudou"
+            )),
+            "player_selected 事件应发出：{bodies:?}"
+        );
+    }
+
+    #[test]
+    fn select_player_unknown_name_rejected_with_event_and_me_untouched() {
+        // NAME_UNKNOWN：players/ 目录没有该角色的 .wat（文件锚=身份，文件在=角色在）
+        // ——拒绝走事件回执，me.txt 不动
+        let (mut world, mut map, dir) = onboarding_stage();
+        let intents = vec![input::Intent::SelectPlayer {
+            name: "nobody".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert!(!dir.join("me.txt").exists(), "me.txt 不动（拒绝路径零落盘）");
+        let bodies = next_unowned_frame(&mut map);
+        assert!(
+            bodies.iter().any(|b| matches!(
+                b,
+                crate::events::EventBody::SelectPlayerRejected { reason: "NAME_UNKNOWN" }
+            )),
+            "NAME_UNKNOWN 事件应发出：{bodies:?}"
+        );
+    }
+
+    #[test]
+    fn select_player_env_locked_rejected_with_event() {
+        // ME_ENV_LOCKED：CODEWORLD_ME 环境变量已设 = env 锁定优先于一切 me 声明
+        //（诚实拒绝，不悄悄忽略选择）。env_me_set 由调用方传入（保持函数纯可测）
+        // ——直接调 process_select_player，不经 tick_with_intents（不碰真实环境变量）
+        let (_world, mut map, dir) = onboarding_stage();
+        std::fs::write(dir.join("tudou.wat"), "(module)").unwrap();
+        map.players.mark_absent("tudou");
+        process_select_player(&mut map, "tudou", 1, true);
+        assert!(!dir.join("me.txt").exists(), "env 锁定下 me.txt 不动");
+        assert!(map.players.is_absent("tudou"), "absent 标记不动（拒绝路径零副作用）");
+        let bodies = next_unowned_frame(&mut map);
+        assert!(
+            bodies.iter().any(|b| matches!(
+                b,
+                crate::events::EventBody::SelectPlayerRejected { reason: "ME_ENV_LOCKED" }
+            )),
+            "ME_ENV_LOCKED 事件应发出：{bodies:?}"
+        );
     }
 
     #[test]

@@ -203,6 +203,56 @@
   #createPanel .go:hover { background: #2ea043; }
   #createPanel .go:disabled { opacity: 0.5; cursor: default; }
   #createPanel .hint { color: #484f58; font-size: 11px; margin-top: 10px; line-height: 1.5; }
+  #createPanel .back {
+    display: block; margin: 10px auto 0; background: none; border: none;
+    color: #8b949e; font: inherit; font-size: 12px; padding: 4px 8px; cursor: pointer;
+  }
+  #createPanel .back:hover { color: #c9d1d9; }
+  /* D-021d 登录/选角页：本会话未选角前常驻全屏遮罩（与世界里有无玩家无关）。
+     z 序在 createPanel/logoutPanel(5) 之下——新建面板要盖住登录页；出生/登出
+     横幅(4)在 DOM 更后，同层自然盖住它 */
+  #loginPanel {
+    position: absolute; inset: 0; z-index: 4;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(14, 17, 22, 0.72);
+    transition: opacity 0.25s ease;
+  }
+  #loginPanel.closing { opacity: 0; pointer-events: none; }
+  #loginPanel .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 18px 20px; width: 380px; max-height: 82%; overflow-y: auto;
+  }
+  #loginPanel .title { color: #e6edf3; font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+  #loginPanel .sub { color: #8b949e; font-size: 12px; margin-bottom: 12px; }
+  #loginPanel .loading { color: #484f58; font-size: 12px; padding: 2px 0 10px; }
+  /* 角色行：色块圆片(glyph) + 名字 + 在场/离场小标签；触达区 ≥36px 高 */
+  #loginPanel .char {
+    display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+    background: #21262d; border: 1px solid #30363d; border-radius: 6px;
+    color: #e6edf3; font: inherit; padding: 8px 12px; cursor: pointer; margin-bottom: 8px;
+  }
+  #loginPanel .char:hover { border-color: #58a6ff; }
+  #loginPanel .char .g {
+    width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 13px; color: #0e1116;
+  }
+  #loginPanel .char b { font-weight: 700; }
+  #loginPanel .char .st { margin-left: auto; font-size: 11px; color: #8b949e; flex-shrink: 0; }
+  #loginPanel .char .st.on { color: #3fb950; }
+  /* 新建入口：虚线边框区分（与角色行不同族） */
+  #loginPanel .new {
+    width: 100%; background: none; border: 1px dashed #30363d; border-radius: 6px;
+    color: #58a6ff; font: inherit; padding: 8px 0; cursor: pointer;
+  }
+  #loginPanel .new:hover { border-color: #58a6ff; }
+  #loginPanel .err { color: #f85149; font-size: 12px; min-height: 16px; margin-top: 8px; margin-bottom: 0; }
+  /* 开发者逃生门（ME_ENV_LOCKED 专用）：仅隐藏登录页不重连 */
+  #loginPanel .skip {
+    width: 100%; background: none; border: 1px solid #30363d; border-radius: 6px;
+    color: #8b949e; font: inherit; padding: 6px 0; cursor: pointer; margin-top: 8px;
+  }
+  #loginPanel .skip:hover { color: #c9d1d9; border-color: #8b949e; }
   /* 出生横幅（D-021b 出生时刻）：非阻塞，绿色心情色，5s 自动收起 */
   #bornBanner {
     position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
@@ -322,6 +372,20 @@
 <div id="stage">
   <canvas id="cv"></canvas>
   <div id="tip" hidden></div>
+  <!-- D-021d 登录/选角页：本会话未选角前常驻（与世界里有无玩家无关——其他游戏
+       每次登录都有这个页面）。角色列表=players/*.wat 全量（player_roster 下行），
+       点选=select_player 上行以该角色进场；"+ 新建角色"复用 createPanel（盖上层）。
+       页面加载即显示（未连接时列表区显示"正在读取"） -->
+  <div id="loginPanel">
+    <div class="card">
+      <div class="title">选择你的角色</div>
+      <div class="sub">选一个进场，或新建一个</div>
+      <div id="loginList"><div class="loading">正在读取角色列表……</div></div>
+      <button class="new" type="button" id="loginNew">+ 新建角色</button>
+      <div class="err" id="loginErr"></div>
+      <button class="skip" type="button" id="loginSkip" hidden>直接进入世界（观战）</button>
+    </div>
+  </div>
   <div id="logoutPanel" hidden>
     <div class="card">
       <div class="title">登出——你的角色怎么处置？</div>
@@ -359,6 +423,7 @@
       <div class="err" id="createErr"></div>
       <button class="go" type="button" id="createGo">出生</button>
       <div class="hint">你的代码会存在 players/&lt;名字&gt;.wat——改那个文件就是改它的命运。<br>模板全文可以在 <b>static/templates/</b> 里抄（GET /templates/*.wat）。</div>
+      <button class="back" type="button" id="createBack" hidden>← 返回角色列表</button>
     </div>
   </div>
   <!-- D-021b 出生时刻横幅（非阻塞，5s 自动收起） -->
@@ -448,6 +513,13 @@
   var reenterBtnEl = document.getElementById('reenterBtn');
   var dcBannerEl = document.getElementById('dcBanner');
   var dcBannerTextEl = document.getElementById('dcBannerText');
+  // D-021d 登录/选角页
+  var loginPanelEl = document.getElementById('loginPanel');
+  var loginListEl = document.getElementById('loginList');
+  var loginNewEl = document.getElementById('loginNew');
+  var loginErrEl = document.getElementById('loginErr');
+  var loginSkipEl = document.getElementById('loginSkip');
+  var createBackEl = document.getElementById('createBack');
 
   // ---- 状态 ----
   var buf = [];                 // 快照缓冲 [{t:接收时刻, tick, caption, viewport, ents:Map(id->e)}]
@@ -487,6 +559,18 @@
   var loggedOut = null;         // 已登出的处置（'take'|'stay_auto'|'stay_ai'，#025）；null=未登出
                                 // 登出后连接降级观战继续直播；此时断线不自动重连（重连=抢回操控）
   var logoutPanelBusy = false;  // 弹窗决策/淡出进行中：禁一切面板交互（防双发 logout）
+  // ---- D-021d 登录/选角页会话状态 ----
+  var sessionSelected = false;  // 本会话已进场（选角/新建/逃生门后=true）——登录页显隐主判定
+                                // 与"世界里有无玩家"无关：未选角就见登录页，选角完成才进世界画面
+  var rosterData = null;        // player_roster 下发的角色列表（null=未收到，列表区显示"正在读取"）；
+                                // "在场"标记是下发时点状态，允许陈旧（前端不做实时刷新）
+  var loginBusy = false;        // 选角决策中（防双发 select_player）
+  var loginBusyTimer = null;    // busy 兜底解锁（15s 无回执自动解锁——回执铁律的兜底）
+  var pendingSelect = null;     // 在途选角名（player_selected 是公共新闻，按名匹配防
+                                // "别人的回执"误触发本机重连）
+  var pendingCreate = null;     // 在途创建名（player_joined 同为公共新闻，同款防误触）
+  var createManualOpen = false; // 用户从登录页"+ 新建角色"显式打开创建面板（不被快照自动显隐抢走）
+  var createDismissed = false;  // 用户点了"← 返回角色列表"（空世界也不自动重弹，可从登录页重开）
   var avatarAssets = [];        // D-017 资产调试面板 [{id,url,w,h,canvas}]——canvas=128x128
                                 // 离屏掩码图（实心白半透明），avatar_assets 消息到达即重建
   var skinCache = new Map();    // #051 皮入沙箱：asset_id -> {img, state:'loading'|'ready'|'failed'}
@@ -502,6 +586,13 @@
     // D-017：avatar_assets 资产消息（连接首帧，非快照）——分流处理不进快照缓冲
     if (snap && snap.type === 'avatar_assets') {
       handleAvatarAssets(snap);
+      return;
+    }
+    // D-021d：player_roster 角色列表（连接建立 avatar_assets 后下发，一次性全量，
+    // 非快照）——存列表+渲染（登录页可见时）；列表是下发时点状态，允许陈旧
+    if (snap && snap.type === 'player_roster') {
+      rosterData = Array.isArray(snap.characters) ? snap.characters : [];
+      renderLoginList();
       return;
     }
     if (!snap || !Array.isArray(snap.entities) || !snap.viewport) {
@@ -1218,11 +1309,6 @@
     return me;
   }
 
-  // 登出处置选项 -> 大白话文案（面板/横幅共用；非法值原样兜底）
-  function logoutChoiceLabel(d) {
-    return { take: '带走', stay_auto: '留下 · 自主', stay_ai: '留下 · 等 AI' }[d] || d;
-  }
-
   // 实体头顶处置标注（#025 快照 disposition 字段；null=在线态无标注）。
   // dispose_wait 带倒数（意外断线的抢救窗口），auto/ai-await 是状态签
   function disposeTag(e) {
@@ -1833,8 +1919,9 @@
   }
 
   // 选项落地：卡片按下高亮一拍（视觉回执）→ 发 logout 消息（服务器释放操控令牌，
-  // 本连接降级观战——世界继续直播，P 的自主活动照常可见）→ 弹窗 0.25s 淡出关门
-  // → 横幅接管（重新进入世界入口；重连=重新认领操控）
+  // 本连接降级观战）→ 弹窗 0.25s 淡出关门 → 登录页接管。
+  // D-021d：处置三选一语义（logout 消息+choice）一字不动，只是处置完成后的
+  // 落点从"世界画面观战+横幅"改为登录页——重新进场=在列表里点角色
   Array.prototype.forEach.call(
     document.querySelectorAll('#logoutPanel .disp'),
     function (btn) {
@@ -1849,8 +1936,8 @@
           moveTarget = null;
           clearPrediction(); // 已无操控：预测态清空（重进后从服务器快照重来）
           fadeOutLogoutPanel(function () {
-            bannerTextEl.textContent = '已登出（处置：' + logoutChoiceLabel(d) + '）· 世界直播中';
-            logoutBannerEl.hidden = false;
+            sessionSelected = false; // 回登录页（重开浏览器=重新选角的会话语义）
+            showLoginPanel();
           });
         }, PANEL_ACK_MS);
       });
@@ -1859,19 +1946,12 @@
   logoutBtnEl.addEventListener('click', showLogoutPanel);
   logoutCancelEl.addEventListener('click', cancelLogoutPanel);
 
-  // 重新进入世界：关掉观战连接 -> 全新连接（第一连接=操控端，重新认领）。
-  // take 处置下服务器会重生角色；stay_* 处置下直接抢回操控（接管者被顶掉）
+  // 重新进入世界：清登出残留 + 关掉观战连接 -> 全新连接（第一连接=操控端，
+  // 重新认领）。D-021d 起主路径=登录页点角色（loginPanelOnEvent 同款三步），
+  // 本按钮随 logoutBanner 退役（元素保留防引用悬空，不再有展示入口）
   reenterBtnEl.addEventListener('click', function () {
-    loggedOut = null;
-    logoutBannerEl.hidden = true;
-    dcBannerEl.hidden = true; // #036：重连路径重建横幅状态（连上隐藏/失败重现）
-    if (wsSock) {
-      var old = wsSock;
-      wsSock = null;
-      old.onclose = null; // 老连接的断开回调作废（防调度自动重连）
-      try { old.close(); } catch (e) { /* 已断则忽略 */ }
-    }
-    connect();
+    clearLoggedOutResidue();
+    freshConnection();
   });
 
   // 镜头切换（第四刀 C3）：跟随/全景；P 不存在时自动回落全景（loop 里生效）
@@ -1909,6 +1989,9 @@
       clearPrediction();        // 预测状态一并清空（重连后世界可能重启，坐标不连续）
       createBusy = false;       // D-021b：断线丢回执的创建请求解锁（可重发）
       createGoEl.disabled = false;
+      loginBusy = false;        // D-021d：断线丢回执的选角请求解锁（可重发）
+      pendingSelect = null;
+      if (loginBusyTimer) { clearTimeout(loginBusyTimer); loginBusyTimer = null; }
       attackLines = [];
       killFx = [];
       dustFx = [];
@@ -1933,10 +2016,10 @@
       noReachFx = [];
       shootArcs = [];
       connState = 'bad';
-      // 已登出（#025）：不自动重连——重连=重新认领操控（顶掉接管者），
-      // 这是"重新进入世界"按钮的显式动作；横幅保留，连接状态如实显示
+      // 已登出（#025）：不自动重连——重连=重新认领操控（顶掉接管者/取消处置），
+      // 那是登录页点角色的显式动作；连接状态如实显示
       if (loggedOut) {
-        connEl.textContent = '已登出 · 连接已断（点「重新进入世界」回来）';
+        connEl.textContent = '已登出 · 连接已断（刷新页面回登录页重新选角）';
         connEl.className = 'bad';
         return;
       }
@@ -2130,6 +2213,174 @@
   consoleRenderSkills();
   setInterval(consoleRenderSkills, 500); // 冷却解除重绘（0.5s 粒度足够观感）
 
+  // ===== D-021d 登录/选角页（常驻：未选角前永远显示，与世界里有无玩家无关）=====
+  // 产品形态（土豆定案）：其他游戏每次登录都有这个页面——可以新建角色，可以用
+  // 之前的角色，跟世界有没有玩家没关系。数据链：player_roster 下行全量列表
+  // （players/*.wat，含旧测试角色）→ 点行发 select_player → 等回执
+  // （player_selected=收场+断开重连认领操控；select_player_rejected=红字解锁）。
+  // 无密码单机阶段：文件锚=身份（players/<name>.wat 在=角色在），选角=me.txt 声明。
+
+  // 拒绝码 -> 人话（与 main.rs process_select_player / api.md 码表同源）
+  var SELECT_REJECT_TEXT = {
+    NAME_UNKNOWN: 'players/ 里没有这个角色',
+    ME_ENV_LOCKED: '操控已由 CODEWORLD_ME 环境变量锁定',
+    IO_ERROR: '服务器写 me.txt 失败（看 battle.log）'
+  };
+
+  // 属性转义（名字/颜色进 HTML 属性——文件名可含引号等字符，textContent 级
+  // 转义不够；列表来自服务器 scan_dir，仍按不信任输入对待）
+  function attrEscape(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // 角色列表渲染（player_roster 到达 / 登录页显示时调用；不可见不折腾 DOM）
+  function renderLoginList() {
+    if (loginPanelEl.hidden) return;
+    if (!rosterData) {
+      loginListEl.innerHTML = '<div class="loading">正在读取角色列表……</div>';
+      return;
+    }
+    if (rosterData.length === 0) {
+      loginListEl.innerHTML = '<div class="loading">这个世界还没有角色——新建一个吧</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < rosterData.length; i++) {
+      var c = rosterData[i];
+      if (!c || typeof c.name !== 'string') continue; // 字段护栏（协议不符条目跳过）
+      html += '<button class="char" type="button" data-n="' + attrEscape(c.name) + '">' +
+        '<span class="g" style="background:' + attrEscape(c.color || '#8b949e') + '">' +
+        escapeHtml(c.glyph || '?') + '</span>' +
+        '<b>' + escapeHtml(c.name) + '</b>' +
+        '<span class="st' + (c.online ? ' on' : '') + '">' + (c.online ? '在场' : '离场') + '</span></button>';
+    }
+    loginListEl.innerHTML = html;
+    Array.prototype.forEach.call(loginListEl.querySelectorAll('.char'), function (el) {
+      el.addEventListener('click', function () {
+        selectPlayer(el.getAttribute('data-n'));
+      });
+    });
+  }
+
+  function showLoginPanel() {
+    loginPanelEl.classList.remove('closing');
+    loginErrEl.textContent = '';
+    loginSkipEl.hidden = true;
+    renderLoginList(); // rosterData 已到则直接渲染；未到显示"正在读取"
+    loginPanelEl.hidden = false;
+  }
+
+  // 决策即关门（弹窗铁律同族）：0.25s 淡出后收起
+  function fadeHideLoginPanel() {
+    loginPanelEl.classList.add('closing');
+    setTimeout(function () {
+      loginPanelEl.hidden = true;
+      loginPanelEl.classList.remove('closing');
+    }, PANEL_FADE_MS);
+  }
+
+  // 选角：busy 锁 -> 发 select_player -> 等回执（不本地乐观进世界——服务器说了
+  // 才算，诚实 UI）。busy 兜底 15s（同 createBusyTimer：任何路径漏回执也不锁死）
+  function selectPlayer(name) {
+    if (loginBusy || sessionSelected) return;
+    loginBusy = true;
+    pendingSelect = name;
+    loginErrEl.textContent = '';
+    if (loginBusyTimer) clearTimeout(loginBusyTimer);
+    loginBusyTimer = setTimeout(function () {
+      if (loginBusy) {
+        loginBusy = false;
+        pendingSelect = null;
+        loginErrEl.textContent = '服务器没有回应，再试一次';
+      }
+    }, 15000);
+    sendMsg({ type: 'select_player', name: name });
+  }
+
+  // 登出残留清场（选角=显式重新进场，语义覆盖旧「重新进入世界」按钮）
+  function clearLoggedOutResidue() {
+    loggedOut = null;
+    logoutBannerEl.hidden = true;
+    dcBannerEl.hidden = true;
+  }
+
+  // 关掉当前连接 -> 全新连接（第一连接=操控端，重新认领）。
+  // take 处置下服务器会重生角色；stay_* 处置下直接抢回操控（接管者被顶掉）
+  function freshConnection() {
+    if (wsSock) {
+      var old = wsSock;
+      wsSock = null;
+      old.onclose = null; // 老连接的断开回调作废（防调度自动重连）
+      try { old.close(); } catch (e) { /* 已断则忽略 */ }
+    }
+    connect();
+  }
+
+  // 选角/新建回执（consoleOnSnapshot 的事件循环里调，与 createPanelOnEvent 同一条
+  // 公共信道）。player_selected / player_joined 都是无主公共新闻（所有浏览器可见）
+  // ——按在途名匹配，只有自己的回执才收场+重连（别人的进场新闻只进控制台流）
+  function loginPanelOnEvent(ev) {
+    if (ev.kind === 'player_selected') {
+      if (pendingSelect !== ev.name) return; // 别人的选角新闻：不误触发本机重连
+      pendingSelect = null;
+      loginBusy = false;
+      if (loginBusyTimer) { clearTimeout(loginBusyTimer); loginBusyTimer = null; }
+      sessionSelected = true;       // 选角完成才进世界画面
+      createManualOpen = false;
+      createDismissed = false;
+      fadeHideLoginPanel();
+      clearLoggedOutResidue();
+      bornBannerTextEl.textContent = '「' + (ev.name || '?') + '」进场了';
+      bornBannerEl.hidden = false;
+      if (bornTimer) clearTimeout(bornTimer);
+      bornTimer = setTimeout(function () { bornBannerEl.hidden = true; }, 5000);
+      freshConnection(); // 断开重连（防早关丢消息；重连=第一连接重新认领操控令牌）
+    } else if (ev.kind === 'select_player_rejected') {
+      if (!loginBusy) return; // 拒绝事件不带名字：只有本机在途请求才认领（别人的被拒新闻不理）
+      loginBusy = false;
+      pendingSelect = null;
+      if (loginBusyTimer) { clearTimeout(loginBusyTimer); loginBusyTimer = null; }
+      if (ev.reason === 'ME_ENV_LOCKED') {
+        // 开发者逃生门：env 已在服务器侧锁定操控（me 声明归 env 管）——
+        // 给"直接进入世界"（仅隐藏登录页，不重连不写声明）
+        loginErrEl.textContent = SELECT_REJECT_TEXT.ME_ENV_LOCKED;
+        loginSkipEl.hidden = false;
+      } else {
+        loginErrEl.textContent = '进不去这个角色（' + (SELECT_REJECT_TEXT[ev.reason] || ev.reason || '?') + '）';
+      }
+    } else if (ev.kind === 'player_joined') {
+      // 新建角色成功（createPanelOnEvent 已收面板+亮出生横幅）：这里统一做
+      // 登录页收场+断开重连——新建后 me.txt 已写，重连即操控（与选角一条路径）
+      if (pendingCreate !== ev.name) return; // 别人的进场新闻：不误触发本机重连
+      pendingCreate = null;
+      sessionSelected = true;
+      createManualOpen = false;
+      createDismissed = false;
+      fadeHideLoginPanel();
+      clearLoggedOutResidue();
+      freshConnection();
+    }
+  }
+
+  loginNewEl.addEventListener('click', function () {
+    // 新建入口：createPanel 盖在登录页上层（z 序 5>4）；列表为空时它是唯一出路
+    createManualOpen = true;
+    createDismissed = false;
+    syncCreateBackLink();
+    createPanelEl.hidden = false;
+    createNameEl.focus();
+  });
+
+  // ME_ENV_LOCKED 逃生门：env 已在操控——仅隐藏登录页不重连（开发者用）
+  loginSkipEl.addEventListener('click', function () {
+    loginSkipEl.hidden = true;
+    sessionSelected = true;
+    createManualOpen = false;
+    createDismissed = false;
+    fadeHideLoginPanel();
+  });
+
   // ===== D-021b 进场仪式：创建你的角色面板（空世界+无玩家实体时登场） =====
   // 显示条件（每帧评估）：已连接 + 快照里没有任何 player 实体（kind=player，
   // 含处置中的——findDisposedPlayer 同款）+ 本会话未完成过创建。有玩家实体的
@@ -2191,6 +2442,7 @@
     var err = createNameOk(name);
     if (err) { createErrEl.textContent = err; return; }
     createBusy = true;
+    pendingCreate = name.trim(); // 回执按名匹配（player_joined 是公共新闻）
     createErrEl.textContent = '';
     createGoEl.disabled = true;
     sendMsg({ type: 'create_player', name: name.trim(), template: createTpl });
@@ -2214,27 +2466,48 @@
     if (ev.key === 'Enter') { ev.preventDefault(); createSend(); }
   });
 
-  // 面板显隐（onMessage 每帧调）：空世界 + 未创建 + 已连接 = 该我登场
+  // 面板显隐（onMessage 每帧调）。D-021d：旧判定"世界里有玩家就不弹面板"作废
+  // ——新判定=sessionSelected（未选角=登录页常驻；空世界+未选角时本面板照旧
+  // 自动弹，叠在登录页上层）。用户显式动作（+ 新建角色打开 / ← 返回关闭）优先
+  // 于自动显隐
   function createPanelOnSnapshot(snap, ents) {
-    if (createDone || loggedOut) { createPanelEl.hidden = true; return; }
+    if (sessionSelected || loggedOut) { createPanelEl.hidden = true; return; }
     if (connState !== 'ok') return; // 未连接不动面板（首帧前的等待画面照旧）
+    if (createManualOpen) return;   // 用户从登录页显式打开：关由用户/回执决定
+    syncCreateBackLink();
     var hasPlayer = false;
     ents.forEach(function (e) { if (e.kind === 'player') hasPlayer = true; });
-    var show = !hasPlayer;
+    var show = !hasPlayer && !createDismissed;
     if (show && createPanelEl.hidden && !createBusy) {
       createPanelEl.hidden = false;
       createNameEl.focus();
     } else if (!show && !createPanelEl.hidden) {
-      // 世界里已有玩家（开发者 .wat 直放/他人先建）：面板退场不抢戏
+      // 世界里已有玩家（开发者 .wat 直放/他人先建）：面板退场不抢戏（登录页还在）
       createPanelEl.hidden = true;
     }
   }
 
+  // "← 返回角色列表"小链接只在列表非空时显示（空世界=唯一出路，不显示）
+  function syncCreateBackLink() {
+    createBackEl.hidden = !(rosterData && rosterData.length > 0);
+  }
+
+  createBackEl.addEventListener('click', function () {
+    createDismissed = true;      // 空世界也不自动重弹（可从登录页"+ 新建角色"重开）
+    createManualOpen = false;
+    createErrEl.textContent = '';
+    createPanelEl.hidden = true;
+  });
+
   // 事件回执（consoleOnSnapshot 的事件循环里调——同一条公共信道，两处消费）
   function createPanelOnEvent(ev) {
     if (ev.kind === 'player_joined') {
+      if (pendingCreate !== ev.name) return; // 别人的进场：面板不动（登录页照常）
+      pendingCreate = null;
       createDone = true;
       createBusy = false;
+      createManualOpen = false;
+      createDismissed = false;
       if (createBusyTimer) { clearTimeout(createBusyTimer); createBusyTimer = null; }
       createGoEl.disabled = false;
       // 决策即关门（0.25s 淡出，弹窗铁律）
@@ -2246,7 +2519,9 @@
       if (bornTimer) clearTimeout(bornTimer);
       bornTimer = setTimeout(function () { bornBannerEl.hidden = true; }, 5000);
     } else if (ev.kind === 'create_player_rejected') {
+      if (!createBusy) return; // 拒绝事件不带名字：只有本机在途请求才认领
       createBusy = false;
+      pendingCreate = null;
       if (createBusyTimer) { clearTimeout(createBusyTimer); createBusyTimer = null; }
       createGoEl.disabled = false;
       createErrEl.textContent = CREATE_REJECT_TEXT[ev.reason] || ev.reason || '被拒';
@@ -2284,6 +2559,10 @@
         return { cls: 'info', msg: '玩家「' + (b.name || '?') + '」进场了' };
       case 'create_player_rejected':
         return { cls: 'err', msg: '创建角色被拒：' + (CREATE_REJECT_TEXT[b.reason] || b.reason) };
+      case 'player_selected':
+        return { cls: 'info', msg: '玩家「' + (b.name || '?') + '」选角进场了' };
+      case 'select_player_rejected':
+        return { cls: 'err', msg: '选角被拒：' + (b.reason || '?') };
       default:
         return null; // 未知 kind 容忍跳过（协议前向兼容）
     }
@@ -2323,6 +2602,7 @@
     for (var j = 0; j < evs2.length; j++) {
       var ev = evs2[j];
       createPanelOnEvent(ev); // D-021b 进场仪式回执（player_joined / rejected）
+      loginPanelOnEvent(ev);  // D-021d 登录/选角页回执（player_selected / rejected / joined）
       var c = consoleClassify(ev);
       if (!c) continue;
       var srcName = consoleNameOf(ents, ev.entity_id) || (ev.entity_id ? ev.entity_id.slice(0, 8) : '世界');
@@ -2840,7 +3120,7 @@
     style.textContent =
       '#threeCanvas { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; }' +
       '#cv { display: none !important; }' + // 2D 战场层（含等待文案）一并隐藏——污染对比
-      '#caption, #bar, #dcBanner, #logoutBanner, #tip, #matPanel { display: none !important; }';
+      '#caption, #bar, #dcBanner, #logoutBanner, #tip, #matPanel, #loginPanel, #createPanel { display: none !important; }';
     document.head.appendChild(style);
     window.dispatchEvent(new Event('resize')); // 已开层时补一次尺寸同步
   }
