@@ -171,3 +171,17 @@
 - tracing ANSI 码拆散 marker=N → bat 断言前 strip ANSI（D-007 同款坑）
 - bat 计时禁用 timeout.exe（无 tty 报错），用 ping -n；世界进程 start /B 后台+taskkill（管道范式会死锁）
 - 假服务器空闲 15s 自杀（固定生存期在连续重跑时撞文件锁）
+
+---
+
+# cc-task 进度：D-021a 空世界模式——A/D 补开关 + 一键空世界启动（2026-10-29 收工）
+
+> 玩家之旅第一刀（#011 同向）：世界出厂=空，第一个生物是玩家自己。开局四生物定位=开发期冒烟剧本。
+
+## 落地
+- config 三字段：a_enabled/d_enabled（默认 true，CODEWORLD_A/D_ENABLED=0/false 关，与 H/S 同款关闭型）+ empty_world（默认 false，CODEWORLD_EMPTY_WORLD=1/true 开，开启型方向相反）
+- spawn_test_entities 签名改收 &Config，A/D 与 H/S 同款条件登场；新增纯判定 fn spawn_test_entities_enabled（empty_world 或四开关全零 -> false）
+- 调用处：空世界时跳过布阵，打「空世界模式：无开局生物，等待玩家进场」（四开关全零未开 empty_world 也打同一行）
+- api.md 开局四生物段更新（定位说明+四开关+空世界示例）；start.bat 未动（默认剧本保留）
+- workspace 1216 passed / 0 failed / 2 ignored（亲跑）；clippy 干净；冒烟双证（EMPTY_WORLD=1 空世界 log 出现无登场；不设 env 四生物照旧+开局布阵）
+- TDD：config 8 测试 + main 5 测试先 RED（亲见编译失败：no field/签名不符）后 GREEN

@@ -1563,9 +1563,14 @@ fn main() -> Result<()> {
         None
     };
 
-    // 新世界或恢复后无实体：放测试实体（含 WASM 沙箱）让 MVP 有东西渲染、能跑玩家代码
+    // 新世界或恢复后无实体：放开局生物让 MVP 有东西渲染、能跑玩家代码
+    //（D-021a：空世界模式或四开关全零时不登场——世界出厂=空，第一个生物是玩家自己）
     if world.entities.is_empty() {
-        spawn_test_entities(&mut world, &mut sandbox_map, config.d_shield, config.h_enabled, config.s_enabled);
+        if spawn_test_entities_enabled(&config) {
+            spawn_test_entities(&mut world, &mut sandbox_map, &config);
+        } else {
+            tracing::info!("空世界模式：无开局生物，等待玩家进场");
+        }
     }
 
     // 门一进场（world-foundation 二）：装配玩家目录（启动扫描 + 每 tick 在线锚轮询）。
@@ -4783,13 +4788,7 @@ const SPY_INTERCEPT_MARKER: i32 = 11;
 /// 破坏剧本 1-3 回归；(25,12) 距 D 15.6 排最远也不抢锁；且每拍悬浮位移
 /// 使 S 的结算坐标恒差快照 9.8，反制刀坐标过期落空（打不到悬停者）。
 /// 默认参数（盾 10）双生物剧本 D 的反制先杀死 A；盾 1 则 A 磨穿防守反杀。
-fn spawn_test_entities(
-    world: &mut WorldState,
-    sandbox_map: &mut EntitySandboxMap,
-    d_shield: i32,
-    h_enabled: bool,
-    s_enabled: bool,
-) {
+fn spawn_test_entities(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, config: &Config) {
     let fuel = 1_000_000; // 100 万条指令配额（fuel trap 会进程 abort，配额必须给足）
     let mut spawn = |code_id: &str, glyph: &str, color: &str, pos: (f64, f64), wat: &[u8]| -> bool {
         let e = Entity::new(
@@ -4811,22 +4810,32 @@ fn spawn_test_entities(
             false
         }
     };
-    let a_ok = spawn(ATTACKER_CODE, "A", "red", (5.0, 0.0), &wasm(ATTACKER_WAT));
-    let d_ok = spawn(
-        DEFENDER_CODE,
-        "D",
-        "cyan",
-        (15.0, 0.0),
-        &wasm(&defender_wat(d_shield)),
-    );
+    // A/D/H/S 四开关各自把关（D-021a 起 A/D 与 H/S 同款可选登场；空世界模式在
+    // 调用方 spawn_test_entities_enabled 拦截，走不到这里）
+    let a_ok = if config.a_enabled {
+        spawn(ATTACKER_CODE, "A", "red", (5.0, 0.0), &wasm(ATTACKER_WAT))
+    } else {
+        false
+    };
+    let d_ok = if config.d_enabled {
+        spawn(
+            DEFENDER_CODE,
+            "D",
+            "cyan",
+            (15.0, 0.0),
+            &wasm(&defender_wat(config.d_shield)),
+        )
+    } else {
+        false
+    };
     // H 搅局者（可选登场）：出生中场上空 (10,8)，受重力 1-2 tick 内落地站稳
-    let h_ok = if h_enabled {
+    let h_ok = if config.h_enabled {
         spawn(HUNTER_CODE, "H", "yellow", (10.0, 8.0), &wasm(&hunter_wat()))
     } else {
         false
     };
     // S 伪装者（可选登场）：右侧高空悬停 (25,12)（玩家代码每拍抵消重力），驻守侦察不移动
-    let s_ok = if s_enabled {
+    let s_ok = if config.s_enabled {
         spawn(SPY_CODE, "S", "purple", (25.0, 12.0), &wasm(SPY_WAT))
     } else {
         false
@@ -4837,11 +4846,20 @@ fn spawn_test_entities(
         hunter_spawned = h_ok,
         spy_spawned = s_ok,
         distance_a_d = 10.0,
-        defender_shield = d_shield,
+        defender_shield = config.d_shield,
         "开局布阵：A 攻击者冲锋 / D 防御者站桩（盾每拦一刀-1，每4tick反制）/ H 搅局者={}（投机者：敌人进3格参战，被攻击50%拦截）/ S 伪装者={}（间谍：悬停高空+每4tick扫描+probe，on_probe撒谎友军，替身盾3拦截+伪装台词）",
-        if h_enabled { "登场" } else { "缺席" },
-        if s_enabled { "登场" } else { "缺席" }
+        if config.h_enabled { "登场" } else { "缺席" },
+        if config.s_enabled { "登场" } else { "缺席" }
     );
+}
+
+/// 是否在空世界（无实体）时登场开局布阵生物（D-021a 玩家之旅第一刀）
+///
+/// 两类情况跳过布阵：①空世界模式（CODEWORLD_EMPTY_WORLD=1）——世界出厂为空，
+/// 第一个生物是玩家自己（#011）；②四开关全零（A/D/H/S 全关）——无实体可登。
+fn spawn_test_entities_enabled(config: &Config) -> bool {
+    !(config.empty_world
+        || (!config.a_enabled && !config.d_enabled && !config.h_enabled && !config.s_enabled))
 }
 
 /// WAT 文本 -> WASM 字节码（编译玩家代码模块）
@@ -6079,7 +6097,16 @@ mod tests {
         // 都站地面 y=0（地面实体不受重力，坐标稳定，scan/attack 坐标精确匹配）。
         let mut world = WorldState::new();
         let mut sandbox_map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut sandbox_map, 10, false, false);
+        spawn_test_entities(
+            &mut world,
+            &mut sandbox_map,
+            &Config {
+                d_shield: 10,
+                h_enabled: false,
+                s_enabled: false,
+                ..Config::default()
+            },
+        );
         assert_eq!(world.entities.len(), 2, "H 关闭时应创建两只生物");
         let attacker = world
             .entities
@@ -6110,7 +6137,15 @@ mod tests {
         // 混战布阵（H 登场）：第三只生物 H 黄"H"@(10,8) 中场上空，落地后受重力站稳
         let mut world = WorldState::new();
         let mut sandbox_map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut sandbox_map, 10, true, false);
+        spawn_test_entities(
+            &mut world,
+            &mut sandbox_map,
+            &Config {
+                d_shield: 10,
+                s_enabled: false,
+                ..Config::default()
+            },
+        );
         assert_eq!(world.entities.len(), 3, "H 登场时应创建三只生物");
         let hunter = world
             .entities
@@ -6128,7 +6163,16 @@ mod tests {
         // ② 翻盘实验：d_shield 参数透传到 D 沙箱的盾全局（观测导出 get_shield）
         let mut world = WorldState::new();
         let mut sandbox_map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut sandbox_map, 1, false, false);
+        spawn_test_entities(
+            &mut world,
+            &mut sandbox_map,
+            &Config {
+                d_shield: 1,
+                h_enabled: false,
+                s_enabled: false,
+                ..Config::default()
+            },
+        );
         let d = world
             .entities
             .values()
@@ -8864,7 +8908,14 @@ mod tests {
         // S 登场：CODEWORLD_S_ENABLED 默认开 -> 四方布阵含紫"S"（code_hash=spy）
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut map, 10, true, true);
+        spawn_test_entities(
+            &mut world,
+            &mut map,
+            &Config {
+                d_shield: 10,
+                ..Config::default()
+            },
+        );
         let spy = world.entities.values().find(|e| e.code_hash == SPY_CODE);
         assert!(spy.is_some(), "s_enabled=true 应登场伪装者 S");
         let s = spy.unwrap();
@@ -8878,12 +8929,121 @@ mod tests {
         // S 缺席：s_enabled=false -> 三方布阵（剧本 1-3 回归形态）
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut map, 10, true, false);
+        spawn_test_entities(
+            &mut world,
+            &mut map,
+            &Config {
+                d_shield: 10,
+                s_enabled: false,
+                ..Config::default()
+            },
+        );
         assert!(
             !world.entities.values().any(|e| e.code_hash == SPY_CODE),
             "s_enabled=false 不应有 S"
         );
         assert_eq!(world.entities.len(), 3, "S 缺席时应有 3 个实体");
+    }
+
+    // === D-021a：A/D 开关与空世界模式 ===
+
+    #[test]
+    fn spawn_test_entities_skips_attacker_when_a_disabled() {
+        // A 缺席：a_enabled=false -> A 不登场，D/H/S 照常（四开关同款语义）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        spawn_test_entities(
+            &mut world,
+            &mut map,
+            &Config {
+                a_enabled: false,
+                ..Config::default()
+            },
+        );
+        assert!(
+            !world
+                .entities
+                .values()
+                .any(|e| e.code_hash == ATTACKER_CODE),
+            "a_enabled=false 不应有 A"
+        );
+        assert_eq!(world.entities.len(), 3, "A 缺席时应有 3 个实体");
+    }
+
+    #[test]
+    fn spawn_test_entities_skips_defender_when_d_disabled() {
+        // D 缺席：d_enabled=false -> D 不登场，A 照常登场（互不牵连）
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        spawn_test_entities(
+            &mut world,
+            &mut map,
+            &Config {
+                d_enabled: false,
+                ..Config::default()
+            },
+        );
+        assert!(
+            !world
+                .entities
+                .values()
+                .any(|e| e.code_hash == DEFENDER_CODE),
+            "d_enabled=false 不应有 D"
+        );
+        assert!(
+            world
+                .entities
+                .values()
+                .any(|e| e.code_hash == ATTACKER_CODE),
+            "d_enabled=false 不影响 A 登场"
+        );
+        assert_eq!(world.entities.len(), 3, "D 缺席时应有 3 个实体");
+    }
+
+    #[test]
+    fn spawn_gate_empty_world_blocks_even_with_switches_on() {
+        // 空世界模式一键全关：empty_world=true 时四开关即使默认全开也不登任何开局生物
+        let config = Config {
+            empty_world: true,
+            ..Config::default()
+        };
+        assert!(
+            !spawn_test_entities_enabled(&config),
+            "empty_world=true 应跳过开局布阵"
+        );
+    }
+
+    #[test]
+    fn spawn_gate_all_four_switches_off_blocks() {
+        // 四开关全零（未开 empty_world）= 无实体可登，同样跳过（打空世界 log 的判定口径）
+        let config = Config {
+            a_enabled: false,
+            d_enabled: false,
+            h_enabled: false,
+            s_enabled: false,
+            ..Config::default()
+        };
+        assert!(
+            !spawn_test_entities_enabled(&config),
+            "四开关全零应跳过开局布阵"
+        );
+    }
+
+    #[test]
+    fn spawn_gate_default_and_partial_switches_spawn() {
+        // 默认配置与部分开关关闭（仍有人可登）都照常布阵（默认剧本零回归的判定锚）
+        assert!(
+            spawn_test_entities_enabled(&Config::default()),
+            "默认应照常开局布阵"
+        );
+        let partial = Config {
+            s_enabled: false,
+            ..Config::default()
+        };
+        assert!(
+            spawn_test_entities_enabled(&partial),
+            "部分开关关闭（仍有人可登）应照常布阵"
+        );
     }
 
     // === 悬浮间谍（S 每拍抵消重力，悬停高空）===
@@ -10512,7 +10672,14 @@ mod tests {
         // - D 若活下来：距离序清场会走到 E（地面目标）贴身收割 -> D 与 E 不共存
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut map, 10, true, true);
+        spawn_test_entities(
+            &mut world,
+            &mut map,
+            &Config {
+                d_shield: 10,
+                ..Config::default()
+            },
+        );
         let e = EntityId(Uuid::from_u128(200));
         world
             .entities
@@ -10565,7 +10732,14 @@ mod tests {
         // fourth_kills（3 拦 1 破逐刀断言）承担。
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut map, 10, true, true);
+        spawn_test_entities(
+            &mut world,
+            &mut map,
+            &Config {
+                d_shield: 10,
+                ..Config::default()
+            },
+        );
         let d_id = world
             .entities
             .values()
@@ -10650,7 +10824,16 @@ mod tests {
         // - E@35 屏外 -> 无人能锁，全程存活（屏外才打不到，本次清算的目标语义）
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut map, 10, false, false);
+        spawn_test_entities(
+            &mut world,
+            &mut map,
+            &Config {
+                d_shield: 10,
+                h_enabled: false,
+                s_enabled: false,
+                ..Config::default()
+            },
+        );
         let e = EntityId(Uuid::from_u128(201));
         // E 出生在地面 y=0：空中出生会被重力拉到地面，坐标断言要求出生位稳定
         world
@@ -10700,7 +10883,14 @@ mod tests {
         std::fs::write(dir.join("pioneer.wat"), wat_text).unwrap();
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        spawn_test_entities(&mut world, &mut map, 10, true, true);
+        spawn_test_entities(
+            &mut world,
+            &mut map,
+            &Config {
+                d_shield: 10,
+                ..Config::default()
+            },
+        );
         map.players = PlayerDirectory::new(&dir);
         map.load_players_initial(&mut world).unwrap();
         let mut time = TimeEngine::new();

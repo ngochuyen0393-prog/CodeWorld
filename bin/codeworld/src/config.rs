@@ -41,6 +41,17 @@ pub struct Config {
     /// 是否登场第四只生物 S（紫"S" 伪装者/间谍），默认 true。
     /// CODEWORLD_S_ENABLED=0/false 关闭（三方混战对局，供剧本 1-3 冒烟对照）。
     pub s_enabled: bool,
+    /// 是否登场开局生物 A（红"A" 攻击者），默认 true。
+    /// CODEWORLD_A_ENABLED=0/false 关闭（与 H/S 同款关闭型语义）；CODEWORLD_EMPTY_WORLD=1 一键全关（D-021a）。
+    pub a_enabled: bool,
+    /// 是否登场开局生物 D（青"D" 防御者），默认 true。
+    /// CODEWORLD_D_ENABLED=0/false 关闭（与 H/S 同款关闭型语义）；CODEWORLD_EMPTY_WORLD=1 一键全关（D-021a）。
+    pub d_enabled: bool,
+    /// 空世界模式（D-021a 玩家之旅第一刀），默认 false。
+    /// true = 开局四生物 A/D/H/S 全不登场：世界出厂为空，第一个生物是玩家自己。
+    /// CODEWORLD_EMPTY_WORLD 开启型开关：值 "1"/"true"（大小写不敏感）= 开启，
+    /// 其余值不开启（方向与 A/D/H/S 的关闭型相反）。
+    pub empty_world: bool,
     /// 玩家目录路径（门一进场：一个 .wat 文件 = 一名玩家），默认 "./players"。
     /// CODEWORLD_PLAYERS_DIR 覆盖；目录不存在自动创建。
     pub players_dir: String,
@@ -140,6 +151,9 @@ impl Default for Config {
             h_enabled: true,
             probe_fuel: 10_000,
             s_enabled: true,
+            a_enabled: true,
+            d_enabled: true,
+            empty_world: false,
             players_dir: "./players".to_string(),
             max_entities: 64,
             ws_port: 8080,
@@ -237,6 +251,23 @@ impl Config {
         if let Ok(v) = std::env::var("CODEWORLD_S_ENABLED") {
             if v == "0" || v.eq_ignore_ascii_case("false") {
                 cfg.s_enabled = false;
+            }
+        }
+        if let Ok(v) = std::env::var("CODEWORLD_A_ENABLED") {
+            if v == "0" || v.eq_ignore_ascii_case("false") {
+                cfg.a_enabled = false;
+            }
+        }
+        if let Ok(v) = std::env::var("CODEWORLD_D_ENABLED") {
+            if v == "0" || v.eq_ignore_ascii_case("false") {
+                cfg.d_enabled = false;
+            }
+        }
+        // 空世界模式（D-021a，开启型开关）：值 "1"/"true"（大小写不敏感）= 开启，
+        // 其余值不开启——方向与上面关闭型开关相反
+        if let Ok(v) = std::env::var("CODEWORLD_EMPTY_WORLD") {
+            if v == "1" || v.eq_ignore_ascii_case("true") {
+                cfg.empty_world = true;
             }
         }
         // 字符串类：有值即覆盖（空字符串也覆盖，符合"显式设置"语义）
@@ -523,6 +554,98 @@ mod tests {
         std::env::remove_var("CODEWORLD_H_ENABLED");
         let c = Config::load();
         assert!(c.h_enabled, "无环境变量时 H 应默认登场");
+    }
+
+    // === D-021a：A/D 开关与空世界模式 ===
+
+    #[test]
+    fn default_a_d_enabled_and_empty_world_false() {
+        // 创建：A/D 默认登场、空世界模式默认关（不设 env 四生物照旧，冒烟剧本零回归）
+        let c = Config::default();
+        assert!(c.a_enabled, "A 攻击者默认应登场");
+        assert!(c.d_enabled, "D 防御者默认应登场");
+        assert!(!c.empty_world, "空世界模式默认应关闭");
+    }
+
+    #[test]
+    fn load_a_enabled_env_can_disable() {
+        // 修改：CODEWORLD_A_ENABLED=0/false 关闭 A（与 H/S 同款关闭型语义）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_A_ENABLED", "0");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_A_ENABLED");
+        assert!(!c.a_enabled, "CODEWORLD_A_ENABLED=0 应关闭 A");
+        std::env::set_var("CODEWORLD_A_ENABLED", "false");
+        let c2 = Config::load();
+        std::env::remove_var("CODEWORLD_A_ENABLED");
+        assert!(!c2.a_enabled, "CODEWORLD_A_ENABLED=false 应关闭 A");
+    }
+
+    #[test]
+    fn load_a_enabled_absent_defaults_to_enabled() {
+        // 边界：无环境变量 -> A 默认登场
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CODEWORLD_A_ENABLED");
+        let c = Config::load();
+        assert!(c.a_enabled, "无环境变量时 A 应默认登场");
+    }
+
+    #[test]
+    fn load_d_enabled_env_can_disable() {
+        // 修改：CODEWORLD_D_ENABLED=0/false 关闭 D（与 H/S 同款关闭型语义）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_D_ENABLED", "0");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_D_ENABLED");
+        assert!(!c.d_enabled, "CODEWORLD_D_ENABLED=0 应关闭 D");
+        std::env::set_var("CODEWORLD_D_ENABLED", "FALSE");
+        let c2 = Config::load();
+        std::env::remove_var("CODEWORLD_D_ENABLED");
+        assert!(!c2.d_enabled, "CODEWORLD_D_ENABLED=FALSE（大小写不敏感）应关闭 D");
+    }
+
+    #[test]
+    fn load_d_enabled_absent_defaults_to_enabled() {
+        // 边界：无环境变量 -> D 默认登场
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CODEWORLD_D_ENABLED");
+        let c = Config::load();
+        assert!(c.d_enabled, "无环境变量时 D 应默认登场");
+    }
+
+    #[test]
+    fn load_empty_world_env_can_enable() {
+        // 修改：CODEWORLD_EMPTY_WORLD=1/true 开启空世界（开启型开关，D-021a）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CODEWORLD_EMPTY_WORLD", "1");
+        let c = Config::load();
+        std::env::remove_var("CODEWORLD_EMPTY_WORLD");
+        assert!(c.empty_world, "CODEWORLD_EMPTY_WORLD=1 应开启空世界模式");
+        std::env::set_var("CODEWORLD_EMPTY_WORLD", "TRUE");
+        let c2 = Config::load();
+        std::env::remove_var("CODEWORLD_EMPTY_WORLD");
+        assert!(c2.empty_world, "CODEWORLD_EMPTY_WORLD=TRUE（大小写不敏感）应开启空世界模式");
+    }
+
+    #[test]
+    fn load_empty_world_absent_defaults_to_false() {
+        // 边界：无环境变量 -> 空世界默认关闭（默认冒烟剧本零回归）
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CODEWORLD_EMPTY_WORLD");
+        let c = Config::load();
+        assert!(!c.empty_world, "无环境变量时空世界模式应默认关闭");
+    }
+
+    #[test]
+    fn load_empty_world_zero_or_other_values_do_not_enable() {
+        // 边界：值非 "1"/"true" 一律不开启（开启型开关方向，勿与 H/S 关闭型弄反）
+        let _g = ENV_LOCK.lock().unwrap();
+        for v in ["0", "yes", "on", ""] {
+            std::env::set_var("CODEWORLD_EMPTY_WORLD", v);
+            let c = Config::load();
+            assert!(!c.empty_world, "CODEWORLD_EMPTY_WORLD={v} 不应开启空世界模式");
+        }
+        std::env::remove_var("CODEWORLD_EMPTY_WORLD");
     }
 
     #[test]
