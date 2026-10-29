@@ -2,7 +2,17 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-29 D-021b 进场仪式落地，待土豆验收）
+## 现在（2026-10-30 D-021d 登录/选角页重做落地，待土豆验收）
+
+- 完成：D-021d（commit 7fb4bd6，协议 v2.6→v2.7）——D-021b"世界为空才弹创建面板"是产品错误（土豆原话："其他游戏每次登录都有这个页面，可以新创建角色，可以用之前的角色，跟世界有没有玩家没关系"）。本卡按通行产品形态重做：**浏览器连接后未选角前永远先见登录/选角页**。
+- 服务端：下行 `player_roster`（连接建立 avatar_assets 后第二帧，players/*.wat 全量——在线条目取活实体实际 glyph/color，离线=首字符大写+中性灰 #8b949e"出生序号离线不可知，灰=诚实"；每拍 build_roster 重建共享槽 1Hz 白菜价）；上行 `select_player`（任意连接生效）：NAME_UNKNOWN / ME_ENV_LOCKED / IO_ERROR 三码结构化回执（IO_ERROR 是任务书两码外按"任何拒绝必须有事件回执"铁律补的第三码）；成功覆写 me.txt（#024 契约不动）+ 清 absent/处置/编译失败黑名单三样会话级状态 + `player_selected` 公共事件。create_player 同步放开任意连接生效（登出后的观战连接也要能新建）。
+- 前端（index.html）：#loginPanel 全屏遮罩常驻（z 序在 createPanel 之下——新建面板盖上层）；点角色行→busy 锁→select_player→player_selected（**按在途名匹配**——公共新闻不误触发别人的收场重连）→断开重连认领操控+绿横幅；ME_ENV_LOCKED 给"直接进入世界"逃生门；登出三选一处置语义一字不动、处置完成落点从世界画面改回登录页（logoutBanner/reenter 退役留档）；createPanelOnSnapshot"世界里有玩家就不弹"判定作废改 sessionSelected；player_joined 统一断开重连。
+- start-new.bat 删自动归档（角色列表本就能看到旧角色）；文档 net-protocol v2.7（§10 player_roster 节）+ api.md 登录/选角页节。
+- 验证：workspace **1241 绿**（基线 1229+12，TDD 红绿全程）/clippy 本刀 hunks 零新警告/前端 JS 编译过/**A 轨机证探针三断言全过**（roster 下发含 tudou/T/green/online、select_player→player_selected+me.txt 变更、未知名→NAME_UNKNOWN 拒绝+me.txt 不动，日志 .cc-scratch/d021d-probe.log）。
+- 已知边界（申报）：选"已死"角色=只写 me.txt 不重生（死亡是真死亡=既有世界法）；登出后连接已断的登录页不自动重连（防意外重进，刷新页面即回正常登录页）；FULL_MODE 隐藏列表追加 #loginPanel/#createPanel（保全截图隔离契约，卡面"别动"锚的申报偏差）。
+- 下一步：土豆 A 轨验收——开 start-new.bat→登录页列出全部旧角色（在场/离场标签）→点一个进场/点新建创建→登出三选一后回登录页再点角色重新进场。
+
+## 现在（2026-10-29 D-021b 进场仪式落地，已被 D-021d 产品化重做取代）
 
 - 完成：D-021b（t_be0de36c）——浏览器"创建你的角色"面板全链。玩家之旅第③站"进场看它活"的仪式化 + "新玩家 30 分钟第一次成功"前半段。
 - 服务端（协议 v2.6）：上行 `create_player {name, template}`（net.rs 解析+转发）→ `Intent::CreatePlayer`（input.rs，Intent Copy 退役改 Clone——String 载荷）→ `process_create_player`（main.rs）：sanitize 起名（1..=24 字符，字母/数字/中文/_/-，拒路径注入）→ 同名/模板六码结构化拒绝 → 写 `players/<name>.wat`（内容=模板全文）→ 当拍 spawn_player（不等目录轮询——出生时刻当拍兑现）→ 写 `players/me.txt`（操控接管；CODEWORLD_ME 显式设置不覆盖）。新事件两类（无主公共新闻，take_frame 白名单放行）：`player_joined` / `create_player_rejected`。**首启归档**（D-021a 亲测缺口的解法，中途换位）：空世界模式+空玩家目录启动时旧 db 挪 archive/——首版在 create_player 进程内做，实测 Windows sqlite 句柄锁 db（os error 32 rename 必败），改启动瞬间 StorageEngine::open 之前做，create_player 链路永不碰 db。
