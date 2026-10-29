@@ -85,6 +85,11 @@ pub(crate) enum EventBody {
     },
     /// 造物调 env.log(marker)
     PlayerLog { marker: i64 },
+    /// 玩家进场成功（D-021b 进场仪式）：无主公共新闻（全员可见——面板据它收
+    /// 起创建浮层 + 亮"你的生物出生了"横幅）
+    PlayerJoined { name: String },
+    /// create_player 被拒（D-021b）：无主公共新闻（结构化原因码回执面板红字）
+    CreatePlayerRejected { reason: &'static str },
 }
 
 /// 事件汇：世界单调 seq 计数器 + 本拍待发缓冲（挂在 EntitySandboxMap 上，
@@ -180,8 +185,14 @@ impl EventSink {
             .into_iter()
             .filter(|ev| match (&ev.owner_name, controller) {
                 (Some(owner), Some(name)) => owner == name,
-                // 无主事件：只放行 compile_failed（玩家进场失败的公共新闻）
-                (None, _) => matches!(ev.body, EventBody::CompileFailed { .. }),
+                // 无主事件：只放行公共新闻（compile_failed / player_joined /
+                // create_player_rejected——D-021b 进场仪式回执走同一条公共信道）
+                (None, _) => matches!(
+                    ev.body,
+                    EventBody::CompileFailed { .. }
+                        | EventBody::PlayerJoined { .. }
+                        | EventBody::CreatePlayerRejected { .. }
+                ),
                 // 有主事件但无操控连接：不发（宁缺勿泄）
                 (Some(_), None) => false,
             })

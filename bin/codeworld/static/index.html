@@ -163,6 +163,53 @@
     background: rgba(22, 27, 34, 0.92); border: 1px solid #30363d;
     border-radius: 6px; padding: 8px 14px; color: #e6edf3; white-space: nowrap;
   }
+  /* D-021b 进场仪式：创建你的角色面板（空世界+无操控实体时登场——玩家之旅
+     第一站）。同 logoutPanel 弹窗铁律：决策即关门 0.25s 淡出 */
+  #createPanel {
+    position: absolute; inset: 0; z-index: 5;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(14, 17, 22, 0.72);
+    transition: opacity 0.25s ease;
+  }
+  #createPanel.closing { opacity: 0; pointer-events: none; }
+  #createPanel .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 18px 20px; width: 380px;
+  }
+  #createPanel .title { color: #e6edf3; font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+  #createPanel .sub { color: #8b949e; font-size: 12px; margin-bottom: 12px; }
+  #createPanel input[type=text] {
+    width: 100%; box-sizing: border-box;
+    background: #0e1116; border: 1px solid #30363d; border-radius: 6px;
+    color: #e6edf3; font: inherit; padding: 8px 10px; margin-bottom: 12px;
+  }
+  #createPanel input[type=text]:focus { outline: none; border-color: #58a6ff; }
+  #createPanel .tpls { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+  #createPanel .tpl {
+    display: flex; align-items: center; gap: 10px; text-align: left;
+    background: #21262d; border: 1px solid #30363d; border-radius: 6px;
+    color: #e6edf3; font: inherit; padding: 8px 12px; cursor: pointer;
+  }
+  #createPanel .tpl:hover { border-color: #58a6ff; }
+  #createPanel .tpl.sel { border-color: #3fb950; background: #12261e; }
+  #createPanel .tpl .g { font-size: 20px; font-weight: 700; color: #58a6ff; width: 22px; }
+  #createPanel .tpl b { display: block; font-size: 13px; }
+  #createPanel .tpl span { display: block; color: #8b949e; font-size: 11px; }
+  #createPanel .err { color: #f85149; font-size: 12px; min-height: 16px; margin-bottom: 8px; }
+  #createPanel .go {
+    width: 100%; background: #238636; border: 1px solid #2ea043; color: #fff;
+    font: inherit; font-weight: 700; padding: 8px 0; border-radius: 6px; cursor: pointer;
+  }
+  #createPanel .go:hover { background: #2ea043; }
+  #createPanel .go:disabled { opacity: 0.5; cursor: default; }
+  #createPanel .hint { color: #484f58; font-size: 11px; margin-top: 10px; line-height: 1.5; }
+  /* 出生横幅（D-021b 出生时刻）：非阻塞，绿色心情色，5s 自动收起 */
+  #bornBanner {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    z-index: 4;
+    background: rgba(18, 38, 30, 0.94); border: 1px solid #3fb950;
+    border-radius: 6px; padding: 8px 14px; color: #cfe8cf; white-space: nowrap;
+  }
   /* 断线横幅（#036 断线冻结）：与世界失联时顶栏醒目警示——预测已冻结，
      点击无任何反馈，画面停在最后一帧快照；自动重连中 */
   #dcBanner {
@@ -290,6 +337,33 @@
   </div>
   <div id="dcBanner" hidden>
     <span id="dcBannerText"></span>
+  </div>
+  <!-- D-021b 进场仪式：创建你的角色（空世界+无操控实体时显示；世界只修路——
+       名字+模板经 create_player 上行，服务器写 players/<name>.wat） -->
+  <div id="createPanel" hidden>
+    <div class="card">
+      <div class="title">创建你的角色</div>
+      <div class="sub">这个世界还是空的——第一个生物，是你自己的代码</div>
+      <input type="text" id="createName" maxlength="24" placeholder="给它起个名字（字母/数字/中文，最多 24 字符）" autocomplete="off">
+      <div class="tpls" id="createTpls">
+        <button class="tpl sel" type="button" data-t="blank">
+          <span class="g">S</span><span><b>空白木桩</b><span>什么都不做，只活着——你的起跑线</span></span>
+        </button>
+        <button class="tpl" type="button" data-t="grazer">
+          <span class="g">G</span><span><b>吃草彷徨者</b><span>胆小的食草动物：有人靠近就逃，没人就散步</span></span>
+        </button>
+        <button class="tpl" type="button" data-t="hunter">
+          <span class="g">H</span><span><b>小猎手</b><span>锁定最近的活物，追上去，贴身出刀</span></span>
+        </button>
+      </div>
+      <div class="err" id="createErr"></div>
+      <button class="go" type="button" id="createGo">出生</button>
+      <div class="hint">你的代码会存在 players/&lt;名字&gt;.wat——改那个文件就是改它的命运。<br>模板全文可以在 <b>static/templates/</b> 里抄（GET /templates/*.wat）。</div>
+    </div>
+  </div>
+  <!-- D-021b 出生时刻横幅（非阻塞，5s 自动收起） -->
+  <div id="bornBanner" hidden>
+    <span id="bornBannerText"></span>
   </div>
   <!-- D-004b 材质微调面板（3D 层开启时经「材质」按钮开合；滑条直改共享 uniforms 实时生效） -->
   <div id="matPanel" hidden>
@@ -1833,6 +1907,8 @@
       resetBuffer();            // 重连后清空缓冲重新开始（断线期间旧帧与新世界不连续）
       moveTarget = null;        // 断线期间旧目标失效（重连后重新点击）
       clearPrediction();        // 预测状态一并清空（重连后世界可能重启，坐标不连续）
+      createBusy = false;       // D-021b：断线丢回执的创建请求解锁（可重发）
+      createGoEl.disabled = false;
       attackLines = [];
       killFx = [];
       dustFx = [];
@@ -2054,6 +2130,114 @@
   consoleRenderSkills();
   setInterval(consoleRenderSkills, 500); // 冷却解除重绘（0.5s 粒度足够观感）
 
+  // ===== D-021b 进场仪式：创建你的角色面板（空世界+无玩家实体时登场） =====
+  // 显示条件（每帧评估）：已连接 + 快照里没有任何 player 实体（kind=player，
+  // 含处置中的——findDisposedPlayer 同款）+ 本会话未完成过创建。有玩家实体的
+  // 世界（开发者 players/ 放 .wat / 已创建）永不弹面板。
+  var createPanelEl = document.getElementById('createPanel');
+  var createNameEl = document.getElementById('createName');
+  var createErrEl = document.getElementById('createErr');
+  var createGoEl = document.getElementById('createGo');
+  var createTplsEl = document.getElementById('createTpls');
+  var bornBannerEl = document.getElementById('bornBanner');
+  var bornBannerTextEl = document.getElementById('bornBannerText');
+  var createTpl = 'blank';       // 选中模板 id（默认第一张）
+  var createBusy = false;        // 决策/淡出中（防双发）
+  var createDone = false;        // 本会话已创建（player_joined 置位；面板永不再弹）
+  var bornTimer = null;
+
+  // 拒绝码 -> 人话（与服务器 onboarding.rs / api.md 码表同源）
+  var CREATE_REJECT_TEXT = {
+    NAME_EMPTY: '名字不能为空',
+    NAME_TOO_LONG: '名字太长（最多 24 个字符）',
+    NAME_BAD_CHAR: '名字只能用字母、数字、中文、_ 和 -',
+    NAME_TAKEN: '这个名字已经有人用了，换一个',
+    TEMPLATE_MISSING: '模板不存在（世界侧未装配）',
+    IO_ERROR: '服务器写文件失败（看 battle.log）'
+  };
+
+  // 模板卡单选
+  Array.prototype.forEach.call(createTplsEl.querySelectorAll('.tpl'), function (el) {
+    el.addEventListener('click', function () {
+      createTpl = el.getAttribute('data-t') || 'blank';
+      Array.prototype.forEach.call(createTplsEl.querySelectorAll('.tpl'), function (e2) {
+        e2.classList.toggle('sel', e2 === el);
+      });
+    });
+  });
+
+  // 本地起名校验（与服务器 sanitize_name 同规则——双门同锁，前端先拦省往返）
+  function createNameOk(name) {
+    var t = name.trim();
+    if (!t) return '名字不能为空';
+    if ([].slice.call(t).length > 24) return '名字太长（最多 24 个字符）';
+    for (var i = 0; i < t.length; i++) {
+      var c = t[i];
+      var ok = /[A-Za-z0-9_\-]/.test(c) || /[\u0080-\uffff]/.test(c);
+      if (!ok) return '名字只能用字母、数字、中文、_ 和 -';
+    }
+    return null;
+  }
+
+  function createSend() {
+    if (createBusy || createDone) return;
+    var name = createNameEl.value;
+    var err = createNameOk(name);
+    if (err) { createErrEl.textContent = err; return; }
+    createBusy = true;
+    createErrEl.textContent = '';
+    createGoEl.disabled = true;
+    sendMsg({ type: 'create_player', name: name.trim(), template: createTpl });
+    // 意图已上行：等服务器回执（player_joined=成功收面板；create_player_rejected=
+    // 红字+解锁重试）。不本地乐观收面板——世界说了才算（诚实 UI）
+  }
+
+  createGoEl.addEventListener('click', createSend);
+  createNameEl.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter') { ev.preventDefault(); createSend(); }
+  });
+
+  // 面板显隐（onMessage 每帧调）：空世界 + 未创建 + 已连接 = 该我登场
+  function createPanelOnSnapshot(snap, ents) {
+    if (createDone || loggedOut) { createPanelEl.hidden = true; return; }
+    if (connState !== 'ok') return; // 未连接不动面板（首帧前的等待画面照旧）
+    var hasPlayer = false;
+    ents.forEach(function (e) { if (e.kind === 'player') hasPlayer = true; });
+    var show = !hasPlayer;
+    if (show && createPanelEl.hidden && !createBusy) {
+      createPanelEl.hidden = false;
+      createNameEl.focus();
+    } else if (!show && !createPanelEl.hidden) {
+      // 世界里已有玩家（开发者 .wat 直放/他人先建）：面板退场不抢戏
+      createPanelEl.hidden = true;
+    }
+  }
+
+  // 事件回执（consoleOnSnapshot 的事件循环里调——同一条公共信道，两处消费）
+  function createPanelOnEvent(ev) {
+    if (ev.kind === 'player_joined') {
+      createDone = true;
+      createBusy = false;
+      createGoEl.disabled = false;
+      // 决策即关门（0.25s 淡出，弹窗铁律）
+      createPanelEl.classList.add('closing');
+      setTimeout(function () { createPanelEl.hidden = true; createPanelEl.classList.remove('closing'); }, 250);
+      // 出生时刻横幅（非阻塞，5s 自动收起）
+      bornBannerTextEl.textContent = '你的生物「' + (ev.name || '?') + '」出生了——点地面走，点敌人打';
+      bornBannerEl.hidden = false;
+      if (bornTimer) clearTimeout(bornTimer);
+      bornTimer = setTimeout(function () { bornBannerEl.hidden = true; }, 5000);
+    } else if (ev.kind === 'create_player_rejected') {
+      createBusy = false;
+      createGoEl.disabled = false;
+      createErrEl.textContent = CREATE_REJECT_TEXT[ev.reason] || ev.reason || '被拒';
+      createNameEl.focus();
+    }
+  }
+
+  // 挂进快照/事件流（consoleOnSnapshot 内调用点）
+  // （挂接见 consoleOnSnapshot 尾部 createPanelOnSnapshot / 事件循环 createPanelOnEvent）
+
   // 事件 -> 行分类（四色：err/warn/info/log）
   function consoleClassify(ev) {
     var b = ev || {};
@@ -2077,6 +2261,10 @@
           : '运行错死亡' };
       case 'player_log':
         return { cls: 'log', msg: 'log: marker ' + b.marker };
+      case 'player_joined':
+        return { cls: 'info', msg: '玩家「' + (b.name || '?') + '」进场了' };
+      case 'create_player_rejected':
+        return { cls: 'err', msg: '创建角色被拒：' + (CREATE_REJECT_TEXT[b.reason] || b.reason) };
       default:
         return null; // 未知 kind 容忍跳过（协议前向兼容）
     }
@@ -2115,6 +2303,7 @@
     var evs2 = Array.isArray(snap.player_events) ? snap.player_events : [];
     for (var j = 0; j < evs2.length; j++) {
       var ev = evs2[j];
+      createPanelOnEvent(ev); // D-021b 进场仪式回执（player_joined / rejected）
       var c = consoleClassify(ev);
       if (!c) continue;
       var srcName = consoleNameOf(ents, ev.entity_id) || (ev.entity_id ? ev.entity_id.slice(0, 8) : '世界');
@@ -2134,6 +2323,7 @@
     while (cRows.length > cRowsMax) cRows.shift();
     consoleRenderStream();
     consoleRenderUnits(ents, snap.tick);
+    createPanelOnSnapshot(snap, ents); // D-021b 进场仪式面板显隐（每帧评估）
   }
 
   // 实体名解析（造物名=glyph+序号在渲染时补；玩家/已知实体=name）

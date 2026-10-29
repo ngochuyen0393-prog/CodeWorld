@@ -1,4 +1,4 @@
-# CodeWorld 网络协议：快照推送 + 意图上行（期四 v1 - v1.6 / 期五 v1.7 - v1.9 / D-017 协议小刀 v2.0 / 收图通道 v2.2 / D-012 力场 v2.3 / 皮入沙箱 v2.4）
+# CodeWorld 网络协议：快照推送 + 意图上行（期四 v1 - v1.6 / 期五 v1.7 - v1.9 / D-017 协议小刀 v2.0 / 收图通道 v2.2 / D-012 力场 v2.3 / 皮入沙箱 v2.4 / D-020a 事件流+技能栏 v2.5 / D-021b 进场仪式 v2.6）
 
 > 前端契约文档。第二刀（Canvas 渲染）/第三刀（鼠标操控）/第五刀（操控飞行）/第六刀（半径物理）/期五第一刀（下线处置权）依赖本文字段名与语义；改字段先改这里再改代码。
 > 依据 decisions.md #026（薄客户端/快照推送）、#027（鼠标操控/操控独占）、#029（操控飞行无税：飞行=代码对抗世界规则，fuel 是保险丝不入玩法）、#030/#031（半径物理：格子降级为地址系统，实体不可重叠精确化为半径碰撞）、#025（操控独占与下线处置权）；世界是唯一权威，浏览器只是显示器+遥控器。
@@ -70,7 +70,7 @@
 | `seq` | u64 | 世界单调递增事件号（EntitySandboxMap 计数器；断线对账游标） |
 | `tick` | u64 | 事件发生拍 |
 | `entity_id` | string | 事件主体实体 UUID（compile_failed 无主体=空串） |
-| `kind` | string | `spawn_rejected` / `compile_failed` / `runtime_error` / `born` / `died` / `player_log` |
+| `kind` | string | `spawn_rejected` / `compile_failed` / `runtime_error` / `born` / `died` / `player_log` / `player_joined` / `create_player_rejected`（后两类 v2.6，D-021b：无主公共新闻，entity_id=空串） |
 
 **断线补拉口径（MVP 选 B）**：断线即丢不回放；前端按 `events_cursor − 本地已收 seq` 估算丢失数，断线横幅提示"断线期间约 N 条事件未收到"。（A 档=服务端环形缓冲 256 条重连首帧回放，将来带宽富余再议——服务端不做每连接游标账本。）
 
@@ -139,9 +139,9 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 | WS 线程异常/端口占用 | warn 一次，终端世界照常运行（线程隔离） |
 | （预留，未实现）`{"type":"shutdown"}` | **v1.9 注记**：WS 关世界接口预留——世界关闭的正规路径 MVP 只做终端 Q 二段确认（#036）；若将来开放，仅本机 localhost 操控连接允许，服务器存档+退出全体。本版收到 `{"type":"shutdown"}` 按未知 type 丢弃 |
 
-## 6. 上行意图协议（v1.2 新增，#027；v1.7 增 logout，#025；v1.9 增 shoot，#036；v2.5 增 skill，D-020a）
+## 6. 上行意图协议（v1.2 新增，#027；v1.7 增 logout，#025；v1.9 增 shoot，#036；v2.5 增 skill，D-020a；v2.6 增 create_player，D-021b）
 
-客户端 → 服务器 JSON 文本消息，六型。坐标一律**世界坐标**（快照 viewport 域内）。
+客户端 → 服务器 JSON 文本消息，七型。坐标一律**世界坐标**（快照 viewport 域内）。
 
 ### 6.1 消息格式
 
@@ -152,6 +152,7 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 {"type": "stop"}                              // 清除走位目标，站住
 {"type": "logout", "disposition": "stay_auto"} // 登出处置三选一（v1.7，#025）
 {"type": "skill", "slot": 1}                  // 技能栏（v2.5，D-020a）：slot=1..4，替操控玩家 spawn 预置模板造物
+{"type": "create_player", "name": "土豆", "template": "grazer"} // 进场仪式（v2.6，D-021b）：写 players/土豆.wat 当拍进场
 ```
 
 ### 6.2 语义（服务器裁决，薄客户端 #026）
@@ -164,6 +165,7 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 | `stop` | 清除走位目标站住（#025 操控独占的"我不动"）。**v1.4 起：stop 在空中 = 悬停不坠**（stop 语义是"停止移动"不是"坠落"；悬停锚点改写为脚下坐标，要落地玩家点地面）。前端由右键（contextmenu）或 S 键产生 |
 | `logout` | **主动登出三选一**（v1.7，#025 下线处置权；仅操控连接生效，观战连接照旧丢弃）：`disposition` 取 `take`（带走：角色立即移除，文件锚保留，重连认领=重新进场重生）/ `stay_auto`（停留+自主接管：on_tick 恢复，角色自己活，重连=接管者被顶掉）/ `stay_ai`（停留+AI 待接入：站桩等外部 AI，端点协议是 #014 未来端点本刀不实现）。服务器收即释放操控令牌、连接降级观战（快照照收）；**处置中的玩家不被 me 声明重认领**——抢回操控必须走重连认领（操控权=me 声明+连接在，#024 精神） |
 | `skill` | **技能栏**（v2.5，D-020a）：`slot`=1..4，替操控玩家排一个 spawn（世界侧预置模板：投掷器/飞剑/护盾场/侦察弹，模板能力全部来自已开放 spawn 参数零新原语，全文可抄 `GET /skills/*.wat`）。出生点=操控实体东侧身位偏移；**每实体每拍 1 发**（同拍连按只发第一发，再按报 RATE_LIMITED 事件）；失败走 spawn_rejected 事件回报面板（闭环）。非法槽位（0/5+/缺参）解析层拒绝丢弃。模板清单见 api.md「五点十、技能栏」 |
+| `create_player` | **进场仪式**（v2.6，D-021b）：`name`+`template`（blank/grazer/hunter 三选）→ 服务器写 `players/<name>.wat`（内容=模板全文，`GET /templates/<id>.wat` 同源）→ **当拍进场**（不等目录轮询）→ 写 `players/me.txt`（操控接管；`CODEWORLD_ME` 显式设置时不覆盖）。回执走 player_events 公共新闻：成功=`player_joined {name}`（面板收起+出生横幅），失败=`create_player_rejected {reason}`（NAME_EMPTY/NAME_TOO_LONG/NAME_BAD_CHAR/NAME_TAKEN/TEMPLATE_MISSING/IO_ERROR，红字回执）。名字基础格式解析层拒绝；同名/模板缺失等业务拒绝走事件。仅操控连接生效（观战连接丢弃）。**首启归档**：空世界模式+空玩家目录启动时旧 db 挪 `archive/`（启动瞬间做——sqlite 句柄锁 db，进程内挪不动；create_player 链路永不碰 db）。详见 api.md「进场仪式」节 |
 
 ### 6.3 冲突与状态规则
 
@@ -354,6 +356,16 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
   **服务端按操控玩家过滤后广播**（可见性铁律 decisions #054 同族：宁缺勿泄）；
   断线补拉 MVP 选 B（断线即丢，前端按游标差估丢失数，无 missed_events 帧——A 档
   环形缓冲回放留待带宽富余再议）
+- **进场仪式（v2.6，D-021b，2026-10-29；t_be0de36c）**：上行新增
+  `{"type":"create_player","name":"..","template":"blank|grazer|hunter"}`——浏览器
+  "创建你的角色"面板的服务端落地：写 `players/<name>.wat`（模板全文，static/templates/
+  同源伺服）→ 当拍进场 → 写 me.txt（操控接管）。player_events 新增两类**无主公共新闻**：
+  `player_joined {name}`（成功——面板收起+出生横幅）与 `create_player_rejected {reason}`
+  （六码：NAME_EMPTY/NAME_TOO_LONG/NAME_BAD_CHAR/NAME_TAKEN/TEMPLATE_MISSING/IO_ERROR）。
+  名字格式解析层双门（前端同规则先拦）；仅操控连接生效。配套**首启归档**（非协议变更）：
+  空世界模式+空玩家目录启动时旧 db 挪 archive/（启动瞬间 StorageEngine::open 之前——
+  Windows 下 sqlite 句柄锁 db 进程内 rename 必失败 os error 32，实测改启动时归档；
+  create_player 链路永不碰 db）
 - 预留演进（不在本版实现）：
   - delta 快照 / 二进制编码（实体数增长或拍频提高后再做）
   - 多操控连接 / 连接身份与 me 声明合并（认证化）

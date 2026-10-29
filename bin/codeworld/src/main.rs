@@ -18,6 +18,7 @@ mod events;
 mod input;
 mod mirror;
 mod net;
+mod onboarding;
 mod players;
 mod skills;
 
@@ -156,6 +157,9 @@ struct EntitySandboxMap {
     /// 技能书（D-020a）：启动时从 static/skills/ 读入的 4 槽模板源；缺文件/编译
     /// 失败的槽位禁用（技能栏是便利层不是玩法命脉）
     skills: crate::skills::SkillBook,
+    /// 新手模板书（D-021b 进场仪式）：static/templates/ 读入的起跑模板源；
+    /// create_player 上行落地用（浏览器"创建你的角色"面板）
+    templates: crate::onboarding::TemplateBook,
 }
 
 /// 世界内链消息（D-011 投递侧内部结构）：collect 扇出/沿链寻址后的逐目标消息，
@@ -225,6 +229,9 @@ impl EntitySandboxMap {
             events: crate::events::EventSink::new(),
             skill_spawns: Vec::new(),
             skills: crate::skills::SkillBook::disabled(),
+            templates: crate::onboarding::TemplateBook::load(std::path::Path::new(
+                "bin/codeworld/static/templates",
+            )),
         })
     }
 
@@ -1432,6 +1439,18 @@ fn main() -> Result<()> {
     init_tracing(&config.log_level);
     tracing::info!(tick_ms = config.tick_interval_ms, db = %config.db_path, "CodeWorld 主程序启动");
 
+    // D-021b 进场仪式配套：空世界模式 + 玩家目录空（首建前夜）→ 旧档归档。
+    // 归档而非删除（archive/ 可找回）；必须在 StorageEngine::open **之前**——
+    // Windows 下 sqlite 句柄锁着 db 文件，进程内 rename 必失败（进程内首建归档
+    // 实测 os error 32，改启动时归档）。create_player 意图侧不再动 db。
+    if config.empty_world
+        && crate::onboarding::players_dir_is_fresh(std::path::Path::new(&config.players_dir))
+    {
+        if let Some(dest) = crate::onboarding::archive_old_world(&config.db_path) {
+            tracing::info!(to = %dest.display(), "[onboarding] 空世界首启：旧档已归档，新玩家从干净世界开始");
+        }
+    }
+
     // 打开存储，尝试恢复快照；无快照则新建世界
     let mut storage = StorageEngine::open(&config.db_path)?;
     // D-016：快照恢复判定（恢复的世界地形随快照走，不按 config 重生成高度图）
@@ -1518,6 +1537,9 @@ fn main() -> Result<()> {
     sandbox_map.duel_step_fuel = config.duel_step_fuel;
     // D-020a 技能书装配（static/skills/ 四模板启动读入；缺文件/编译失败槽位禁用）
     sandbox_map.skills = crate::skills::load_from_static(std::path::Path::new(net::STATIC_DIR));
+    // D-021b 新手模板书装配（static/templates/ 三模板；进场仪式面板用）
+    sandbox_map.templates =
+        crate::onboarding::load_templates_from_static(std::path::Path::new(net::STATIC_DIR));
     // #051 皮入沙箱装配：资产镜像仓从 D-017 登记表建仓（同图全局一份，sha256
     // 去重）+ 单沙箱资产配额（CODEWORLD_ASSET_QUOTA 覆盖）。登记表独立 load 一份
     //（ws 线程的登记表归 net 模块，跨线程不共享句柄——镜像仓只在主循环侧用）
@@ -1792,7 +1814,13 @@ fn tick_with_intents(
     let mut logout_handled = false;
     let mut ctrl_intents: Vec<input::Intent> = Vec::with_capacity(intents.len());
     for it in intents {
-        if let input::Intent::Logout { choice } = *it {
+        // D-021b CreatePlayer 分流（同 Logout 模式：会话动作不走操控路由）；
+        // Copy 已退役：clone 入 ctrl 队，CreatePlayer 原地消费（String 载荷不复制两次）
+        if let input::Intent::CreatePlayer { name, template } = it {
+            process_create_player(sandbox_map, world, name, template, current_tick);
+            continue;
+        }
+        if let input::Intent::Logout { choice } = it {
             logout_handled = true;
             match me.as_deref() {
                 Some(name) if sandbox_map.players.is_online(name) => {
@@ -1801,14 +1829,14 @@ fn tick_with_intents(
                         choice = choice.wire_name(),
                         "[dispose] 收到登出消息"
                     );
-                    dispose_apply_logout(sandbox_map, world, name, choice);
+                    dispose_apply_logout(sandbox_map, world, name, *choice);
                 }
                 _ => {
                     tracing::warn!("[dispose] 登出消息无法落地（无 me 声明或声明玩家不在线），忽略");
                 }
             }
         } else {
-            ctrl_intents.push(*it);
+            ctrl_intents.push(it.clone());
         }
     }
     // 连接事件（WS 操控令牌翻转沿；WS 禁用/无翻转=None，take 后清空防跨拍残留）
@@ -3331,6 +3359,92 @@ fn process_spawn_requests(
                 lifespan_ticks: req.lifespan_ticks,
             },
         );
+    }
+}
+
+/// create_player 落地（D-021b 进场仪式，t_be0de36c）：
+/// 名字+模板 → 校验 → [首建归档旧档] → 写 players/<name>.wat → 写 me.txt
+/// → 立即 spawn_player（不等下一拍目录轮询——仪式的"出生时刻"要当拍兑现）
+/// → player_joined 事件（前端收浮层收起 + 出生横幅）。
+/// 拒绝路径全部结构化回执（create_player_rejected 事件 + 面板红字）：
+/// NAME_* 三码 + NAME_TAKEN（同名已存在）+ TEMPLATE_MISSING（id 不在表/未装配）。
+fn process_create_player(
+    sandbox_map: &mut EntitySandboxMap,
+    world: &mut WorldState,
+    raw_name: &str,
+    template_id: &str,
+    current_tick: u64,
+) {
+    // 1. 起名校验（与 net.rs 解析层同一实现——双门同锁）
+    let name = match crate::onboarding::sanitize_name(raw_name) {
+        Ok(n) => n,
+        Err(reason) => {
+            tracing::info!(raw = raw_name, reason = reason.wire(), "[onboarding] 起名被拒");
+            sandbox_map.events.emit_unowned(
+                current_tick,
+                crate::events::EventBody::CreatePlayerRejected { reason: reason.wire() },
+            );
+            return;
+        }
+    };
+    // 2. 同名检查：在线/文件已存在 = 拒绝（本机单机阶段不做唯一性注册，文件在=名字在）
+    let wat_path = sandbox_map
+        .players
+        .dir()
+        .join(format!("{name}.wat"));
+    if sandbox_map.players.is_online(&name) || wat_path.exists() {
+        tracing::info!(player = %name, "[onboarding] 同名创建被拒（已存在）");
+        sandbox_map.events.emit_unowned(
+            current_tick,
+            crate::events::EventBody::CreatePlayerRejected { reason: "NAME_TAKEN" },
+        );
+        return;
+    }
+    // 3. 模板解析（id 合法 + 已装配；模板缺文件=禁用态）
+    let Some(code) = sandbox_map.templates.source(template_id).map(str::to_string) else {
+        tracing::info!(template = template_id, "[onboarding] 模板不存在或未装配，拒绝");
+        sandbox_map.events.emit_unowned(
+            current_tick,
+            crate::events::EventBody::CreatePlayerRejected { reason: "TEMPLATE_MISSING" },
+        );
+        return;
+    };
+    // （首建归档在 main() 启动时做——空世界模式+空玩家目录即归档，见 main 头部；
+    // 进程内不做：Windows 下 sqlite 句柄锁 db，rename 必失败 os error 32，实测）
+    // 5. 写玩家文件 + me 声明（CODEWORLD_ME 环境变量优先级更高——显式设了 env
+    //    的开发者不受面板影响；面板是浏览器玩家的 me 声明通道）
+    if let Err(e) = std::fs::write(&wat_path, code.as_bytes()) {
+        tracing::warn!(path = %wat_path.display(), error = %e, "[onboarding] 玩家文件写入失败");
+        sandbox_map.events.emit_unowned(
+            current_tick,
+            crate::events::EventBody::CreatePlayerRejected { reason: "IO_ERROR" },
+        );
+        return;
+    }
+    if std::env::var_os("CODEWORLD_ME").is_none() {
+        let me_path = sandbox_map.players.dir().join("me.txt");
+        // me.txt 只认一行玩家名（#024 契约）：覆盖写，防旧内容残留整串失效
+        if let Err(e) = std::fs::write(&me_path, format!("{name}\n")) {
+            tracing::warn!(path = %me_path.display(), error = %e, "[onboarding] me.txt 写入失败（操控不生效，观战兜底）");
+        }
+    }
+    tracing::info!(player = %name, template = template_id, "[onboarding] 角色文件已写入：{}（改这个文件=改命运）", wat_path.display());
+    // 6. 当拍进场（不等目录轮询——出生时刻当拍兑现；失败路径与门一一致：
+    //    spawn_player 内部已 warn+compile_failed 事件，此处补 NAME_TAKEN 语义的
+    //    极端时序（同拍两连接并发同名：第二个进场时文件已在=轮询会跳过，这里
+    //    显式 spawn 保证语义确定））
+    if sandbox_map.spawn_player(world, &name, current_tick) {
+        sandbox_map.events.emit_unowned(
+            current_tick,
+            crate::events::EventBody::PlayerJoined { name: name.clone() },
+        );
+        // 出生时刻日志（验收锚：grep "玩家进场仪式"）
+        tracing::info!(player = %name, tick = current_tick, "[onboarding] 玩家进场仪式完成：你的生物出生了");
+    } else {
+        // spawn 失败（编译/沙箱）：文件已写但进场失败——摘掉文件防下拍轮询反复
+        // 重试刷 compile_failed；玩家重新起名再来
+        let _ = std::fs::remove_file(&wat_path);
+        tracing::warn!(player = %name, "[onboarding] 进场失败，已回滚玩家文件（重新起名再试）");
     }
 }
 
@@ -6696,6 +6810,171 @@ mod tests {
             &mut map,
         );
         assert!(map.ctrl_exclusive_active, "me 声明恢复，操控独占重建");
+    }
+
+    // === D-021b 进场仪式（create_player 落地）===
+
+    /// 进场仪式测试台：空玩家目录 + 真模板装配（测试 CWD=bin/codeworld，
+    /// static/templates 相对可达——skills 测试同款口径）
+    fn onboarding_stage() -> (WorldState, EntitySandboxMap, PathBuf) {
+        let world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let dir = temp_players_dir("onboard");
+        map.players = PlayerDirectory::new(&dir);
+        map.templates = crate::onboarding::load_templates_from_static(std::path::Path::new("static"));
+        assert!(
+            map.templates.source("grazer").is_some(),
+            "真模板装配（grazer 应可用；CWD 应在 bin/codeworld）"
+        );
+        (world, map, dir)
+    }
+
+    /// 下一拍 frame 里找指定 kind 的无主事件（player_joined/create_player_rejected）
+    fn next_unowned_frame(map: &mut EntitySandboxMap) -> Vec<crate::events::EventBody> {
+        let (frame, _) = map.events.take_frame(None);
+        frame.into_iter().map(|e| e.body).collect()
+    }
+
+    #[test]
+    fn create_player_intent_spawns_player_writes_file_and_me() {
+        // 主链（验收 2）：CreatePlayer 意图 -> 写 players/xinren.wat + me.txt
+        // -> 当拍进场在线 -> player_joined 公共事件
+        let (mut world, mut map, dir) = onboarding_stage();
+        let intents = vec![input::Intent::CreatePlayer {
+            name: "xinren".to_string(),
+            template: "grazer".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        // 文件落地 + me 声明接管
+        assert!(dir.join("xinren.wat").exists(), "玩家文件已写入");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("me.txt")).unwrap().trim(),
+            "xinren",
+            "me.txt 写为单行新玩家名（操控接管）"
+        );
+        // 当拍进场（不等目录轮询）
+        assert!(map.players.is_online("xinren"), "当拍进场在线");
+        find_player_id(&world, "xinren"); // 存在性断言（panics if missing）
+        // player_joined 公共事件（无操控连接也放行——面板回执信道）
+        let bodies = next_unowned_frame(&mut map);
+        assert!(
+            bodies
+                .iter()
+                .any(|b| matches!(b, crate::events::EventBody::PlayerJoined { name } if name == "xinren")),
+            "player_joined 事件应发出：{bodies:?}"
+        );
+        // 写入的文件内容=模板全文（真代码在 players/，改文件=改命运）
+        let written = std::fs::read_to_string(dir.join("xinren.wat")).unwrap();
+        assert_eq!(written, map.templates.source("grazer").unwrap(), "文件内容=模板原文");
+    }
+
+    #[test]
+    fn create_player_duplicate_name_rejected_with_event() {
+        // 同名拒绝（验收 3）：已存在 xinren.wat 再建 -> NAME_TAKEN 事件，
+        // 不覆盖既有文件（注：既有文件本身会被同拍 d0 目录轮询正常加载进场——
+        // 那是门一语义，与"创建被拒"正交；拒绝发生在意图分发拍、文件原样）
+        let (mut world, mut map, dir) = onboarding_stage();
+        std::fs::write(dir.join("xinren.wat"), "(module)").unwrap();
+        let intents = vec![input::Intent::CreatePlayer {
+            name: "xinren".to_string(),
+            template: "blank".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("xinren.wat")).unwrap(),
+            "(module)",
+            "既有文件不被覆盖（创建路径零写入）"
+        );
+        let bodies = next_unowned_frame(&mut map);
+        assert!(
+            bodies.iter().any(|b| matches!(
+                b,
+                crate::events::EventBody::CreatePlayerRejected { reason: "NAME_TAKEN" }
+            )),
+            "NAME_TAKEN 事件应发出：{bodies:?}"
+        );
+    }
+
+    #[test]
+    fn create_player_unknown_template_rejected() {
+        // 模板缺失拒绝：dragon 不在表 -> TEMPLATE_MISSING 事件，无文件落地
+        let (mut world, mut map, dir) = onboarding_stage();
+        let intents = vec![input::Intent::CreatePlayer {
+            name: "xinren".to_string(),
+            template: "dragon".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert!(!dir.join("xinren.wat").exists(), "无文件落地");
+        let bodies = next_unowned_frame(&mut map);
+        assert!(
+            bodies.iter().any(|b| matches!(
+                b,
+                crate::events::EventBody::CreatePlayerRejected { reason: "TEMPLATE_MISSING" }
+            )),
+            "TEMPLATE_MISSING 事件应发出：{bodies:?}"
+        );
+    }
+
+    #[test]
+    fn create_player_never_touches_db_file() {
+        // 归档位置纪律（D-021b 收口）：首建归档在 main() 启动时做（空世界+空
+        // 玩家目录），create_player 意图侧**永不碰 db**——Windows 下 sqlite 句柄
+        // 锁着 db，进程内 rename 必失败（os error 32，实测）。本测锚定：创建链路
+        // 全程 db 文件纹丝不动（启动归档的端到端由 smoke 脚本覆盖）。
+        let (mut world, mut map, dir) = onboarding_stage();
+        let db_dir = temp_players_dir("onboard-db");
+        let db = db_dir.join("codeworld.db");
+        std::fs::write(&db, b"old-world-bytes").unwrap();
+        let intents = vec![input::Intent::CreatePlayer {
+            name: "xinren".to_string(),
+            template: "blank".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert!(db.exists(), "db 文件原地未动（创建链路不碰 db）");
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            b"old-world-bytes",
+            "内容零变化"
+        );
+        assert!(!db_dir.join("archive").exists(), "进程内不建 archive");
+        assert!(map.players.is_online("xinren"), "创建照常成功");
+        let _ = dir;
     }
 
     #[test]

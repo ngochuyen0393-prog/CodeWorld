@@ -63,6 +63,11 @@ pub(crate) enum ClientMessage {
         #[serde(rename = "disposition")]
         choice: crate::dispose::LogoutChoice,
     },
+    /// 创建角色（D-021b 进场仪式）：name+template（blank/grazer/hunter）→
+    /// 服务器写 players/<name>.wat 当拍进场；回执走 player_events
+    /// （player_joined / create_player_rejected，公共新闻）
+    #[serde(rename = "create_player")]
+    CreatePlayer { name: String, template: String },
 }
 
 /// 上行文本 -> 客户端消息（纯函数；Err 带原因供 warn 丢弃，不 panic 不部分接受）
@@ -74,6 +79,9 @@ pub(crate) fn parse_client_message(text: &str) -> Result<ClientMessage, String> 
         ClientMessage::Move { x, y } | ClientMessage::Attack { x, y } => finite(*x) && finite(*y),
         ClientMessage::Shoot { x, y } => finite(*x) && finite(*y),
         ClientMessage::Stop | ClientMessage::Logout { .. } | ClientMessage::Skill { .. } => true,
+        // D-021b：名字基础校验在解析层（空/超长/危险字符当场拒绝——省一次
+        // 往返；同名/模板缺失等业务拒绝走 tick 侧结构化事件回执）
+        ClientMessage::CreatePlayer { .. } => true,
     };
     if !coords_ok {
         return Err("坐标非有限值（NaN/无穷）".to_string());
@@ -82,6 +90,13 @@ pub(crate) fn parse_client_message(text: &str) -> Result<ClientMessage, String> 
     if let ClientMessage::Skill { slot } = &msg {
         if *slot < 1 || *slot > crate::skills::SKILL_SLOT_COUNT {
             return Err(format!("技能槽位非法（{slot}，合法域 1..=4）"));
+        }
+    }
+    // create_player 解析层校验（D-021b）：名字格式当场拒绝；模板 id 只查表
+    // （不在表=业务拒绝走事件回执——解析层不重复业务规则）
+    if let ClientMessage::CreatePlayer { name, .. } = &msg {
+        if let Err(reason) = crate::onboarding::sanitize_name(name) {
+            return Err(format!("起名被拒（{}）", reason.text()));
         }
     }
     Ok(msg)
@@ -704,6 +719,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                             state.ctrl_taken.store(false, Ordering::SeqCst);
                             controller = false;
                         }
+                        Ok(ClientMessage::CreatePlayer { name, template }) => {
+                            // D-021b 进场仪式：名字格式已在解析层校验，这里只转发
+                            // 意图（业务拒绝=同名/模板缺失走 player_events 回执面板）
+                            tracing::info!(
+                                name = %name,
+                                template = %template,
+                                "[onboarding] WS 收到创建角色消息"
+                            );
+                            state.intents.send(crate::input::Intent::CreatePlayer { name, template });
+                        }
                         Err(reason) => {
                             tracing::warn!(raw = %text, reason, "[ws] 非法上行消息丢弃");
                         }
@@ -877,6 +902,45 @@ mod tests {
             parse_client_message(r#"{"type":"skill"}"#).is_err(),
             "缺 slot 字段应拒绝"
         );
+    }
+
+    // === D-021b create_player（进场仪式上行）===
+
+    #[test]
+    fn t21_create_player_message_parses_name_and_template() {
+        // 契约（v2.6）：{"type":"create_player","name":..,"template":..} 三字段
+        // 齐全且名字过 sanitize 才放行；模板 id 只查非空（业务拒绝归 tick 侧）
+        let msg = parse_client_message(
+            r#"{"type":"create_player","name":"土豆","template":"grazer"}"#,
+        )
+        .expect("合法创建应放行");
+        assert_eq!(
+            msg,
+            ClientMessage::CreatePlayer {
+                name: "土豆".to_string(),
+                template: "grazer".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn t21_create_player_rejects_bad_names_at_parse_layer() {
+        // 解析层双门之一：名字格式（空/超长/危险字符）当场拒绝——前端已先拦，
+        // 这里兜直连 WS 的原始客户端
+        for bad in [
+            r#"{"type":"create_player","name":"","template":"blank"}"#,
+            r#"{"type":"create_player","name":"   ","template":"blank"}"#,
+            r#"{"type":"create_player","name":"a/b","template":"blank"}"#,
+            r#"{"type":"create_player","name":"a.wat","template":"blank"}"#,
+            r#"{"type":"create_player","name":"..","template":"blank"}"#,
+        ] {
+            assert!(
+                parse_client_message(bad).is_err(),
+                "危险名字应解析层拒绝：{bad}"
+            );
+        }
+        // 缺字段拒绝（serde 必填）
+        assert!(parse_client_message(r#"{"type":"create_player","name":"ok"}"#).is_err());
     }
 
     #[test]
@@ -2140,6 +2204,41 @@ mod tests {
         let frame: serde_json::Value = serde_json::from_str(&next_text(&mut c1).await).unwrap();
         assert_eq!(frame["caption"], "after-logout", "登出连接下行快照照收（观战）");
 
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn create_player_message_queues_intent_from_controller_socket() {
+        // D-021b 进场仪式 WS 端到端：操控连接发 create_player -> CreatePlayer
+        // 意图入共享队列（名字+模板原样转发；落地在 tick 侧 process_create_player，
+        // 单元测试已覆盖）；观战连接发 create_player 同样被丢弃（单连接假设）
+        let static_dir = temp_static_dir("onboard");
+        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
+        let mut c1 = connect_client(addr).await;
+        c1.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"create_player","name":"土豆","template":"hunter"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::CreatePlayer {
+                name: "土豆".to_string(),
+                template: "hunter".to_string(),
+            },
+            "创建意图经单入口入共享队列（中文名原样）"
+        );
+        // 观战连接（c1 占着操控权，c2=观战）发 create_player：丢弃
+        let mut c2 = connect_client(addr).await;
+        c2.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"create_player","name":"ghost","template":"blank"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(queue.drain().is_empty(), "观战连接的创建请求被丢弃");
         shutdown_tx.send(()).ok();
         let _ = server.await;
     }

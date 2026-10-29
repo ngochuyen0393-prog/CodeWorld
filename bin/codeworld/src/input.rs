@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 操控意图（#022：输入 = 意图流；#027 期四第三刀：终端键盘与 WS 鼠标双来源共享单入口）
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// D-021b 起 CreatePlayer 带 String 载荷，Copy 退役改 Clone（逐点见使用处）
+#[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
     /// 移动（方向键/WASD -> 四方向；步长 1.0 格，方向由 dx/dy 携带）
     Move { dx: f64, dy: f64 },
@@ -43,6 +44,10 @@ pub enum Intent {
     /// 登出处置（#025 期五第一刀：WS logout 上行经同一意图单入口入队，tick 侧
     /// 先分流给处置状态机，不进 route_intents；路由分支是漏分流的防御性兜底）
     Logout { choice: crate::dispose::LogoutChoice },
+    /// 创建角色（D-021b 进场仪式：浏览器"创建你的角色"面板上行）。名字+模板
+    /// id → 服务器写 players/<name>.wat + 首建归档旧档 + me 声明接管；
+    /// 落地在 main.rs process_create_player（不走 route_intents——不是操控动作）
+    CreatePlayer { name: String, template: String },
 }
 
 /// 按键 -> 意图映射全表（纯函数；crossterm KeyEvent 可在测试中直接构造）
@@ -226,6 +231,11 @@ pub fn route_intents(
                 // 防御性兜底：Logout 在 tick 侧已分流给处置状态机，不应到达路由
                 tracing::debug!("[input] Logout 意图漏分流到路由，忽略（处置归 dispose 状态机）");
             }
+            Intent::CreatePlayer { .. } => {
+                // 防御性兜底：CreatePlayer 在 tick 侧已分流（D-021b 进场仪式），
+                // 不应到达路由
+                tracing::debug!("[input] CreatePlayer 意图漏分流到路由，忽略");
+            }
         }
     }
     // 持续目标执行：本拍无其他行动且点击目标在册 -> 向目标走一步；到达（格距≤0.5）清除站住
@@ -364,7 +374,8 @@ impl ShutdownConfirmWindow {
 }
 
 /// 按键决策（#036：q 与 Q 语义分离；纯函数，输入线程照此执行）
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Copy 已退役（D-021b：Intent 含 String 载荷不再 Copy，决策跟随 Clone）
+#[derive(Debug, Clone, PartialEq)]
 pub enum KeyDecision {
     /// 产生操控意图（入队，走原 key_to_intent 通路）
     Intent(Intent),
@@ -391,8 +402,11 @@ pub fn classify_key(key: KeyEvent, confirm_armed: bool) -> Option<KeyDecision> {
         });
     }
     match key_to_intent(key) {
-        Some(Intent::Quit) => Some(KeyDecision::ClientQuit),
-        Some(intent) => Some(KeyDecision::Intent(intent)),
+        // Copy 已退役（D-021b）：先按值取回再匹配，Quit 分流客户端退出
+        Some(intent) => match intent {
+            Intent::Quit => Some(KeyDecision::ClientQuit),
+            other => Some(KeyDecision::Intent(other)),
+        },
         None => None,
     }
 }
@@ -680,7 +694,7 @@ mod tests {
         };
         let mut mt: Option<(EntityId, (f64, f64))> = None;
         let action = route_intents(
-            &[logout],
+            std::slice::from_ref(&logout),
             Some(target),
             None,
             Some((30.0, 0.5)),
@@ -692,7 +706,7 @@ mod tests {
         // 在册目标不被 Logout 清除（持续目标执行照旧，与 Logout 无关）
         let mut mt2: Option<(EntityId, (f64, f64))> = Some((target, (5.0, 0.0)));
         let _ = route_intents(
-            &[logout],
+            std::slice::from_ref(&logout),
             Some(target),
             None,
             Some((30.0, 0.5)),

@@ -2,6 +2,16 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
+## 现在（2026-10-29 D-021b 进场仪式落地，待土豆验收）
+
+- 完成：D-021b（t_be0de36c）——浏览器"创建你的角色"面板全链。玩家之旅第③站"进场看它活"的仪式化 + "新玩家 30 分钟第一次成功"前半段。
+- 服务端（协议 v2.6）：上行 `create_player {name, template}`（net.rs 解析+转发）→ `Intent::CreatePlayer`（input.rs，Intent Copy 退役改 Clone——String 载荷）→ `process_create_player`（main.rs）：sanitize 起名（1..=24 字符，字母/数字/中文/_/-，拒路径注入）→ 同名/模板六码结构化拒绝 → 写 `players/<name>.wat`（内容=模板全文）→ 当拍 spawn_player（不等目录轮询——出生时刻当拍兑现）→ 写 `players/me.txt`（操控接管；CODEWORLD_ME 显式设置不覆盖）。新事件两类（无主公共新闻，take_frame 白名单放行）：`player_joined` / `create_player_rejected`。**首启归档**（D-021a 亲测缺口的解法，中途换位）：空世界模式+空玩家目录启动时旧 db 挪 archive/——首版在 create_player 进程内做，实测 Windows sqlite 句柄锁 db（os error 32 rename 必败），改启动瞬间 StorageEngine::open 之前做，create_player 链路永不碰 db。
+- 新手模板三个（static/templates/，真跑验证：进场+行为+猎手两连击杀全对）：blank 空白木桩（只活着的起跑线）/ grazer 吃草彷徨者（scan+逃跑+散步）/ hunter 小猎手（scan+追击+贴身出刀，ATTACKER_WAT 同款久经考验骨架）。模板=官方示例以玩家身份进场的最小实现（#011）。
+- 前端：#createPanel 面板（空世界+无 player 实体+已连接时登场；有玩家实体的世界永不弹）——起名框（maxlength 24）+三模板卡单选+出生按钮+「你的代码在 players/<名字>.wat——改文件=改命运」引导；本地校验与服务器同规则（双门同锁）；弹窗铁律（决策即关门 0.25s 淡出+busy 防双发）；player_joined → 面板淡出+绿横幅"你的生物「N」出生了——点地面走，点敌人打"（5s 自动收）；rejected → 红字+解锁重试；断线重连解锁 busy。控制台事件流两分类同步。
+- 文档：api.md「进场仪式」节（模板表/起名规则六码/首建归档/me 优先级）；net-protocol.md v2.6（6.1/6.2 create_player 行+3.3 kind 表两成员+版本史）。
+- 验证：模板真跑（空世界三生物进场，hunter 击杀链 battle.log 对账）；cargo test --workspace 亲跑 1228/0/2（基线 1216+12 新增：net 解析 2+WS e2e 1+main 落地 4+onboarding 5）；**A 轨机证冒烟脚本**（scratch smoke_d021b.js，node 裸 WS 协议客户端）：真世界起服→发 create_player→player_joined 事件+实体进场（glyph=T/green/(30,0.5)）+players/tudou.wat（模板全文）+me.txt 接管+首启归档 archive/ 全链 ✓，同名重建 NAME_TAKEN 事件 ✓；前端 JS 语法编译过（node new Function）；clippy 新增警告 0。
+- 下一步：土豆 A 轨验收——空世界起服→浏览器自动弹"创建你的角色"→起名选模板点出生→画面出现自己的生物+绿横幅；改名重建看红字拒绝。
+
 ## 现在（2026-10-28 Defold 引擎工程地图落地，待土豆验收）
 
 - 完成：docs/engine-map.md（t_f5646e6d，commit e3ef594）——game-menu.md 的姊妹篇"引擎工程器官"视角总索引。三层结构：①engine/ 32 楼层清单（六组分类：骨架 2/零件库 1/表现层 9/输入 2/逻辑物理 3/地基后勤 15，每组一句话职能）②176 个要害器官四栏表（文件｜功能一句话｜对应 CodeWorld 哪个 crate/宪法条款｜状态记号；176=§2 四栏表数据行逐楼脚本计数，与 §3 已标列 32/32 一致）③每楼三行账（文件总数/已标数/胶水与资源归堆）+ 顶层"四机器分工"节（editor(Clojure)/engine(C++)/Bob(Java)/external 借件清单）+ "未定性"诚实名单 + 读码锚点速查表（11 锚点行号亲核）。
