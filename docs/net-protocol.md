@@ -8,7 +8,7 @@
 | 项 | 值 |
 |----|----|
 | 协议 | WebSocket（升级自 HTTP） |
-| 路径 | `/ws`（同源；静态页由同一端口 ServeDir 伺服）。**v2.9 起支持 `?token=<会话令牌>` 参数**（D-021f 凭据认领，见 §11；不带=观战连接）。**v2.2 起**另有 HTTP 通道：`POST /upload/avatar`（收图）+ `GET /assets/{id}.png`（原图直取）；**v3.0 起再加工坊 HTTP 通道**：`GET/POST/DELETE /api/player-code` + `GET /api/bridge-config`（见 §12） |
+| 路径 | `/ws`（同源；静态页由同一端口 ServeDir 伺服）。**v2.9 起支持 `?token=<会话令牌>` 参数**（D-021f 凭据认领，见 §11；不带=观战连接）。**v2.2 起**另有 HTTP 通道：`POST /upload/avatar`（收图）+ `GET /assets/{id}.png`（原图直取）；**v3.0 起再加工坊 HTTP 通道**：`GET/POST/DELETE /api/player-code` + `GET/POST /api/bridge-config`（D-022b 起外桥可编辑，见 §12） |
 | 端口 | `CODEWORLD_WS_PORT`，默认 8080；**0 = 禁用 WS**（纯终端模式，零开销） |
 | 绑定 | 127.0.0.1（仅本机浏览器可访问；局域网观战留后续） |
 | 方向 | 双向：下行=每拍全量快照推送；上行=客户端意图消息（v1.2 起） |
@@ -607,12 +607,14 @@ me.txt 声明）。**每个 WS 连接建立后下发一次**（avatar_assets 之
 - 出生镜头：观战全景中选角完成 → 相机从当前视野中心起步（`CAM_LERP` 复用，零新
   常数）平滑飞向自己实体；从未渲染过=直接对准（旧行为）
 
-## 12. 工坊 HTTP 通道（v3.0，D-022 造物工坊）
+## 12. 工坊 HTTP 通道（v3.0 基础 + D-022b 面板迁入/外桥可编辑小扩展）
 
-玩家工作台 `workshop.html`（战场页底栏「🛠 工坊」/快捷键 B，新标签打开）的四个
-HTTP 路由，全部挂 WS 同端口，HTTP 恒 200、成败看 body `ok` 字段（upload/avatar
-同款约定）。工坊的 WS 是**无 token 观战连接**（收 player_events/player_roster
-做列表与事件流，不发任何上行意图，不需要操控权）。核心语义：**玩家 .wat=热进场
+玩家工作台=**世界页面内的侧滑面板**（D-022b 起：战场页底栏「🛠 工坊」/快捷键 B
+开合，ESC 收起；workshop.html 新标签页已退役删除）的五个 HTTP 路由，全部挂 WS
+同端口，HTTP 恒 200、成败看 body `ok` 字段（upload/avatar 同款约定）。工坊的 WS
+是**无 token 观战连接**（收 player_events/player_roster 做列表与事件流，不发任何
+上行意图，不需要操控权；主连接的 player_events 按操控玩家过滤，工坊独立连接看
+全角色事件——谁的 compile_failed 都能标红定位）。核心语义：**玩家 .wat=热进场
 ——保存=写 `players/<名>.wat`，世界每拍目录轮询自动接手（新文件下拍进场、删除
 下拍残影下线），零新进场协议**。
 
@@ -645,17 +647,45 @@ HTTP 路由，全部挂 WS 同端口，HTTP 恒 200、成败看 body `ok` 字段
   在线角色删除同理）。**不动 me.txt**。
 - 拒绝：`NAME_*` / `NAME_UNKNOWN` / `IO_ERROR`。
 
-### 12.4 GET /api/bridge-config（外桥只读展示）
+### 12.4 GET/POST /api/bridge-config（外桥端点表读+写，D-022b 可编辑）
 
-- BridgeVault 读锁 → `{"ok":true,"ports":[{"port":1,"note":"外脑服务器"},...]}`
-  （端口升序；note=bridges.json 人读字段原样透传，可空串）。
-- 桥未启用（`CODEWORLD_BRIDGE` 未开）或 vault 未装配 → `{"ok":true,"ports":[]}`
-  （ok 恒 true，前端不必区分原因）。
-- **不做写路由**（改服务器配置越权，玩家侧不开放——端点登记在世界目录
-  bridges.json，mtime 热重载，改文件生效）。
+- **GET**：vault 装配 → `{"ok":true,"enabled":true,"ports":[{"port":1,
+  "url":"http://127.0.0.1:9001","note":"外脑服务器"},...]}`（端口升序；url=
+  编辑框回填用，D-022b 新增；note=bridges.json 人读字段原样透传，可空串）。
+- GET 桥未启用（`CODEWORLD_BRIDGE` 未开）→ `{"ok":true,"enabled":false,
+  "ports":[]}`（前端黄字提示桥未启用，仍可编辑保存——写盘即用，桥下次启用生效）。
+- **POST**（D-022b 新增写通道）：请求 `application/json`，
+  `{"ports":[{"port":1,"url":"http://127.0.0.1:9001","note":"外脑服务器"},...]}`。
+  处理链：**整批校验**（与 load 装载校验同一套规则函数——port>0 且回环 host 且回复
+  http；任一条非法=**整单拒绝**，文件一字不动）→ 读旧文件按 port 合并 headers
+  （**凭证不落浏览器**：headers 不进 UI 不进请求体，已登记的鉴权头原样保留）→
+  pretty JSON **原子写** bridges.json（临时文件同目录先落再换名，防写一半崩档）→
+  vault 装配时写锁 reload 内存同步（`bridge_send` 下一拍按新表解析；主循环每拍
+  mtime 热重载走同一把 RwLock，幂等无害）。
+  - vault 未装配（桥未启用）POST 也受理：写盘成功即返回 ok（桥下次带
+    `CODEWORLD_BRIDGE=1` 启动即用）。
+  - 空数组=清空登记（文件落 `[]`）。
+  - 响应：`{"ok":true}` / `{"ok":false,"reason":"<码>","index":<定位下标>}`：
 
-### 12.5 工坊页前端行为（static/workshop.html + workshop.js）
+  | reason | 触发 |
+  |--------|------|
+  | `BAD_JSON` | 请求体不是合法 JSON |
+  | `PORT_INVALID` | 某条 port ≤ 0（index 指向第几条，0 起） |
+  | `URL_INVALID` | 某条地址非法：https 拒（MVP 客户端只做本机 http）/ 非 http
+    scheme / URL 解析失败 / host 非本机回环（仅 127.0.0.1/localhost，大小写
+    不敏感）（index 同上） |
+  | `IO_ERROR` | 写盘失败（服务器 warn 日志留痕；无 index） |
 
+- 测试连接**不在协议面**：纯浏览器侧 `fetch(url, {method:'HEAD', mode:'no-cors'})`
+  直连测可达（opaque 响应 resolve=可达，reject/3 秒超时=不通），零服务端参与。
+
+### 12.5 工坊面板前端行为（index.html 侧滑面板，D-022b 迁入）
+
+- 面板语义：`#wsPanel` 侧滑（宽 min(640px,66vw)，B 键/底栏按钮开合、ESC 收起、
+  删除确认弹窗优先；与右侧控制台可同开）。**首开懒装配**：Monaco loader 动态
+  注入（省主页面首屏）+ 独立观战 WS 连接 + 补全数据，各一次；面板关闭**不销毁**
+  ——编辑中代码/当前角色/事件流不丢，再开即用。workshop.html/workshop.js 已删
+  （逻辑整体迁入 index.html 独立脚本块，DOM id 全量 ws 前缀防撞）。
 - Monaco **vendored 单文件 amd 版**（`static/vendor/monaco/vs/` 整目录入 git，
   白名单例外同 three.module.min.js 先例；**禁 CDN**）。加载失败/超时 → textarea
   降级 + 顶部黄条，保存/删除/事件流照常（走 HTTP/WS 不依赖编辑器）。

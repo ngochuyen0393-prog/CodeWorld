@@ -125,7 +125,7 @@
     background: #21262d; border: 1px solid #30363d; color: #f85149;
     font: inherit; padding: 0 8px; cursor: pointer;
   }
-  /* D-022 工坊入口：新标签打开造物工坊（可分屏），快捷键 B */
+  /* D-022b 工坊入口：B 键/底栏按钮开合侧滑面板（工坊嵌世界页面内） */
   #workshopBtn {
     background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
     font: inherit; padding: 0 8px; cursor: pointer;
@@ -406,6 +406,205 @@
     color: #484f58; font-size: 12px; line-height: 1.6;
   }
   #console.collapsed ~ #skillbar { left: calc((100% - 28px) / 2); }
+
+  /* ===== D-022b 造物工坊侧滑面板（workshop.html 迁入；与 #console 同家族：
+     默认收起，B 键/工坊按钮开合，ESC 收起。与右侧 #console 可同开——世界画面
+     在中间被夹住属可接受，卡面已定不做拖拽分屏。
+     迁入样式全量加 #wsPanel 作用域前缀：主页面全局类 .unit/.row 族不串扰
+     （特异性 0x11 压过全局 0x10）；结构类统一 ws 前缀（.wstopbar 族） ===== */
+  #wsPanel {
+    position: fixed; top: 0; left: 0; bottom: 0;
+    width: min(640px, 66vw); z-index: 45;
+    transform: translateX(-100%); /* 默认收起 */
+    transition: transform .18s ease;
+    display: flex; flex-direction: column;
+    background: #0d1117; color: #c9d1d9;
+    border-right: 1px solid #30363d;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 13px; line-height: 1.6;
+  }
+  #wsPanel.open { transform: translateX(0); }
+  #wsPanel button {
+    background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+    font: inherit; padding: 2px 10px; cursor: pointer;
+  }
+  #wsPanel button:hover { border-color: #8b949e; }
+  #wsPanel button:disabled { opacity: 0.5; cursor: default; }
+  #wsPanel input[type="text"], #wsPanel input[type="number"], #wsPanel input[type="url"], #wsPanel select {
+    background: #0d1117; border: 1px solid #30363d; color: #e6edf3;
+    font: inherit; padding: 4px 8px;
+  }
+  #wsPanel input:focus, #wsPanel select:focus { outline: none; border-color: #58a6ff; }
+
+  /* 顶栏（workshop.html #topbar 迁入） */
+  #wsPanel .wstopbar {
+    display: flex; align-items: center; gap: 12px; padding: 8px 14px;
+    background: #161b22; border-bottom: 1px solid #30363d; flex-shrink: 0;
+  }
+  #wsPanel .wstopbar .logo { font-weight: 700; color: #e6edf3; font-size: 15px; }
+  #wsPanel .wstopbar .sub { color: #8b949e; }
+  #wsPanel .wstopbar .spacer { flex: 1; }
+  #wsPanel #wsConn.ok { color: #3fb950; }
+  #wsPanel #wsConn.bad { color: #f85149; }
+  #wsPanel #wsConn, #wsPanel .wstickwrap { color: #8b949e; font-family: Consolas, monospace; }
+  #wsPanel #wsEditingName { color: #58a6ff; }
+  #wsPanel #wsSaveBtn { font-weight: 700; }
+  #wsPanel #wsCloseBtn { padding: 2px 8px; }
+
+  /* 降级黄条（workshop.html #monacoWarn 迁入） */
+  #wsMonacoWarn {
+    background: #5a4a12; border-bottom: 1px solid #d29922; color: #f0d47a;
+    padding: 6px 14px; flex-shrink: 0;
+  }
+
+  /* 轻提示 toast（workshop.html #flash 迁入；fixed 于页面层——transform 祖先
+     会破坏 position:fixed，故 DOM 放 #wsPanel 外、样式独立作用域） */
+  #wsFlash {
+    position: fixed; top: 52px; left: 50%; transform: translateX(-50%);
+    z-index: 60; background: #1c2128; border: 1px solid #3fb950;
+    border-radius: 6px; color: #cfe8cf; padding: 6px 16px; max-width: 70%;
+  }
+  #wsFlash.err { border-color: #f85149; color: #ffb3ad; }
+
+  /* 主区：左面板 260px + 右编辑器（workshop.html #main/#side 迁入） */
+  #wsPanel .wsmain { display: flex; flex: 1; min-height: 0; }
+  #wsSide {
+    width: 260px; flex-shrink: 0; display: flex; flex-direction: column;
+    background: #161b22; border-right: 1px solid #30363d; overflow-y: auto;
+  }
+  #wsPanel #wsSide h3 {
+    margin: 0; padding: 10px 12px 4px; font-size: 12px; font-weight: 700;
+    color: #8b949e; letter-spacing: 0;
+  }
+  #wsPanel #wsSide .sec { border-bottom: 1px solid #21262d; padding-bottom: 8px; }
+
+  /* 角色文件列表 */
+  #wsPanel #wsCharList { min-height: 60px; max-height: 180px; overflow-y: auto; }
+  #wsPanel .crow {
+    display: flex; align-items: center; gap: 8px; padding: 5px 12px;
+    cursor: pointer; border-left: 2px solid transparent;
+  }
+  #wsPanel .crow:hover { background: #1c2128; }
+  #wsPanel .crow.sel { background: #1c2128; border-left-color: #58a6ff; }
+  #wsPanel .crow .dot {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+    background: #484f58; /* 离场=灰 */
+  }
+  #wsPanel .crow .dot.on { background: #3fb950; } /* 在场=绿 */
+  #wsPanel .crow .glyph { width: 20px; text-align: center; font-weight: 700; flex-shrink: 0; }
+  #wsPanel .crow .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #e6edf3; }
+  #wsPanel .crow .del { padding: 0 6px; font-size: 12px; border: none; background: none; }
+  #wsPanel .crow .del:hover { color: #f85149; }
+  #wsPanel .empty { color: #484f58; padding: 8px 12px; font-size: 12px; }
+
+  /* 在场造物列表 */
+  #wsPanel #wsCreatList { max-height: 160px; overflow-y: auto; }
+  #wsPanel .unit {
+    display: flex; align-items: center; gap: 8px; padding: 4px 12px;
+    cursor: pointer; font-size: 12px;
+  }
+  #wsPanel .unit:hover { background: #1c2128; }
+  #wsPanel .unit.sel { background: #1c2128; }
+  #wsPanel .unit .glyph {
+    width: 20px; height: 20px; border-radius: 4px; background: #21262d;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  #wsPanel .unit .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #wsPanel .unit .nm i { font-style: normal; color: #8b949e; }
+  #wsPanel .unit .life { color: #8b949e; font-family: Consolas, monospace; font-size: 11px; }
+  #wsPanel .unit .life.low { color: #e3b341; }
+  #wsPanel .unit-detail { background: #0d1117; padding: 4px 12px 6px 40px; }
+  #wsPanel .unit-detail .uev { font-size: 11px; color: #8b949e; font-family: Consolas, monospace; }
+  #wsPanel .unit-detail .uev.dim { color: #484f58; }
+
+  /* 新建造物表单 */
+  #wsPanel .wsnewform { padding: 4px 12px 0; display: flex; flex-direction: column; gap: 6px; }
+  #wsPanel .wsnewform input[type="text"], #wsPanel .wsnewform select { width: 100%; }
+  #wsPanel .wsfilerow { display: flex; align-items: center; gap: 8px; }
+  #wsPanel .wsfilerow input[type="file"] { font-size: 11px; color: #8b949e; max-width: 150px; }
+  #wsPanel #wsNewPreview { width: 32px; height: 32px; object-fit: contain; background: #1c2128; border: 1px solid #30363d; }
+  #wsPanel .wsnewform .btnrow { display: flex; gap: 8px; }
+
+  /* 外桥折叠区（D-022b 升级可编辑：每端点一行（窄栏自动折行）+ 保存/测试） */
+  #wsPanel #wsBridgeSec { padding: 0 12px 10px; }
+  #wsPanel #wsBridgeSec summary { cursor: pointer; color: #8b949e; font-size: 12px; padding: 6px 0; }
+  #wsPanel .wsbridge-row {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    padding: 4px 0; border-bottom: 1px dashed #21262d;
+  }
+  #wsPanel .wsbridge-row input[type="number"] { width: 60px; }
+  #wsPanel .wsbridge-row input[type="url"] { flex: 1.4; min-width: 150px; }
+  #wsPanel .wsbridge-row input[type="text"] { flex: 1; min-width: 100px; }
+  #wsPanel .wsbridge-row .wsbdel { padding: 2px 6px; font-size: 12px; }
+  #wsPanel .wsbridge-row .wsbtest { font-size: 11px; flex-basis: 100%; }
+  #wsPanel .wsbridge-row .wsbtest.okay { color: #3fb950; }
+  #wsPanel .wsbridge-row .wsbtest.bad { color: #f85149; }
+  #wsPanel .wsbbtnrow { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  #wsPanel .wsbnote { color: #d29922; font-size: 11px; margin-top: 6px; }
+  #wsPanel .wsbhint { color: #484f58; font-size: 11px; margin-top: 6px; }
+
+  /* 编辑器 */
+  #wsPanel .wseditorarea { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #wsPanel #wsEditorWrap { flex: 1; min-height: 0; }
+  #wsPanel #wsEditorHost { width: 100%; height: 100%; }
+  #wsPanel #wsEditorHost.degraded { padding: 0; }
+  #wsPanel #wsFallbackEditor {
+    flex: 1; min-height: 0; width: 100%; resize: none; border: none;
+    background: #0d1117; color: #c9d1d9;
+    font-family: Consolas, "Courier New", monospace; font-size: 14px;
+    padding: 10px 14px; line-height: 1.5;
+  }
+
+  /* 底部：错误面板 + 事件流（workshop.html #bottom 迁入） */
+  #wsPanel .wsbottom {
+    height: 200px; flex-shrink: 0; display: flex; flex-direction: column;
+    background: #161b22; border-top: 1px solid #30363d;
+  }
+  #wsPanel #wsErrPanel {
+    max-height: 90px; overflow-y: auto; padding: 6px 14px;
+    background: #2d1215; border-bottom: 1px solid #f85149; color: #ffb3ad;
+  }
+  #wsPanel #wsErrPanel b { font-weight: 700; }
+  #wsPanel #wsErrPanel pre { margin: 4px 0 0; white-space: pre-wrap; font-family: Consolas, monospace; font-size: 12px; }
+  #wsPanel .wsstreamtitle { padding: 6px 14px 2px; color: #8b949e; font-size: 12px; flex-shrink: 0; }
+  #wsPanel #wsStream { flex: 1; overflow-y: auto; padding: 2px 0 6px; font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+  #wsPanel .evrow { display: flex; gap: 8px; padding: 2px 14px; line-height: 1.5; }
+  #wsPanel .evrow.err, #wsPanel .evrow.warn { cursor: pointer; }
+  #wsPanel .evrow:hover { background: #1c2128; }
+  #wsPanel .evrow .tk { color: #484f58; flex-shrink: 0; }
+  #wsPanel .evrow .kind { flex-shrink: 0; color: #79c0ff; }
+  #wsPanel .evrow .msg { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #wsPanel .evrow.err .msg, #wsPanel .evrow.err .kind { color: #f85149; }
+  #wsPanel .evrow.warn .msg { color: #e3b341; }
+  #wsPanel .evrow.info .msg { color: #8b949e; }
+  #wsPanel .evrow.log .msg { color: #e6edf3; }
+  #wsPanel .evrow .rep { color: #8b949e; flex-shrink: 0; }
+
+  /* 页脚声明（workshop.html #foot 迁入） */
+  #wsPanel .wsfoot {
+    padding: 4px 14px; color: #484f58; font-size: 11px;
+    border-top: 1px solid #21262d; flex-shrink: 0;
+  }
+
+  /* 删除确认弹窗（workshop.html #delDialog 迁入；fixed 于页面层——同 #wsFlash，
+     DOM 放 #wsPanel 外防 transform 祖先破坏 fixed 定位。决策即关门 0.25s 淡出
+     + busy 守卫，logoutPanel 模式） */
+  #wsDelDialog {
+    position: fixed; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(14, 17, 22, 0.72);
+    transition: opacity 0.25s ease;
+  }
+  #wsDelDialog.closing { opacity: 0; pointer-events: none; }
+  #wsDelDialog .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 18px 20px; width: 320px;
+  }
+  #wsDelDialog .title { color: #e6edf3; margin-bottom: 12px; }
+  #wsDelDialog .title b { color: #f85149; }
+  #wsDelDialog .desc { color: #8b949e; margin-bottom: 14px; }
+  #wsDelDialog .btnrow { display: flex; gap: 10px; justify-content: flex-end; }
+  #wsDelYes { border-color: #f85149; color: #f85149; }
 </style>
 </head>
 <body>
@@ -499,8 +698,8 @@
   <button id="threeBtn" type="button">3D 层：关</button>
   <span id="threeStatus"></span>
   <button id="matBtn" type="button" hidden>材质</button>
-  <!-- D-022 工坊入口：workshop.html 新标签（可分屏；工坊自带观战 WS 连接） -->
-  <button id="workshopBtn" type="button" title="造物工坊（编辑器+造物管理，新标签打开）">🛠 工坊</button>
+  <!-- D-022b 工坊入口：侧滑面板开合（B 键同效；工坊自带观战 WS 连接） -->
+  <button id="workshopBtn" type="button" title="造物工坊（编辑器+造物管理，B 键开合侧滑面板）">🛠 工坊</button>
   <button id="logoutBtn" type="button">登出</button>
   <span id="mouse">x=- , y=-</span>
 </div>
@@ -522,6 +721,85 @@
      从快照派生（owner=操控实体且 creation 系按 name 聚合），空栏起步；
      点击格子/数字键 1..9 = skill{slot:N} 上行（服务端按格重放同款造物） -->
 <div id="skillbar"></div>
+<!-- D-022b 造物工坊侧滑面板（workshop.html 迁入）：默认收起，B 键/底栏按钮开合，
+     ESC 收起。#wsFlash/#wsDelDialog 放面板外（transform 祖先会破坏 fixed 定位）。
+     逻辑全在下方独立脚本块（workshop.js 迁入，IIFE 原结构保留） -->
+<div id="wsPanel">
+  <div class="wstopbar">
+    <span class="logo">🛠 造物工坊</span>
+    <span class="sub">代码即现实——你的 .wat 就是身体</span>
+    <span class="spacer"></span>
+    <span id="wsConn">连接中……</span>
+    <span class="wstickwrap">tick <span id="wsTick">-</span></span>
+    <span>编辑：<span id="wsEditingName">（未选择）</span></span>
+    <button id="wsSaveBtn" type="button" title="Ctrl+S">保存</button>
+    <button id="wsCloseBtn" type="button" title="收起（B / ESC）">✕</button>
+  </div>
+  <div id="wsMonacoWarn" hidden></div>
+  <div class="wsmain">
+    <div id="wsSide">
+      <div class="sec">
+        <h3>角色文件（players/）</h3>
+        <div id="wsCharList"><div class="empty">打开面板时读取……</div></div>
+      </div>
+      <div class="sec">
+        <h3>在场造物</h3>
+        <div id="wsCreatList"><div class="empty">等待世界快照……</div></div>
+      </div>
+      <div class="sec">
+        <h3>新建造物</h3>
+        <div class="wsnewform">
+          <input type="text" id="wsNewName" maxlength="24" placeholder="名字（字母/数字/中文，≤24）" autocomplete="off">
+          <select id="wsNewTpl"></select>
+          <div class="wsfilerow">
+            <input type="file" id="wsNewFile" accept="image/png" title="上传皮（PNG 透明底，≤2MB）">
+            <img id="wsNewPreview" hidden alt="">
+          </div>
+          <div class="btnrow">
+            <button id="wsNewUpload" type="button" title="上传入库，拿 asset_id">上传皮</button>
+            <button id="wsNewGen" type="button" title="按模板生成骨架进编辑器（不落盘）">生成骨架</button>
+          </div>
+        </div>
+      </div>
+      <div class="sec">
+        <details id="wsBridgeSec">
+          <summary>外桥</summary>
+          <div id="wsBridgeBody">
+            <div id="wsBridgeList"><div class="empty">展开时读取……</div></div>
+            <div class="wsbbtnrow">
+              <button id="wsBridgeAdd" type="button">+ 添加端点</button>
+              <button id="wsBridgeSave" type="button">保存</button>
+              <button id="wsBridgeTest" type="button">测试连接</button>
+            </div>
+            <div class="wsbnote" id="wsBridgeEnabledNote" hidden></div>
+            <div class="wsbhint">端点登记在世界目录 bridges.json；保存即写盘并热生效（bridge_send 下一拍按新表走）。鉴权头（headers）不在此编辑——已登记的凭证原样保留。</div>
+          </div>
+        </details>
+      </div>
+    </div>
+    <div class="wseditorarea">
+      <div id="wsEditorWrap"><div id="wsEditorHost"></div></div>
+      <textarea id="wsFallbackEditor" hidden spellcheck="false"></textarea>
+    </div>
+  </div>
+  <div class="wsbottom">
+    <div id="wsErrPanel" hidden></div>
+    <div class="wsstreamtitle">事件流（compile_failed / 造物被拒 / 运行错可点击定位到编辑器）</div>
+    <div id="wsStream"><div class="empty" style="padding:4px 14px">等待事件……（编译失败/出生/运行错都在这里）</div></div>
+  </div>
+  <div class="wsfoot">工坊定位：编辑 + 保存（=新造物进场通道）+ 皮入库。真·断点/单步/回放不做（违拍制全局心跳，另卡）；在线角色保存后下次进场生效（无热替换）。</div>
+</div>
+<div id="wsFlash" hidden></div>
+<div id="wsDelDialog" hidden>
+  <div class="card">
+    <div class="title">删除角色文件「<b id="wsDelName"></b>」？</div>
+    <div class="desc">删除 players/&lt;名字&gt;.wat——世界下拍残影下线（在线角色同理）。me 声明不动；文件删了就没了（没有回收站）。</div>
+    <div class="btnrow">
+      <button id="wsDelYes" type="button">删除</button>
+      <button id="wsDelNo" type="button">取消</button>
+    </div>
+  </div>
+</div>
 <script>
 (function () {
   'use strict';
@@ -2042,7 +2320,9 @@
     stopPrediction();
   });
   window.addEventListener('keydown', function (ev) {
-    if (ev.target && ev.target.tagName === 'INPUT') return; // 输入框里敲键不触发快捷键（S/F/L/T/B 同治）
+    // 输入框/文本域里敲键不触发快捷键（S/F/L/T/B 同治；TEXTAREA 一并守卫——
+    // D-022b 工坊 Monaco 自建 textarea 也是 TEXTAREA，编辑器里打字按 B 不得被截走）
+    if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA')) return;
     if (ev.key === 's' || ev.key === 'S') {
       sendMsg({ type: 'stop' });
       stopPrediction();
@@ -2050,26 +2330,35 @@
     if (ev.key === 'f' || ev.key === 'F') {
       toggleCamera();
     }
-    // D-022 造物工坊：B 键/底栏按钮，新标签打开（不与 S/F/L/T/1-4 冲突）
+    // D-022b 造物工坊：B 键/底栏按钮 = 侧滑面板开合（不与 S/F/L/T/1-4 冲突；
+    // 工坊 IIFE 经 window.CwWorkshopPanel 桥接，首开懒装配 Monaco+观战 WS）
     if (ev.key === 'b' || ev.key === 'B') {
-      openWorkshop();
+      if (window.CwWorkshopPanel) window.CwWorkshopPanel.toggle();
     }
     // 登出处置（#025）：L 键/底部按钮开面板，Esc 取消
     if (ev.key === 'l' || ev.key === 'L') {
       showLogoutPanel();
     }
     if (ev.key === 'Escape') {
-      cancelLogoutPanel(); // Esc = 取消（弹窗开着且非决策/淡出中才生效）
+      // Esc 优先级（D-022b）：logoutPanel 弹窗照旧 > 工坊 delDialog（工坊 IIFE
+      // 自己监听关闭）> 收起工坊侧滑面板
+      if (logoutPanelEl.hidden) {
+        var wsDel = document.getElementById('wsDelDialog');
+        if ((!wsDel || wsDel.hidden) && window.CwWorkshopPanel && window.CwWorkshopPanel.isOpen()) {
+          window.CwWorkshopPanel.close();
+        }
+      } else {
+        cancelLogoutPanel(); // Esc = 取消（弹窗开着且非决策/淡出中才生效）
+      }
     }
   });
   camBtnEl.addEventListener('click', toggleCamera);
 
-  // ---- D-022 造物工坊入口：workshop.html 新标签打开（可分屏；工坊页自带观战
-  // WS 连接收事件流/角色列表，不动本页操控连接）----
-  function openWorkshop() {
-    window.open('workshop.html', '_blank');
-  }
-  workshopBtnEl.addEventListener('click', openWorkshop);
+  // ---- D-022b 造物工坊入口：底栏按钮 = 侧滑面板开合（面板自带观战 WS 连接
+  // 收事件流/角色列表，不动本页操控连接；Monaco 首开才装配）----
+  workshopBtnEl.addEventListener('click', function () {
+    if (window.CwWorkshopPanel) window.CwWorkshopPanel.toggle();
+  });
 
   // ---- 登出处置（#025 期五第一刀；期五第二刀决策即关门）----
   // 弹窗是一次决策的场所：点任一选项/取消/Esc = 决策完成 = 弹窗立刻淡出关门，
@@ -2974,6 +3263,1069 @@
       });
     });
   }
+})();
+</script>
+<script>
+/**
+ * 面板：造物工坊（D-022b，workshop.js 整体迁入 index.html 侧滑面板）
+ * 功能：Monaco 编辑器（WAT 高亮 / 编译错红波浪线 / 自动补全）+ 造物管理
+ *      （角色文件列表 / 在场造物 / 新建造物+皮上传 / 外桥可编辑）+ 事件流面板。
+ * 面板语义（D-022b）：默认收起，B 键/底栏按钮开合，ESC 收起（delDialog 优先）；
+ *      首开懒装配（补全数据+观战 WS+Monaco 动态注入 loader 各一次），面板关闭
+ *      不销毁——编辑中代码/当前角色/事件流不丢，再开即用。
+ * 流程：1. 首开连 WS（无 token=观战连接，收 player_roster + 每拍快照的
+ *          player_events/entities——工坊不需要操控权；独立于主页面操控连接，
+ *          全角色事件都看得到，谁的 compile_failed 都能标红定位）
+ *       2. 左列表点选角色 -> GET /api/player-code 载入编辑器
+ *       3. Ctrl+S / 保存按钮 -> POST /api/player-code（写 players/<名>.wat，
+ *          新文件=世界下拍目录轮询自动进场；在线角色=下次进场生效）
+ *       4. compile_failed -> 正则解析行号（wat 错误格式 `--> <anon>:行:列`）
+ *          -> Monaco markers 红波浪线；运行错面板点击跳转导出函数所在行
+ * 降级：Monaco 加载失败（vendor 缺失/超时）-> textarea + 顶部黄条，保存/加载/
+ *      删除/事件流功能不炸（它们走 HTTP/WS，不依赖编辑器）。
+ * 边界（卡面声明）：真·断点/单步/回放不做（违拍制全局心跳，另卡）；
+ *      在线热替换不做（保存=下次进场生效）；装戴 API 未开放（皮只入库）。
+ */
+
+(function () {
+  'use strict';
+
+  // ---- 常数 ----
+  var MONACO_TIMEOUT_MS = 8000;     // Monaco 加载兜底超时（vendor 缺失时不再干等）
+  var PANEL_ACK_MS = 120;           // 确认弹窗按下回执时长（同 index.html 登出面板）
+  var PANEL_FADE_MS = 250;          // 确认弹窗 0.25s 淡出（决策即关门标准）
+  var WS_BACKOFF_INIT_MS = 1000;    // WS 重连退避起步
+  var WS_BACKOFF_MAX_MS = 30000;    // WS 重连退避封顶
+  var EVENT_STREAM_CAP = 200;       // 事件流行数上限（防长跑内存涨）
+  var ENTITY_EVENT_KEEP = 20;       // 每造物事件缓存条数上限（展开面板取最近 3 条）
+  var BRIDGE_TEST_TIMEOUT_MS = 3000; // 外桥测试连接超时（AbortController 保险丝）
+
+  // 保存/删除拒绝码 -> 人话（与 api.md 码表同源；服务器侧 wire 值）
+  var SAVE_REJECT_TEXT = {
+    NAME_EMPTY: '名字不能为空',
+    NAME_TOO_LONG: '名字太长（最多 24 字符）',
+    NAME_BAD_CHAR: '名字只能用字母/数字/中文/_/-（拒路径分隔符和点号）',
+    CODE_TOO_LONG: '代码超过 256KB 上限',
+    IO_ERROR: '服务器写盘失败（看世界日志）',
+    BAD_JSON: '请求格式错误（浏览器侧 bug？）'
+  };
+  var DELETE_REJECT_TEXT = {
+    NAME_EMPTY: '名字不能为空',
+    NAME_TOO_LONG: '名字太长',
+    NAME_BAD_CHAR: '非法名字',
+    NAME_UNKNOWN: '角色不存在（可能已被删除）',
+    IO_ERROR: '服务器删除失败（看世界日志）'
+  };
+  // 外桥保存拒绝码 -> 人话（D-022b；与 api.md 码表同源）
+  var BRIDGE_REJECT_TEXT = {
+    BAD_JSON: '请求格式错误',
+    PORT_INVALID: '端口非法（须大于 0）',
+    URL_INVALID: '地址非法（仅支持 http://127.0.0.1 或 http://localhost，https 不支持）',
+    IO_ERROR: '服务器写盘失败（看世界日志）'
+  };
+
+  // 事件 kind -> 四色分类（err 红 / warn 黄 / info 灰 / log 白）
+  var EVENT_CLASS = {
+    compile_failed: 'err',
+    runtime_error: 'err',
+    create_player_rejected: 'err',
+    select_player_rejected: 'err',
+    spawn_rejected: 'warn',
+    died: 'warn',
+    born: 'info',
+    player_joined: 'info',
+    player_selected: 'info',
+    player_log: 'log'
+  };
+  var EVENT_LABEL = {
+    compile_failed: '编译失败',
+    runtime_error: '运行错',
+    spawn_rejected: '造物被拒',
+    born: '出生',
+    died: '死亡',
+    player_log: '输出',
+    player_joined: '进场',
+    player_selected: '选角',
+    create_player_rejected: '创建被拒',
+    select_player_rejected: '选角被拒'
+  };
+
+  // 新建造物模板下拉（与 onboarding::TEMPLATES 同源：blank/grazer/hunter/tower）
+  var TEMPLATES = [
+    { id: 'blank', label: '空白木桩（只活着）' },
+    { id: 'grazer', label: '吃草彷徨者（逃跑+散步）' },
+    { id: 'hunter', label: '小猎手（追击+贴身刀）' },
+    { id: 'tower', label: '箭塔（站桩哨塔+盾拦）' }
+  ];
+
+  // ---- DOM（id 全量 ws 前缀防与主页面撞）----
+  var panelEl = document.getElementById('wsPanel');
+  var connEl = document.getElementById('wsConn');
+  var tickEl = document.getElementById('wsTick');
+  var warnBarEl = document.getElementById('wsMonacoWarn');
+  var closeBtnEl = document.getElementById('wsCloseBtn');
+  var listEl = document.getElementById('wsCharList');
+  var creatListEl = document.getElementById('wsCreatList');
+  var newNameEl = document.getElementById('wsNewName');
+  var newTplEl = document.getElementById('wsNewTpl');
+  var newFileEl = document.getElementById('wsNewFile');
+  var newPreviewEl = document.getElementById('wsNewPreview');
+  var newUploadEl = document.getElementById('wsNewUpload');
+  var newGenEl = document.getElementById('wsNewGen');
+  var editorWrapEl = document.getElementById('wsEditorWrap');
+  var textareaEl = document.getElementById('wsFallbackEditor');
+  var editingNameEl = document.getElementById('wsEditingName');
+  var saveBtnEl = document.getElementById('wsSaveBtn');
+  var flashEl = document.getElementById('wsFlash');
+  var errPanelEl = document.getElementById('wsErrPanel');
+  var streamEl = document.getElementById('wsStream');
+  var bridgeSecEl = document.getElementById('wsBridgeSec');
+  var bridgeListEl = document.getElementById('wsBridgeList');
+  var bridgeAddEl = document.getElementById('wsBridgeAdd');
+  var bridgeSaveEl = document.getElementById('wsBridgeSave');
+  var bridgeTestEl = document.getElementById('wsBridgeTest');
+  var bridgeNoteEl = document.getElementById('wsBridgeEnabledNote');
+  var delDialogEl = document.getElementById('wsDelDialog');
+  var delNameEl = document.getElementById('wsDelName');
+  var delYesEl = document.getElementById('wsDelYes');
+  var delNoEl = document.getElementById('wsDelNo');
+
+  // ---- 状态 ----
+  var booted = false;               // 首开懒装配标记（补全数据+WS+Monaco 各一次）
+  var monacoReady = false;          // Monaco 可用（false=textarea 降级）
+  var editor = null;                // Monaco 实例（降级时 null）
+  var currentName = null;           // 正在编辑的角色名（保存目标）
+  var dirty = false;                // 编辑器内容未保存标记
+  var saving = false;               // 保存/删除请求在途（防双发）
+  var roster = [];                  // player_roster 角色（{name,glyph,color,online}）
+  var entities = [];                // 最近一帧快照实体（在线判定/造物列表数据源）
+  var entById = {};                 // 最近一帧实体索引（runtime_error 归属名解析用）
+  var worldTick = 0;                // 最近一帧 tick（剩余寿命计算）
+  var myEntityId = null;            // 操控玩家实体 id（owner 链根；观战连接也能看到 controlled 标记）
+  var eventSeq = 0;                 // 本地事件行计数（DOM key 用）
+  var lastEventKey = null;          // 折叠：上一行 (entity+kind) 键
+  var entityEvents = {};            // entity_id -> [事件摘要]（造物展开面板用）
+  var completions = null;           // 补全数据（fetch templates/api-completions.json）
+  var bridgeEnabled = true;         // 外桥装配态（GET enabled 字段；保存提示文案分流）
+  var bridgeTesting = false;        // 测试连接在途（防双发）
+  var lastAssetId = null;           // 新建造物流程：最近上传成功的皮 asset_id
+  var delTarget = null;             // 删除确认弹窗的目标名
+  var delBusy = false;              // 删除弹窗决策/淡出中（防双发）
+  var ws = null;
+  var wsBackoff = WS_BACKOFF_INIT_MS;
+
+  // ---- 工具 ----
+  function esc(s) {
+    // DOM 转义（列表/事件流全部走 textContent 或此函数，防名字注入 HTML）
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // 名字闸门前端镜像（与服务端 onboarding::sanitize_name 同规则，前端先验省往返）：
+  // trim 后 1..=24 字符；每字符 = ASCII 字母/数字/_/- 或非 ASCII 字母（中文等）。
+  // 全角数字/标点/emoji 皆拒（与后端 is_alphabetic 同锁）。
+  function nameCharOk(c) {
+    var code = c.charCodeAt(0);
+    if ((code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)) return true;
+    if (c === '_' || c === '-') return true;
+    return code > 127 && /\p{L}/u.test(c);
+  }
+  function nameValid(raw) {
+    var name = raw.trim();
+    if (!name.length || name.length > 24) return false;
+    for (var i = 0; i < name.length; i++) {
+      if (!nameCharOk(name[i])) return false;
+    }
+    return true;
+  }
+
+  function flash(text, isErr) {
+    flashEl.textContent = text;
+    flashEl.classList.toggle('err', !!isErr);
+    flashEl.hidden = false;
+    clearTimeout(flash._t);
+    flash._t = setTimeout(function () { flashEl.hidden = true; }, 5000);
+  }
+
+  // 角色当前是否在场：以快照实体为准（player kind 的 name；每拍都是真值，
+  // roster.online 只是下发时点快照）
+  function isOnline(name) {
+    return entities.some(function (e) { return e.kind === 'player' && e.name === name; });
+  }
+
+  // ---- WS（观战连接：无 token。收 roster + 快照；上行不发任何意图）----
+  function connect() {
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    ws = new WebSocket(proto + location.host + '/ws');
+    ws.onopen = function () {
+      connEl.textContent = '已连接';
+      connEl.className = 'ok';
+      wsBackoff = WS_BACKOFF_INIT_MS;
+    };
+    ws.onclose = function () {
+      connEl.textContent = '断线，重连中……';
+      connEl.className = 'bad';
+      setTimeout(connect, wsBackoff);
+      wsBackoff = Math.min(wsBackoff * 2, WS_BACKOFF_MAX_MS);
+    };
+    ws.onerror = function () { ws.close(); };
+    ws.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === 'player_roster') {
+        roster = msg.characters || [];
+        renderRoster();
+      } else if (msg.type === 'avatar_assets') {
+        // 工坊不消费资产掩码（皮上传走 HTTP，实体渲染是战场页的事）
+      } else if (msg.type === 'control_revoked') {
+        // 工坊本就是无 token 观战，stale 属预期，不打扰
+      } else if (msg.tick !== undefined) {
+        onSnapshot(msg);
+      }
+    };
+  }
+
+  // ---- 快照消费（在线圆点 / 在场造物 / 事件流）----
+  function onSnapshot(frame) {
+    worldTick = frame.tick || 0;
+    tickEl.textContent = String(worldTick);
+    entities = frame.entities || [];
+    entById = {};
+    entities.forEach(function (e) { entById[e.id] = e; });
+    var controlled = entities.filter(function (e) { return e.kind === 'player' && e.controlled; });
+    myEntityId = controlled.length ? controlled[0].id : null;
+    renderRoster();      // 在线圆点逐拍校真
+    renderCreations();
+    renderEvents(frame.player_events || []);
+  }
+
+  // ---- 角色文件列表（player_roster ∪ 本会话保存过的新角色；在线圆点逐拍校真）----
+  function renderRoster() {
+    var seen = {};
+    var rows = [];
+    roster.forEach(function (c) {
+      if (!seen[c.name]) { seen[c.name] = true; rows.push(c); }
+    });
+    listEl.innerHTML = '';
+    if (!rows.length) {
+      listEl.innerHTML = '<div class="empty">还没有角色——右边新建一个，<br>或用战场页登录面板创建。</div>';
+      return;
+    }
+    rows.forEach(function (c) {
+      var online = isOnline(c.name);
+      var row = document.createElement('div');
+      row.className = 'crow' + (currentName === c.name ? ' sel' : '');
+      row.innerHTML =
+        '<span class="dot' + (online ? ' on' : '') + '" title="' + (online ? '在场' : '离场') + '"></span>' +
+        '<span class="glyph" style="color:' + esc(c.color) + '">' + esc(c.glyph) + '</span>' +
+        '<span class="nm">' + esc(c.name) + '</span>' +
+        '<button class="del" type="button" title="删除角色文件">🗑</button>';
+      row.querySelector('.nm').addEventListener('click', function () { loadCharacter(c.name); });
+      row.querySelector('.del').addEventListener('click', function () { askDelete(c.name); });
+      listEl.appendChild(row);
+    });
+  }
+
+  // ---- 在场造物（快照 entities 里 owner=操控玩家实体 的 creation/creation_dynamic）----
+  var expandedCreat = null; // 当前展开查看事件的造物实体 id
+  function renderCreations() {
+    creatListEl.innerHTML = '';
+    var mine = entities.filter(function (e) {
+      return (e.kind === 'creation' || e.kind === 'creation_dynamic') && myEntityId && e.owner === myEntityId;
+    });
+    if (!mine.length) {
+      creatListEl.innerHTML = '<div class="empty">没有在场造物——<br>保存代码让角色进场，<br>它就能 spawn 造物。</div>';
+      return;
+    }
+    mine.forEach(function (e) {
+      var remain = e.lifespan_ticks > 0 ? e.lifespan_ticks - (worldTick - (e.born_tick || 0)) : 0;
+      var row = document.createElement('div');
+      row.className = 'unit' + (expandedCreat === e.id ? ' sel' : '');
+      row.innerHTML =
+        '<span class="glyph">' + esc(e.glyph) + '</span>' +
+        '<span class="nm">' + esc(e.kind === 'creation_dynamic' ? '活物' : '造物') +
+        ' <i>(' + Number(e.x).toFixed(1) + ', ' + Number(e.y).toFixed(1) + ')</i></span>' +
+        '<span class="life' + (e.lifespan_ticks > 0 && remain <= 10 ? ' low' : '') + '">' +
+        (e.lifespan_ticks > 0 ? remain + ' 拍' : '永生') + '</span>';
+      row.addEventListener('click', function () {
+        expandedCreat = expandedCreat === e.id ? null : e.id;
+        renderCreations();
+      });
+      creatListEl.appendChild(row);
+      if (expandedCreat === e.id) {
+        var det = document.createElement('div');
+        det.className = 'unit-detail';
+        var evs = (entityEvents[e.id] || []).slice(-3).reverse();
+        det.innerHTML = evs.length
+          ? evs.map(function (ev) { return '<div class="uev">' + esc(ev) + '</div>'; }).join('')
+          : '<div class="uev dim">最近没有事件</div>';
+        creatListEl.appendChild(det);
+      }
+    });
+  }
+
+  // ---- 事件流（四色 + 同实体同类连续折叠 + 可点击定位）----
+  function classifyEvent(ev) {
+    return EVENT_CLASS[ev.kind] || 'info';
+  }
+  function describeEvent(ev) {
+    var p = ev.payload || {};
+    switch (ev.kind) {
+      case 'compile_failed': return (p.name || '?') + '：' + (p.error || '');
+      case 'runtime_error': return (p.which || '?') + ' 跑挂了：' + (p.error || '') + (p.died ? '（已标记死亡）' : '');
+      case 'spawn_rejected': return (p.reason || '?') + (p.code_hint ? '：' + p.code_hint : '') + ' @(' + Number(p.x).toFixed(1) + ',' + Number(p.y).toFixed(1) + ')';
+      case 'born': return (p.name || p.glyph || '?') + ' 进场了';
+      case 'died': return '死因=' + (p.cause || '?') + (p.killer ? ' 凶手=' + String(p.killer).slice(0, 8) : '');
+      case 'player_log': return 'marker=' + (p.marker !== undefined ? p.marker : '?');
+      case 'player_joined': return (p.name || '') + ' 进场了';
+      case 'player_selected': return (p.name || '') + ' 被选中进场';
+      case 'create_player_rejected': return (p.name || '') + '：' + (p.reason || '');
+      case 'select_player_rejected': return (p.name || '') + '：' + (p.reason || '');
+      default: return JSON.stringify(p);
+    }
+  }
+  function renderEvents(events) {
+    events.forEach(function (ev) {
+      // 首条事件到达时清掉"等待事件"占位（占位是 stream 的第一个子节点）
+      var first = streamEl.firstElementChild;
+      if (first && first.classList.contains('empty')) streamEl.removeChild(first);
+      var cls = classifyEvent(ev);
+      var desc = describeEvent(ev);
+      // 造物事件缓存（展开面板显示最近 3 条）
+      if (ev.entity_id) {
+        var arr = entityEvents[ev.entity_id] || (entityEvents[ev.entity_id] = []);
+        arr.push('t' + ev.tick + ' ' + (EVENT_LABEL[ev.kind] || ev.kind) + ' ' + desc);
+        if (arr.length > ENTITY_EVENT_KEEP) arr.splice(0, arr.length - ENTITY_EVENT_KEEP);
+      }
+      // 同 entity+kind 连续报折叠（"又N次"，D-020a foldKey 同款）
+      var key = ev.entity_id + '|' + ev.kind;
+      var lastRow = streamEl.lastElementChild;
+      if (lastRow && lastRow._foldKey === key && lastRow._baseDesc === desc) {
+        lastRow._count++;
+        lastRow.querySelector('.rep').textContent = '又 ' + lastRow._count + ' 次';
+        return;
+      }
+      var row = document.createElement('div');
+      row.className = 'evrow ' + cls;
+      row._foldKey = key;
+      row._baseDesc = desc;
+      row._count = 1;
+      var clickable = ev.kind === 'compile_failed' || ev.kind === 'spawn_rejected' || ev.kind === 'runtime_error';
+      row.innerHTML =
+        '<span class="tk">t' + ev.tick + '</span>' +
+        '<span class="kind">' + esc(EVENT_LABEL[ev.kind] || ev.kind) + '</span>' +
+        '<span class="msg">' + esc(desc) + '</span>' +
+        '<span class="rep"></span>';
+      if (clickable) {
+        row.title = '点击定位到编辑器';
+        row.addEventListener('click', function () { locateEvent(ev, desc); });
+      }
+      // 自动定位（卡面 R5）：编译失败/运行错与当前编辑名匹配时免点击直接标红跳转
+      // ——compile_failed 带 name；runtime_error 靠快照实体 id 反查名字
+      if (monacoReady && currentName) {
+        if (ev.kind === 'compile_failed' && ev.payload && ev.payload.name === currentName) {
+          locateEvent(ev, desc);
+        } else if (ev.kind === 'runtime_error' && ev.entity_id) {
+          var ent = entById[ev.entity_id];
+          if (ent && ent.name === currentName) locateEvent(ev, desc);
+        }
+      }
+      streamEl.appendChild(row);
+      while (streamEl.children.length > EVENT_STREAM_CAP) streamEl.removeChild(streamEl.firstElementChild);
+      streamEl.scrollTop = streamEl.scrollHeight;
+    });
+  }
+
+  // ---- 错误定位链（compile_failed / spawn_rejected / runtime_error -> 编辑器）----
+  function locateEvent(ev, desc) {
+    if (ev.kind === 'compile_failed') {
+      var errText = (ev.payload && ev.payload.error) || desc;
+      showErrPanel('编译失败：' + ((ev.payload && ev.payload.name) || ''), errText);
+      markCompileError(errText);
+    } else if (ev.kind === 'spawn_rejected') {
+      showErrPanel('造物被拒：' + ((ev.payload && ev.payload.reason) || ''), (ev.payload && ev.payload.code_hint) || '');
+      markCompileError((ev.payload && ev.payload.code_hint) || '');
+    } else if (ev.kind === 'runtime_error') {
+      var which = (ev.payload && ev.payload.which) || '';
+      showErrPanel('运行错（' + which + '）：' + ((ev.payload && ev.payload.died) ? '实体已标记死亡' : '仍在跑'), (ev.payload && ev.payload.error) || '');
+      jumpToExport(which);
+    }
+  }
+
+  function showErrPanel(title, body) {
+    errPanelEl.innerHTML = '<b>' + esc(title) + '</b><pre>' + esc(body || '（无详情）') + '</pre>';
+    errPanelEl.hidden = false;
+  }
+
+  // wat crate 错误格式实证（D-022 探针）：多行，含 `--> <anon>:行:列`。
+  // 行号提取多正则兜底：先锚 --> 行，再退化 /line (\d+)/i。
+  function parseErrorLine(errText) {
+    var m = /-->\s*\S*?:(\d+):\d+/.exec(errText);
+    if (m) return parseInt(m[1], 10);
+    m = /line (\d+)/i.exec(errText);
+    if (m) return parseInt(m[1], 10);
+    return null;
+  }
+
+  function markCompileError(errText) {
+    if (!monacoReady) return; // 降级模式只在错误面板显示
+    var line = parseErrorLine(errText);
+    if (line == null) return; // 提取不到行号不标红（诚实反馈，全文在错误面板）
+    var model = editor.getModel();
+    var maxLine = model.getLineCount();
+    if (line > maxLine) return;
+    monaco.editor.setModelMarkers(model, 'wat', [{
+      startLineNumber: line,
+      endLineNumber: line,
+      startColumn: 1,
+      endColumn: model.getLineMaxColumn(line),
+      message: errText,
+      severity: monaco.MarkerSeverity.Error
+    }]);
+    editor.revealLineInCenter(line);
+  }
+
+  function clearCompileMarkers() {
+    if (monacoReady) monaco.editor.setModelMarkers(editor.getModel(), 'wat', []);
+  }
+
+  // 运行错定位：grep 当前文档 `(func (export "on_tick")` 所在行（尽力而为）
+  function jumpToExport(funcName) {
+    if (!monacoReady || !funcName) return;
+    var model = editor.getModel();
+    var re = new RegExp('\\(func\\s*\\(export\\s*"' + funcName.replace(/"/g, '') + '"');
+    for (var ln = 1; ln <= model.getLineCount(); ln++) {
+      if (re.test(model.getLineContent(ln))) {
+        editor.revealLineInCenter(ln);
+        editor.setPosition({ lineNumber: ln, column: 1 });
+        return;
+      }
+    }
+  }
+
+  // ---- 编辑器（Monaco + 降级 textarea）----
+  function getValue() {
+    return monacoReady ? editor.getValue() : textareaEl.value;
+  }
+  function setValue(text) {
+    if (monacoReady) {
+      var model = editor.getModel();
+      // 同名重载清 markers（换文件旧错误不再残留）
+      monaco.editor.setModelMarkers(model, 'wat', []);
+      editor.setValue(text);
+    } else {
+      textareaEl.value = text;
+    }
+    dirty = false;
+    updateTitle();
+  }
+
+  function updateTitle() {
+    editingNameEl.textContent = currentName || '（未选择——点左侧角色，或新建）';
+    saveBtnEl.textContent = dirty ? '保存 *' : '保存';
+  }
+
+  function loadCharacter(name) {
+    if (dirty && !window.confirm('「' + currentName + '」有未保存的修改，切换会丢掉。继续？')) return;
+    fetch('/api/player-code?name=' + encodeURIComponent(name))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j.ok) { flash('读取失败：' + (SAVE_REJECT_TEXT[j.reason] || j.reason), true); return; }
+        currentName = name;
+        setValue(j.code);
+        errPanelEl.hidden = true;
+        flash('已载入 ' + name);
+      })
+      .catch(function (e) { flash('读取请求失败：' + e, true); });
+  }
+
+  function saveCode() {
+    if (saving) return;
+    var name = (currentName || '').trim();
+    if (!nameValid(name)) {
+      flash('没有合法的编辑目标名（trim 后 1..=24 字符：字母/数字/中文/_/-）——先点左侧角色或在「新建造物」起名', true);
+      return;
+    }
+    var code = getValue();
+    if (new Blob([code]).size > 256 * 1024) {
+      flash('代码超过 256KB 上限', true);
+      return;
+    }
+    saving = true;
+    saveBtnEl.disabled = true;
+    fetch('/api/player-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, code: code })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        saving = false;
+        saveBtnEl.disabled = false;
+        if (j.ok) {
+          dirty = false;
+          updateTitle();
+          mergeRosterLocal(name); // 本地合并（player_roster 只在连接时下发，不重连）
+          flash(isOnline(name)
+            ? '已保存 ' + name + '；该角色在场中，下次进场生效'
+            : '已保存 ' + name + '（写 players/' + name + '.wat；新文件=世界下拍进场）');
+        } else {
+          flash('保存被拒：' + (SAVE_REJECT_TEXT[j.reason] || j.reason), true);
+        }
+      })
+      .catch(function (e) {
+        saving = false;
+        saveBtnEl.disabled = false;
+        flash('保存请求失败：' + e, true);
+      });
+  }
+
+  // 保存成功后本地补列表项（roster 是连接时一次性下发，工坊不重连——
+  // glyph=名字首字符大写、灰点离场，与世界侧规则同款；重开页面即校真）
+  function mergeRosterLocal(name) {
+    if (roster.some(function (c) { return c.name === name; })) { renderRoster(); return; }
+    var first = name.charAt(0).toUpperCase();
+    roster = roster.concat([{ name: name, glyph: first, color: '#8b949e', online: false }]);
+    roster.sort(function (a, b) { return a.name < b.name ? -1 : 1; });
+    renderRoster();
+  }
+
+  // ---- 删除（确认弹窗：决策即关门 0.25s 淡出 + busy 守卫，logoutPanel 同款）----
+  function askDelete(name) {
+    if (delBusy) return;
+    delTarget = name;
+    delNameEl.textContent = name;
+    delDialogEl.classList.remove('closing');
+    delDialogEl.hidden = false;
+  }
+  function closeDelDialog(after) {
+    delDialogEl.classList.add('closing');
+    setTimeout(function () {
+      delDialogEl.hidden = true;
+      delDialogEl.classList.remove('closing');
+      delBusy = false;
+      if (after) after();
+    }, PANEL_FADE_MS);
+  }
+  delYesEl.addEventListener('click', function () {
+    if (delBusy || !delTarget) return;
+    delBusy = true;
+    var name = delTarget;
+    setTimeout(function () {
+      fetch('/api/player-code?name=' + encodeURIComponent(name), { method: 'DELETE' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (!j.ok) { flash('删除被拒：' + (DELETE_REJECT_TEXT[j.reason] || j.reason), true); }
+          else {
+            roster = roster.filter(function (c) { return c.name !== name; });
+            renderRoster();
+            if (currentName === name) { currentName = null; updateTitle(); }
+            flash('已删除 ' + name + '（文件没了；世界下拍残影下线）');
+          }
+          closeDelDialog(null);
+        })
+        .catch(function (e) { flash('删除请求失败：' + e, true); closeDelDialog(null); });
+    }, PANEL_ACK_MS);
+  });
+  delNoEl.addEventListener('click', function () {
+    if (delBusy) return;
+    delBusy = true;
+    closeDelDialog(null);
+  });
+  window.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape' && !delDialogEl.hidden && !delBusy) {
+      delBusy = true;
+      closeDelDialog(null);
+    }
+  });
+
+  // ---- 新建造物（名字 + 模板 + 皮上传 -> 骨架进编辑器，不落盘）----
+  TEMPLATES.forEach(function (t) {
+    var opt = document.createElement('option');
+    opt.value = t.id;
+    opt.textContent = t.label;
+    newTplEl.appendChild(opt);
+  });
+
+  newFileEl.addEventListener('change', function () {
+    var f = newFileEl.files && newFileEl.files[0];
+    if (!f) return;
+    if (f.size > 2 * 1024 * 1024) { flash('PNG 超过 2MB 上限（上传通道护栏）', true); newFileEl.value = ''; return; }
+    if (newPreviewEl.src) URL.revokeObjectURL(newPreviewEl.src);
+    newPreviewEl.src = URL.createObjectURL(f);
+    newPreviewEl.hidden = false;
+    lastAssetId = null; // 换图后旧 asset 作废，重新上传
+  });
+
+  newUploadEl.addEventListener('click', function () {
+    var f = newFileEl.files && newFileEl.files[0];
+    if (!f) { flash('先选一张 PNG（透明底角色图）', true); return; }
+    var name = (newNameEl.value || '').trim() || 'creation';
+    var fd = new FormData();
+    fd.append('file', f);
+    fd.append('name', name);
+    newUploadEl.disabled = true;
+    fetch('/upload/avatar', { method: 'POST', body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        newUploadEl.disabled = false;
+        if (j.ok) {
+          lastAssetId = j.asset_id;
+          flash('皮已入库：' + j.asset_id + '（装戴 API 属后续刀，先记在骨架注释里）');
+        } else {
+          var reasonText = {
+            oversize: 'PNG 超 2MB',
+            oversize_dim: '原图边长超 1024px',
+            decode_failed: 'PNG 解码失败',
+            isolate_fail: '断件图（多个分离的实心块）',
+            bad_json: '请求格式错误'
+          }[j.reason] || j.reason;
+          flash('上传被拒：' + reasonText, true);
+        }
+      })
+      .catch(function (e) { newUploadEl.disabled = false; flash('上传请求失败：' + e, true); });
+  });
+
+  newGenEl.addEventListener('click', function () {
+    var name = (newNameEl.value || '').trim();
+    if (!nameValid(name)) {
+      flash('名字不合法（trim 后 1..=24 字符：字母/数字/中文/_/-）', true);
+      return;
+    }
+    if (dirty && !window.confirm('当前编辑器有未保存修改，生成骨架会覆盖。继续？')) return;
+    var tplId = newTplEl.value;
+    fetch('/templates/' + tplId + '.wat')
+      .then(function (r) {
+        if (!r.ok) throw new Error('模板取不到（HTTP ' + r.status + '）');
+        return r.text();
+      })
+      .then(function (tpl) {
+        var head =
+          ';; —— 造物工坊骨架 ——\n' +
+          ';; 名字：' + name + '　模板：' + tplId + '\n' +
+          (lastAssetId
+            ? ';; 皮肤资产：' + lastAssetId + '（装戴 API 属后续刀）\n'
+            : ';; 皮肤资产：（未上传——传了会在这里记 asset_id；装戴 API 属后续刀）\n') +
+          ';; 保存（Ctrl+S）= 写 players/' + name + '.wat，世界下拍进场\n\n';
+        currentName = name;
+        setValue(head + tpl);
+        errPanelEl.hidden = true;
+        flash('骨架已生成——改完按 Ctrl+S 保存进场');
+      })
+      .catch(function (e) { flash('生成失败：' + e, true); });
+  });
+
+  // ---- 外桥配置（D-022b 可编辑）：折叠区每次展开重新 GET（热重载改了文件
+  // UI 能看到）；行编辑 + 保存（POST 整批）+ 测试连接（纯浏览器侧 HEAD no-cors
+  // ——opaque 响应 resolve=可达，reject/超时=不通，拿不到状态码属预期）----
+  function bridgeReasonText(reason, index) {
+    var base = BRIDGE_REJECT_TEXT[reason] || reason;
+    return (index !== undefined && index !== null) ? '第 ' + (index + 1) + ' 条：' + base : base;
+  }
+
+  // 单行端点编辑器（端口 number min=1 + 地址 url + 备注 + 删除该行 + 测试徽标）
+  function makeBridgeRow(p) {
+    var row = document.createElement('div');
+    row.className = 'wsbridge-row';
+    var port = document.createElement('input');
+    port.type = 'number';
+    port.min = '1';
+    port.value = p.port || '';
+    port.title = '端口别名（大于 0）';
+    var url = document.createElement('input');
+    url.type = 'url';
+    url.value = p.url || '';
+    url.placeholder = 'http://127.0.0.1:9001';
+    url.title = '地址（仅本机回环 http）';
+    var note = document.createElement('input');
+    note.type = 'text';
+    note.value = p.note || '';
+    note.placeholder = '备注';
+    var del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'wsbdel';
+    del.textContent = '✕';
+    del.title = '删除该行';
+    del.addEventListener('click', function () { row.remove(); });
+    var test = document.createElement('span');
+    test.className = 'wsbtest';
+    test.hidden = true;
+    row.appendChild(port);
+    row.appendChild(url);
+    row.appendChild(note);
+    row.appendChild(del);
+    row.appendChild(test);
+    return row;
+  }
+
+  function renderBridgeRows(ports) {
+    bridgeListEl.innerHTML = '';
+    bridgeNoteEl.hidden = !bridgeEnabled ? false : true;
+    bridgeNoteEl.textContent = '桥未启用（CODEWORLD_BRIDGE=1 重启世界才启用）——仍可编辑保存，写盘即用';
+    if (!ports.length) {
+      var empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = '没有登记的端点——点「+ 添加端点」登记一个（如 http://127.0.0.1:9001）。';
+      bridgeListEl.appendChild(empty);
+      return;
+    }
+    ports.forEach(function (p) { bridgeListEl.appendChild(makeBridgeRow(p)); });
+  }
+
+  function collectBridgeRows() {
+    var ports = [];
+    Array.prototype.forEach.call(bridgeListEl.querySelectorAll('.wsbridge-row'), function (row) {
+      ports.push({
+        port: parseInt(row.querySelector('input[type=number]').value, 10) || 0,
+        url: (row.querySelector('input[type=url]').value || '').trim(),
+        note: (row.querySelector('input[type=text]').value || '').trim()
+      });
+    });
+    return ports;
+  }
+
+  bridgeAddEl.addEventListener('click', function () {
+    bridgeListEl.appendChild(makeBridgeRow({ port: '', url: '', note: '' }));
+  });
+
+  bridgeSaveEl.addEventListener('click', function () {
+    var ports = collectBridgeRows();
+    fetch('/api/bridge-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ports: ports })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j.ok) {
+          // 文案区分 enabled 两种情况（bridgeEnabled 来自最近一次 GET）
+          flash(bridgeEnabled
+            ? '已保存——端点表已热生效（bridge_send 下一拍按新表走）'
+            : '已保存——桥未启用（CODEWORLD_BRIDGE=1 重启世界才启用），bridges.json 已更新');
+        } else {
+          flash('保存被拒：' + bridgeReasonText(j.reason, j.index), true);
+        }
+      })
+      .catch(function (e) { flash('保存请求失败：' + e, true); });
+  });
+
+  bridgeTestEl.addEventListener('click', function () {
+    if (bridgeTesting) return;
+    var rows = Array.prototype.slice.call(bridgeListEl.querySelectorAll('.wsbridge-row'));
+    if (!rows.length) { flash('没有可测的端点——先添加一行', true); return; }
+    bridgeTesting = true;
+    bridgeTestEl.disabled = true;
+    bridgeTestEl.textContent = '测试中…';
+    var pending = rows.length;
+    function done() {
+      pending--;
+      if (pending > 0) return;
+      bridgeTesting = false;
+      bridgeTestEl.disabled = false;
+      bridgeTestEl.textContent = '测试连接';
+    }
+    rows.forEach(function (row) {
+      var badge = row.querySelector('.wsbtest');
+      var url = (row.querySelector('input[type=url]').value || '').trim();
+      var t0 = performance.now();
+      if (!url) {
+        badge.hidden = false;
+        badge.className = 'wsbtest bad';
+        badge.textContent = '✗ 未填地址';
+        done();
+        return;
+      }
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { ctrl.abort(); }, BRIDGE_TEST_TIMEOUT_MS);
+      fetch(url, { method: 'HEAD', mode: 'no-cors', signal: ctrl.signal })
+        .then(function () {
+          clearTimeout(timer);
+          badge.hidden = false;
+          badge.className = 'wsbtest okay';
+          badge.textContent = '✓ 可达 ' + Math.round(performance.now() - t0) + 'ms';
+          done();
+        })
+        .catch(function (e) {
+          clearTimeout(timer);
+          badge.hidden = false;
+          badge.className = 'wsbtest bad';
+          badge.textContent = '✗ 不通（' + (e && e.name === 'AbortError' ? '超时' : '连不上/地址无效') + '）';
+          done();
+        });
+    });
+  });
+
+  // 折叠区每次展开重新 GET（D-022b：不再懒加载一次定终身——热重载改了文件
+  // UI 能看到；toggle 事件在 details 上）
+  bridgeSecEl.addEventListener('toggle', function (ev) {
+    if (!ev.target.open) return;
+    fetch('/api/bridge-config')
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        bridgeEnabled = !!(j && j.enabled);
+        renderBridgeRows((j && j.ports) || []);
+      })
+      .catch(function (e) {
+        bridgeListEl.innerHTML = '<div class="empty">读取失败：' + esc(String(e)) + '</div>';
+      });
+  });
+
+  // ---- Monaco 装配（失败降级 textarea + 黄条；D-022b 起动态注入 loader）----
+  function degrade(message) {
+    monacoReady = false;
+    editorWrapEl.hidden = true;
+    textareaEl.hidden = false;
+    warnBarEl.hidden = false;
+    warnBarEl.textContent = '⚠ 编辑器降级为纯文本（' + message + '）——保存/删除/事件流照常，错误标红与自动补全不可用';
+    document.getElementById('wsEditorHost').classList.add('degraded');
+  }
+
+  function setupWatLanguage() {
+    monaco.languages.register({ id: 'wat' });
+    monaco.languages.setLanguageConfiguration('wat', {
+      comments: { lineComment: ';;', blockComment: ['(;', ';)'] },
+      brackets: [['(', ')']],
+      autoClosingPairs: [
+        { open: '(', close: ')' },
+        { open: '"', close: '"', notIn: ['string', 'comment'] }
+      ],
+      surroundingPairs: [
+        { open: '(', close: ')' },
+        { open: '"', close: '"' }
+      ],
+      folding: {
+        markers: {
+          start: /^\s*\(;/,
+          end: /^\s*;\)/
+        }
+      }
+    });
+    // WAT Monarch tokenizer：;; 行注释 / (; 块注释（可嵌套） / 字符串 / 十六进制与
+    // 十进制数（含浮点）/ s-expr 关键字 / i32. 前缀操作码 / $ 标识符 / 括号配色
+    monaco.languages.setMonarchTokensProvider('wat', {
+      ignoreCase: false,
+      keywords: [
+        'module', 'import', 'func', 'export', 'memory', 'table', 'global',
+        'param', 'result', 'type', 'local', 'data', 'elem', 'start', 'mut',
+        'offset', 'item', 'if', 'then', 'else', 'block', 'loop', 'br', 'br_if',
+        'br_table', 'return', 'call', 'call_indirect', 'drop', 'select', 'nop',
+        'unreachable', 'end', 'ref.func', 'ref.null', 'funcref', 'externref'
+      ],
+      types: ['i32', 'i64', 'f32', 'f64'],
+      tokenizer: {
+        root: [
+          [/;;.*$/, 'comment'],
+          [/\(;/, 'comment', '@blockComment'],
+          [/\(/, '@bracket'],
+          [/\)/, '@bracket'],
+          [/"(?:[^"\\]|\\.)*"/, 'string'],
+          [/-?0x[0-9a-fA-F_]+/, 'number.hex'],
+          [/-?\d+\.\d*(?:[eE][-+]?\d+)?/, 'number.float'],
+          [/-?\d+/, 'number'],
+          [/\$[a-zA-Z0-9_.<>=+\-*/\\^~?#@!&'`|]+/, 'variable'],
+          [/[a-zA-Z_][\w.!<>=+\-*/\\^~?#@!&'`|]*/, {
+            cases: {
+              '@types': 'type',
+              'i32\\..*': 'keyword',
+              '@keywords': 'keyword',
+              '@default': 'identifier'
+            }
+          }],
+          [/i32\.|i64\.|f32\.|f64\./, 'keyword']
+        ],
+        blockComment: [
+          [/;\)/, 'comment', '@pop'],
+          [/\(;/, 'comment', '@push'],
+          [/[^;()]+/, 'comment'],
+          [/./, 'comment']
+        ]
+      }
+    });
+  }
+
+  function setupCompletions() {
+    if (!completions) return;
+    // 字母触发 + 括号触发；插入文本用纯文本（snippet 语法会把 $标识符 当模板变量）
+    monaco.languages.registerCompletionItemProvider('wat', {
+      triggerCharacters: ['(', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '_', '-'],
+      provideCompletionItems: function (model, position) {
+        var word = model.getWordUntilPosition(position);
+        var range = {
+          startLineNumber: position.lineNumber,
+          endLineNumber: position.lineNumber,
+          startColumn: word.startColumn,
+          endColumn: word.endColumn
+        };
+        var typed = (word.word || '').toLowerCase();
+        var suggestions = [];
+        (completions.imports || []).forEach(function (imp) {
+          if (typed && imp.name.toLowerCase().indexOf(typed) !== 0) return;
+          suggestions.push({
+            label: imp.name,
+            kind: monaco.languages.CompletionItemKind.Function,
+            detail: imp.signature,
+            documentation: { value: '**' + imp.signature + '**\n\n' + imp.doc },
+            insertText: imp.snippet,
+            range: range,
+            sortText: '0' + imp.name
+          });
+        });
+        (completions.exports || []).forEach(function (ex) {
+          if (typed && ex.name.toLowerCase().indexOf(typed) !== 0) return;
+          suggestions.push({
+            label: ex.name,
+            kind: monaco.languages.CompletionItemKind.Event,
+            detail: ex.signature + '（导出）',
+            documentation: { value: '**' + ex.signature + '**\n\n' + ex.doc },
+            insertText: ex.snippet,
+            range: range,
+            sortText: '1' + ex.name
+          });
+        });
+        (completions.keywords || []).forEach(function (kw) {
+          if (typed && kw.toLowerCase().indexOf(typed) !== 0) return;
+          suggestions.push({
+            label: kw,
+            kind: monaco.languages.CompletionItemKind.Keyword,
+            insertText: kw,
+            range: range,
+            sortText: '2' + kw
+          });
+        });
+        return { suggestions: suggestions };
+      }
+    });
+    // 悬浮：光标停已在文本里的 import 名上也看得到签名+中文文档
+    monaco.languages.registerHoverProvider('wat', {
+      provideHover: function (model, position) {
+        var word = model.getWordUntilPosition(position);
+        if (!word.word) return null;
+        var hit = (completions.imports || []).concat((completions.exports || []).map(function (ex) {
+          return { signature: ex.signature, doc: ex.doc + '（可缺省导出）' };
+        })).find(function (i) { return i.name === word.word; });
+        if (!hit) return null;
+        var range = {
+          startLineNumber: position.lineNumber,
+          endLineNumber: position.lineNumber,
+          startColumn: word.startColumn,
+          endColumn: word.endColumn
+        };
+        return {
+          range: range,
+          contents: [
+            { value: '**' + hit.signature + '**' },
+            { value: hit.doc }
+          ]
+        };
+      }
+    });
+  }
+
+  function setupEditor() {
+    editor = monaco.editor.create(document.getElementById('wsEditorHost'), {
+      value: ';; 点左侧角色载入代码；或左侧「新建造物」生成骨架。\n;; Ctrl+S 保存 = 写 players/<名字>.wat，世界下拍进场。\n(module\n  ;; 这里就是你在世界里的身体\n)\n',
+      language: 'wat',
+      theme: 'vs-dark',
+      fontSize: 14,
+      minimap: { enabled: false },
+      automaticLayout: true,
+      scrollBeyondLastLine: false,
+      renderWhitespace: 'none',
+      tabSize: 2
+    });
+    monacoReady = true;
+    editor.onDidChangeModelContent(function () {
+      dirty = true;
+      clearCompileMarkers(); // 改动即清错误标红（改对了看得见，诚实反馈）
+      updateTitle();
+    });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveCode);
+    setupWatLanguage();
+    setupCompletions();
+    updateTitle();
+  }
+
+  function bootMonacoWithLoader() {
+    if (monacoReady || editor) return; // 幂等（面板反复开合不重建）
+    require.config({ paths: { vs: 'vendor/monaco/vs' } });
+    var settled = false;
+    var timer = setTimeout(function () {
+      if (!settled) { settled = true; degrade('加载超时'); }
+    }, MONACO_TIMEOUT_MS);
+    require(['vs/editor/editor.main'], function () {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        setupEditor();
+      } catch (e) {
+        degrade('初始化失败：' + e);
+      }
+    }, function (err) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      degrade('模块加载失败：' + (err && (err.message || err.rootModuleId || '')) );
+    });
+  }
+
+  function bootMonaco() {
+    // D-022b：loader.js 从静态 <script> 引入改动态注入（面板首开才拉，
+    // 省主页面首屏；注入失败如实降级 textarea）
+    if (window.require) { bootMonacoWithLoader(); return; }
+    var s = document.createElement('script');
+    s.src = 'vendor/monaco/vs/loader.js';
+    s.onload = bootMonacoWithLoader;
+    s.onerror = function () { degrade('vendor/monaco/vs/loader.js 加载失败'); };
+    document.head.appendChild(s);
+  }
+
+  // ---- 键位（Ctrl+S 保存，仅面板开着时生效——收起时不截主页面/浏览器按键；
+  // textarea 降级时同样生效；ESC 归 delDialog 弹窗）----
+  window.addEventListener('keydown', function (ev) {
+    if (!panelEl.classList.contains('open')) return;
+    if ((ev.ctrlKey || ev.metaKey) && (ev.key === 's' || ev.key === 'S')) {
+      ev.preventDefault();
+      saveCode();
+    }
+  });
+  saveBtnEl.addEventListener('click', saveCode);
+  textareaEl.addEventListener('input', function () {
+    dirty = true;
+    updateTitle();
+  });
+
+  // ---- 面板开合（D-022b 侧滑语义）：首开懒装配（booted 幂等），关闭不销毁
+  // （编辑中代码/当前角色/事件流不丢，再开即用）；B 键/底栏按钮/ESC 三入口经
+  // window.CwWorkshopPanel 桥接（主页面 IIFE 与本 IIFE 经全局对象互桥，零耦合）----
+  function boot() {
+    if (booted) return;
+    booted = true;
+    fetch('templates/api-completions.json')
+      .then(function (r) { return r.json(); })
+      .then(function (j) { completions = j; })
+      .catch(function () { /* 补全数据缺失不炸页面：只少补全 */ });
+    bootMonaco();
+    connect();
+    updateTitle();
+  }
+  function openPanel() {
+    panelEl.classList.add('open');
+    boot(); // 首开懒装配；再开即用
+  }
+  function closePanel() {
+    panelEl.classList.remove('open');
+  }
+  function togglePanel() {
+    if (panelEl.classList.contains('open')) closePanel(); else openPanel();
+  }
+  window.CwWorkshopPanel = {
+    toggle: togglePanel,
+    close: closePanel,
+    isOpen: function () { return panelEl.classList.contains('open'); }
+  };
+  closeBtnEl.addEventListener('click', closePanel);
 })();
 </script>
 <!-- D-004b Three.js 3D 层：module 脚本（defer 语义，DOM 就绪后执行；与上方经典

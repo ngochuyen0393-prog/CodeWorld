@@ -73,6 +73,129 @@ struct BridgeEndpointRaw {
     note: String,
 }
 
+/// POST /api/bridge-config 写通道的单条输入（D-022b：port/url/note 三字段——
+/// headers 凭证字段不进 UI 不进请求体，写盘时按 port 合并保留旧文件已有值）
+#[derive(Debug, Clone)]
+pub(crate) struct BridgeEntryInput {
+    pub port: i32,
+    pub url: String,
+    pub note: String,
+}
+
+/// 保存整单拒绝原因（D-022b：reason 码 + 定位下标；index=None=非条目问题如 IO 失败）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BridgeSaveReject {
+    pub reason: &'static str,
+    pub index: Option<usize>,
+}
+
+/// 端点展示视图（GET /api/bridge-config 数据源；D-022b 起含 url——编辑框回填。
+/// headers 凭证字段不进视图：凭证不落浏览器）
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct BridgeEndpointView {
+    pub port: i32,
+    pub url: String,
+    pub note: String,
+}
+
+/// 端点校验唯一规则源（D-022b：load 校验与 POST 复验共用同一函数，防两套规则
+/// 漂移）。合法返回 Ok(())；非法返回原因码：
+/// - PORT_INVALID：port<=0
+/// - URL_INVALID：https 拒（MVP 客户端只做本机 http，design-bridge §2.8）/
+///   非 http scheme / URL 解析失败 / host 非本机回环（127.0.0.1/localhost，
+///   localhost 大小写不敏感——P2-D 同锁）
+fn check_endpoint(port: i32, url: &str) -> Result<(), &'static str> {
+    if port <= 0 {
+        return Err("PORT_INVALID");
+    }
+    // scheme 校验（大小写不敏感前缀匹配，与 load 校验同源）
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Err("URL_INVALID");
+    }
+    if !lower.starts_with("http://") {
+        return Err("URL_INVALID");
+    }
+    // host 校验：MVP 客户端只做本机回环
+    let Some((host, _, _)) = parse_http_url(url) else {
+        return Err("URL_INVALID");
+    };
+    if host != "127.0.0.1" && !host.eq_ignore_ascii_case("localhost") {
+        return Err("URL_INVALID");
+    }
+    Ok(())
+}
+
+/// 保存端点登记表（D-022b POST /api/bridge-config 写通道）：
+/// ① 整批校验（check_endpoint 唯一规则源，任一条非法=整单拒绝**不动盘**）->
+/// ② 读旧文件按 port 合并 headers（凭证不落浏览器，写盘保留已有值；坏 JSON=
+/// 无旧值可并，按 UI 提交为准）-> ③ pretty JSON 原子写（同目录 .tmp 先落再换名
+/// ——Windows rename 不覆盖已存在目标，先 remove；防写一半崩档）。
+/// 返回 Err=整单拒绝（文件保持原样）。
+pub(crate) fn save_endpoint_entries(
+    path: &Path,
+    entries: &[BridgeEntryInput],
+) -> Result<(), BridgeSaveReject> {
+    // ① 整批校验（先全查后动盘）
+    for (i, e) in entries.iter().enumerate() {
+        if let Err(reason) = check_endpoint(e.port, &e.url) {
+            tracing::info!(index = i, reason = reason, "[bridge-config] 端点校验未过，整单拒绝");
+            return Err(BridgeSaveReject {
+                reason,
+                index: Some(i),
+            });
+        }
+    }
+    // ② 读旧文件提取 headers（按 port 索引；读失败/坏 JSON 不阻断——登记表本就
+    // 人手维护，坏档时以 UI 提交为准，warn 留痕）
+    let old_headers: HashMap<i32, HashMap<String, String>> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
+        .map(|list| {
+            list.into_iter()
+                .filter_map(|v| {
+                    let port = v.get("port")?.as_i64()? as i32;
+                    let headers: HashMap<String, String> =
+                        serde_json::from_value(v.get("headers")?.clone()).ok()?;
+                    Some((port, headers))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // ③ 组装端点数组（headers=旧文件同 port 值原样保留；无则不写该字段）
+    let list: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            let mut obj = serde_json::json!({ "port": e.port, "url": e.url, "note": e.note });
+            if let Some(h) = old_headers.get(&e.port) {
+                obj["headers"] = serde_json::to_value(h).expect("headers 应可序列化");
+            }
+            obj
+        })
+        .collect();
+    let text =
+        serde_json::to_string_pretty(&list).expect("端点表应可序列化");
+    // ④ 原子写：同目录 .tmp 先落，remove 目标后换名（崩在窗口内=旧档还在或
+    // 新档已换名，无半截档）
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| {
+        tracing::warn!(error = %e, tmp = %tmp.display(), "[bridge-config] 临时文件写盘失败");
+        BridgeSaveReject {
+            reason: "IO_ERROR",
+            index: None,
+        }
+    })?;
+    std::fs::remove_file(path).ok(); // Windows rename 不覆盖已存在目标，先移除
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!(error = %e, path = %path.display(), "[bridge-config] 换名失败（临时文件留存）");
+        return Err(BridgeSaveReject {
+            reason: "IO_ERROR",
+            index: None,
+        });
+    }
+    Ok(())
+}
+
 impl BridgeVault {
     /// 加载保险库（文件不存在=空表首启；JSON 坏=warn 空表不崩世界）
     pub fn load(path: &Path) -> Self {
@@ -113,43 +236,22 @@ impl BridgeVault {
         }
     }
 
-    /// 校验端点列表（详见 struct 文档的规则）
+    /// 校验端点列表（规则=check_endpoint 唯一规则源；本函数只负责 warn 留痕
+    /// 与重复 port 后者胜的装载语义）
     fn validate(list: Vec<BridgeEndpointRaw>) -> Vec<BridgeEndpoint> {
         let mut out: Vec<BridgeEndpoint> = Vec::new();
         for raw in list {
-            if raw.port <= 0 {
-                tracing::warn!(port = raw.port, url = %raw.url, "[bridge] 端点 port 非法（须>0），拒收");
-                continue;
-            }
-            // scheme 校验（大小写不敏感前缀匹配）
-            let lower = raw.url.to_ascii_lowercase();
-            if let Some(rest) = lower.strip_prefix("https://") {
-                let _ = rest;
+            if let Err(reason) = check_endpoint(raw.port, &raw.url) {
                 tracing::warn!(
                     port = raw.port,
                     url = %raw.url,
-                    "[bridge] https 端点本 MVP 不支持，停用（挂起项见 design-bridge §2.8）"
+                    reason = reason,
+                    "[bridge] 端点校验未过，拒收（https 挂起项见 design-bridge §2.8）"
                 );
                 continue;
             }
-            if !lower.starts_with("http://") {
-                tracing::warn!(port = raw.port, url = %raw.url, "[bridge] 非_http scheme 不支持，拒收");
-                continue;
-            }
-            // host 校验：MVP 客户端只做本机回环（localhost 大小写不敏感——
-            // http://LocalHost:8080 与 http://localhost 等价，P2-D）
-            let Some((host, port_num, path)) = parse_http_url(&raw.url) else {
-                tracing::warn!(port = raw.port, url = %raw.url, "[bridge] URL 解析失败，拒收");
-                continue;
-            };
-            if host != "127.0.0.1" && !host.eq_ignore_ascii_case("localhost") {
-                tracing::warn!(
-                    port = raw.port,
-                    url = %raw.url,
-                    "[bridge] http 端点非本机回环（仅 127.0.0.1/localhost），拒收"
-                );
-                continue;
-            }
+            let (host, port_num, path) =
+                parse_http_url(&raw.url).expect("check_endpoint 已过，URL 解析必成");
             // 重复后者胜：同 port 旧条目移除再追加
             if let Some(pos) = out.iter().position(|e| e.port == raw.port) {
                 tracing::warn!(
@@ -197,16 +299,21 @@ impl BridgeVault {
         ports
     }
 
-    /// 端口+备注成对列表（升序；D-022 工坊 /api/bridge-config 只读展示数据源。
-    /// note=bridges.json 人读字段原样透传，缺省空串——世界不解释内容）
-    pub fn port_notes(&self) -> Vec<(i32, String)> {
-        let mut pairs: Vec<(i32, String)> = self
+    /// 端点展示视图列表（升序；D-022b 起含 url——编辑框回填用。headers 凭证
+    /// 字段不进视图：凭证不落浏览器。note=bridges.json 人读字段原样透传，
+    /// 缺省空串——世界不解释内容）
+    pub fn views(&self) -> Vec<BridgeEndpointView> {
+        let mut out: Vec<BridgeEndpointView> = self
             .endpoints
             .iter()
-            .map(|e| (e.port, e.note.clone()))
+            .map(|e| BridgeEndpointView {
+                port: e.port,
+                url: e.url.clone(),
+                note: e.note.clone(),
+            })
             .collect();
-        pairs.sort_by_key(|(p, _)| *p);
-        pairs
+        out.sort_by_key(|v| v.port);
+        out
     }
 
     /// 解析 port -> 端点（collect 出站时解析 URL；热重载后消失 -> None 作废）
@@ -583,6 +690,120 @@ mod tests {
         path
     }
 
+    // ===== D-022b 外桥可编辑（POST /api/bridge-config 写通道）=====
+
+    #[test]
+    fn check_endpoint_is_the_single_rule_source() {
+        // 唯一规则源（load 校验与 POST 复验共用——防两套规则漂移）：
+        // 合法回环 http 收；port<=0 / https / 非 http / 非回环 / 坏 URL 各归其码
+        assert_eq!(check_endpoint(1, "http://127.0.0.1:9001"), Ok(()));
+        assert_eq!(check_endpoint(2, "http://localhost"), Ok(()));
+        assert_eq!(
+            check_endpoint(3, "http://LocalHost:8080/x"),
+            Ok(()),
+            "localhost 大小写不敏感（P2-D 同锁）"
+        );
+        assert_eq!(check_endpoint(0, "http://127.0.0.1:9001"), Err("PORT_INVALID"));
+        assert_eq!(check_endpoint(-2, "http://127.0.0.1:9001"), Err("PORT_INVALID"));
+        assert_eq!(
+            check_endpoint(1, "https://127.0.0.1:9001"),
+            Err("URL_INVALID"),
+            "https 拒（MVP 客户端只做本机 http，语义不变）"
+        );
+        assert_eq!(check_endpoint(1, "ftp://127.0.0.1:9001"), Err("URL_INVALID"), "非 http scheme 拒");
+        assert_eq!(check_endpoint(1, "127.0.0.1:9001"), Err("URL_INVALID"), "缺 scheme 拒");
+        assert_eq!(check_endpoint(1, "http://10.0.0.5:80"), Err("URL_INVALID"), "非回环 host 拒");
+        assert_eq!(
+            check_endpoint(1, "http://Example.COM"),
+            Err("URL_INVALID"),
+            "非回环 host 大写形态仍拒"
+        );
+        assert_eq!(check_endpoint(1, "http://"), Err("URL_INVALID"), "空 host 拒");
+    }
+
+    #[test]
+    fn save_endpoint_entries_writes_pretty_json_merging_headers() {
+        // 保存：合法整批 -> pretty JSON 落盘（port/url/note 取 UI 提交值，整表替换）；
+        // headers 凭证字段不进 UI 不进请求体——按 port 从旧文件合并保留（防凭证
+        // 被 UI 保存抹掉）；旧文件无同 port headers=不写该字段
+        let path = write_vault(
+            r#"[
+                {"port": 1, "url": "http://127.0.0.1:9001", "note": "旧备注", "headers": {"Authorization": "Bearer old"}},
+                {"port": 9, "url": "http://127.0.0.1:9009", "headers": {"X-Token": "keep-me"}}
+            ]"#,
+        );
+        let entries = vec![
+            BridgeEntryInput {
+                port: 1,
+                url: "http://localhost:9001".to_string(),
+                note: "外脑服务器".to_string(),
+            },
+            BridgeEntryInput {
+                port: 2,
+                url: "http://127.0.0.1:9002".to_string(),
+                note: String::new(),
+            },
+        ];
+        save_endpoint_entries(&path, &entries).expect("合法整批应保存成功");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let list: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let arr = list.as_array().expect("应为 JSON 数组");
+        assert_eq!(arr.len(), 2, "整表替换（旧 port 9 不在新表=消失）");
+        assert_eq!(arr[0]["port"], 1);
+        assert_eq!(arr[0]["url"], "http://localhost:9001", "url 取 UI 提交值");
+        assert_eq!(arr[0]["note"], "外脑服务器");
+        assert_eq!(
+            arr[0]["headers"]["Authorization"], "Bearer old",
+            "同 port 旧 headers 原样保留（凭证不落浏览器，也不许被保存抹掉）"
+        );
+        assert!(
+            arr[1].get("headers").is_none(),
+            "旧文件无同 port headers=输出不写该字段"
+        );
+        assert!(text.contains('\n'), "pretty 格式（人手可读，非单行紧凑）");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_endpoint_entries_rejects_whole_batch_without_touching_file() {
+        // 整单拒绝：任一条非法 -> Err(原因码+定位下标)，文件一字不动（先全查后动盘）
+        let original = r#"[{"port": 1, "url": "http://127.0.0.1:9001", "note": "保持原样"}]"#;
+        let path = write_vault(original);
+        let mk = |port: i32, url: &str| BridgeEntryInput {
+            port,
+            url: url.to_string(),
+            note: String::new(),
+        };
+        // port=0 在第二条：整单拒绝且定位下标=1
+        let err = save_endpoint_entries(&path, &[mk(1, "http://127.0.0.1:9001"), mk(0, "http://127.0.0.1:9002")])
+            .expect_err("port=0 应整单拒绝");
+        assert_eq!(err.reason, "PORT_INVALID");
+        assert_eq!(err.index, Some(1), "拒绝应定位到第二条（下标 1）");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "文件不被改写");
+        // https 整单拒绝
+        let err2 = save_endpoint_entries(&path, &[mk(3, "https://127.0.0.1:9003")])
+            .expect_err("https 应整单拒绝");
+        assert_eq!(err2.reason, "URL_INVALID");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // 非回环 host 整单拒绝
+        let err3 = save_endpoint_entries(&path, &[mk(3, "http://example.com")])
+            .expect_err("非回环应整单拒绝");
+        assert_eq!(err3.reason, "URL_INVALID");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_endpoint_entries_empty_list_clears_file() {
+        // 空数组=清空登记（文件存在且内容为空表 []）
+        let path = write_vault(r#"[{"port": 1, "url": "http://127.0.0.1:9001"}]"#);
+        save_endpoint_entries(&path, &[]).expect("空数组应受理（清空登记）");
+        let list: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0, "清空后为空表");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn vault_loads_and_validates_endpoints() {
         // 加载+校验：本机 http 收；重复 port 后者胜；非本机 http 拒收；
@@ -612,8 +833,9 @@ mod tests {
     }
 
     #[test]
-    fn port_notes_lists_ports_with_notes_sorted() {
-        // D-022 工坊 bridge-config 数据源：port+note 成对升序（note 缺省=空串）
+    fn views_lists_port_url_note_sorted_without_headers() {
+        // GET /api/bridge-config 数据源：port/url/note 三字段视图（headers 凭证
+        // 字段不进视图——凭证不落浏览器），port 升序；note 缺省=空串
         let path = write_vault(
             r#"[
                 {"port": 3, "url": "http://127.0.0.1:18083"},
@@ -622,16 +844,15 @@ mod tests {
             ]"#,
         );
         let vault = BridgeVault::load(&path);
-        let pairs = vault.port_notes();
-        assert_eq!(
-            pairs,
-            vec![
-                (1, "外脑".to_string()),
-                (2, String::new()),
-                (3, String::new()),
-            ],
-            "升序成对；缺省 note=空串"
-        );
+        let views = vault.views();
+        assert_eq!(views.len(), 3);
+        assert_eq!(views[0].port, 1, "升序");
+        assert_eq!(views[0].url, "http://127.0.0.1:18081", "url 透传（编辑框回填用）");
+        assert_eq!(views[0].note, "外脑");
+        assert_eq!(views[1].port, 2);
+        assert_eq!(views[1].note, "", "缺省 note=空串");
+        assert_eq!(views[2].port, 3);
+        assert_eq!(views[2].note, "");
         let _ = std::fs::remove_file(&path);
     }
 

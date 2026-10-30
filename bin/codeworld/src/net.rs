@@ -466,10 +466,13 @@ pub(crate) struct WsState {
     ///——工坊保存=写文件=世界目录轮询自动接手，零新进场协议）
     pub(crate) players_dir: std::path::PathBuf,
     /// 外桥保险库只读句柄（D-022 GET /api/bridge-config 端口列表只读展示；
-    /// None=桥未启用/未装配——路由回空列表。与主循环共享同一把 RwLock，
-    /// bridges.json mtime 热重载两边看同一份账）
+    /// None=桥未启用/未装配——GET 回 enabled:false 空列表。与主循环共享同一把
+    /// RwLock，bridges.json mtime 热重载两边看同一份账）
     pub(crate) bridge_vault:
         Option<Arc<std::sync::RwLock<crate::bridges::BridgeVault>>>,
+    /// 外桥登记表路径（D-022b POST /api/bridge-config 写盘目标=config.bridge_config，
+    /// 默认世界目录 bridges.json。vault 未装配也持有——写盘受理，桥下次启用即用）
+    pub(crate) bridge_config_path: std::path::PathBuf,
 }
 
 /// 主循环持有的 WS 句柄：快照推送端、操控连接 id 观测（#025 期五第一刀；
@@ -538,6 +541,9 @@ pub(crate) fn init(
         roster: roster.clone(),
         players_dir: std::path::PathBuf::from(&config.players_dir),
         bridge_vault,
+        // D-022b：登记表路径与 BridgeOutbox 装配同源（config.bridge_config，
+        // 默认 bridges.json 与 codeworld.db 同级落世界工作目录）
+        bridge_config_path: std::path::PathBuf::from(&config.bridge_config),
     });
     let handle = WsHandle {
         snapshots: tx,
@@ -625,14 +631,15 @@ pub(crate) async fn serve(
         .route("/ws", get(ws_handler))
         .route("/upload/avatar", post(upload_avatar))
         // D-022 造物工坊 HTTP 通道：保存=写 players/<名>.wat（热进场靠目录轮询）、
-        // 读取=编辑器加载全文、删除=下拍残影下线；bridge-config=外桥端口只读展示
+        // 读取=编辑器加载全文、删除=下拍残影下线；bridge-config=外桥端点表
+        // 读+写（D-022b 可编辑：POST 整批校验+原子写盘+内存同步）
         .route(
             "/api/player-code",
             post(player_code_write)
                 .get(player_code_read)
                 .delete(player_code_delete),
         )
-        .route("/api/bridge-config", get(bridge_config))
+        .route("/api/bridge-config", get(bridge_config).post(bridge_config_save))
         .layer(axum::extract::DefaultBodyLimit::max(
             avatars::MAX_AVATAR_PNG_BYTES * 2, // 2MB PNG + multipart 边界开销余量；护栏仍由 store_upload 按 PNG 字节判
         ))
@@ -904,22 +911,95 @@ async fn player_code_delete(
     }
 }
 
-/// GET /api/bridge-config（D-022 工坊外桥只读展示）：BridgeVault 读锁 ->
-/// {ok,ports:[{port,note}]}（端口升序；note 可空串）。vault 未装配（桥未启用）
-/// -> {ok,ports:[]}。不做写路由（改服务器配置越权，玩家侧不开放——端点登记
-/// 在世界目录 bridges.json，mtime 热重载改文件生效）。
+/// GET /api/bridge-config（D-022 工坊外桥展示；D-022b 升级可编辑回填）：
+/// vault 装配 -> {ok,enabled:true,ports:[{port,url,note}]}（端口升序）；
+/// 未装配 -> {ok,enabled:false,ports:[]}（前端黄字提示桥未启用，仍可编辑保存
+/// ——写盘即用，桥下次带 CODEWORLD_BRIDGE=1 启动生效）。
 async fn bridge_config(State(state): State<Arc<WsState>>) -> Response {
-    let ports: Vec<serde_json::Value> = match &state.bridge_vault {
-        Some(vault) => vault
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .port_notes()
-            .into_iter()
-            .map(|(port, note)| serde_json::json!({ "port": port, "note": note }))
-            .collect(),
-        None => Vec::new(),
+    let (enabled, views) = match &state.bridge_vault {
+        Some(vault) => {
+            let views = vault
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .views();
+            (true, views)
+        }
+        None => (false, Vec::new()),
     };
-    Json(serde_json::json!({ "ok": true, "ports": ports })).into_response()
+    let ports: Vec<serde_json::Value> = views
+        .into_iter()
+        .map(|v| serde_json::json!({ "port": v.port, "url": v.url, "note": v.note }))
+        .collect();
+    Json(serde_json::json!({ "ok": true, "enabled": enabled, "ports": ports })).into_response()
+}
+
+/// POST /api/bridge-config 请求体（JSON：端点整批替换表。headers 凭证字段不进
+/// 请求体——写盘按 port 合并保留旧文件已有值；未知字段 serde 默认忽略）
+#[derive(Debug, Deserialize)]
+struct BridgeConfigBody {
+    ports: Vec<BridgePortEntryBody>,
+}
+
+/// POST /api/bridge-config 单端点条目（note 可缺省）
+#[derive(Debug, Deserialize)]
+struct BridgePortEntryBody {
+    port: i32,
+    url: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// POST /api/bridge-config（D-022b 工坊外桥可编辑）：JSON {ports:[{port,url,note}]}
+/// -> 整批校验（bridges::check_endpoint 唯一规则源，任一条非法=整单拒绝带 index
+/// 定位）-> 原子写 bridges.json（headers 按 port 合并保留旧凭证）-> vault 装配时
+/// 内存同步（写锁 reload_if_changed——下一拍 bridge_send 按新表解析）。vault 未
+/// 装配也受理（写盘即用，桥下次启用生效）。返回 {ok:true} / {ok:false,reason,index?}。
+async fn bridge_config_save(State(state): State<Arc<WsState>>, body: axum::body::Bytes) -> Response {
+    let req: BridgeConfigBody = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "[bridge-config] 保存请求 JSON 解析失败（BAD_JSON）");
+            return workshop_reject_json("BAD_JSON");
+        }
+    };
+    let entries: Vec<crate::bridges::BridgeEntryInput> = req
+        .ports
+        .into_iter()
+        .map(|p| crate::bridges::BridgeEntryInput {
+            port: p.port,
+            url: p.url,
+            note: p.note,
+        })
+        .collect();
+    tracing::info!(count = entries.len(), "[bridge-config] 收到保存请求");
+    match crate::bridges::save_endpoint_entries(&state.bridge_config_path, &entries) {
+        Ok(()) => {
+            // 内存同步（vault 装配时）：盘上 mtime 已变，reload_if_changed 重载
+            // 新表（主循环每拍热重载走同一把 RwLock，两边看同一份账）
+            let synced = match &state.bridge_vault {
+                Some(vault) => vault
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .reload_if_changed(),
+                None => false,
+            };
+            tracing::info!(
+                path = %state.bridge_config_path.display(),
+                count = entries.len(),
+                vault_synced = synced,
+                "[bridge-config] 端点表已写盘+内存同步（bridge_send 下一拍按新表解析）"
+            );
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(rej) => {
+            tracing::info!(reason = rej.reason, index = ?rej.index, "[bridge-config] 保存整单拒绝");
+            let mut body = serde_json::json!({ "ok": false, "reason": rej.reason });
+            if let Some(i) = rej.index {
+                body["index"] = serde_json::json!(i);
+            }
+            Json(body).into_response()
+        }
+    }
 }
 
 /// 单连接循环：下行推快照广播，上行解析意图入共享队列（仅操控连接）。
@@ -1685,6 +1765,7 @@ mod tests {
             roster: roster.clone(),
             players_dir: temp_assets_dir("shared-players"),
             bridge_vault: None,
+            bridge_config_path: temp_bridge_vault_path("shared-bridge"),
         });
         let handle = tokio::spawn(async move {
             serve(
@@ -2225,6 +2306,7 @@ mod tests {
             roster: Arc::new(std::sync::Mutex::new(Vec::new())),
             players_dir: temp_assets_dir("d021f-players"),
             bridge_vault: None,
+            bridge_config_path: temp_bridge_vault_path("d021f-bridge"),
         });
         let handle = tokio::spawn(async move {
             serve(
@@ -3045,6 +3127,19 @@ mod tests {
         dir
     }
 
+    /// 临时桥登记表路径（D-022b bridge-config 测试用；独立路径，绝不碰世界目录
+    /// 真 bridges.json——POST 会写盘，必须落在系统临时目录）
+    fn temp_bridge_vault_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "codeworld-net-bridges-{tag}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ))
+    }
+
     /// 带玩家目录与外桥保险库的测试服务器（D-022 工坊通道测试用；其余同
     /// start_test_server_with_avatars。vault=None=桥未装配，路由应回空列表）
     #[allow(clippy::type_complexity)]
@@ -3053,6 +3148,7 @@ mod tests {
         avatars_dir: &std::path::Path,
         players_dir: &std::path::Path,
         vault: Option<Arc<std::sync::RwLock<crate::bridges::BridgeVault>>>,
+        bridge_config_path: &std::path::Path,
     ) -> (
         std::net::SocketAddr,
         broadcast::Sender<String>,
@@ -3081,6 +3177,7 @@ mod tests {
             roster: roster.clone(),
             players_dir: players_dir.to_path_buf(),
             bridge_vault: vault,
+            bridge_config_path: bridge_config_path.to_path_buf(),
         });
         let handle = tokio::spawn(async move {
             serve(
@@ -3124,8 +3221,14 @@ mod tests {
         let static_dir = temp_static_dir("ws-save");
         let players_dir = temp_net_players_dir("ws-save");
         let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
-            start_test_server_full(static_dir, &temp_assets_dir("ws-save"), &players_dir, None)
-                .await;
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("ws-save"),
+                &players_dir,
+                None,
+                &temp_bridge_vault_path("ws-save"),
+            )
+            .await;
         let body = serde_json::json!({
             "name": "工坊造物",
             "code": "(module (func (export \"life\") (result i32) i32.const 1))",
@@ -3151,8 +3254,14 @@ mod tests {
         let static_dir = temp_static_dir("ws-rej");
         let players_dir = temp_net_players_dir("ws-rej");
         let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
-            start_test_server_full(static_dir, &temp_assets_dir("ws-rej"), &players_dir, None)
-                .await;
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("ws-rej"),
+                &players_dir,
+                None,
+                &temp_bridge_vault_path("ws-rej"),
+            )
+            .await;
         // 危险名字（路径注入）拒绝
         let json = post_json(
             &addr,
@@ -3193,8 +3302,14 @@ mod tests {
         let static_dir = temp_static_dir("ws-read");
         let players_dir = temp_net_players_dir("ws-read");
         let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
-            start_test_server_full(static_dir, &temp_assets_dir("ws-read"), &players_dir, None)
-                .await;
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("ws-read"),
+                &players_dir,
+                None,
+                &temp_bridge_vault_path("ws-read"),
+            )
+            .await;
         let body = serde_json::json!({ "name": "wstower", "code": "(module)\n;; 塔骨架" });
         assert_eq!(post_json(&addr, "/api/player-code", &body).await["ok"], true);
         let resp = http_request(&addr, "GET", "/api/player-code?name=wstower", None, None).await;
@@ -3222,8 +3337,14 @@ mod tests {
         let static_dir = temp_static_dir("ws-read-big");
         let players_dir = temp_net_players_dir("ws-read-big");
         let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
-            start_test_server_full(static_dir, &temp_assets_dir("ws-read-big"), &players_dir, None)
-                .await;
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("ws-read-big"),
+                &players_dir,
+                None,
+                &temp_bridge_vault_path("ws-read-big"),
+            )
+            .await;
         std::fs::write(players.join("bigguy.wat"), vec![b'a'; 256 * 1024 + 1]).unwrap();
         let resp = http_request(&addr, "GET", "/api/player-code?name=bigguy", None, None).await;
         let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
@@ -3240,8 +3361,14 @@ mod tests {
         let static_dir = temp_static_dir("ws-del");
         let players_dir = temp_net_players_dir("ws-del");
         let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
-            start_test_server_full(static_dir, &temp_assets_dir("ws-del"), &players_dir, None)
-                .await;
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("ws-del"),
+                &players_dir,
+                None,
+                &temp_bridge_vault_path("ws-del"),
+            )
+            .await;
         std::fs::write(players.join("me.txt"), "wstower\n").unwrap();
         let body = serde_json::json!({ "name": "wstower", "code": "(module)" });
         assert_eq!(post_json(&addr, "/api/player-code", &body).await["ok"], true);
@@ -3266,18 +3393,12 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_config_lists_registered_ports_with_notes() {
-        // GET /api/bridge-config：保险库读锁 -> ports 升序 [{port,note}]；
-        // 桥未装配（vault=None）-> {ok:true,ports:[]}（工坊只读展示，不做写路由）
+        // GET /api/bridge-config（D-022b 扩展）：保险库读锁 -> ports 升序
+        // [{port,url,note}] + enabled:true；桥未装配（vault=None）->
+        // {ok:true,enabled:false,ports:[]}（前端黄字提示桥未启用，仍可编辑保存）
         let static_dir = temp_static_dir("ws-bridge");
         let players_dir = temp_net_players_dir("ws-bridge");
-        let vault_path = std::env::temp_dir().join(format!(
-            "cw-net-bridges-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let vault_path = temp_bridge_vault_path("ws-bridge");
         std::fs::write(
             &vault_path,
             serde_json::to_string(&serde_json::json!([
@@ -3296,30 +3417,276 @@ mod tests {
                 &temp_assets_dir("ws-bridge"),
                 &players_dir,
                 Some(vault),
+                &vault_path,
             )
             .await;
         let resp = http_request(&addr, "GET", "/api/bridge-config", None, None).await;
         let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
         assert_eq!(json["ok"], true);
+        assert_eq!(json["enabled"], true, "vault 装配=enabled:true");
         let ports = json["ports"].as_array().expect("ports 数组恒有");
         assert_eq!(ports.len(), 2, "登记的两条端点都该列出");
         assert_eq!(ports[0]["port"], 1, "端口升序");
+        assert_eq!(ports[0]["url"], "http://localhost:9001", "url 回显（编辑框回填）");
         assert_eq!(ports[0]["note"], "外脑服务器", "note 原样透传");
         assert_eq!(ports[1]["port"], 2);
+        assert_eq!(ports[1]["url"], "http://127.0.0.1:9002");
         assert_eq!(ports[1]["note"], "后装端点");
         shutdown_tx.send(()).ok();
         let _ = server.await;
         let _ = std::fs::remove_file(&vault_path);
-        // 桥未装配：空列表（ok 仍 true——前端不必区分原因）
+        // 桥未装配：enabled:false 空列表（ok 仍 true）
         let static_dir = temp_static_dir("ws-bridge2");
         let players_dir = temp_net_players_dir("ws-bridge2");
+        let vault_path2 = temp_bridge_vault_path("ws-bridge2");
         let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
-            start_test_server_full(static_dir, &temp_assets_dir("ws-bridge2"), &players_dir, None)
-                .await;
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("ws-bridge2"),
+                &players_dir,
+                None,
+                &vault_path2,
+            )
+            .await;
         let resp = http_request(&addr, "GET", "/api/bridge-config", None, None).await;
         let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
         assert_eq!(json["ok"], true);
+        assert_eq!(json["enabled"], false, "无保险库=enabled:false");
         assert_eq!(json["ports"].as_array().unwrap().len(), 0, "无保险库=空列表");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&vault_path2);
+    }
+
+    // === D-022b 外桥可编辑（POST /api/bridge-config 写通道）===
+
+    #[tokio::test]
+    async fn bridge_config_post_saves_valid_batch_get_echoes_url() {
+        // T1：POST 合法单端点 -> ok:true -> 文件落盘内容正确（读回断言）->
+        // GET 立即回显含 url（内存同步，不等 mtime 拍）+ enabled:true
+        let static_dir = temp_static_dir("bc-post");
+        let players_dir = temp_net_players_dir("bc-post");
+        let vault_path = temp_bridge_vault_path("bc-post");
+        let _ = std::fs::remove_file(&vault_path);
+        let vault = Arc::new(std::sync::RwLock::new(crate::bridges::BridgeVault::load(
+            &vault_path,
+        )));
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("bc-post"),
+                &players_dir,
+                Some(vault),
+                &vault_path,
+            )
+            .await;
+        let body = serde_json::json!({
+            "ports": [ { "port": 1, "url": "http://127.0.0.1:9001", "note": "外脑服务器" } ]
+        });
+        let json = post_json(&addr, "/api/bridge-config", &body).await;
+        assert_eq!(json["ok"], true, "合法整批应保存成功：{json}");
+        // 文件落盘（读回断言：port/url/note 齐；headers 字段不凭空出现）
+        let text = std::fs::read_to_string(&vault_path).expect("bridges.json 应落盘");
+        let list: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(list[0]["port"], 1);
+        assert_eq!(list[0]["url"], "http://127.0.0.1:9001");
+        assert_eq!(list[0]["note"], "外脑服务器");
+        assert!(list[0].get("headers").is_none(), "无凭证可并=不写 headers 字段");
+        // GET 立即回显（内存同步生效）
+        let resp = http_request(&addr, "GET", "/api/bridge-config", None, None).await;
+        let get: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(get["enabled"], true, "vault 装配=enabled:true");
+        let ports = get["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), 1, "保存后 GET 应见到新端点");
+        assert_eq!(ports[0]["port"], 1);
+        assert_eq!(ports[0]["url"], "http://127.0.0.1:9001", "GET 回显 url（编辑框回填）");
+        assert_eq!(ports[0]["note"], "外脑服务器");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&vault_path);
+    }
+
+    #[tokio::test]
+    async fn bridge_config_post_rejects_invalid_batches_and_keeps_file() {
+        // T2：非法批（port=0 / url=https / 非回环 host / 非回环域名）-> ok:false
+        // 对应 reason（带 index 定位），文件不被改写，GET 仍回旧表
+        let static_dir = temp_static_dir("bc-rej");
+        let players_dir = temp_net_players_dir("bc-rej");
+        let vault_path = temp_bridge_vault_path("bc-rej");
+        std::fs::write(
+            &vault_path,
+            r#"[{"port": 5, "url": "http://127.0.0.1:9005", "note": "保持原样"}]"#,
+        )
+        .unwrap();
+        let vault = Arc::new(std::sync::RwLock::new(crate::bridges::BridgeVault::load(
+            &vault_path,
+        )));
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("bc-rej"),
+                &players_dir,
+                Some(vault),
+                &vault_path,
+            )
+            .await;
+        // 四种非法形态：port=0 / https / 非回环 IP / 非回环域名（各自一条 POST）
+        let cases = [
+            (
+                serde_json::json!({ "ports": [
+                    { "port": 1, "url": "http://127.0.0.1:9001" },
+                    { "port": 0, "url": "http://127.0.0.1:9002" }
+                ] }),
+                "PORT_INVALID",
+                1,
+            ),
+            (
+                serde_json::json!({ "ports": [
+                    { "port": 2, "url": "https://127.0.0.1:9003" }
+                ] }),
+                "URL_INVALID",
+                0,
+            ),
+            (
+                serde_json::json!({ "ports": [
+                    { "port": 3, "url": "http://10.0.0.5:80" }
+                ] }),
+                "URL_INVALID",
+                0,
+            ),
+            (
+                serde_json::json!({ "ports": [
+                    { "port": 4, "url": "http://Example.COM" }
+                ] }),
+                "URL_INVALID",
+                0,
+            ),
+        ];
+        for (body, reason, index) in cases {
+            let json = post_json(&addr, "/api/bridge-config", &body).await;
+            assert_eq!(json["ok"], false, "非法批应拒绝：{body}");
+            assert_eq!(json["reason"], reason, "原因码：{json}");
+            assert_eq!(json["index"], index, "定位下标：{json}");
+            // 文件不被改写（原表仍在）
+            let text = std::fs::read_to_string(&vault_path).unwrap();
+            assert!(
+                text.contains("保持原样"),
+                "拒绝后文件不被改写（body={body}）"
+            );
+        }
+        // GET 仍回旧表（内存未被污染）
+        let resp = http_request(&addr, "GET", "/api/bridge-config", None, None).await;
+        let get: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        let ports = get["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), 1, "拒绝后内存仍旧表");
+        assert_eq!(ports[0]["port"], 5);
+        assert_eq!(ports[0]["note"], "保持原样");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&vault_path);
+    }
+
+    #[tokio::test]
+    async fn bridge_config_post_empty_array_clears_registry() {
+        // T3：POST 空数组 -> 清空登记（文件空表）-> GET ports 空
+        let static_dir = temp_static_dir("bc-empty");
+        let players_dir = temp_net_players_dir("bc-empty");
+        let vault_path = temp_bridge_vault_path("bc-empty");
+        std::fs::write(
+            &vault_path,
+            r#"[{"port": 1, "url": "http://127.0.0.1:9001", "note": "将被清空"}]"#,
+        )
+        .unwrap();
+        let vault = Arc::new(std::sync::RwLock::new(crate::bridges::BridgeVault::load(
+            &vault_path,
+        )));
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("bc-empty"),
+                &players_dir,
+                Some(vault),
+                &vault_path,
+            )
+            .await;
+        let json = post_json(&addr, "/api/bridge-config", &serde_json::json!({ "ports": [] })).await;
+        assert_eq!(json["ok"], true, "空数组=清空登记，应受理：{json}");
+        let list: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&vault_path).unwrap()).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 0, "文件应为空表");
+        let resp = http_request(&addr, "GET", "/api/bridge-config", None, None).await;
+        let get: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(get["ports"].as_array().unwrap().len(), 0, "GET 应回空列表");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&vault_path);
+    }
+
+    #[tokio::test]
+    async fn bridge_config_post_works_without_vault_enabled_flag_false() {
+        // T4：vault=None（桥未启用 CODEWORLD_BRIDGE）-> POST 也受理（文件落盘，
+        // 桥下次启用即用）；GET enabled:false ports:[]（仍可编辑保存的语义）
+        let static_dir = temp_static_dir("bc-novault");
+        let players_dir = temp_net_players_dir("bc-novault");
+        let vault_path = temp_bridge_vault_path("bc-novault");
+        let _ = std::fs::remove_file(&vault_path);
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("bc-novault"),
+                &players_dir,
+                None,
+                &vault_path,
+            )
+            .await;
+        let body = serde_json::json!({
+            "ports": [ { "port": 1, "url": "http://localhost:9001", "note": "桥未启用也保存" } ]
+        });
+        let json = post_json(&addr, "/api/bridge-config", &body).await;
+        assert_eq!(json["ok"], true, "vault 未装配也应受理写盘：{json}");
+        let text = std::fs::read_to_string(&vault_path).expect("文件应落盘（桥下次启用即用）");
+        let list: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(list[0]["port"], 1);
+        assert_eq!(list[0]["url"], "http://localhost:9001");
+        // GET：enabled:false + ports 空（无 vault 内存可回显，文件内容不进 GET）
+        let resp = http_request(&addr, "GET", "/api/bridge-config", None, None).await;
+        let get: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(get["ok"], true);
+        assert_eq!(get["enabled"], false);
+        assert_eq!(get["ports"].as_array().unwrap().len(), 0);
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&vault_path);
+    }
+
+    #[tokio::test]
+    async fn bridge_config_post_bad_json_rejected() {
+        // T5：请求体非 JSON -> ok:false reason:BAD_JSON（文件不动）
+        let static_dir = temp_static_dir("bc-badjson");
+        let players_dir = temp_net_players_dir("bc-badjson");
+        let vault_path = temp_bridge_vault_path("bc-badjson");
+        let _ = std::fs::remove_file(&vault_path);
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("bc-badjson"),
+                &players_dir,
+                None,
+                &vault_path,
+            )
+            .await;
+        let resp = http_request(
+            &addr,
+            "POST",
+            "/api/bridge-config",
+            Some("application/json"),
+            Some(b"this is not json".as_slice()),
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "BAD_JSON");
+        assert!(!vault_path.exists(), "BAD_JSON 不得写盘");
         shutdown_tx.send(()).ok();
         let _ = server.await;
     }
