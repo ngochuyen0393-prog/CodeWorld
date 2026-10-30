@@ -4340,12 +4340,10 @@
   function openPanel() {
     panelEl.classList.add('open');
     boot(); // 首开懒装配；再开即用
-    // 收起期间数据照常逐拍更新但列表 DOM 未重建——打开补一轮（首次打开前
-    // 保留占位文案，不补）；事件流一直在滚无需补
-    if (booted) {
-      renderRoster();
-      renderCreations();
-    }
+    // 补一轮列表渲染（R3 清理死守卫：boot() 同步置位 booted，此处条件恒真——
+    // 首开渲染空态文案占位，WS 数据到达后即校真；事件流一直在滚无需补）
+    renderRoster();
+    renderCreations();
   }
   function closePanel() {
     panelEl.classList.remove('open');
