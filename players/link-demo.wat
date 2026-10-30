@@ -18,7 +18,7 @@
   (import "env" "log" (func $log (param i32)))
   (import "env" "get_pos" (func $get_pos (result f64 f64)))
   (import "env" "command" (func $command (param i32 i32) (result i32)))
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
 
   (memory (export "memory") 1)
 
@@ -30,6 +30,8 @@
   ;; ── 侦察弹外观数据（NUL 结尾）─────────────────────────
   (data (i32.const 8192) "K\00")
   (data (i32.const 8256) "cyan\00")
+  ;; ── 造物实名（D-020b 第 24 参，NUL 结尾，≤16 字符；控制台播报/技能栏显示名）──
+  (data (i32.const 8704) "侦察弹\00")
 
   (global $tick (mut i32) (i32.const 0))
   (global $kite_done (mut i32) (i32.const 0))
@@ -81,7 +83,8 @@
             (i32.const 1)                                     ;; link（第20参，1=活链——风筝线的诞生）
             (f64.const 0.0)                                   ;; restitution（第21参，D-010，0=撞停默认）
             (f64.const 0.6)                                   ;; friction（第22参，D-010，0.6=默认）
-            (i32.const 10000)))                               ;; lifespan（D-019 第 23 参，强制声明：>=1 才出生；长寿造物 10000）
+            (i32.const 10000)                                 ;; lifespan（D-019 第 23 参，强制声明：>=1 才出生；长寿造物 10000）
+            (i32.const 8704)))                                ;; name_ptr（D-020b 第24参，造物实名"侦察弹"）
         (i32.const 5) (call $log)                             ;; marker 5 = 放飞信号
         (global.set $kite_done (i32.const 1))
         (return)))

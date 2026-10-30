@@ -189,6 +189,13 @@ pub struct Entity {
     #[serde(default = "default_lifespan_ticks")]
     lifespan_ticks: u64,
 
+    // 造物实名（D-020b 出生标签第 24 参：玩家给造物起的名字——控制台播报/技能栏
+    // 上栏的显示名）。纯标签不进物理/结算（名字不改变碰撞/判定，#041 不冲突）；
+    // None=未命名（旧存档或空/超长名落默认），显示层回退"造物#短id"。
+    /// serde default：旧存档无此字段时回退 None（存储向后兼容，radius 家族先例）
+    #[serde(default)]
+    creation_name: Option<String>,
+
     // 链账本（D-011 世界内链路段：link=binding 家族新成员，decisions.md #038
     // 通道公理世界内段）。活链造物指向母体——与 bound_to 同款形态（Option<EntityId>
     // 实体字段）、同款快照待遇。链管通信（契约管生死，两轴正交自由组合）：
@@ -539,6 +546,7 @@ impl Entity {
             restitution: default_restitution(),
             friction: default_friction(),
             lifespan_ticks: default_lifespan_ticks(),
+            creation_name: None,
             link_to: None,
             storage: Vec::new(),
             appearance,
@@ -714,6 +722,21 @@ impl Entity {
     /// 设置造物寿命（import 层已 try_lifespan_ticks 校验 >=1，此处直存）
     pub fn set_lifespan_ticks(&mut self, lifespan_ticks: u64) {
         self.lifespan_ticks = lifespan_ticks;
+    }
+
+    /// 造物实名（D-020b：None=未命名，显示层回退"造物#短id"）
+    pub fn creation_name(&self) -> Option<&str> {
+        self.creation_name.as_deref()
+    }
+
+    /// 设置造物实名（阶段二落名：import 层已校验 UTF-8/≤16 字符，此处直存）
+    pub fn set_creation_name(&mut self, name: Option<String>) {
+        tracing::debug!(
+            entity_id = %self.id.0,
+            name = ?name,
+            "[spawn] 造物实名落库（D-020b 出生标签）"
+        );
+        self.creation_name = name;
     }
 
     /// 活链母体（D-011：None=无链放生，Some=活链可控+可传）
@@ -1523,6 +1546,32 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         let back: Entity = serde_json::from_str(&json).unwrap();
         assert_eq!(back.lifespan_ticks(), 30, "寿命应往返保真");
+    }
+
+    // === D-020b 造物实名（spawn 第 24 参名字）：creation_name 标签字段 ===
+
+    #[test]
+    fn creation_name_defaults_none_on_old_snapshot() {
+        // 边界：旧存档（无 creation_name 字段）反序列化回退 None（serde default，
+        // radius/lifespan 家族同款先例；显示层对 None 回退"造物#短id"）
+        let mut obj: serde_json::Value = serde_json::to_value(sample_entity()).unwrap();
+        obj.as_object_mut().unwrap().remove("creation_name");
+        let json = serde_json::to_string(&obj).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.creation_name(), None, "旧存档应回退 None（显示层回退造物#短id）");
+    }
+
+    #[test]
+    fn creation_name_setter_and_roundtrip() {
+        // 创建/读写：setter 直存（名字是标签，import 层已校验 UTF-8/≤16 字符，
+        // 照 lifespan 直存模式）+ 序列化往返保留（快照存档实名不丢）
+        let mut e = sample_entity();
+        assert_eq!(e.creation_name(), None, "缺省无实名");
+        e.set_creation_name(Some("箭塔".to_string()));
+        assert_eq!(e.creation_name(), Some("箭塔"));
+        let json = serde_json::to_string(&e).unwrap();
+        let back: Entity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.creation_name(), Some("箭塔"), "实名应往返保真");
     }
 
     #[test]

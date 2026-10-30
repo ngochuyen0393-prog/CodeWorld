@@ -71,17 +71,21 @@ pub(crate) enum EventBody {
         error: String,
         died: bool,
     },
-    /// 造物诞生
+    /// 造物诞生（D-020b 加 name：实体显示名——服务端 emit 时带上，前端零 join）
     Born {
         x: f64,
         y: f64,
         glyph: String,
         lifespan_ticks: u64,
+        name: String,
     },
-    /// 实体死亡（killed/life_false/lifespan_expired/runtime 四因）
+    /// 实体死亡（killed/life_false/lifespan_expired/runtime 四因；D-020b 加 name：
+    /// 死者显示名——死者已出快照实体表，前端 join 不到，必须服务端带；
+    /// killer 语义 v3.1 起=显示名（玩家名/造物实名），不再是 UUID）
     Died {
         cause: &'static str,
         killer: Option<String>,
+        name: String,
     },
     /// 造物调 env.log(marker)
     PlayerLog { marker: i64 },
@@ -122,8 +126,9 @@ impl EventSink {
     /// code_hash 字符串**——玩家可命名 creation.wat/attacker.wat 进场，字符串
     /// 判归属=身份碰撞绕穿可见性铁律。链路：主体 owner（玩家=自有实体 id/
     /// 造物=创造者实体 id，进场产权根修复后统一形态）→ owner 实体是在线玩家
-    /// → 归属其名；owner 不可达时 bound_to 兜底一跳；全不通 = None（宁缺勿泄）
-    fn resolve_owner(
+    /// → 归属其名；owner 不可达时 bound_to 兜底一跳；全不通 = None（宁缺勿泄）。
+    /// pub(crate)：D-020b 技能格模板入列/落名复用同一产权链解析（单一实现防两套口径）
+    pub(crate) fn resolve_owner(
         world: &WorldState,
         players: &PlayerDirectory,
         subject: EntityId,
@@ -265,8 +270,8 @@ mod tests {
         // 丢弃——快照是单帧广播，一拍只出一帧过滤结果）；无操控连接（None）
         // 时有主事件一律不发（宁缺勿泄）
         let mut sink = EventSink::new();
-        push_with_owner(&mut sink, Some("alice"), EventBody::Born { x: 1.0, y: 0.0, glyph: "T".into(), lifespan_ticks: 10 });
-        push_with_owner(&mut sink, Some("bob"), EventBody::Born { x: 2.0, y: 0.0, glyph: "T".into(), lifespan_ticks: 10 });
+        push_with_owner(&mut sink, Some("alice"), EventBody::Born { x: 1.0, y: 0.0, glyph: "T".into(), lifespan_ticks: 10, name: "造物#1".into() });
+        push_with_owner(&mut sink, Some("bob"), EventBody::Born { x: 2.0, y: 0.0, glyph: "T".into(), lifespan_ticks: 10, name: "造物#2".into() });
         let (alice_frame, _) = sink.take_frame(Some("alice"));
         assert_eq!(alice_frame.len(), 1, "alice 只见自己的 1 条（bob 的被过滤）");
         assert_eq!(alice_frame[0].owner_name.as_deref(), Some("alice"));
@@ -275,7 +280,7 @@ mod tests {
         assert!(empty.is_empty(), "排干后无滞留（bob 视角切换场景由下一拍事件补）");
         // 换新汇：bob 作为自己世界的操控者，看得到自己的事件
         let mut sink_bob = EventSink::new();
-        push_with_owner(&mut sink_bob, Some("bob"), EventBody::Born { x: 2.0, y: 0.0, glyph: "T".into(), lifespan_ticks: 10 });
+        push_with_owner(&mut sink_bob, Some("bob"), EventBody::Born { x: 2.0, y: 0.0, glyph: "T".into(), lifespan_ticks: 10, name: "造物#2".into() });
         let (bob_frame, _) = sink_bob.take_frame(Some("bob"));
         assert_eq!(bob_frame.len(), 1, "bob 操控视角见自己的 1 条");
         // 无操控：有主事件一律不发

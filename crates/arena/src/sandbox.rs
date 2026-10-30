@@ -136,6 +136,14 @@ pub struct PendingSpawn {
     /// 校验 <1 整次拒绝（0=不声明/负值同罪）。>0=出生后 N 拍世界托管消散（非击杀
     /// 无掠夺遗嘱不触发，残影消散同款路径语义——main.rs expire_due_lifespans 结算）
     pub lifespan_ticks: u64,
+    /// 造物实名（D-020b spawn 第 24 参，出生标签家族）：玩家给造物起的名字，
+    /// 纯标签不进物理/结算。import 层已校验：读失败整次拒绝、空/超 16 字符钳
+    /// None（阶段二落名回退默认"造物#序号"——名字是标签，玩家不给就默认发）
+    pub name: Option<String>,
+    /// 驾驶层代 spawn（D-020b 来源位）：true=操控定装弹（世界代射的消耗品，
+    /// 不记玩家技能格模板、不占默认名序号——弹匣不是造物清单）；false=玩家
+    /// spawn 通道（代码 spawn/技能格重放，落地成功自动入列）
+    pub driver_spawn: bool,
     /// 造物 fuel 配额（继承创造者沙箱的 fuel_limit）
     pub fuel_limit: u64,
 }
@@ -165,6 +173,11 @@ pub struct PendingLinkOut {
     /// 信体（import 层已读出并过上限校验）
     pub payload: Vec<u8>,
 }
+
+/// 造物实名合法域上界（D-020b spawn 第 24 参，按 chars 计）：≤16 字符放行，
+/// 超出钳 None（阶段二回退默认"造物#序号"）。名字是标签非门禁——读失败
+/// （指针非法/非 UTF-8）才拒绝整次 spawn（外观参数家族同构）
+pub const CREATION_NAME_MAX_CHARS: usize = 16;
 
 /// 贴身可读实体快照（D-011 storage_read/send 的数据通路）：host 拍首按视口
 /// 过滤存活实体填充（与 visible 同批同源口径，EntityId 升序稳定排序、排除自己）
@@ -1061,6 +1074,7 @@ impl SandboxManager {
                     wasmtime::ValType::I32, // link（D-011 第 20 参）
                     wasmtime::ValType::F64, wasmtime::ValType::F64, // e/f 两参（D-010 第 21/22 参）
                     wasmtime::ValType::I32, // lifespan（D-019 第 23 参）
+                    wasmtime::ValType::I32, // name_ptr（D-020b 第 24 参，造物实名）
                 ],
                 [wasmtime::ValType::I32],
             ),
@@ -1122,7 +1136,8 @@ impl SandboxManager {
                 let restitution = f64_at(20);
                 let friction = f64_at(21);
                 let lifespan = i32_at(22);
-                // 校验体（23 参签名，与 func_wrap 时代闭包体逐行同代码）
+                let name_ptr = i32_at(23);
+                // 校验体（24 参签名，与 func_wrap 时代闭包体逐行同代码）
                 #[allow(clippy::too_many_arguments)]
                 let spawn_call = |caller: &mut Caller<SandboxData>,
                                   code_ptr: i32,
@@ -1147,7 +1162,8 @@ impl SandboxManager {
                                   link: i32,
                                   restitution: f64,
                                   friction: f64,
-                                  lifespan: i32|
+                                  lifespan: i32,
+                                  name_ptr: i32|
                  -> i32 {
                 caller.data_mut().api_calls.push("spawn".to_string());
                 let creator = caller.data().entity_id;
@@ -1316,6 +1332,47 @@ impl SandboxManager {
                     );
                     return 0;
                 };
+                // D-020b 第 24 参造物实名校验（出生标签家族）：读失败（指针非法/
+                // 无 NUL/非 UTF-8）= 拒绝整次 spawn（glyph/color 外观家族同构）；
+                // 空名/超 16 字符（按 chars 计）= 钳 None 不拒绝——名字是标签非
+                // 门禁，玩家不给就默认发（阶段二落名回退"造物#序号"，门永远开
+                // 哲学）。读取窗口=16 字符×4 字节+NUL（非 MAX_META_LEN——64 字节
+                // 窗口会把"恰 16 个 4 字节字符"（64 字节+NUL）误判读失败拒绝，
+                // 违反 ≤16 字符放行契约）
+                let name = match read_cstring_from_caller(
+                    caller,
+                    name_ptr,
+                    CREATION_NAME_MAX_CHARS * 4 + 1,
+                ) {
+                    Some(s) => {
+                        let chars = s.chars().count();
+                        if s.is_empty() {
+                            tracing::info!(
+                                entity_id = %creator.0,
+                                "[spawn] 名字为空，钳默认（阶段二回退 造物#序号）"
+                            );
+                            None
+                        } else if chars > CREATION_NAME_MAX_CHARS {
+                            tracing::info!(
+                                entity_id = %creator.0,
+                                name_chars = chars,
+                                max = CREATION_NAME_MAX_CHARS,
+                                "[spawn] 名字超长，钳默认（阶段二回退 造物#序号）"
+                            );
+                            None
+                        } else {
+                            Some(s)
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            entity_id = %creator.0,
+                            name_ptr,
+                            "[spawn] 名字读取失败（指针非法/无 NUL/非 UTF-8），拒绝"
+                        );
+                        return 0;
+                    }
+                };
                 tracing::info!(
                     creator = %creator.0,
                     birth = ?(x, y),
@@ -1338,6 +1395,7 @@ impl SandboxManager {
                     restitution,
                     friction,
                     lifespan_ticks,
+                    name = ?name,
                     "[spawn] 造物请求已排队（阶段二统一处理）"
                 );
                 caller
@@ -1365,6 +1423,8 @@ impl SandboxManager {
                         restitution,
                         friction,
                         lifespan_ticks,
+                        name,
+                        driver_spawn: false,
                         fuel_limit,
                     });
                 1
@@ -1394,6 +1454,7 @@ impl SandboxManager {
                     restitution,
                     friction,
                     lifespan,
+                    name_ptr,
                 );
                 results[0] = wasmtime::Val::I32(ret);
                 Ok(())
@@ -4495,12 +4556,13 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
     {x} {y}
@@ -4521,6 +4583,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     {lifespan}
+    i32.const 8704
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -4541,13 +4604,14 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (global $r1 (mut i32) (i32.const -1))
   (global $r2 (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
     f64.const 1.0 f64.const 1.0
@@ -4569,6 +4633,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn global.set $r1
     i32.const 0 i32.const {len}
     f64.const 4.0 f64.const 4.0
@@ -4590,6 +4655,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn global.set $r2)
   (func (export "get_r1") (result i32) global.get $r1)
   (func (export "get_r2") (result i32) global.get $r2)
@@ -4605,12 +4671,13 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
     f64.const 1.0 f64.const 1.0
@@ -4632,6 +4699,7 @@ mod tests {
     f64.const {e}
     f64.const {f}
     i32.const 10000
+    i32.const 8704
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -4644,11 +4712,12 @@ mod tests {
 
     /// 空 code WAT：code_len=0 应拒绝（没有代码造不出活的造物）
     const EMPTY_CODE_SPAWNER_WAT: &str = r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 8192) "T\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const 0
     f64.const 1.0 f64.const 1.0
@@ -4670,6 +4739,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#;
@@ -4679,12 +4749,13 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "TT\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
     f64.const 1.0 f64.const 1.0
@@ -4706,6 +4777,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -4755,11 +4827,12 @@ mod tests {
         // 两次调用只排队第一次（限流）——本测试只关心 mass 钳制，单发即可
         let wat_text = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
     f64.const 1.0 f64.const 1.0
@@ -4781,6 +4854,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -4804,11 +4878,12 @@ mod tests {
         let escaped = wat_escape(SPAWNED_CODE);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
     f64.const 1.0 f64.const 1.0
@@ -4830,6 +4905,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn global.set $ret)
   (global $ret (mut i32) (i32.const -1))
   (func (export "get_ret") (result i32) global.get $ret)
@@ -4896,11 +4972,12 @@ mod tests {
         let escaped = wat_escape(SPAWNED_CODE);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "W\00")
   (data (i32.const 8256) "blue\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
     f64.const 1.0 f64.const 1.0
@@ -4922,6 +4999,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -5475,12 +5553,13 @@ mod tests {
         let blob_escaped: String = blob_data.iter().map(|b| format!("\\{b:02x}")).collect();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (data (i32.const 8500) "{blob_escaped}")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
@@ -5502,6 +5581,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -6226,7 +6306,7 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (global $ret (mut i32) (i32.const -1))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
@@ -6253,6 +6333,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn global.set $ret)
   (func (export "get_ret") (result i32) global.get $ret)
   (func (export "life") (result i32) i32.const 1))"#,
@@ -6457,7 +6538,7 @@ mod tests {
     #[test]
     fn t1_legacy_22_param_spawn_import_rejected() {
         // T1 零回归（R1 破坏性变更边界）：R1 前协议的旧 22 参 spawn import
-        // 签名（末位无 lifespan i32）与 host 侧 23 参 FuncType 不匹配——
+        // 签名（末位无 lifespan i32）与 host 侧 FuncType 不匹配——
         // wasmtime 实例化期 import mismatch，旧协议模块装不进沙箱（破坏性
         // 变更必然失败=旧 .wat 玩家升级时可见的明确报错）
         let mgr = SandboxManager::new().unwrap();
@@ -6469,6 +6550,179 @@ mod tests {
         assert!(
             result.is_err(),
             "旧 22 参 spawn 签名应实例化失败（import mismatch）"
+        );
+    }
+
+    // === D-020b 造物实名（spawn 第 24 参 name_ptr：NUL 结尾字符串，纯标签不进结算）===
+
+    /// 带名字的造物方 WAT（D-020b spawn 第 24 参）：名字数据段放 8704（外观段
+    /// 8256 之后），name_ptr 直传；name_escaped 为 WAT 转义后的名字字节
+    fn spawner_named_wat(name_escaped: &str) -> String {
+        let escaped = wat_escape(SPAWNED_CODE);
+        format!(
+            r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
+  (global $ret (mut i32) (i32.const -1))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{escaped}\00")
+  (data (i32.const 8192) "T\00")
+  (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
+  (data (i32.const 8704) "{name_escaped}\00")
+  (func (export "on_tick")
+    i32.const 0 i32.const {len}
+    f64.const 1.0 f64.const 1.0
+    i32.const 8192 i32.const 8256
+    f64.const 0.5
+    f64.const 1.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    i32.const 0
+    f64.const 0.0
+    f64.const 1.0
+    f64.const 0.0
+    f64.const 0.0
+    f64.const 0.0
+    i32.const 0
+    f64.const 0.0
+    f64.const 0.6
+    i32.const 10000
+    i32.const 8704
+    call $spawn global.set $ret)
+  (func (export "get_ret") (result i32) global.get $ret)
+  (func (export "life") (result i32) i32.const 1))"#,
+            escaped = escaped,
+            len = SPAWNED_CODE.len(),
+            name_escaped = name_escaped,
+        )
+    }
+
+    #[test]
+    fn d020b_name_param_passes_to_pending_spawn() {
+        // 第 24 参名字（UTF-8 ≤16 字符）原样入队 PendingSpawn.name——阶段二落库
+        //（快照/播报/技能栏的显示名数据源，纯标签不进结算）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&spawner_named_wat("Tower")), 100_000, id(893))
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(call_i32_export(&mut handle, "get_ret"), 1, "合法名字应放行");
+        assert_eq!(
+            handle.store.data().pending_spawns[0].name.as_deref(),
+            Some("Tower"),
+            "名字应原样入队（标签透传）"
+        );
+    }
+
+    #[test]
+    fn d020b_name_overlong_or_empty_clamps_to_none() {
+        // 名字是标签非门禁：超 16 字符（按 chars 计）/空名不拒绝，钳 None——阶段二
+        // 落名时回退默认"造物#序号"（门永远开哲学：玩家不给就默认发）；16 字符
+        // 恰等放行 Some（域闭区间）
+        let mgr = SandboxManager::new().unwrap();
+        // 超长：17 个中文字符（51 字节 < MAX_META_LEN 64，读得出但按字符数超域）
+        let overlong = "塔".repeat(17);
+        let mut h1 = mgr
+            .create_sandbox(
+                &wasm(&spawner_named_wat(&wat_escape(&overlong))),
+                100_000,
+                id(894),
+            )
+            .unwrap();
+        h1.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut h1).unwrap();
+        assert_eq!(call_i32_export(&mut h1, "get_ret"), 1, "超长名不拒绝");
+        assert_eq!(
+            h1.store.data().pending_spawns[0].name, None,
+            "超 16 字符应钳 None（阶段二回退默认名）"
+        );
+        // 恰 16 字符：闭区间上界放行
+        let edge = "塔".repeat(16);
+        let mut h2 = mgr
+            .create_sandbox(
+                &wasm(&spawner_named_wat(&wat_escape(&edge))),
+                100_000,
+                id(896),
+            )
+            .unwrap();
+        h2.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut h2).unwrap();
+        assert_eq!(
+            h2.store.data().pending_spawns[0].name.as_deref(),
+            Some(edge.as_str()),
+            "恰 16 字符应放行（域 [1,16] 闭区间）"
+        );
+        // 空名：指向纯 NUL 数据段（读出空串）→ None（默认名兜底）
+        let mut h3 = mgr
+            .create_sandbox(&wasm(&spawner_named_wat("")), 100_000, id(897))
+            .unwrap();
+        h3.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut h3).unwrap();
+        assert_eq!(call_i32_export(&mut h3, "get_ret"), 1, "空名不拒绝");
+        assert_eq!(
+            h3.store.data().pending_spawns[0].name, None,
+            "空名应钳 None（阶段二回退默认名）"
+        );
+        // 16 个 4 字节字符（64 字节+NUL=65 字节，恰满读取窗口）：放行 Some
+        //（读取窗口=16×4+1 的回归锚——旧 64 字节窗口会把本例误判读失败拒绝）
+        let wide = "\u{1F600}".repeat(16); // 😀×16 = 64 字节（4 字节 UTF-8 上界情形）
+        let mut h4 = mgr
+            .create_sandbox(
+                &wasm(&spawner_named_wat(&wat_escape(&wide))),
+                100_000,
+                id(900),
+            )
+            .unwrap();
+        h4.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut h4).unwrap();
+        assert_eq!(call_i32_export(&mut h4, "get_ret"), 1, "16×4 字节名不拒绝");
+        assert_eq!(
+            h4.store.data().pending_spawns[0].name.as_deref(),
+            Some(wide.as_str()),
+            "恰 16 个 4 字节字符应放行（窗口 16×4+1 回归锚）"
+        );
+    }
+
+    #[test]
+    fn d020b_name_read_failure_rejects_spawn() {
+        // 名字读取失败（非 UTF-8 字节）= 拒绝整次 spawn（外观参数家族同构——
+        // glyph/color 读失败同样拒绝；返回 0 且不入队）
+        let mgr = SandboxManager::new().unwrap();
+        let mut handle = mgr
+            .create_sandbox(&wasm(&spawner_named_wat("\\ff\\fe")), 100_000, id(898))
+            .unwrap();
+        handle.store.data_mut().pos = (10.0, 10.0);
+        mgr.call_on_tick(&mut handle).unwrap();
+        assert_eq!(
+            call_i32_export(&mut handle, "get_ret"),
+            0,
+            "名字非 UTF-8 应拒绝（返回 0）"
+        );
+        assert!(
+            handle.store.data().pending_spawns.is_empty(),
+            "读失败不入队"
+        );
+    }
+
+    #[test]
+    fn t1_legacy_23_param_spawn_import_rejected() {
+        // D-020b 破坏性变更边界：R1 时代 23 参 spawn import 签名（末位无 name i32）
+        // 与 host 侧 24 参 FuncType 不匹配——实例化期 import mismatch（22 参先例
+        // 同款，旧 .wat 玩家升级时可见的明确报错）。
+        // ⚠️ 本测试的 23 参签名是历史标本，勿"顺手升级"——改了测试就失去边界锚
+        let mgr = SandboxManager::new().unwrap();
+        let legacy = r#"(module
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "life") (result i32) i32.const 1))"#;
+        let result = mgr.create_sandbox(&wasm(legacy), 100_000, id(899));
+        assert!(
+            result.is_err(),
+            "旧 23 参 spawn 签名应实例化失败（import mismatch）"
         );
     }
 

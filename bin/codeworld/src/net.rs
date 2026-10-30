@@ -109,10 +109,14 @@ pub(crate) fn parse_client_message(text: &str) -> Result<ClientMessage, String> 
     if !coords_ok {
         return Err("坐标非有限值（NaN/无穷）".to_string());
     }
-    // 技能槽位域校验（v2.5，D-020a）：1..=4 之外拒绝（0/5/99 等非法值丢弃）
+    // 技能槽位域校验（v2.5，D-020a；D-020b 语义重定义：slot=玩家技能格下标
+    // 1..=9，格=该玩家 spawn 成功的造物模板清单）之外拒绝（0/10/99 等非法值丢弃）
     if let ClientMessage::Skill { slot } = &msg {
-        if *slot < 1 || *slot > crate::skills::SKILL_SLOT_COUNT {
-            return Err(format!("技能槽位非法（{slot}，合法域 1..=4）"));
+        if *slot < 1 || *slot as usize > crate::skills::SKILL_SLOTS_MAX {
+            return Err(format!(
+                "技能槽位非法（{slot}，合法域 1..={})",
+                crate::skills::SKILL_SLOTS_MAX
+            ));
         }
     }
     // create_player（D-021b）：解析层不做名字校验——R1 复审改法 B：名字校验
@@ -221,7 +225,9 @@ pub(crate) struct ViewportInfo {
 }
 
 /// 单实体快照。kind 决定可选字段：player 带 controlled；creation 带 owner；
-/// name 恒有（v1.1，= code_hash 代码身份）；npc 无可选字段（skip_serializing_if 保持 JSON 干净）。
+/// name 恒有（v1.1=code_hash 代码身份；**v3.1 起造物实名优先**——creation/
+/// creation_dynamic 的 name=creation_name 实名，缺省回退"造物#短id"，其他 kind
+/// 照旧 code_hash）；npc 无可选字段（skip_serializing_if 保持 JSON 干净）。
 /// radius（v1.5，#030）：活动实体圆半径（前端按它画身体圆）；creation 是格对齐
 /// 方块，radius 无意义（前端按 kind=creation 画方格底衬）。
 /// disposition/wait_left（v1.7，#025）：处置状态签与等待倒数（仅处置中的玩家有；
@@ -308,6 +314,15 @@ pub(crate) fn build_snapshot(
             // 处置状态签（v1.7，#025）：账本命中的实体带 disposition/wait_left
             //（账本只收玩家名，npc/creation 天然缺席）；字段缺席=online 在线态
             let disposed = players.dispose.get(&e.code_hash);
+            // 实名优先（v3.1，D-020b）：造物的 name=creation_name 实名，缺省回退
+            // "造物#短id"（旧存档/驾驶层定装弹）；其他 kind 照旧 code_hash
+            let name = if kind == "creation" || kind == "creation_dynamic" {
+                e.creation_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("造物#{}", &e.id.0.to_string()[..8]))
+            } else {
+                e.code_hash.clone()
+            };
             EntitySnapshot {
                 id: e.id.0.to_string(),
                 glyph: e.appearance.glyph.clone(),
@@ -316,7 +331,7 @@ pub(crate) fn build_snapshot(
                 y,
                 radius: e.radius(),
                 kind,
-                name: e.code_hash.clone(),
+                name,
                 controlled: (kind == "player").then(|| Some(e.id) == controlled),
                 owner: (kind == "creation" || kind == "creation_dynamic")
                     .then(|| e.owner.0.to_string()),
@@ -1264,14 +1279,15 @@ mod tests {
 
     #[test]
     fn t20_skill_message_parses_valid_slots_and_rejects_bad() {
-        // 上行解析锚：skill 消息 slot=1..4 合法；0/5/99/缺参拒绝（解析层丢弃，
-        // Err 带原因）。serde tag lowercase（wire 形如 {"type":"skill","slot":2}）
-        for slot in 1u8..=4 {
+        // 上行解析锚（D-020b 域扩到 1..=9）：skill 消息 slot=1..9 合法；
+        // 0/10/99/缺参拒绝（解析层丢弃，Err 带原因）。serde tag lowercase
+        //（wire 形如 {"type":"skill","slot":2}）
+        for slot in 1u8..=crate::skills::SKILL_SLOTS_MAX as u8 {
             let msg = parse_client_message(&format!(r#"{{"type":"skill","slot":{slot}}}"#))
                 .unwrap_or_else(|e| panic!("slot {slot} 应合法：{e}"));
             assert_eq!(msg, ClientMessage::Skill { slot }, "slot {slot} 解析保真");
         }
-        for bad in [0u8, 5, 99] {
+        for bad in [0u8, 10, 99] {
             let err = parse_client_message(&format!(r#"{{"type":"skill","slot":{bad}}}"#))
                 .expect_err("非法槽位应拒绝");
             assert!(err.contains("槽位非法"), "拒绝原因应明示槽位域：{err}");
@@ -1453,20 +1469,54 @@ mod tests {
 
     #[test]
     fn creation_maps_to_creation_kind_with_owner_uuid() {
-        // 规则：code_hash="creation" = 造物，owner = 创造者 PlayerId 的 UUID 字符串
+        // 规则：code_hash="creation" = 造物，owner = 创造者 PlayerId 的 UUID 字符串。
+        // v3.1（D-020b）：name=实名优先——测试桩无 creation_name → 回退"造物#短id"
+        //（8 位十六进制短 id，旧存档/无名造物的显示兜底）
         let mut world = WorldState::new();
-        let (_, owner) = put_entity(&mut world, "creation", "T", "cyan", (40.0, 0.0));
+        let (cid, owner) = put_entity(&mut world, "creation", "T", "cyan", (40.0, 0.0));
         let dir = PlayerDirectory::disabled();
         let json = build(&world, &dir, None);
         let e = &json["entities"][0];
         assert_eq!(e["kind"], "creation");
-        assert_eq!(e["name"], "creation", "creation 的 name = code_hash 原文");
+        let fallback = format!("造物#{}", cid.0.to_string()[..8].to_string());
+        assert_eq!(e["name"], fallback, "无名造物 name 回退 造物#短id（v3.1）");
+        assert_ne!(e["name"], "creation", "造物 name 不再裸奔 code_hash");
         assert_eq!(
             e["owner"],
             owner.0.to_string(),
             "owner = 创造者 PlayerId UUID 字符串"
         );
         assert!(e.get("controlled").is_none(), "creation 不带 controlled");
+    }
+
+    #[test]
+    fn creation_snapshot_name_prefers_creation_name() {
+        // v3.1 实名优先（D-020b）：带 creation_name 的造物快照 name=实名（前端
+        // 播报/技能栏/造物列表的显示名数据源）；非造物 kind 不受影响照旧 code_hash
+        let mut world = WorldState::new();
+        let (cid, _) = put_entity(&mut world, "creation", "T", "cyan", (40.0, 0.0));
+        world
+            .entities
+            .get_mut(&cid)
+            .unwrap()
+            .set_creation_name(Some("箭塔".to_string()));
+        let (pid, _) = put_entity(&mut world, "pioneer", "P", "blue", (0.0, 0.0));
+        let dir = PlayerDirectory::disabled();
+        let json = build(&world, &dir, None);
+        let tower = json["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == cid.0.to_string().as_str())
+            .unwrap();
+        assert_eq!(tower["name"], "箭塔", "造物 name=creation_name 实名");
+        let other = json["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == pid.0.to_string().as_str())
+            .unwrap();
+        assert_eq!(other["name"], "pioneer", "非造物 name 照旧 code_hash 不受影响");
     }
 
     #[test]

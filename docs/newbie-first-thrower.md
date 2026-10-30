@@ -18,7 +18,7 @@
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
   (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
   (import "env" "spawn" (func $spawn
-    (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32)
+    (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32)
     (result i32)))
   (memory (export "memory") 1)
   ;; ↓↓↓ 改这里 1：子弹代码（data 段 [4096..)，别与 scan 缓冲 [0..16) 重叠）
@@ -74,7 +74,8 @@
           (i32.const 0)             ;; 20 link（D-011，0=无链放生；1=活链可控+可传）
           (f64.const 0.0)           ;; 21 restitution（D-010，0=撞停默认）
           (f64.const 0.6)           ;; 22 friction（D-010，0.6=默认摩擦）
-          (i32.const 10)))          ;; 23 lifespan（D-019 R1 强制声明：>=1 才出生；模板给 10 拍≈"活十秒"——当前 1拍/秒，打不中的弹到拍自己消散，不堵世界名额）
+          (i32.const 10)            ;; 23 lifespan（D-019 R1 强制声明：>=1 才出生；模板给 10 拍≈"活十秒"——当前 1拍/秒，打不中的弹到拍自己消散，不堵世界名额）
+          (i32.const 0)))           ;; 24 name_ptr（D-020b，0=空名→默认"造物#N"；想起名就 data 段放个 NUL 结尾字符串把指针传进来，≤16 字符）
         (return)))
     ;; 贴身机会刀（投掷器也能近战）
     (if (f64.le (local.get $dist) (f64.const 1.0))

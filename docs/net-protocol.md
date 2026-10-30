@@ -1,4 +1,4 @@
-# CodeWorld 网络协议：快照推送 + 意图上行（期四 v1 - v1.6 / 期五 v1.7 - v1.9 / D-017 协议小刀 v2.0 / 收图通道 v2.2 / D-012 力场 v2.3 / 皮入沙箱 v2.4 / D-020a 事件流+技能栏 v2.5 / D-021b 进场仪式 v2.6 / D-021d 登录选角页 v2.7 / D-021e 角色列表私有化 v2.8 / D-021f 会话令牌 v2.9 / D-022 造物工坊 v3.0）
+# CodeWorld 网络协议：快照推送 + 意图上行（期四 v1 - v1.6 / 期五 v1.7 - v1.9 / D-017 协议小刀 v2.0 / 收图通道 v2.2 / D-012 力场 v2.3 / 皮入沙箱 v2.4 / D-020a 事件流+技能栏 v2.5 / D-021b 进场仪式 v2.6 / D-021d 登录选角页 v2.7 / D-021e 角色列表私有化 v2.8 / D-021f 会话令牌 v2.9 / D-022 造物工坊 v3.0 / D-020b 技能栏独立+造物实名播报 v3.1）
 
 > 前端契约文档。第二刀（Canvas 渲染）/第三刀（鼠标操控）/第五刀（操控飞行）/第六刀（半径物理）/期五第一刀（下线处置权）依赖本文字段名与语义；改字段先改这里再改代码。
 > 依据 decisions.md #026（薄客户端/快照推送）、#027（鼠标操控/操控独占）、#029（操控飞行无税：飞行=代码对抗世界规则，fuel 是保险丝不入玩法）、#030/#031（半径物理：格子降级为地址系统，实体不可重叠精确化为半径碰撞）、#025（操控独占与下线处置权）；世界是唯一权威，浏览器只是显示器+遥控器。
@@ -27,7 +27,7 @@
   "terrain": {"x0": -50.0, "dx": 0.25, "heights": [0.0, 0.13, ...]},
   "attacks": [ {"attacker": "uuid", "target": "uuid", "x": 15.0, "y": 0.5} ],
   "fields": [ {"x": 15.0, "y": 0.5, "radius": 3.0, "formed": true} ],
-  "player_events": [ {"seq": 7, "tick": 42, "entity_id": "uuid", "kind": "born", "x": 40.0, "y": 0.0, "glyph": "塔", "lifespan_ticks": 10000} ],
+  "player_events": [ {"seq": 7, "tick": 42, "entity_id": "uuid", "kind": "born", "x": 40.0, "y": 0.0, "glyph": "塔", "lifespan_ticks": 10000, "name": "箭塔"} ],
   "events_cursor": 7
 }
 ```
@@ -54,7 +54,7 @@
 | `x`, `y` | f64 | 恒有 | 世界坐标（f64 原值，未取整；画布换算见 §4）。活动实体 y ≥ radius（圆心即位置，脚贴地）；creation 落地 y=0（占地格贴地） |
 | `radius` | f64 | 恒有（v1.5 起，#030） | 活动实体身体圆半径（默认 0.5；合法域 0.05..=25.0）——前端按它画身体圆轮廓。**creation（static）不用它**（身体=占地格 AABB：`floor(x)..floor(x)+1 × floor(y)..floor(y)+1`，前端按 kind=creation 画方格底衬）；**creation_dynamic（v2.1，D-003）身体=此半径的圆**，渲染/点击同活动实体 |
 | `kind` | string | 恒有 | `"npc"` / `"player"` / `"creation"` / `"creation_dynamic"`（v2.1 起，见 §3.1） / `"projectile"` |
-| `name` | string | 恒有（v1.1 起，原仅 player） | 代码身份 `code_hash` 原文：npc=`attacker`/`defender`/`hunter`/`spy`；player=玩家名（players/ 文件名）；creation=`"creation"`（身份看 `owner`） |
+| `name` | string | 恒有（v1.1 起，原仅 player） | 显示名。**v3.1 起造物实名优先（D-020b）**：creation/creation_dynamic=`creation_name` 实名（spawn 第 24 参声明，如"箭塔"），缺省回退 `"造物#<8位短id>"`（旧存档/无名造物）；其余照旧 code_hash 原文：npc=`attacker`/`defender`/`hunter`/`spy`；player=玩家名（players/ 文件名）。前端控制台播报/造物列表/技能栏都显示它，十六进制 id 降级为悬浮 tooltip |
 | `controlled` | bool | 仅 player | `true` = me 声明的操控目标（#024，每拍解析）；player 字段恒在（前端 `e.controlled` 直接可用） |
 | `disposition` | string | 处置中的 player（v1.7 起，#025） | 会话级下线处置状态签：`"dispose_wait"`（处置等待中，操控连接意外断开倒计时）/ `"auto"`（停留+自主接管，on_tick 恢复）/ `"ai-await"`（停留+等外部 AI 接入，站桩）。**字段缺席 = online 在线态**（操控独占照常） |
 | `wait_left` | u64 | 仅 `disposition="dispose_wait"` | 处置等待剩余拍数（每拍 -1，到 0 即被服务器默认带走）——前端画"处置等待中 NN 拍"抢救倒计时 |
@@ -75,6 +75,8 @@
 | `kind` | string | `spawn_rejected` / `compile_failed` / `runtime_error` / `born` / `died` / `player_log` / `player_joined` / `create_player_rejected`（后两类 v2.6，D-021b：无主公共新闻，entity_id=空串）/ `player_selected {name}` / `select_player_rejected {reason}`（后两类 v2.7，D-021d：无主公共新闻，登录/选角页回执，entity_id=空串） |
 
 **断线补拉口径（MVP 选 B）**：断线即丢不回放；前端按 `events_cursor − 本地已收 seq` 估算丢失数，断线横幅提示"断线期间约 N 条事件未收到"。（A 档=服务端环形缓冲 256 条重连首帧回放，将来带宽富余再议——服务端不做每连接游标账本。）
+
+**实名播报（v3.1，D-020b）**：born 带 `name`（实体显示名）；died 带 `name`（死者显示名——死者已出快照实体表，前端 join 不到，必须服务端带）且 `killer` 从实体 UUID 改为**显示名**（凶手是玩家→玩家名；是造物→造物实名；查无此实体→8 位短 id 兜底）。前端播报格式：`【箭塔】诞生 (x,y) · 声明寿命 N 拍` / `【箭塔】被击杀（凶手【测试】）`。
 
 npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSON 干净）；v1.1 起 `name` 全实体恒有（第二刀悬浮提示需要 npc 的代码身份）。
 
@@ -153,7 +155,7 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 {"type": "shoot", "x": 15.0, "y": 0.0}       // 点击远处敌人 → 操控射击（v1.9，#036；#045 起弹=定装 spawn 造物弹，见 6.2 与版本史退役口径）
 {"type": "stop"}                              // 清除走位目标，站住
 {"type": "logout", "disposition": "stay_auto"} // 登出处置三选一（v1.7，#025）
-{"type": "skill", "slot": 1}                  // 技能栏（v2.5，D-020a）：slot=1..4，替操控玩家 spawn 预置模板造物
+{"type": "skill", "slot": 1}                  // 技能栏（v2.5，D-020a 立项；v3.1 D-020b 语义重定义）：slot=玩家技能格下标 1..9，重放该格造物模板
 {"type": "create_player", "name": "土豆", "template": "grazer"} // 进场仪式（v2.6，D-021b）：写 players/土豆.wat 当拍进场
 {"type": "select_player", "name": "土豆"}     // 选角进场（v2.7，D-021d）：以 players/ 既有角色进场（等价 me.txt 声明）
 ```
@@ -167,7 +169,7 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 | `shoot` | **操控射击（v1.9，#036；#045 弹丸退役后世界侧换载具）**：操控目标向目标方向发射一发**定装造物弹**——世界不再配发弹丸身体（#045 修路不跑车），改为解算器 `solve_launch_vector` 解出初速后 **spawn 一个 dynamic 造物**（小圆点 0.15/同款质量/unbound），出生点沿发射方向外推出膛，命中归接触通道（on_contact 代码攻）。初速解算=速度梯搜索（基准 12 封顶 22）+真实物理步序逐拍模拟（重力→阻力→极速钳→中点位移），无解不发射（服务器侧不发射+INFO，前端同判据不发消息）。**自定义弹道**：env.shoot 已随 #045 退役——玩家代码用 spawn 第 11/12 参出生初速自己拼（教学模板 docs/newbie-first-thrower.md）。**每拍 1 发限流沿用**（同拍多次点击后到覆盖先到，恰 1 发）。**与 move 并存**（边走边射）：shoot 不清除走位目标，射击拍不移动、下拍恢复走位；悬空射击照常免重力（升力独立） |
 | `stop` | 清除走位目标站住（#025 操控独占的"我不动"）。**v1.4 起：stop 在空中 = 悬停不坠**（stop 语义是"停止移动"不是"坠落"；悬停锚点改写为脚下坐标，要落地玩家点地面）。前端由右键（contextmenu）或 S 键产生 |
 | `logout` | **主动登出三选一**（v1.7，#025 下线处置权；仅操控连接生效，观战连接照旧丢弃）：`disposition` 取 `take`（带走：角色立即移除，文件锚保留，重连认领=重新进场重生）/ `stay_auto`（停留+自主接管：on_tick 恢复，角色自己活，重连=接管者被顶掉）/ `stay_ai`（停留+AI 待接入：站桩等外部 AI，端点协议是 #014 未来端点本刀不实现）。服务器收即释放操控令牌、连接降级观战（快照照收）；**处置中的玩家不被 me 声明重认领**——抢回操控必须走重连认领（操控权=me 声明+连接在，#024 精神） |
-| `skill` | **技能栏**（v2.5，D-020a）：`slot`=1..4，替操控玩家排一个 spawn（世界侧预置模板：投掷器/飞剑/护盾场/侦察弹，模板能力全部来自已开放 spawn 参数零新原语，全文可抄 `GET /skills/*.wat`）。出生点=操控实体东侧身位偏移；**每实体每拍 1 发**（同拍连按只发第一发，再按报 RATE_LIMITED 事件）；失败走 spawn_rejected 事件回报面板（闭环）。非法槽位（0/5+/缺参）解析层拒绝丢弃。模板清单见 api.md「五点十、技能栏」 |
+| `skill` | **技能栏**（v2.5 立项，D-020a；**v3.1 D-020b 语义重定义**）：`slot`=**该玩家技能格下标 1..9**（格=玩家 spawn 成功的造物模板清单，同名合并保留首次，上限 9；按格上行=服务端取出模板重新 spawn，出生点=操控实体旁 r+0.7，#030 预检/上限/编译全适用，失败走 spawn_rejected 事件闭环）。**技能=我的造物非预置清单**（v3.1 起预置四技能退役，`GET /skills/*.wat` 同退）；空格/越界 warn 丢弃。出生点=操控实体东侧身位偏移；**每实体每拍 1 发**（同拍连按只发第一发，再按报 RATE_LIMITED 事件）。非法槽位（0/10+/缺参）解析层拒绝丢弃。详见 api.md「五点十、技能栏」 |
 | `create_player` | **进场仪式**（v2.6，D-021b）：`name`+`template`（blank/grazer/hunter 三选）→ 服务器写 `players/<name>.wat`（内容=模板全文，`GET /templates/<id>.wat` 同源）→ **当拍进场**（不等目录轮询）→ 写 `players/me.txt`（操控接管；`CODEWORLD_ME` 显式设置时不覆盖）。回执走 player_events 公共新闻：成功=`player_joined {name}`（面板收起+出生横幅），失败=`create_player_rejected {reason}`（NAME_EMPTY/NAME_TOO_LONG/NAME_BAD_CHAR/NAME_TAKEN/TEMPLATE_MISSING/IO_ERROR，红字回执）。名字校验的权威闸门在服务器 tick 侧（R1 复审改法 B：解析层不做名字校验——Err 分支=静默丢弃无回执，前端 busy 锁会挂死；全部拒绝统一走事件回执，含格式类 NAME_* 三码）。**v2.7 起：任意连接生效**（登出后的观战连接也要能新建——旧"仅操控连接生效"作废）。**v2.9 起：服务器收到即颁发会话令牌**（当场单播 `session_token {token,name}`，成功路径绑定进会话表——重连/刷新凭它认领操控，见 §11）。**首启归档**：空世界模式+空玩家目录启动时旧 db 挪 `archive/`（启动瞬间做——sqlite 句柄锁 db，进程内挪不动；create_player 链路永不碰 db）。详见 api.md「进场仪式」节 |
 | `select_player` | **选角进场**（v2.7，D-021d 登录/选角页）：`name` 必须在 `players/` 有 `.wat`（文件锚=身份）→ 覆写 `players/me.txt` 为单行该名字（#024 契约，等价 me 声明）→ 清该名字的 absent 离场标记（登出带走后选角=下拍扫描重生角色）+ 处置状态（接管者被顶掉）+ 编译失败黑名单（显式选择=允许重试一次，失败会重新拉黑）→ 回执 `player_selected {name}`（前端收到**才**断开重连——重连带 token=凭据认领操控，v2.9）。拒绝回执 `select_player_rejected {reason}`：`NAME_UNKNOWN`（players/ 无此角色）/ `ME_ENV_LOCKED`（`CODEWORLD_ME` 环境变量已设——env 锁定优先于一切 me 声明，诚实拒绝）/ `IO_ERROR`（me.txt 写失败）。**任意连接生效**（登出后的观战连接是登录页的选角通道）。**v2.9 起：服务器收到即颁发会话令牌**（同 create_player，见 §11）。me.txt 契约一字不动（单行玩家名；`CODEWORLD_ME` 优先级不变） |
 
@@ -411,6 +413,18 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
   白名单例外同 three.module.min.js 先例）。新手模板表新增 `tower` 箭塔
  （create_player 模板选择同步可取，无害）。工坊保存成功路径登记本机角色档案
  （create_player 同款——工坊角色列表数据源=player_roster）
+- **技能栏独立+造物实名播报（v3.1，D-020b，2026-10-30；t_bdb1da48）**：两刀——
+  ①**技能=我的造物**（skill 上行 slot 语义 1..4 预置槽 → 玩家技能格下标 1..9，
+  格=玩家 spawn 成功的造物模板清单，同名合并上限 9，服务端 SkillMemory 内存态
+  不持久化；预置四技能退役）——前端技能栏从控制台面板拆出，世界画面底部常驻
+  横条，空栏起步，从快照派生（owner=操控实体且 creation 系按 name 聚合+计数
+  角标，造物消亡格子保留=历史模板）。②**造物实名**（spawn 新增第 24 参
+  `name_ptr`：NUL 结尾 UTF-8 ≤16 字符，读失败拒绝/空超钳默认"造物#N"=该玩家
+  累计 spawn 成功数；纯标签不进物理结算；实体侧 `creation_name` serde default
+  旧存档兼容）。快照 `name` 对 creation 系改实名优先（缺省回退"造物#短id"，
+  其余 kind 照旧）；born 事件加 `name` 字段；died 事件加 `name`（死者显示名，
+  死者已出实体表必须服务端带）且 `killer` 从 UUID 改**显示名**；十六进制 id
+  前端降级为悬浮 tooltip。驾驶层定装弹不入技能格不占序号（driver_spawn 来源位）
 - 预留演进（不在本版实现）：
   - delta 快照 / 二进制编码（实体数增长或拍频提高后再做）
   - 多操控连接 / 连接身份与 me 声明合并（认证化）

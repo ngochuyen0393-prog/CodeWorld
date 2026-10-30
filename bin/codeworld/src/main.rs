@@ -157,9 +157,13 @@ struct EntitySandboxMap {
     /// 技能栏 spawn 排队（D-020a）：Skill 意图产的预置模板造物请求；阶段二 a1
     /// 与 ctrl_shell_spawns 同一 process_spawn_requests 出口统一落地
     skill_spawns: Vec<PendingSpawn>,
-    /// 技能书（D-020a）：启动时从 static/skills/ 读入的 4 槽模板源；缺文件/编译
-    /// 失败的槽位禁用（技能栏是便利层不是玩法命脉）
-    skills: crate::skills::SkillBook,
+    /// 技能格账本（D-020b 语义重定义）：按玩家记的"造物模板清单"——玩家 spawn
+    /// 成功的造物自动入列（同名去重保留首次，上限 9），skill 上行按格下标重放。
+    /// 随进程存活不持久化（重启=空栏重来，同会话令牌 v2.9 生命周期）
+    skills: crate::skills::SkillMemory,
+    /// spawn 成功计数器（D-020b，按玩家累计）：空/超长名的默认名"造物#N"序号源
+    /// （服务端计数器，随技能格账本同生命周期）
+    spawn_counters: std::collections::HashMap<String, u64>,
     /// 新手模板书（D-021b 进场仪式）：static/templates/ 读入的起跑模板源；
     /// create_player 上行落地用（浏览器"创建你的角色"面板）
     templates: crate::onboarding::TemplateBook,
@@ -232,7 +236,8 @@ impl EntitySandboxMap {
             duel_step_fuel: 10_000,
             events: crate::events::EventSink::new(),
             skill_spawns: Vec::new(),
-            skills: crate::skills::SkillBook::disabled(),
+            skills: crate::skills::SkillMemory::default(),
+            spawn_counters: std::collections::HashMap::new(),
             templates: crate::onboarding::TemplateBook::load(std::path::Path::new(
                 "bin/codeworld/static/templates",
             )),
@@ -507,7 +512,9 @@ impl EntitySandboxMap {
                 Ok(true) => {} // 仍存活
                 Ok(false) => {
                     tracing::info!(entity_id = %entity_id.0, "life()=false，标记死亡");
-                    // D-020a 事件投影：died(cause=life_false)——代码自杀，无击杀者
+                    // D-020a 事件投影：died(cause=life_false)——代码自杀，无击杀者；
+                    // D-020b 加 name=死者显示名（死者已出快照实体表，必须服务端带）
+                    let dead_name = crate::entity_display_name(world, &self.players, entity_id);
                     crate::events::EventSink::emit(
                         &mut self.events,
                         world,
@@ -517,6 +524,7 @@ impl EntitySandboxMap {
                         crate::events::EventBody::Died {
                             cause: "life_false",
                             killer: None,
+                            name: dead_name,
                         },
                     );
                     to_kill.push(entity_id);
@@ -536,6 +544,7 @@ impl EntitySandboxMap {
                             died: true,
                         },
                     );
+                    let dead_name = crate::entity_display_name(world, &self.players, entity_id);
                     crate::events::EventSink::emit(
                         &mut self.events,
                         world,
@@ -545,6 +554,7 @@ impl EntitySandboxMap {
                         crate::events::EventBody::Died {
                             cause: "runtime",
                             killer: None,
+                            name: dead_name,
                         },
                     );
                     to_kill.push(entity_id);
@@ -1559,8 +1569,8 @@ fn main() -> Result<()> {
     sandbox_map.death_fuel = config.death_fuel;
     // D-005 决斗单窗预算装配（架构 3.3 同族技术保护可调）
     sandbox_map.duel_step_fuel = config.duel_step_fuel;
-    // D-020a 技能书装配（static/skills/ 四模板启动读入；缺文件/编译失败槽位禁用）
-    sandbox_map.skills = crate::skills::load_from_static(std::path::Path::new(net::STATIC_DIR));
+    // D-020b 技能格账本：静态表退役——技能=玩家 spawn 成功的造物自动入列
+    //（SkillMemory 内存态随进程存活，启动无需装配；static/skills/ 预置模板删除）
     // D-021b 新手模板书装配（static/templates/ 三模板；进场仪式面板用）
     sandbox_map.templates =
         crate::onboarding::load_templates_from_static(std::path::Path::new(net::STATIC_DIR));
@@ -2221,6 +2231,10 @@ fn tick_with_intents(
                                     // D-019 第 23 参：哑弹安全网寿命 30 拍——打不中的
                                     // 弹到拍世界托管消散，不堵门不占世界名额
                                     lifespan_ticks: 30,
+                                    // D-020b 第 24 参：定装弹是无名消耗品（不占技能格
+                                    // 不占默认名序号——弹匣不是造物清单）
+                                    name: None,
+                                    driver_spawn: true,
                                     fuel_limit,
                                 });
                             }
@@ -3368,12 +3382,36 @@ fn process_spawn_requests(
         // 活满 N 拍后由世界托管消散（expire_due_lifespans，残影消散同款路径
         // 语义：非击杀无掠夺遗嘱不触发）；字段 0 仅存于存量快照实体=v1 永生
         entity.set_lifespan_ticks(req.lifespan_ticks);
+        // D-020b 第 24 参造物实名落库（出生标签家族）：import 层校验后的实名优先；
+        // 空/超长（import 层已钳 None）回退"造物#N"——N=该玩家累计 spawn 成功数
+        // （服务端计数器，产权链根在线玩家键控；无主造物无计数挂靠，落 None 由
+        // 显示层回退"造物#短id"）。名字纯标签不进物理/结算。
+        // 驾驶层定装弹（driver_spawn）不计数不落默认名——弹匣不是造物清单
+        let owner_name =
+            crate::events::EventSink::resolve_owner(world, &sandbox_map.players, req.creator);
+        let default_seq = (!req.driver_spawn).then(|| {
+            owner_name.as_ref().map(|n| {
+                let c = sandbox_map.spawn_counters.entry(n.clone()).or_insert(0);
+                *c += 1;
+                *c
+            })
+        }).flatten();
+        let creation_name = req.name.clone().or_else(|| default_seq.map(|c| format!("造物#{c}")));
+        entity.set_creation_name(creation_name.clone());
         // 出生初速（spawn 第 11/12 参，D-018 一体式发射提前落地）：import 层已校验
         // （有限+模长 ≤ 世界极速），此处写进造物 velocity 字段。位置积分（造物被
         // 初速带着飞）不做——那是 D-018「通用有速度实体物理」的活；velocity 字段
         // 所有实体都有，static 造物钉死不吃速度物理（初速仅对 dynamic 造物有
         // 物理意义，api.md 载明）
         entity.set_velocity((req.vx, req.vy));
+        // D-020b 模板提取（先于 req.blob move——PendingSpawn 部分move 前借完）：
+        // 驾驶层定装弹不入列（driver_spawn——弹匣不是造物清单，每发默认名不同
+        // 会绕过去重刷爆 9 格）
+        let template = if req.driver_spawn {
+            None
+        } else {
+            Some(crate::skills::SkillTemplate::from_pending(&req))
+        };
         // 沙箱创建成功才插入世界（失败则实体不落世界，不留无沙箱活体）。
         // D-009 液体造物跳过 create_sandbox（纯布景无沙箱——液体是物理域不是
         // 居民；编译步照常跑=spawn 合法性校验的一部分）
@@ -3396,12 +3434,30 @@ fn process_spawn_requests(
             }
         }
         world.entities.insert(entity_id, entity);
+        // D-020b 技能格模板入列（spawn 落地成功那刻——失败品不上栏）：按产权链
+        // 根玩家记账，同名去重保留首次（重 spawn 同款不占新格），上限 9 在
+        // SkillMemory::record 内判。模板名用已落名的 creation_name（非原始
+        // req.name——无名造物 req.name=None，若入列空串模板，重放会以 Some("")
+        // 穿透所有显示兜底：快照空名/播报"【】诞生"）
+        if !req.driver_spawn {
+            if let (Some(player), Some(tpl)) = (&owner_name, template) {
+                let mut tpl = tpl;
+                tpl.name = creation_name.clone().unwrap_or_default();
+                sandbox_map.skills.record(player, tpl);
+            }
+        }
+        let born_name = world
+            .entities
+            .get(&entity_id)
+            .map(crate::creation_display_name)
+            .unwrap_or_default();
         tracing::info!(
             entity_id = %entity_id.0,
             creator = %req.creator.0,
             owner = %owner.0,
             pos = ?req.pos,
             glyph = %req.glyph,
+            name = %born_name,
             motion,
             vx = req.vx,
             vy = req.vy,
@@ -3410,10 +3466,11 @@ fn process_spawn_requests(
             liquid_drag = req.liquid_drag,
             lifespan_ticks = req.lifespan_ticks,
             sandboxed = !is_liquid,
-            "造物诞生：玩家造物进场（门二，产权链归属创造者 owner；D-003 motion={}；D-009 液体造物=无沙箱布景）",
+            "造物诞生：玩家造物进场（门二，产权链归属创造者 owner；D-003 motion={}；D-009 液体造物=无沙箱布景；D-020b 实名播报）",
             if motion == codeworld_core::entity::MOTION_DYNAMIC { "dynamic 全活" } else { "static 钉死" }
         );
-        // D-020a 事件投影：born（主体=新造物，归属沿产权链解析到主人）
+        // D-020a 事件投影：born（主体=新造物，归属沿产权链解析到主人；
+        // D-020b 加 name=实体显示名，前端零 join）
         crate::events::EventSink::emit(
             &mut sandbox_map.events,
             world,
@@ -3425,9 +3482,39 @@ fn process_spawn_requests(
                 y: req.pos.1,
                 glyph: req.glyph.clone(),
                 lifespan_ticks: req.lifespan_ticks,
+                name: born_name,
             },
         );
     }
+}
+
+/// 实体显示名（D-020b 实名播报）：造物=creation_name 实名优先，缺省回退
+/// "造物#<8 位短 id>"；其他实体（玩家/npc）=code_hash（玩家名/生物名）。
+/// 查无此实体由调用方兜底（settle 路径死者/凶手发射前刚验证在册）
+pub(crate) fn creation_display_name(e: &codeworld_core::entity::Entity) -> String {
+    e.creation_name()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("造物#{}", &e.id.0.to_string()[..8]))
+}
+
+/// 实体显示名（世界视角，D-020b died 事件/击杀日志用）：在线玩家=玩家名
+/// （code_hash）；造物（含液体造物）=creation_display_name；其他=npc 名；
+/// 查无此实体=8 位短 id 兜底（凶手同拍已死且被 d 步清走的边角）
+pub(crate) fn entity_display_name(
+    world: &WorldState,
+    players: &PlayerDirectory,
+    id: EntityId,
+) -> String {
+    let Some(e) = world.entities.get(&id) else {
+        return id.0.to_string()[..8].to_string();
+    };
+    if players.is_online(&e.code_hash) {
+        return e.code_hash.clone();
+    }
+    if e.code_hash == "creation" {
+        return creation_display_name(e);
+    }
+    e.code_hash.clone()
 }
 
 /// create_player 落地（D-021b 进场仪式，t_be0de36c）：
@@ -3624,11 +3711,12 @@ fn poll_conn_event(
     ev
 }
 
-/// 技能栏意图落地（D-020a，t_06b4efc6）：Skill 意图 -> 预置模板造物请求排队。
-/// 出生点=操控实体东侧身位偏移（r+0.7，贴身可出、#030 预检放行）；限流=每实体
-/// 每拍 1 发（与 ctrl_shell/技能排队共享计数，撞限报 RATE_LIMITED 事件闭环）；
-/// 模板源未装配的槽位 warn 丢弃。技能失败（出生点被占/世界满等）由
-/// process_spawn_requests 的 spawn_rejected 事件回报面板
+/// 技能栏意图落地（D-020b 语义重定义，t_bdb1da48）：Skill 意图 -> 该玩家的
+/// 技能格模板重放。slot=玩家技能格下标（1..=9，格=该玩家 spawn 成功的造物模板
+/// 清单，同名合并）；出生点=操控实体东侧身位偏移（r+0.7，贴身可出、#030 预检
+/// 放行）；限流=每实体每拍 1 发（撞限报 RATE_LIMITED 事件闭环）。技能失败
+/// （出生点被占/世界满/编译等）由 process_spawn_requests 的 spawn_rejected
+/// 事件回报面板；空格/越界 warn 丢弃（前端数据源派生，正常操作摸不到）
 fn handle_skill_intents(
     world: &WorldState,
     sandbox_map: &mut EntitySandboxMap,
@@ -3636,28 +3724,35 @@ fn handle_skill_intents(
     slots: &[u8],
     current_tick: u64,
 ) {
+    // 操控玩家名=技能格账本键（只认在线玩家——观测/测试实体无账本，warn 丢弃；
+    // 与事件归属同款 is_online 判据）
+    let player_name: Option<String> = world
+        .entities
+        .get(&creator)
+        .map(|e| e.code_hash.clone())
+        .filter(|name| sandbox_map.players.is_online(name));
     for &slot in slots {
-        let Some(def) = sandbox_map.skills.def(slot) else {
-            tracing::warn!(slot, "[skill] 非法槽位（1..=4 之外），忽略");
+        let Some(player) = &player_name else {
+            tracing::warn!(slot, "[skill] 操控实体非在线玩家（无技能格账本），忽略");
             continue;
         };
-        let Some(code) = sandbox_map.skills.source(slot) else {
-            tracing::warn!(slot, name = def.name, "[skill] 模板未装配（缺文件/编译失败），忽略");
+        let Some(tpl) = sandbox_map.skills.template(player, slot) else {
+            tracing::warn!(slot, player = %player, "[skill] 空格/越界（该玩家模板清单无此下标），忽略");
             continue;
         };
-        // 每实体每拍 1 发：本拍已排过技能弹再按 = RATE_LIMITED。（与操控定装弹
-        // 的跨通道互斥在 Shoot 分支反向查 skill_spawns——skill 收集在拍首，射击
-        // 路由在其后，此处查 ctrl_shell 恒空是死代码，已删）
         let (px, py) = match world.entities.get(&creator) {
             Some(e) => e.pos(),
             None => continue, // 操控实体本拍刚死：静默丢（下一拍 control_target 自然消失）
         };
+        // 每实体每拍 1 发：本拍已排过技能弹再按 = RATE_LIMITED。（与操控定装弹
+        // 的跨通道互斥在 Shoot 分支反向查 skill_spawns——skill 收集在拍首，射击
+        // 路由在其后，此处查 ctrl_shell 恒空是死代码，已删）
         let already = sandbox_map
             .skill_spawns
             .iter()
             .any(|s| s.creator == creator);
         if already {
-            tracing::info!(slot, name = def.name, "[skill] 本拍已 spawn 过，限流拒绝");
+            tracing::info!(slot, name = %tpl.name, "[skill] 本拍已 spawn 过，限流拒绝");
             crate::events::EventSink::emit(
                 &mut sandbox_map.events,
                 world,
@@ -3682,39 +3777,44 @@ fn handle_skill_intents(
         sandbox_map.skill_spawns.push(PendingSpawn {
             creator,
             pos: birth,
-            code: code.to_string(),
-            glyph: def.glyph.to_string(),
-            color: def.color.to_string(),
-            radius: def.radius,
-            mass: def.mass,
-            // 技能造物 unbound（不带生死契约——塔不在了弹照飞是玩家代码层的事，
-            // 驾驶舱快捷键不给默认契约）
-            binding: codeworld_core::entity::BINDING_UNBOUND,
-            motion: def.motion,
-            vx: def.vx,
-            vy: def.vy,
-            blob: Vec::new(),
-            field_radius: def.field_radius,
-            field_gravity_scale: def.field_gravity_scale,
-            field_drag_delta: def.field_drag_delta,
-            liquid_density: 0.0,
-            liquid_drag: 0.0,
-            link: 0,
-            restitution: 0.0,
-            friction: 0.6,
-            lifespan_ticks: def.lifespan_ticks,
+            code: tpl.code.clone(),
+            glyph: tpl.glyph.clone(),
+            color: tpl.color.clone(),
+            radius: tpl.radius,
+            mass: tpl.mass,
+            // 出生声明全参原样重放（模板=玩家自己 spawn 成功的造物档案——
+            // 该带什么契约/运动/场/液体/链，玩家当初怎么声明就怎么重放；
+            // 链声明照带，母体不在时 process_spawn_requests 按放生落地兜底）
+            binding: tpl.binding,
+            motion: tpl.motion,
+            vx: tpl.vx,
+            vy: tpl.vy,
+            blob: tpl.blob.clone(),
+            field_radius: tpl.field_radius,
+            field_gravity_scale: tpl.field_gravity_scale,
+            field_drag_delta: tpl.field_drag_delta,
+            liquid_density: tpl.liquid_density,
+            liquid_drag: tpl.liquid_drag,
+            link: tpl.link,
+            restitution: tpl.restitution,
+            friction: tpl.friction,
+            lifespan_ticks: tpl.lifespan_ticks,
+            name: Some(tpl.name.clone()),
+            driver_spawn: false,
+            // fuel 配额继承创造者（重放创造者=操控实体，用其沙箱现配额；
+            // 模板存的那份是历史创造者的，仅作兜底）
             fuel_limit: sandbox_map
                 .sandboxes
                 .get(&creator)
                 .map(|h| h.store.data().fuel_limit)
-                .unwrap_or(1_000_000),
+                .unwrap_or(tpl.fuel_limit),
         });
         tracing::info!(
             slot,
-            name = def.name,
+            name = %tpl.name,
             birth = ?birth,
-            "[skill] 技能 spawn 已排队（预置模板，lifespan={} 拍）",
-            def.lifespan_ticks
+            "[skill] 技能 spawn 已排队（我的造物模板重放，lifespan={} 拍）",
+            tpl.lifespan_ticks
         );
     }
 }
@@ -4167,7 +4267,8 @@ fn expire_due_lifespans(
         // 会话级离场登记：遗嘱窗口见此跳过 on_death（与残影消散同款挂号）
         sandbox_map.session_takes.insert(id);
         // D-020a 事件投影：died(cause=lifespan_expired，无击杀者)——趁实体尚在
-        // 世界（d 步清理前）emit，归属沿产权链解析到主人
+        // 世界（d 步清理前）emit，归属沿产权链解析到主人；D-020b 加 name=死者显示名
+        let dead_name = crate::entity_display_name(world, &sandbox_map.players, id);
         crate::events::EventSink::emit(
             &mut sandbox_map.events,
             world,
@@ -4177,10 +4278,12 @@ fn expire_due_lifespans(
             crate::events::EventBody::Died {
                 cause: "lifespan_expired",
                 killer: None,
+                name: dead_name.clone(),
             },
         );
         tracing::info!(
             entity_id = %id.0,
+            name = %dead_name,
             born_tick,
             lifespan_ticks,
             "[lifespan] 寿命到期消散（非击杀无掠夺，遗嘱不触发）"
@@ -4556,7 +4659,16 @@ fn settle_attacks(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, st
                         if let Some(e) = world.entities.get_mut(&strike.target) {
                             e.kill();
                         }
-                        // D-020a 事件投影：died(cause=killed，killer=击杀者)
+                        // D-020a 事件投影：died(cause=killed，killer=击杀者)；
+                        // D-020b 实名播报：killer=显示名（玩家名/造物实名，v3.1 起
+                        // 不再是 UUID），name=死者显示名（死者已出快照实体表）
+                        let killer_name = crate::entity_display_name(
+                            world,
+                            &sandbox_map.players,
+                            strike.attack.attacker,
+                        );
+                        let dead_name =
+                            crate::entity_display_name(world, &sandbox_map.players, strike.target);
                         crate::events::EventSink::emit(
                             &mut sandbox_map.events,
                             world,
@@ -4565,12 +4677,15 @@ fn settle_attacks(world: &mut WorldState, sandbox_map: &mut EntitySandboxMap, st
                             world.tick(),
                             crate::events::EventBody::Died {
                                 cause: "killed",
-                                killer: Some(strike.attack.attacker.0.to_string()),
+                                killer: Some(killer_name.clone()),
+                                name: dead_name.clone(),
                             },
                         );
                         tracing::info!(
                             attacker = %strike.attack.attacker.0,
+                            attacker_name = %killer_name,
                             target = %strike.target.0,
+                            target_name = %dead_name,
                             order = idx,
                             "[settle_attacks] 击杀成功"
                         );
@@ -5329,11 +5444,12 @@ fn hunter_wat() -> String {
   (import "env" "scan" (func $scan (param i32 i32) (result i32)))
   (import "env" "move_by" (func $move_by (param f64 f64) (result i32)))
   (import "env" "attack_at" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 4096) "{shell_escaped}\00")
   (data (i32.const 16384) ".\00")
   (data (i32.const 16448) "yellow\00")
+  (data (i32.const 8704) "Tower\00")
   ;; tick 计数：on_attack 的 50% 伪随机源（奇=拦截），也是游走方向源与投掷节拍源
   (global $ticks (mut i32) (i32.const 0))
   ;; 被攻击：奇数 tick 拦截（log 6），偶数放行
@@ -5400,7 +5516,8 @@ fn hunter_wat() -> String {
           (f64.const 0.0)
           (f64.const 0.6)
           ;; lifespan（D-019 第 23 参，30 拍哑弹安全网：打不中的弹到拍消散不堵门）
-          (i32.const 30)))
+          (i32.const 30)
+          (i32.const 8704)))
         (return)))
     ;; 3. 贴身机会刀（dist <= 1.0 在贴身判距内；投机者不追击肉搏）
     (if (f64.le (local.get $dist) (f64.const 1.0))
@@ -6238,11 +6355,12 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "W\00")
   (data (i32.const 8256) "blue\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
     f64.const {x} f64.const {y}
@@ -6264,6 +6382,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -10934,6 +11053,8 @@ mod tests {
             restitution: 0.0,
             friction: 0.6,
             lifespan_ticks: 10000, // R1 强制声明：测试桩长寿值，防到期误杀
+            name: None,
+            driver_spawn: false,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(world, map, vec![req], 1, &[]);
@@ -11907,13 +12028,14 @@ mod tests {
         let shell_escaped = shell_wat_escaped();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (import "env" "log" (func $log (param i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{shell_escaped}\00")
   (data (i32.const 16384) ".\00")
   (data (i32.const 16448) "red\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     (if (i32.eqz (global.get $done))
       (then
@@ -11943,7 +12065,8 @@ mod tests {
           (f64.const 0.0)
           (f64.const 0.6)
           ;; lifespan（D-019 R1 强制声明：>=1 才出生；测试桩长寿值防到期误杀）
-          (i32.const 10000))))))
+          (i32.const 10000)
+          (i32.const 8704))))))
   (func (export "life") (result i32) i32.const 1))"#,
             shell_len = CTRL_SHELL_WAT.len(),
         )
@@ -12581,6 +12704,8 @@ mod tests {
             restitution: 0.0,
             friction: 0.6,
             lifespan_ticks,
+            name: None,
+            driver_spawn: false,
             fuel_limit: 1_000_000,
         }
     }
@@ -13142,10 +13267,13 @@ mod tests {
             .expect("born 事件应入帧");
         assert_eq!(born.entity_id, cid.0.to_string(), "主体=新造物");
         match &born.body {
-            crate::events::EventBody::Born { x, y, glyph, lifespan_ticks } => {
+            crate::events::EventBody::Born { x, y, glyph, lifespan_ticks, name } => {
                 assert_eq!((*x, *y), (20.0, 0.0));
                 assert_eq!(glyph, "T");
                 assert_eq!(*lifespan_ticks, 2);
+                // D-020b：alice spawn 成功计数 1，无名造物默认名=造物#1（服务端
+                // 计数器，播报实名数据源）
+                assert_eq!(name, "造物#1", "无名造物默认名=造物#序号");
             }
             other => panic!("应为 born，实为 {other:?}"),
         }
@@ -13163,9 +13291,10 @@ mod tests {
             .find(|e| matches!(e.body, crate::events::EventBody::Died { .. }))
             .expect("died 事件应入帧");
         match &died.body {
-            crate::events::EventBody::Died { cause, killer } => {
+            crate::events::EventBody::Died { cause, killer, name } => {
                 assert_eq!(*cause, "lifespan_expired");
                 assert!(killer.is_none(), "寿命消散无击杀者");
+                assert_eq!(name, "造物#1", "死者显示名（死者已出快照实体表，服务端带）");
             }
             other => panic!("应为 died，实为 {other:?}"),
         }
@@ -13304,48 +13433,123 @@ mod tests {
     }
 
     #[test]
-    fn t20_skill_intent_queues_template_spawn_and_rate_limits() {
-        // 技能栏端到端（验收 3/4 闭环）：Skill 意图 -> 预置模板 spawn 排队
-        //（真 static/skills 模板装配）；同拍第二按=RATE_LIMITED 事件；非法槽位丢弃
+    fn t20_skill_intent_replays_player_template_and_rate_limits() {
+        // 技能栏端到端（D-020b 语义，验收 3/4 闭环）：玩家 spawn 成功造物→模板
+        // 自动入列→按格上行重放排队（出生点=操控实体旁重定位，带实名）；同拍
+        // 第二按=RATE_LIMITED 事件；空格/越界丢弃
+        let dir = temp_players_dir("t20-skill-replay");
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        // 真模板装配（测试 CWD=bin/codeworld，static/skills 相对可达）
-        map.skills = crate::skills::load_from_static(std::path::Path::new("static"));
-        let creator = make_entity_with_sandbox(&mut world, &mut map, 1, (10.0, 0.5), PLAYER_WAT);
+        let creator = t20_make_online_player(&dir, &mut map, &mut world, "alice");
+        // 玩家代码 spawn 一只命名造物（模板入列数据源）
+        let mut req = lifespan_spawn_request(creator, 100);
+        req.pos = (20.0, 0.0);
+        req.name = Some("箭塔".to_string());
+        process_spawn_requests(&mut world, &mut map, vec![req.clone()], 1, &[]);
+        assert_eq!(map.skills.count("alice"), 1, "spawn 成功应自动入列");
+        // 按格 1 重放：排队一发模板造物（出生点=alice 旁重定位）
         handle_skill_intents(&world, &mut map, creator, &[1], 5);
-        assert_eq!(map.skill_spawns.len(), 1, "按 1 应排队一发投掷器弹");
-        let req = &map.skill_spawns[0];
-        assert_eq!(req.creator, creator);
-        assert_eq!(req.glyph, "o");
-        assert!(req.lifespan_ticks >= 1, "技能模板寿命声明 >=1（D-019 R1）");
-        assert!(req.vx.is_finite() && req.vx <= 25.0, "初速合法域");
-        // 同拍第二按（不同槽也算）= 每实体每拍 1 发限流
-        handle_skill_intents(&world, &mut map, creator, &[2, 9], 5);
+        assert_eq!(map.skill_spawns.len(), 1, "按 1 应重放一格（我的造物模板）");
+        let replay = &map.skill_spawns[0];
+        assert_eq!(replay.creator, creator);
+        assert_eq!(replay.name.as_deref(), Some("箭塔"), "重放带实名");
+        assert_eq!(replay.code, req.code, "模板代码原样重放");
+        assert_eq!(replay.glyph, req.glyph, "外观声明重放");
+        assert!(replay.lifespan_ticks >= 1, "重放寿命声明 >=1（D-019 R1 不豁免）");
+        // 同拍第二按 = 每实体每拍 1 发限流（事件回执 RATE_LIMITED）
+        handle_skill_intents(&world, &mut map, creator, &[1], 5);
         assert_eq!(map.skill_spawns.len(), 1, "限流：不再追加排队");
-        assert!(map.skills.def(9).is_none(), "槽位 9 非法定义为 None");
-        let (frame, _) = map.events.take_frame(None);
-        // creator 是 make_entity（code_hash=test 非在线）→ 归属 None → 事件被过滤
-        //（宁缺勿泄）。限流事件的可见性由真实玩家场景覆盖（原因码测试同款），
-        // 这里只断言限流没有追加排队
-        assert!(frame.is_empty(), "无归属事件不进任何帧");
+        // 空格（格 2 无模板）丢弃；越界同路（template() 下标越界=None）
+        handle_skill_intents(&world, &mut map, creator, &[2, 9], 6);
+        assert_eq!(map.skill_spawns.len(), 1, "空格/越界不排队");
+        let (frame, _) = map.events.take_frame(Some("alice"));
+        assert!(
+            frame
+                .iter()
+                .any(|e| matches!(
+                    &e.body,
+                    crate::events::EventBody::SpawnRejected {
+                        reason: crate::events::reason::RATE_LIMITED,
+                        ..
+                    }
+                )),
+            "限流拒绝应走 spawn_rejected 事件回执"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn t20_skill_templates_compile_and_declare_lifespan() {
-        // 技能模板契约（验收 6 联动）：四模板全部 wat 编译通过 + 寿命 >=1 +
-        // 初速 ≤ 世界极速（D-019 R1 强制声明在技能栏不豁免）
-        let book = crate::skills::load_from_static(std::path::Path::new("static"));
-        for def in crate::skills::SKILLS.iter() {
-            let src = book.source(def.slot).expect("四模板应全部装配");
-            wat::parse_str(src).unwrap_or_else(|e| panic!("模板 {} 应编译通过：{e}", def.file));
-            assert!(def.lifespan_ticks >= 1, "{} 寿命声明 >=1", def.name);
-            let speed2 = def.vx * def.vx + def.vy * def.vy;
-            assert!(
-                speed2 <= 25.0 * 25.0,
-                "{} 初速模长不得超世界极速 25",
-                def.name
-            );
-        }
+    fn t20_skill_template_record_dedup_default_name_and_driver_skip() {
+        // 模板入列三锚（D-020b）：①同名去重保留首次（重放再落地不占新格）；
+        // ②无名造物默认名=造物#N（计数器递增）且入列；③驾驶层定装弹不入列
+        // 不计数（弹匣不是造物清单——每发默认名不同会绕过去重刷爆 9 格）
+        let dir = temp_players_dir("t20-skill-record");
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        let creator = t20_make_online_player(&dir, &mut map, &mut world, "alice");
+        // ① 命名造物入列；重放再落地同名不占新格（去重保留首次）
+        let mut req = lifespan_spawn_request(creator, 100);
+        req.pos = (20.0, 0.0);
+        req.name = Some("箭塔".to_string());
+        process_spawn_requests(&mut world, &mut map, vec![req.clone()], 1, &[]);
+        assert_eq!(map.skills.count("alice"), 1);
+        let mut replay = req.clone();
+        replay.pos = (22.0, 0.0); // 模拟技能格重放（新出生点）
+        process_spawn_requests(&mut world, &mut map, vec![replay], 2, &[]);
+        assert_eq!(map.skills.count("alice"), 1, "同名去重保留首次，不占新格");
+        // ② 无名造物：默认名=造物#3（序号=该玩家累计 spawn 成功数——①命名占 1、
+        // ②重放占 2，本次无名取 3）+ 入列
+        let mut anon = lifespan_spawn_request(creator, 100);
+        anon.pos = (-20.0, 0.0);
+        process_spawn_requests(&mut world, &mut map, vec![anon], 3, &[]);
+        assert_eq!(map.skills.count("alice"), 2, "无名造物也入列（默认名）");
+        assert_eq!(
+            map.skills.template("alice", 2).unwrap().name,
+            "造物#3",
+            "入列模板名=落名后的默认名（非空串——空串模板重放会穿透所有显示兜底）"
+        );
+        let gid = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation" && e.pos().0 < 0.0)
+            .expect("无名造物应在场");
+        assert_eq!(gid.creation_name(), Some("造物#3"), "默认名=造物#累计序号");
+        // ③ 驾驶层定装弹（driver_spawn）不入列不计数
+        let shell = PendingSpawn {
+            creator,
+            pos: (24.0, 0.0),
+            code: CTRL_SHELL_WAT.to_string(),
+            glyph: ".".to_string(),
+            color: "red".to_string(),
+            radius: 0.15,
+            mass: 1.0,
+            binding: codeworld_core::entity::BINDING_GRACE_OWNER,
+            motion: codeworld_core::entity::MOTION_DYNAMIC,
+            vx: 0.0,
+            vy: 0.0,
+            blob: Vec::new(),
+            field_radius: 0.0,
+            field_gravity_scale: 1.0,
+            field_drag_delta: 0.0,
+            liquid_density: 0.0,
+            liquid_drag: 0.0,
+            link: 0,
+            restitution: 0.0,
+            friction: 0.6,
+            lifespan_ticks: 10000,
+            name: None,
+            driver_spawn: true,
+            fuel_limit: 1_000_000,
+        };
+        process_spawn_requests(&mut world, &mut map, vec![shell], 4, &[]);
+        assert_eq!(map.skills.count("alice"), 2, "定装弹不入列");
+        let shell_e = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation" && e.pos().0 > 23.0)
+            .expect("定装弹应在场");
+        assert_eq!(shell_e.creation_name(), None, "定装弹不落默认名（不占序号）");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 绑定造物弹实体构造（D-018b grace 测试辅助）：deliver 层实体驱动断言用——
@@ -13580,6 +13784,8 @@ mod tests {
             restitution: 0.0,
             friction: 0.6,
             lifespan_ticks: 10000, // R1 强制声明：测试桩长寿值，防到期误杀
+            name: None,
+            driver_spawn: false,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
@@ -13643,6 +13849,8 @@ mod tests {
             restitution: 0.0,
             friction: 0.6,
             lifespan_ticks: 10000, // R1 强制声明：测试桩长寿值，防到期误杀
+            name: None,
+            driver_spawn: false,
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 1, &[shooter]);
@@ -14622,11 +14830,12 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
     f64.const {x} f64.const {y}
@@ -14648,6 +14857,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -14848,6 +15058,8 @@ mod tests {
                 restitution: 0.0,
                 friction: 0.6,
                 lifespan_ticks: 10000, // R1 强制声明：测试桩长寿值，防到期误杀
+                name: None,
+                driver_spawn: false,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 7);
@@ -14887,11 +15099,12 @@ mod tests {
         let escaped = wat_escape(creation_code);
         let spawner = format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (data (i32.const 8500) "{blob_escaped}")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
@@ -14912,6 +15125,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,
@@ -15118,6 +15332,8 @@ mod tests {
                 restitution: 0.0,
                 friction: 0.6,
                 lifespan_ticks: 10000, // R1 强制声明：测试桩长寿值，防到期误杀
+                name: None,
+                driver_spawn: false,
                 fuel_limit: 1_000_000,
             });
         process_spawns(&mut world, &mut map, 1);
@@ -15357,12 +15573,13 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (global $done (mut i32) (i32.const 0))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "T\00")
   (data (i32.const 8256) "cyan\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     (if (i32.eqz (global.get $done))
       (then
@@ -15390,6 +15607,7 @@ mod tests {
         (f64.const 0.0)
         (f64.const 0.6)
         (i32.const 10000)                   ;; lifespan（D-019 R1 强制声明：>=1 才出生；测试桩长寿值防到期误杀）
+        (i32.const 8704)                    ;; name_ptr（D-020b 第 24 参，造物实名）
         (call $spawn)
         (drop))))
   (func (export "life") (result i32) i32.const 1))"#,
@@ -15486,11 +15704,12 @@ mod tests {
         let escaped = wat_escape(relic_code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "R\00")
   (data (i32.const 8256) "gold\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "life") (result i32) i32.const 0)
   (func (export "on_death")
     i32.const 0 i32.const {len}
@@ -15513,6 +15732,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn drop))"#,
             escaped = escaped,
             len = relic_code.len(),
@@ -15538,7 +15758,7 @@ mod tests {
         let shell_escaped = shell_wat_escaped();
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{shell_escaped}\00")
   (data (i32.const 16384) "*\00")
@@ -15568,6 +15788,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn drop))"#,
             shell_len = CTRL_SHELL_WAT.len(),
         )
@@ -15883,11 +16104,12 @@ mod tests {
         let escaped = wat_escape(code);
         format!(
             r#"(module
-  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))
+  (import "env" "spawn" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32 i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{escaped}\00")
   (data (i32.const 8192) "F\00")
   (data (i32.const 8256) "lime\00")
+  (data (i32.const 8704) "Tower\00")
   (func (export "on_tick")
     i32.const 0 i32.const {len}
     f64.const {x} f64.const {y}
@@ -15909,6 +16131,7 @@ mod tests {
     f64.const 0.0
     f64.const 0.6
     i32.const 10000
+    i32.const 8704
     call $spawn drop)
   (func (export "life") (result i32) i32.const 1))"#,
             escaped = escaped,

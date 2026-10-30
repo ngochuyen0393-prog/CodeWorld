@@ -246,3 +246,18 @@
 - 测试：t21 改向锚新契约（危险名解析层放行+缺字段仍拒）；main 新增 create_player_bad_name_rejected_with_event_not_silent（8 例含三缺口名逐例断言事件回执+零落盘）；onboarding 死代码 NameReject::text() 删除（解析层退役后失调用方）
 - 验证：cargo 1229/0/2 全绿（+1）；clippy 新增 0；前端 JS 编译过+createNameOk 13 例 PASS（磁盘实况提取执行）；A 轨机证 smoke-r1fix.js 全过（三缺口名 NAME_BAD_CHAR 回执/合法中文名出生主链无回归/缺字段静默丢弃对照）
 - 文档：api.md 起名规则句 + net-protocol.md 表格行与 v2.6 变更记录同步（解析层不拦名字、权威闸门在 tick 侧）
+
+---
+
+# cc-task 进度：D-020b 技能栏独立空栏起步（技能=我的造物）+ 控制台造物实名播报（2026-10-30 收工）
+
+> t_bdb1da48。土豆看截图抓的两个产品语义问题：①技能栏不该在控制台里且不该是预置四技能——"技能=我创建的造物，没创建前是空的"；②控制台播报用十六进制编号"看不懂"。D-020a 拍板原文"技能=玩家自己的造物模板快捷方式"被实现跑偏成官方预置（开发期测试内容冒充产品内容，#011 同病），本卡归正。
+
+## 落地
+- **R1b 服务端技能语义重定义**：skills.rs 整文件重写——静态四技能表+static/skills/ 四模板退役；新=SkillMemory（按玩家记 spawn 成功的造物模板清单：同名去重保留首次、上限 9 格、格下标查询，内存态随进程存活不持久化）+ SKILL_SLOTS_MAX=9；handle_skill_intents 重写（slot=玩家技能格下标，重放=模板全参+出生点 r+0.7 重定位，限流每实体每拍 1 发不变）；模板快照时机=process_spawn_requests 落地成功那刻（失败品不上栏）；驾驶层定装弹 driver_spawn 位不入列不占序号（弹匣不是造物清单——每发默认名不同会绕过去重刷爆 9 格，自查发现）
+- **R2 造物实名**：spawn 第 24 参 name_ptr（NUL 结尾 UTF-8 ≤16 字符；读失败拒绝/空名超长钳默认"造物#N"=该玩家累计 spawn 成功数；读取窗口 16×4+1 修正——旧 64 字节窗口会把恰 16 个 4 字节字符误判读失败拒绝）；Entity.creation_name（serde default 旧存档兼容）；快照 name 对 creation 系实名优先（缺省回退"造物#短id"，其余 kind 纹丝不动）；born/died 事件带 name、killer 从 UUID 改显示名；造物诞生/击杀/消散日志加 name；名字纯标签不进物理结算
+- **R1 前端**：控制台侧栏 .cskills 删除；#skillbar 世界底部常驻横条（空栏起步虚线格+引导语；快照派生上栏：owner=操控实体且 creation 系按 name 聚合+在场计数角标+上限 9；skillRoster 历史名册——造物全消亡格子保留，入册字段定死保证格序与服务端恒一致；换角清册；数字键 1-9+输入框守卫）；born/died 播报实名（【箭塔】诞生/被击杀（凶手【测试】））；十六进制 id 全面降级 title tooltip（造物列表 color 直插转义顺带补全）
+- **协议 v3.1**：net-protocol.md（name 实名优先/skill slot 1..9/born+died name/killer 显示名/版本史）+ api.md（spawn 表格第 24 参行/技能栏节重写/事件 payload）+ newbie-first-thrower.md 教学 import 升 24 参；players/{field-tower,link-demo,pioneer}.wat + examples/{field-demo,liquid-demo}.wat 升 24 参带实名 data 段（护盾塔/侦察弹/哨塔/水方块）
+- 测试：workspace **1278 绿 0 失败**（基线 1267 净增 11，全 RED→GREEN）；clippy 0；前端 JS 编译 PASS。自审两轮 4 子代理：第 1 轮抓 4 P1（空名模板穿透兜底/格序漂移/换角不清册/color 未转义）全修+第 2 轮确认
+- 冒烟（起服+浏览器三步亲验）留人工——本机权限边界
+

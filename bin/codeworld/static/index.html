@@ -333,8 +333,7 @@
   }
   #console.collapsed { width: 28px; cursor: pointer; }
   #console.collapsed .chead, #console.collapsed .cfilters,
-  #console.collapsed .cunits, #console.collapsed .cstream,
-  #console.collapsed .cskills { display: none; }
+  #console.collapsed .cunits, #console.collapsed .cstream { display: none; }
   #consoleTab { position: absolute; top: 8px; left: 6px; color: #58a6ff; font-size: 14px; cursor: pointer; user-select: none; z-index: 2; }
   .chead { padding: 10px 12px 10px 26px; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
   .chead .dot { width: 10px; height: 10px; border-radius: 50%; background: #3fb950; }
@@ -365,13 +364,48 @@
   .fold { padding: 3px 12px; color: #8b949e; font-size: 11px; cursor: pointer; }
   .fold:hover { color: #e6edf3; }
   .cempty { color: #484f58; padding: 10px 12px; font-size: 12px; }
-  .cskills { border-top: 1px solid #30363d; padding: 8px 12px; display: flex; gap: 8px; flex-shrink: 0; }
-  .skill { flex: 1; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3;
-           padding: 6px 4px; text-align: center; cursor: pointer; user-select: none; font-size: 12px; }
-  .skill:hover { border-color: #58a6ff; }
-  .skill.cool { opacity: 0.4; pointer-events: none; }
-  .skill .sg { font-size: 16px; font-weight: bold; color: #58a6ff; }
-  .skill .sk { color: #484f58; font-size: 10px; }
+  /* ===== D-020b 技能栏（世界画面底部常驻横条，MMO 技能条样式）=====
+     技能=我的造物（从快照派生：owner=操控实体且 creation 系，按 name 聚合）。
+     空栏起步：虚线空格+一格引导文案；上栏格子实底框+实名+计数角标；
+     点击/数字键 1..9 = skill{slot:N} 上行（服务端按格重放同款造物）。
+     容器 pointer-events:none 不吞战场点击，格子 auto 才可点 */
+  #skillbar {
+    position: fixed; bottom: 14px; left: calc((100% - 400px) / 2);
+    transform: translateX(-50%); z-index: 30;
+    display: flex; gap: 8px; align-items: stretch;
+    padding: 8px 10px; pointer-events: none;
+    background: rgba(13, 17, 23, 0.85); border: 1px solid #30363d; border-radius: 10px;
+    font-family: "Segoe UI","Microsoft YaHei",sans-serif;
+  }
+  #skillbar .sbslot {
+    width: 56px; min-height: 56px; pointer-events: auto;
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    color: #e6edf3; cursor: pointer; user-select: none;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 2px; padding: 4px 2px; position: relative; font-size: 11px; line-height: 1.4;
+    text-align: center;
+  }
+  #skillbar .sbslot:hover { border-color: #58a6ff; }
+  #skillbar .sbslot.cool { opacity: 0.4; pointer-events: none; }
+  #skillbar .sbslot .sg { font-size: 20px; font-weight: bold; color: #58a6ff; }
+  #skillbar .sbslot .nm { max-width: 52px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #skillbar .sbslot .key { color: #484f58; font-size: 10px; }
+  #skillbar .sbslot .cnt {
+    position: absolute; top: -6px; right: -6px;
+    background: #58a6ff; color: #0d1117; border-radius: 9px;
+    padding: 0 5px; font-size: 10px; font-weight: bold;
+  }
+  #skillbar .sbempty {
+    width: 56px; min-height: 56px; pointer-events: none;
+    border: 1px dashed #30363d; border-radius: 8px; color: #484f58;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 2px; padding: 4px 2px; font-size: 11px; text-align: center; line-height: 1.4;
+  }
+  #skillbar .sbhint {
+    align-self: center; max-width: 180px; padding: 0 6px;
+    color: #484f58; font-size: 12px; line-height: 1.6;
+  }
+  #console.collapsed ~ #skillbar { left: calc((100% - 28px) / 2); }
 </style>
 </head>
 <body>
@@ -483,8 +517,11 @@
   </div>
   <div class="cunits" id="cUnits"></div>
   <div class="cstream" id="cStream"><div class="cempty">等待事件……（spawn 被拒/诞生/运行错都在这里）</div></div>
-  <div class="cskills" id="cSkills"></div>
 </div>
+<!-- D-020b 技能栏：世界画面底部常驻横条（独立于控制台）。技能=我的造物——
+     从快照派生（owner=操控实体且 creation 系按 name 聚合），空栏起步；
+     点击格子/数字键 1..9 = skill{slot:N} 上行（服务端按格重放同款造物） -->
+<div id="skillbar"></div>
 <script>
 (function () {
   'use strict';
@@ -2283,7 +2320,7 @@
   var cHeadEl = document.getElementById('cHead');
   var cUnitsEl = document.getElementById('cUnits');
   var cStreamEl = document.getElementById('cStream');
-  var cSkillsEl = document.getElementById('cSkills');
+  var cSkillsEl = document.getElementById('skillbar');
   var cAllEl = document.getElementById('cAll');
   // 原因码 -> 人话（与 api.md 码表同源；服务端 reason 字段 SCREAMING_SNAKE）
   var REASON_TEXT = {
@@ -2301,12 +2338,7 @@
     WORLD_FULL: '世界实体上限已满',
     COMPILE_FAILED: '造物 WAT 编不合法'
   };
-  var SKILL_LABELS = [
-    { slot: 1, glyph: 'o', name: '投掷器' },
-    { slot: 2, glyph: '+', name: '飞剑' },
-    { slot: 3, glyph: '#', name: '护盾场' },
-    { slot: 4, glyph: '^', name: '侦察弹' }
-  ];
+  var SKILL_SLOTS_MAX = 9;   // 技能格上限（与服务端 SKILL_SLOTS_MAX 同源；超出的不显示）
   var cFilters = { error: true, warn: true, info: false, log: true }; // info=生命周期灰字默认折叠（按开关展开）
   var cRows = [];            // 消息行 [{cls,tk,src,msg,fold}]（fold=重复折叠锚）
   var cRowsMax = 300;        // 流上限（防长跑刷 DOM；旧的从头部剔）
@@ -2348,8 +2380,11 @@
       consoleToggle();
       return;
     }
-    // 技能快捷键：数字键 1-4（操控输入不经过这里——世界侧按键语义不变）
-    if (ev.key >= '1' && ev.key <= '4') {
+    // 输入框焦点不抢数字键（起名/创建角色面板打字不受技能快捷键干扰）
+    var tag = ev.target && ev.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    // 技能快捷键：数字键 1-9 对应技能格 1..9（D-020b 起格数动态，超 9 格只用鼠标）
+    if (ev.key >= '1' && ev.key <= '9') {
       consoleSendSkill(Number(ev.key));
     }
   });
@@ -2359,27 +2394,74 @@
     if ((cSkillCool[slot] || 0) > now) return; // 冷却格：本拍一发的客户端观感
     cSkillCool[slot] = now + 1000;
     sendMsg({ type: 'skill', slot: slot });
-    consoleRenderSkills();
+    consoleRenderSkills(lastRawEnts || new Map());
   }
 
-  function consoleRenderSkills() {
+  // 技能栏渲染（D-020b 语义：技能=我的造物，从快照派生零新协议）：
+  // 数据源=entities 里 owner===操控实体 id 且 kind=creation/creation_dynamic 的
+  // 实体，按 name 聚合（同名合并一格+在场计数角标），按首次出生顺序排列，上限 9 格。
+  // 历史名册（skillRoster）：首次见到的名字永久记格——造物全部消亡后格子保留
+  //（这是"我的造物模板"不是"活体计数"：角标只算在场数，消亡后格子还在可重放）
+  var skillRoster = [];  // [{name, glyph, color, id, born}] 永不删格（历史模板）
+  var skillSeen = {};    // name -> roster 下标（查重）
+  var skillRosterMe = null; // 名册归属的操控实体 id（换角清册——技能=该玩家的造物）
+  function consoleRenderSkills(ents) {
     var now = performance.now();
+    var me = findControlled(ents);
+    var myId = me ? me.id : null;
+    // 换角清册（登出→选角→进场不刷新页面路径）：技能格=该玩家的造物模板
+    if (myId !== skillRosterMe) {
+      skillRosterMe = myId;
+      skillRoster = [];
+      skillSeen = {};
+    }
+    // 本拍在场计数（按名字聚合我的造物）
+    var byName = {};
+    ents.forEach(function (e) {
+      if (!myId || e.owner !== myId) return;
+      if (e.kind !== 'creation' && e.kind !== 'creation_dynamic') return;
+      var nm = e.name || '造物';
+      if (!byName[nm]) byName[nm] = { count: 0, glyph: e.glyph, color: e.color || '#8b949e', id: e.id, born: e.born_tick || 0 };
+      byName[nm].count++;
+    });
+    // 新见过的名字入名册（已入册的不覆盖任何字段——格序锚=首见 born，保持
+    // 与服务端 SkillMemory 入列序恒一致；后续重 spawn 同名不改变格下标）
+    Object.keys(byName).forEach(function (nm) {
+      if (skillSeen[nm] !== undefined) return;
+      skillSeen[nm] = skillRoster.length;
+      skillRoster.push({ name: nm, glyph: byName[nm].glyph, color: byName[nm].color, id: byName[nm].id, born: byName[nm].born });
+    });
+    // 格序=首次出生拍序（与服务端技能格下标同源：spawn 落地拍序，每实体每拍
+    // 1 发限流保证同玩家不同名造物出生拍必异拍无歧义）；同拍按入册序稳定
+    var shown = skillRoster.slice().sort(function (a, b) { return a.born - b.born; }).slice(0, SKILL_SLOTS_MAX);
     var html = '';
-    for (var i = 0; i < SKILL_LABELS.length; i++) {
-      var s = SKILL_LABELS[i];
-      var cool = (cSkillCool[s.slot] || 0) > now ? ' cool' : '';
-      html += '<div class="skill' + cool + '" data-slot="' + s.slot + '" title="数字键 ' + s.slot + '">' +
-        '<div class="sg">' + s.glyph + '</div><div>' + s.name + '</div><div class="sk">键 ' + s.slot + '</div></div>';
+    for (var i = 0; i < shown.length; i++) {
+      var s = shown[i];
+      var slot = i + 1;
+      var cool = (cSkillCool[slot] || 0) > now ? ' cool' : '';
+      var live = byName[s.name];
+      var cnt = live ? live.count : 0;
+      var title = s.name + '（' + (cnt ? cnt + ' 只在场' : '已消亡，模板保留') + '）· 点击或按 ' + slot + ' 再造一只 · id ' + s.id.slice(0, 8);
+      html += '<div class="sbslot' + cool + '" data-slot="' + slot + '" title="' + attrEscape(title) + '">' +
+        '<div class="sg" style="color:' + attrEscape(s.color) + '">' + escapeHtml(s.glyph) + '</div>' +
+        '<div class="nm">' + escapeHtml(s.name) + '</div>' +
+        (cnt > 1 ? '<div class="cnt">' + cnt + '</div>' : '') +
+        '<div class="key">键 ' + slot + '</div></div>';
+    }
+    if (!shown.length) {
+      // 空栏起步：虚线空格 + 一格引导（空态必须给下一步动作）
+      html += '<div class="sbempty"><div style="font-size:18px">＋</div><div>空技能格</div></div>' +
+        '<div class="sbhint">还没有技能——spawn 你的第一个造物后自动上栏（造物可起名，同名合并一格）</div>';
     }
     cSkillsEl.innerHTML = html;
-    Array.prototype.forEach.call(cSkillsEl.querySelectorAll('.skill'), function (el) {
+    Array.prototype.forEach.call(cSkillsEl.querySelectorAll('.sbslot'), function (el) {
       el.addEventListener('click', function () {
         consoleSendSkill(Number(el.getAttribute('data-slot')));
       });
     });
   }
-  consoleRenderSkills();
-  setInterval(consoleRenderSkills, 500); // 冷却解除重绘（0.5s 粒度足够观感）
+  consoleRenderSkills(new Map());
+  setInterval(function () { consoleRenderSkills(lastRawEnts || new Map()); }, 500); // 冷却解除重绘（0.5s 粒度足够观感）
 
   // ===== D-021d 登录/选角页（常驻：未选角前永远显示，与世界里有无玩家无关）=====
   // 产品形态（土豆定案）：其他游戏每次登录都有这个页面——可以新建角色，可以用
@@ -2728,12 +2810,15 @@
       case 'runtime_error':
         return { cls: 'err', msg: '运行时错误（' + (b.which || '?') + (b.died ? '，已标记死亡' : '，继续跑') + '）：' + (b.error || '') };
       case 'born':
-        return { cls: 'info', msg: '诞生 (' + b.x + ',' + b.y + ') · 声明寿命 ' + b.lifespan_ticks + ' 拍' };
+        // D-020b 实名播报：name=服务端带的实体显示名（v3.1；缺席回退无名字面）
+        return { cls: 'info', msg: '【' + (b.name || '造物') + '】诞生 (' + b.x + ',' + b.y + ') · 声明寿命 ' + b.lifespan_ticks + ' 拍' };
       case 'died':
-        return { cls: 'info', msg: b.cause === 'killed' ? '被击杀（凶手 ' + (b.killer || '?') + '）'
-          : b.cause === 'life_false' ? '代码自杀（life=false）'
-          : b.cause === 'lifespan_expired' ? '寿命到期消散（非击杀无掠夺）'
-          : '运行错死亡' };
+        // D-020b 实名播报：死者 name 服务端带（已出快照实体表 join 不到）；
+        // killer v3.1 起=显示名（玩家名/造物实名，不再是 UUID）
+        return { cls: 'info', msg: b.cause === 'killed' ? '【' + (b.name || '造物') + '】被击杀（凶手【' + (b.killer || '?') + '】）'
+          : b.cause === 'life_false' ? '【' + (b.name || '造物') + '】代码自杀（life=false）'
+          : b.cause === 'lifespan_expired' ? '【' + (b.name || '造物') + '】寿命到期消散（非击杀无掠夺）'
+          : '【' + (b.name || '造物') + '】运行错死亡' };
       case 'player_log':
         return { cls: 'log', msg: 'log: marker ' + b.marker };
       case 'player_joined':
@@ -2803,15 +2888,16 @@
     while (cRows.length > cRowsMax) cRows.shift();
     consoleRenderStream();
     consoleRenderUnits(ents, snap.tick);
+    consoleRenderSkills(ents); // D-020b 技能栏（世界底部横条，从快照派生我的造物）
     createPanelOnSnapshot(snap, ents); // D-021b 进场仪式面板显隐（每帧评估）
   }
 
-  // 实体名解析（造物名=glyph+序号在渲染时补；玩家/已知实体=name）
+  // 实体名解析（D-020b 实名播报：造物=快照 name 实名优先；玩家/已知实体=name；
+  // 查无此实体（死者已出快照实体表）由调用方回退短 id）
   function consoleNameOf(ents, id) {
     if (!id) return null;
     var e = ents.get(id);
     if (!e) return null;
-    if (e.kind === 'creation' || e.kind === 'creation_dynamic') return null; // 造物名在 units 里编号，流里用 glyph
     return e.name || id.slice(0, 8);
   }
 
@@ -2823,8 +2909,10 @@
       if (cSelected && r.entityId !== cSelected) continue;
       if (!cFilters[r.cls]) continue;
       shown++;
-      html += '<div class="row ' + r.cls + '" data-i="' + i + '"><span class="tk">t' + r.tk + '</span>' +
-        '<span class="src">[' + r.src + ']</span><span class="msg">' + escapeHtml(r.msg) + '</span></div>';
+      // D-020b：十六进制 id 降级为悬浮 tooltip（title 属性，开发者按需看）
+      var tip = r.entityId ? ' id ' + r.entityId.slice(0, 8) : '';
+      html += '<div class="row ' + r.cls + '" data-i="' + i + '"' + (tip ? ' title="' + attrEscape(tip) + '"' : '') + '><span class="tk">t' + r.tk + '</span>' +
+        '<span class="src">[' + escapeHtml(r.src) + ']</span><span class="msg">' + escapeHtml(r.msg) + '</span></div>';
       if (r.foldCount > 0) {
         html += '<div class="fold">▸ 又 ' + r.foldCount + ' 次（t' + r.foldFrom + '–t' + r.foldTo + '，同因聚合）</div>';
       }
@@ -2839,7 +2927,7 @@
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  // 造物分组列表（从 entities 派生：我的=owner 指向操控实体）
+  // 造物分组列表（从 entities 派生：我的=owner 指向操控实体；D-020b 实名优先）
   function consoleRenderUnits(ents, tick) {
     var me = findControlled(ents);
     var myId = me ? me.id : null;
@@ -2850,13 +2938,12 @@
       }
     });
     mine.sort(function (a, b) { return a.id < b.id ? -1 : 1; });
-    // 同 glyph 计数命名（哨塔-01 风格）
-    var counters = {};
     var html = '<div class="unit' + (cSelected === null ? ' sel' : '') + '" data-id=""><span class="glyph" style="color:#58a6ff">全</span><span class="nm">全部</span></div>';
     for (var i = 0; i < mine.length; i++) {
       var e = mine[i];
-      counters[e.glyph] = (counters[e.glyph] || 0) + 1;
-      var nm = '造物-' + e.glyph + '-' + String(counters[e.glyph]).padStart(2, '0');
+      // D-020b 实名优先：快照 name=creation_name 实名（服务端缺省已回退造物#短id）；
+      // 十六进制 id 降级为悬浮 tooltip
+      var nm = e.name || '造物';
       var life;
       var lifeSpan = e.lifespan_ticks;
       if (!lifeSpan) {
@@ -2867,13 +2954,14 @@
       }
       var low = lifeSpan && (lifeSpan - (tick - (e.born_tick || 0))) <= 10 ? ' low' : '';
       var badge = cUnitErr[e.id] ? '<span class="badge">' + cUnitErr[e.id] + '</span>' : '';
-      html += '<div class="unit' + (cSelected === e.id ? ' sel' : '') + '" data-id="' + e.id + '">' +
-        '<span class="glyph" style="color:' + (e.color || '#8b949e') + '">' + e.glyph + '</span>' +
-        '<span class="nm">' + nm + '</span>' + badge +
+      var tip = e.name === e.id ? '' : ' id ' + e.id.slice(0, 8);
+      html += '<div class="unit' + (cSelected === e.id ? ' sel' : '') + '" data-id="' + attrEscape(e.id) + '"' + (tip ? ' title="' + attrEscape(tip) + '"' : '') + '>' +
+        '<span class="glyph" style="color:' + attrEscape(e.color || '#8b949e') + '">' + escapeHtml(e.glyph) + '</span>' +
+        '<span class="nm">' + escapeHtml(nm) + '</span>' + badge +
         '<span class="life' + low + '">' + life + '</span></div>';
     }
     if (!mine.length) {
-      html += '<div class="unit"><span class="glyph">-</span><span class="nm" style="color:#484f58">尚无我的造物（按 1-4 试试技能栏）</span></div>';
+      html += '<div class="unit"><span class="glyph">-</span><span class="nm" style="color:#484f58">尚无我的造物（spawn 一只后自动上技能栏）</span></div>';
     }
     cUnitsEl.innerHTML = html;
     Array.prototype.forEach.call(cUnitsEl.querySelectorAll('.unit'), function (el) {
