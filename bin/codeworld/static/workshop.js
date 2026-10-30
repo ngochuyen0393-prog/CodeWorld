@@ -287,7 +287,7 @@
       case 'compile_failed': return (p.name || '?') + '：' + (p.error || '');
       case 'runtime_error': return (p.which || '?') + ' 跑挂了：' + (p.error || '') + (p.died ? '（已标记死亡）' : '');
       case 'spawn_rejected': return (p.reason || '?') + (p.code_hint ? '：' + p.code_hint : '') + ' @(' + Number(p.x).toFixed(1) + ',' + Number(p.y).toFixed(1) + ')';
-      case 'born': return (p.glyph || '?') + ' 出生 @(' + Number(p.x).toFixed(1) + ',' + Number(p.y).toFixed(1) + ')';
+      case 'born': return (p.name || p.glyph || '?') + ' 进场了';
       case 'died': return '死因=' + (p.cause || '?') + (p.killer ? ' 凶手=' + String(p.killer).slice(0, 8) : '');
       case 'player_log': return 'marker=' + (p.marker !== undefined ? p.marker : '?');
       case 'player_joined': return (p.name || '') + ' 进场了';
