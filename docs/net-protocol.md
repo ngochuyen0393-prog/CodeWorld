@@ -24,6 +24,7 @@
   "caption": "tick=42 | A->D dist=2.4 | D shield=7 | alive=3 | ctrl:P",
   "viewport": {"x0": -50.0, "y0": -25.0, "w": 100.0, "h": 50.0},
   "entities": [ ... ],
+  "terrain": {"x0": -50.0, "dx": 0.25, "heights": [0.0, 0.13, ...]},
   "attacks": [ {"attacker": "uuid", "target": "uuid", "x": 15.0, "y": 0.5} ],
   "fields": [ {"x": 15.0, "y": 0.5, "radius": 3.0, "formed": true} ],
   "player_events": [ {"seq": 7, "tick": 42, "entity_id": "uuid", "kind": "born", "x": 40.0, "y": 0.0, "glyph": "塔", "lifespan_ticks": 10000} ],
@@ -37,6 +38,7 @@
 | `caption` | string | 终端第 1 行战况字幕原文（含 `ctrl:` 操控段，#024 三态） |
 | `viewport` | object | 世界坐标→画布坐标换算基准（见 §4） |
 | `entities` | array | 全部存活实体的快照（含残影），按 `id` 字典序**稳定排列** |
+| `terrain` | object | **地形折线投影**（v1.6 期 D-016 落地，本行为补登）：**仅起伏世界携带**（`CODEWORLD_TERRAIN=hills\|mountain` 起），`{x0, dx, heights}`——x0=首采样点世界 x（-50），dx=采样间距格（0.25），heights=各采样点地面高度数组（覆盖全域 401 点，高度∈[-幅度,+幅度]）；**平地世界/旧协议无此字段**（null 缺席省带宽，前端回落 y=0 水平地面）。物理/坐标语义以 crates/core terrain.rs 为权威，快照字段只是前端画地面贴图（草带+泥土剖面）的投影 |
 | `attacks` | array | **本拍攻击命中事件**（v2.0，D-017）：结算成功的刀的三件套，空数组恒有 |
 | `fields` | array | **力场环投影**（v2.3，D-012 可视铁律）：每条=场源坐标+场域半径+成型态；空数组恒有。`formed=false`=成型中（前端画虚线环，给进攻方反应窗），`true`=已成型（实线环）。场源造物本体照常在 entities 里，fields 层只画"可见气流环"（半透明描边，温迪气流环范本） |
 | `player_events` | array | **本拍玩家事件**（v2.5，D-020a，见 §3.3）：增量事件流（新闻不是档案，只随当拍快照发一次），**已按操控玩家过滤**（可见性铁律：只发归属=操控玩家的事件 + 无主 compile_failed；空数组恒有） |
@@ -378,6 +380,12 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
   `create_player` 从"仅操控连接生效"放开为**任意连接生效**（登出后的观战连接
   也要能新建）。产品行为：浏览器连接后、本会话未选角前，永远先见登录/选角页
   （与世界里有无玩家无关）；登出三选一处置语义不变，处置完成落点=登录页
+- **terrain 地形折线补登（D-016 v1.6 期落地；本刀 2026-10-30 D-021c 补登）**：
+  快照顶层 `terrain` 字段（`{x0,dx,heights}` 401 点折线投影）v1.6 期 D-016 已落地
+  并有测试锚定（`snapshot_flat_world_has_no_terrain_field` /
+  `snapshot_mountain_world_carries_terrain_polyline`），但顶层字段表一直漏登——
+  D-021c 世界贴图刀补登 §2 terrain 行（见该行）。**非协议变更**：上行/下行格式
+  零变更，平地世界不发该字段（省带宽）行为不变
 - **角色列表私有化 + 登出落点改横幅（v2.8，D-021e，2026-10-30；下行/上行帧格式零变更，语义收紧）**：
   `player_roster` 列表改为**本机角色档案过滤**——服务器维护 `players/.my-characters`
   （UTF-8 一行一名，create_player/select_player 成功时追加，重复不追加），列表=

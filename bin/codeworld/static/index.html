@@ -1398,13 +1398,114 @@
   window.addEventListener('resize', resize);
   resize();
 
-  var COLOR_BG = '#0e1116';
   var COLOR_GRID = '#1b222d';
-  var COLOR_GROUND = '#4b5666';
+
+  // ---- D-021c 世界贴图（可读性优先）：天空渐变 + 草带 + 泥土剖面 ----
+  // 天空：静态垂直渐变（深夜感：天顶近黑→地平线微亮，衬托地面剪影与实体
+  // 可读性；帧率纪律=零动画）；渐变对象随画布高度缓存，resize 才重建
+  var skyGradCache = null;
+  var skyGradH = 0;
+  function skyGradient() {
+    if (skyGradCache === null || skyGradH !== viewH) {
+      var g = ctx.createLinearGradient(0, 0, 0, viewH);
+      g.addColorStop(0, '#090d14');    // 天顶：近黑
+      g.addColorStop(0.55, '#111a29'); // 中天：深蓝
+      g.addColorStop(1, '#1d2b40');    // 地平线：微亮夜蓝（地面/实体剪影衬托）
+      skyGradCache = g;
+      skyGradH = viewH;
+    }
+    return skyGradCache;
+  }
+
+  // 地形贴图几何：Path2D 按**世界坐标**构建并缓存（泥土剖面闭合面 + 草带开
+  // 线），快照每拍下发新对象，按内容指纹判「真的变了」才重建——每帧只对
+  // 缓存路径 fill/stroke + 换世界→屏幕仿射变换（相机 lerp 下 view 每帧变，
+  // 屏幕坐标缓存必然每帧失效，世界坐标缓存才能做到只在 terrainData 变化时
+  // 重建）；视口外段由画布光栅自动裁剪，无需逐点剔除
+  var terrainPathCache = null;  // {key, geo:{dirt, grass, minH, maxH}}
+  var GRASS_BAND_PX = 2.5;      // 草带描边宽（CSS 像素，任务书 2~3px）
+  var EDGE_EXTEND_W = 60;       // 域外水平延伸（世界单位；镜像 terrain.rs 域外查询钳到域边语义，不悬空不缺口）
+  var DIRT_DEPTH_W = 300;       // 泥土向下填充深度（世界单位；视口底以下画布自然裁掉）
+
+  // 内容指纹：x0/dx/点数 + 首尾与四分位采样高度（同种子每拍重发=命中缓存；
+  // 换种子/换预设必命中其中一个采样点差）
+  function terrainKey(spec) {
+    var hs = spec.heights, n = hs.length;
+    return spec.x0 + '|' + spec.dx + '|' + n + '|' +
+      hs[0] + '|' + hs[n >> 2] + '|' + hs[n >> 1] + '|' + hs[(3 * n) >> 2] + '|' + hs[n - 1];
+  }
+
+  function buildTerrainPaths(spec) {
+    var hs = spec.heights, n = hs.length;
+    var xL = spec.x0 - EDGE_EXTEND_W;                       // 域左外延（沿边高度水平延伸）
+    var xR = spec.x0 + (n - 1) * spec.dx + EDGE_EXTEND_W;   // 域右外延（沿边高度水平延伸）
+    var minH = hs[0], maxH = hs[0];
+    for (var i = 1; i < n; i++) {
+      if (hs[i] < minH) minH = hs[i];
+      if (hs[i] > maxH) maxH = hs[i];
+    }
+    var floorY = minH - DIRT_DEPTH_W;                       // 深底（视口外画布裁掉）
+    // 泥土剖面：左缘外延高度 → 折线全程 → 右缘外延高度 → 深底矩形闭合
+    var dirt = new Path2D();
+    dirt.moveTo(xL, hs[0]);
+    for (var t = 0; t < n; t++) dirt.lineTo(spec.x0 + t * spec.dx, hs[t]);
+    dirt.lineTo(xR, hs[n - 1]);
+    dirt.lineTo(xR, floorY);
+    dirt.lineTo(xL, floorY);
+    dirt.closePath();
+    // 草带：表面折线开放路径（含两端外延，域外沿边高度收尾不悬空）
+    var grass = new Path2D();
+    grass.moveTo(xL, hs[0]);
+    for (var s = 0; s < n; s++) grass.lineTo(spec.x0 + s * spec.dx, hs[s]);
+    grass.lineTo(xR, hs[n - 1]);
+    return { dirt: dirt, grass: grass, minH: minH, maxH: maxH };
+  }
+
+  // 地面绘制（天空→网格之后、水域/实体之前）：平地=起伏特例同一路径——
+  // 无折线数据（terrainData=null 平地/旧协议）退化为「域跨度两点 y=0」规格，
+  // 不写两套分支；剖面颜色随地面高度轻渐变（高处干浅/低处湿深，可读性
+  // 辅助非写实）；草带=暗底衬+草绿面两层描边（2~3px 贴折线）
+  function drawTerrain() {
+    var spec = (terrainData && Array.isArray(terrainData.heights) && terrainData.heights.length > 1)
+      ? terrainData
+      : (vp ? { x0: vp.x0, dx: vp.w, heights: [0, 0] } : null);
+    if (!spec || !view) return;
+    var key = terrainKey(spec);
+    if (!terrainPathCache || terrainPathCache.key !== key) {
+      terrainPathCache = { key: key, geo: buildTerrainPaths(spec) };
+    }
+    var geo = terrainPathCache.geo;
+    // 世界→屏幕仿射（= worldToScreen 的线性版）：缓存路径每帧只换变换
+    var ax = viewW / view.w, ay = viewH / view.h;
+    ctx.save();
+    ctx.transform(ax, 0, 0, -ay, -view.x0 * ax, viewH + view.y0 * ay);
+    // 泥土剖面：垂直渐变沿世界 y 轴（低处湿深棕 → 高处干浅棕）；平地
+    // min==max 时线性渐变两端重合会「画不出」，按中间纯色兜底
+    if (geo.maxH - geo.minH > 1e-9) {
+      var gg = ctx.createLinearGradient(0, geo.minH, 0, geo.maxH);
+      gg.addColorStop(0, '#4a3524'); // 低处：湿深
+      gg.addColorStop(1, '#7d5f3f'); // 高处：干浅
+      ctx.fillStyle = gg;
+    } else {
+      ctx.fillStyle = '#5f4530';     // 平地：两端中间值的纯色剖面
+    }
+    ctx.fill(geo.dirt);
+    // 草带两层描边；线宽除以仿射平均缩放补偿，屏幕上粗细近似恒定
+    var lw = GRASS_BAND_PX / ((ax + ay) / 2);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#2e5c36';     // 草带暗底衬（厚度感）
+    ctx.lineWidth = lw * 1.8;
+    ctx.stroke(geo.grass);
+    ctx.strokeStyle = '#4caf50';     // 草绿表面
+    ctx.lineWidth = lw;
+    ctx.stroke(geo.grass);
+    ctx.restore();
+  }
 
   // 每帧全量重画（60fps × 实体≤64 + 网格一次 path 画完，无压力）
   function draw(state) {
-    ctx.fillStyle = COLOR_BG;
+    ctx.fillStyle = skyGradient(); // D-021c 天空渐变（深夜感；替代旧单色底）
     ctx.fillRect(0, 0, viewW, viewH);
     if (!state) {
       ctx.fillStyle = '#8b949e';
@@ -1435,26 +1536,10 @@
     }
     ctx.stroke();
 
-    // 地面线（D-016）：有地形折线数据时画高度折线（纯线起步定案，无填充/纹理）；
-    // 无数据（平地/旧协议前端兼容）保留旧 y=0 横线行为
-    if (terrainData && Array.isArray(terrainData.heights) && terrainData.heights.length > 1) {
-      var hs = terrainData.heights;
-      ctx.strokeStyle = COLOR_GROUND;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      for (var ti = 0; ti < hs.length; ti++) {
-        var tp = worldToScreen(terrainData.x0 + ti * terrainData.dx, hs[ti]);
-        if (ti === 0) ctx.moveTo(tp.x, tp.y); else ctx.lineTo(tp.x, tp.y);
-      }
-      ctx.stroke();
-    } else if (view.y0 <= 0 && 0 <= view.y0 + view.h) {
-      var gy = Math.round(worldToScreen(0, 0).y) + 0.5;
-      ctx.strokeStyle = COLOR_GROUND;
-      ctx.beginPath();
-      ctx.moveTo(0, gy);
-      ctx.lineTo(viewW, gy);
-      ctx.stroke();
-    }
+    // 地面贴图（D-021c，升级 D-016 裸折线）：草绿表面带 + 泥土剖面 +
+    // 高度渐变（起伏世界）；平地/旧协议（terrainData=null）同一代码路径
+    // 退化为水平地面草带+纯色泥土填充（平面是起伏的特例）
+    drawTerrain();
 
     // 水域矩形（D-009 可视铁律：水域必须可视）：半透明填充矩形，颜色=密度
     // 映射（查表+线性插值——渲染层装饰非世界事实，玩家造 ρ=0.8 的"蓝油"
