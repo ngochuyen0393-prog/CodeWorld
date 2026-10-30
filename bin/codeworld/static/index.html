@@ -218,8 +218,8 @@
   }
   #createPanel .back:hover { color: #c9d1d9; }
   /* D-021d 登录/选角页：本会话未选角前常驻全屏遮罩（与世界里有无玩家无关）。
-     z 序在 createPanel/logoutPanel(5) 之下——新建面板要盖住登录页；出生/登出
-     横幅(4)在 DOM 更后，同层自然盖住它 */
+     z 序在 createPanel(5)/logoutPanel(46，D-022b 起) 之下——新建面板要盖住
+     登录页；出生/登出横幅(4)在 DOM 更后，同层自然盖住它 */
   #loginPanel {
     position: absolute; inset: 0; z-index: 4;
     display: flex; align-items: center; justify-content: center;
@@ -3502,8 +3502,13 @@
     entities.forEach(function (e) { entById[e.id] = e; });
     var controlled = entities.filter(function (e) { return e.kind === 'player' && e.controlled; });
     myEntityId = controlled.length ? controlled[0].id : null;
-    renderRoster();      // 在线圆点逐拍校真
-    renderCreations();
+    // 面板开着才重建列表 DOM（R2 修复：收起态每拍 innerHTML 全量重建纯为屏外；
+    // 数据照常逐拍更新，openPanel 时补渲染。renderEvents 不在此列——事件流
+    // 缓存与折叠必须持续消化，面板关闭也不丢事件）
+    if (panelEl.classList.contains('open')) {
+      renderRoster();      // 在线圆点逐拍校真
+      renderCreations();
+    }
     renderEvents(frame.player_events || []);
   }
 
@@ -3983,8 +3988,12 @@
   function collectBridgeRows() {
     var ports = [];
     Array.prototype.forEach.call(bridgeListEl.querySelectorAll('.wsbridge-row'), function (row) {
+      // Number+整数域钳（R2 修复：parseInt 曾把 "9e2" 截成 9、"9001.5" 静默截成
+      // 9001——非正整数归 0，走 PORT_INVALID 拿到带行号的诚实拒绝）
+      var n = Number(row.querySelector('input[type=number]').value);
+      var port = Number.isInteger(n) && n >= 1 && n <= 2147483647 ? n : 0;
       ports.push({
-        port: parseInt(row.querySelector('input[type=number]').value, 10) || 0,
+        port: port,
         url: (row.querySelector('input[type=url]').value || '').trim(),
         note: (row.querySelector('input[type=text]').value || '').trim()
       });
@@ -4236,8 +4245,12 @@
   }
 
   function setupEditor() {
+    // D-022b R2 修复：Monaco 就绪前若已载入代码（进隐藏 textarea——WS roster
+    // 快于 vendored editor.main 的冷加载竞态窗口），以其为初始值，否则就绪后
+    // 被默认骨架顶掉，Ctrl+S 会拿占位骨架覆盖真档
+    var initial = textareaEl.value || ';; 点左侧角色载入代码；或左侧「新建造物」生成骨架。\n;; Ctrl+S 保存 = 写 players/<名字>.wat，世界下拍进场。\n(module\n  ;; 这里就是你在世界里的身体\n)\n';
     editor = monaco.editor.create(document.getElementById('wsEditorHost'), {
-      value: ';; 点左侧角色载入代码；或左侧「新建造物」生成骨架。\n;; Ctrl+S 保存 = 写 players/<名字>.wat，世界下拍进场。\n(module\n  ;; 这里就是你在世界里的身体\n)\n',
+      value: initial,
       language: 'wat',
       theme: 'vs-dark',
       fontSize: 14,
@@ -4247,6 +4260,7 @@
       renderWhitespace: 'none',
       tabSize: 2
     });
+    textareaEl.value = ''; // 内容已入编辑器（降级路径只在装配前存在，清空防重复）
     monacoReady = true;
     editor.onDidChangeModelContent(function () {
       dirty = true;
@@ -4326,6 +4340,12 @@
   function openPanel() {
     panelEl.classList.add('open');
     boot(); // 首开懒装配；再开即用
+    // 收起期间数据照常逐拍更新但列表 DOM 未重建——打开补一轮（首次打开前
+    // 保留占位文案，不补）；事件流一直在滚无需补
+    if (booted) {
+      renderRoster();
+      renderCreations();
+    }
   }
   function closePanel() {
     panelEl.classList.remove('open');

@@ -949,12 +949,52 @@ struct BridgePortEntryBody {
     note: String,
 }
 
+/// 跨站写防护同源判定（bridge-config 配置写入通道专用）：
+/// 浏览器跨源 POST（免预检简单请求，Content-Type: text/plain 即可）必带 Origin
+/// 头——authority 与 Host 头不一致=恶意页面在改写世界配置，拒（ORIGIN_MISMATCH）。
+/// 无 Origin（curl/同源非浏览器脚本）放行：既有使用形态零回归。
+/// 依据：合法同源页面 fetch POST 的 Origin authority 恒等于页面 Host；
+/// 异源时两者必不同。回环兜底：check_endpoint 限本机回环，爆炸半径已锁死。
+fn origin_header_allowed(origin: Option<&str>, host: Option<&str>) -> bool {
+    let Some(origin) = origin else {
+        return true; // 无 Origin=非浏览器客户端（curl/脚本）或同源 GET 语义，放行
+    };
+    let Some(host) = host else {
+        return false; // 带 Origin 却无 Host：畸形请求，拒
+    };
+    // Origin: "scheme://authority[/path...]" -> 取 authority 与 Host 比对
+    let authority = origin
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    !authority.is_empty() && authority.eq_ignore_ascii_case(host.trim())
+}
+
 /// POST /api/bridge-config（D-022b 工坊外桥可编辑）：JSON {ports:[{port,url,note}]}
-/// -> 整批校验（bridges::check_endpoint 唯一规则源，任一条非法=整单拒绝带 index
-/// 定位）-> 原子写 bridges.json（headers 按 port 合并保留旧凭证）-> vault 装配时
-/// 内存同步（写锁 reload_if_changed——下一拍 bridge_send 按新表解析）。vault 未
-/// 装配也受理（写盘即用，桥下次启用生效）。返回 {ok:true} / {ok:false,reason,index?}。
-async fn bridge_config_save(State(state): State<Arc<WsState>>, body: axum::body::Bytes) -> Response {
+/// -> 同源校验（Origin↔Host，跨站免预检写配置拒）-> 整批校验（bridges::check_endpoint
+/// 唯一规则源，任一条非法=整单拒绝带 index 定位）-> 原子写 bridges.json（headers
+/// 按 port 合并保留旧凭证）-> vault 装配时内存同步（写锁 reload_if_changed——下一拍
+/// bridge_send 按新表解析）。vault 未装配也受理（写盘即用，桥下次启用生效）。
+/// 返回 {ok:true} / {ok:false,reason,index?}。
+async fn bridge_config_save(
+    State(state): State<Arc<WsState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !origin_header_allowed(
+        headers.get("origin").and_then(|v| v.to_str().ok()),
+        headers.get("host").and_then(|v| v.to_str().ok()),
+    ) {
+        tracing::info!(
+            origin = ?headers.get("origin").and_then(|v| v.to_str().ok()),
+            host = ?headers.get("host").and_then(|v| v.to_str().ok()),
+            "[bridge-config] 同源校验未过（ORIGIN_MISMATCH，疑似跨站免预检写配置），拒"
+        );
+        return workshop_reject_json("ORIGIN_MISMATCH");
+    }
     let req: BridgeConfigBody = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -3530,7 +3570,7 @@ mod tests {
                 &vault_path,
             )
             .await;
-        // 四种非法形态：port=0 / https / 非回环 IP / 非回环域名（各自一条 POST）
+        // 五种非法形态：port=0 / https / 非回环 IP / 非回环域名 / URL 端口 0（各自一条 POST）
         let cases = [
             (
                 serde_json::json!({ "ports": [
@@ -3664,6 +3704,77 @@ mod tests {
         shutdown_tx.send(()).ok();
         let _ = server.await;
         let _ = std::fs::remove_file(&vault_path);
+    }
+
+    #[tokio::test]
+    async fn bridge_config_post_rejects_cross_site_origin() {
+        // T6 跨站写防护：恶意页面免预检跨源 POST（Content-Type: text/plain 简单
+        // 请求）必带 Origin 头——与 Host 不一致=拒（ORIGIN_MISMATCH），文件不动；
+        // 同源 Origin 放行；无 Origin（curl/脚本）放行（既有使用形态零回归）
+        let static_dir = temp_static_dir("bc-origin");
+        let players_dir = temp_net_players_dir("bc-origin");
+        let vault_path = temp_bridge_vault_path("bc-origin");
+        let _ = std::fs::remove_file(&vault_path);
+        let vault = Arc::new(std::sync::RwLock::new(crate::bridges::BridgeVault::load(
+            &vault_path,
+        )));
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("bc-origin"),
+                &players_dir,
+                Some(vault),
+                &vault_path,
+            )
+            .await;
+        let body = serde_json::json!({
+            "ports": [ { "port": 1, "url": "http://127.0.0.1:9001", "note": "恶意页不许写" } ]
+        });
+        let raw = serde_json::to_vec(&body).unwrap();
+        // 异源 Origin：拒且零落盘
+        let resp = http_request_with_origin(&addr, "POST", "/api/bridge-config", Some("http://evil.example"), Some(&raw)).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false, "异源 Origin 应拒：{json}");
+        assert_eq!(json["reason"], "ORIGIN_MISMATCH");
+        assert!(!vault_path.exists(), "跨站写不得落盘");
+        // 同源 Origin（authority=Host 头）：放行
+        let same = format!("http://{}", addr);
+        let resp2 = http_request_with_origin(&addr, "POST", "/api/bridge-config", Some(&same), Some(&raw)).await;
+        let json2: serde_json::Value = serde_json::from_slice(http_body(&resp2)).unwrap();
+        assert_eq!(json2["ok"], true, "同源 Origin 应放行：{json2}");
+        assert!(vault_path.exists(), "同源保存应落盘");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&vault_path);
+    }
+
+    /// 带 Origin 头的 HTTP 请求助手（T6 跨站写防护测试用；Host 头=连接地址，
+    /// 与 http_request 同构）
+    async fn http_request_with_origin(
+        addr: &std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        origin: Option<&str>,
+        body: Option<&[u8]>,
+    ) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut req = format!("{method} {path} HTTP/1.0\r\nHost: {addr}\r\n");
+        if let Some(o) = origin {
+            req.push_str(&format!("Origin: {o}\r\n"));
+        }
+        if let Some(b) = body {
+            req.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", b.len()));
+        }
+        req.push_str("\r\n");
+        let mut raw = req.into_bytes();
+        if let Some(b) = body {
+            raw.extend_from_slice(b);
+        }
+        stream.write_all(&raw).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        buf
     }
 
     #[tokio::test]

@@ -102,14 +102,13 @@ pub(crate) struct BridgeEndpointView {
 /// 漂移）。合法返回 Ok(())；非法返回原因码：
 /// - PORT_INVALID：port<=0
 /// - URL_INVALID：https 拒（MVP 客户端只做本机 http，design-bridge §2.8）/
-///   非 http scheme / URL 解析失败（scheme 前缀判定大小写不敏感，但解析步对
-///   原文大小写敏感——"HTTP://" 拒，两处行为一致）/ URL 端口 0 / host 非本机
-///   回环（127.0.0.1/localhost，localhost 大小写不敏感——P2-D 同锁）
+///   非 http scheme / URL 解析失败 / URL 端口 0 / host 非本机回环
+///   （scheme 全链路大小写不敏感——HTTP:// 等价 http://；host localhost 大小写不敏感——P2-D 同锁）
 fn check_endpoint(port: i32, url: &str) -> Result<(), &'static str> {
     if port <= 0 {
         return Err("PORT_INVALID");
     }
-    // scheme 校验（大小写不敏感前缀匹配；解析步对原文大小写敏感——见函数文档）
+    // scheme 校验（check 与解析两步全链路大小写不敏感——见函数文档）
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("https://") {
         return Err("URL_INVALID");
@@ -337,8 +336,14 @@ impl BridgeVault {
 /// 解析 http://host[:port][/path]（手搓最小版：仅本机 http 需要）
 ///
 /// 返回 (host, port, path)；端口缺省 80，路径缺省 "/"；端口非数字 -> None。
+/// scheme 前缀大小写不敏感（HTTP:// 等价 http://——R2 修复：原实现 check 步
+/// 大小写不敏感、解析步敏感，两步矛盾且与浏览器 scheme 语义不符）。
 fn parse_http_url(url: &str) -> Option<(String, u16, String)> {
-    let rest = url.strip_prefix("http://")?;
+    let lower = url.to_ascii_lowercase();
+    if !lower.starts_with("http://") {
+        return None;
+    }
+    let rest = &url[7..]; // ASCII 前缀定长 7，字节切片安全
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, "/".to_string()),
@@ -723,6 +728,11 @@ mod tests {
             "https 拒（MVP 客户端只做本机 http，语义不变）"
         );
         assert_eq!(check_endpoint(1, "ftp://127.0.0.1:9001"), Err("URL_INVALID"), "非 http scheme 拒");
+        assert_eq!(
+            check_endpoint(1, "HTTP://127.0.0.1:9001"),
+            Ok(()),
+            "scheme 全链路大小写不敏感（R2 修复：解析步对齐 check 步，徽标可达/保存一致）"
+        );
         assert_eq!(check_endpoint(1, "127.0.0.1:9001"), Err("URL_INVALID"), "缺 scheme 拒");
         assert_eq!(check_endpoint(1, "http://10.0.0.5:80"), Err("URL_INVALID"), "非回环 host 拒");
         assert_eq!(
