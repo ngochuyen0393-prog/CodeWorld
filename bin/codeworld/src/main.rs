@@ -13,6 +13,7 @@
 
 mod bridges;
 mod config;
+mod creations;
 mod dispose;
 mod events;
 mod input;
@@ -49,6 +50,9 @@ use tracing_subscriber::filter::LevelFilter;
 struct EntitySandboxMap {
     manager: SandboxManager,
     sandboxes: HashMap<EntityId, SandboxHandle>,
+    /// 世界极速（D-023：creations 文件初速钳制律与 import 层同源装配——
+    /// new_with_max_speed 收到什么存什么，账本建账穿参用）
+    max_speed: f64,
     /// 全局可见实体 id 快照（三层感知 Phase A：fill_visible_snapshots 填充，
     /// run_player_code 挂桥用；EntityId(Uuid) 升序）
     visible_ids: Vec<EntityId>,
@@ -200,6 +204,7 @@ impl EntitySandboxMap {
         Ok(Self {
             manager: SandboxManager::new_with_max_speed(max_speed)?,
             sandboxes: HashMap::new(),
+            max_speed,
             visible_ids: Vec::new(),
             visible_positions: Vec::new(),
             probe_fuel: 10_000,
@@ -1370,6 +1375,16 @@ impl EntitySandboxMap {
             pos = ?(players::spawn_x_for(join_index), 0.0),
             "玩家进场：{name}"
         );
+        // D-023 库存建账：进场扫 @carry 清单建技能账本（文件即真相源，格序=清单
+        // 行序，上限 9 由 rebuild→record 收口）。数据源从「spawn 成功自动入列」
+        // 切换为「@carry 清单」——重启不再清零（重启=重扫目录重建）
+        let ledger = crate::creations::build_player_ledger(
+            self.players.dir(),
+            name,
+            self.max_speed,
+            1_000_000,
+        );
+        self.skills.rebuild(name, ledger);
         true
     }
 
@@ -3404,14 +3419,6 @@ fn process_spawn_requests(
         // 所有实体都有，static 造物钉死不吃速度物理（初速仅对 dynamic 造物有
         // 物理意义，api.md 载明）
         entity.set_velocity((req.vx, req.vy));
-        // D-020b 模板提取（先于 req.blob move——PendingSpawn 部分move 前借完）：
-        // 驾驶层定装弹不入列（driver_spawn——弹匣不是造物清单，每发默认名不同
-        // 会绕过去重刷爆 9 格）
-        let template = if req.driver_spawn {
-            None
-        } else {
-            Some(crate::skills::SkillTemplate::from_pending(&req))
-        };
         // 沙箱创建成功才插入世界（失败则实体不落世界，不留无沙箱活体）。
         // D-009 液体造物跳过 create_sandbox（纯布景无沙箱——液体是物理域不是
         // 居民；编译步照常跑=spawn 合法性校验的一部分）
@@ -3434,18 +3441,9 @@ fn process_spawn_requests(
             }
         }
         world.entities.insert(entity_id, entity);
-        // D-020b 技能格模板入列（spawn 落地成功那刻——失败品不上栏）：按产权链
-        // 根玩家记账，同名去重保留首次（重 spawn 同款不占新格），上限 9 在
-        // SkillMemory::record 内判。模板名用已落名的 creation_name（非原始
-        // req.name——无名造物 req.name=None，若入列空串模板，重放会以 Some("")
-        // 穿透所有显示兜底：快照空名/播报"【】诞生"）
-        if !req.driver_spawn {
-            if let (Some(player), Some(tpl)) = (&owner_name, template) {
-                let mut tpl = tpl;
-                tpl.name = creation_name.clone().unwrap_or_default();
-                sandbox_map.skills.record(player, tpl);
-            }
-        }
+        // D-023 注记：spawn 成功**不再**自动入技能栏——入列时机改「@carry 清单」
+        // （进场建账 + 缓存缺失当拍补账，见 handle_skill_intents / spawn_player）。
+        // 造物实名落库（creation_name）与默认名计数（spawn_counters）照旧
         let born_name = world
             .entities
             .get(&entity_id)
@@ -3731,11 +3729,28 @@ fn handle_skill_intents(
         .get(&creator)
         .map(|e| e.code_hash.clone())
         .filter(|name| sandbox_map.players.is_online(name));
+    // D-023 缓存缺失当拍补账守卫：每玩家每次调用至多重建一次（文件 IO 不进热路径
+    // ——按格是键驱动作，重建只在查空格时发生一次）
+    let mut refreshed: Option<String> = None;
     for &slot in slots {
         let Some(player) = &player_name else {
             tracing::warn!(slot, "[skill] 操控实体非在线玩家（无技能格账本），忽略");
             continue;
         };
+        // 查格未命中 → 文件可能刚变（工坊活建即放/删除即失效）：当拍重建一次账本
+        // 再查（文件即真相源，内存账本只是缓存）；仍空=真空格，warn 丢弃
+        if sandbox_map.skills.template(player, slot).is_none()
+            && refreshed.as_deref() != Some(player.as_str())
+        {
+            refreshed = Some(player.clone());
+            let ledger = crate::creations::build_player_ledger(
+                sandbox_map.players.dir(),
+                player,
+                sandbox_map.max_speed,
+                crate::creations::PLAYER_SANDBOX_FUEL,
+            );
+            sandbox_map.skills.rebuild(player, ledger);
+        }
         let Some(tpl) = sandbox_map.skills.template(player, slot) else {
             tracing::warn!(slot, player = %player, "[skill] 空格/越界（该玩家模板清单无此下标），忽略");
             continue;
@@ -10480,10 +10495,12 @@ mod tests {
 
     #[test]
     fn demo_jumper_wat_compiles_and_thrusts() {
-        // players/jumper.wat 演示生物：语法可编译（wat::parse_str），on_tick 跑通
-        // 并排队冲量（与生产加载路径同款 wat::parse_bytes，见 main.rs:594）
-        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../../players/jumper.wat");
-        let wat_text = std::fs::read_to_string(src).expect("应能读到 players/jumper.wat");
+        // jumper.wat 演示生物（D-023 修埋雷：原 players/jumper.wat 是玩家运行时
+        // 数据会被首建归档挪走，副本迁 tests/fixtures，内容=git 基线字节不变）：
+        // 语法可编译（wat::parse_str），on_tick 跑通并排队冲量（与生产加载路径
+        // 同款 wat::parse_bytes，见 main.rs:594）
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/jumper.wat");
+        let wat_text = std::fs::read_to_string(src).expect("应能读到 tests/fixtures/jumper.wat");
         let wasm_bytes = wat::parse_bytes(wat_text.as_bytes()).expect("jumper.wat 应编译通过");
         let mgr = SandboxManager::new().unwrap();
         let mut handle = mgr
@@ -11436,12 +11453,14 @@ mod tests {
     /// 素 life 模块（链测试通用占位代码——无 on_tick 无副作用）
     const LIFE_WAT_MAIN: &str = r#"(module (func (export "life") (result i32) i32.const 1))"#;
 
-    /// 链演示守卫（G4）：players/link-demo.wat 真文件——全文作为玩家代码走
+    /// 链演示守卫（G4）：tests/fixtures/link-demo.wat（D-023 修埋雷——原
+    /// players/link-demo.wat 是玩家运行时数据，会被首建归档挪走导致测试编译
+    /// 炸；副本迁到测试夹具目录，内容=git 基线字节不变）——全文作为玩家代码走
     /// 真实管线：语法坏/20 参签名漂移/link 参数写错都会在此红（示例即文档，
     /// field-demo 守卫同款哲学）
     #[test]
     fn link_demo_example_compiles_and_flies_kite() {
-        const LINK_DEMO_WAT: &str = include_str!("../../../players/link-demo.wat");
+        const LINK_DEMO_WAT: &str = include_str!("../tests/fixtures/link-demo.wat");
         let mut world = WorldState::new();
         let creator = EntityId(Uuid::from_u128(65));
         world
@@ -11882,8 +11901,10 @@ mod tests {
         // ① 立塔拍：塔立在 +5 格 (35,0)，P 本拍不移动（留 (30,0)）
         // ② 之后每拍东移一步（31→32→33→34）
         // ③ T 全程留在原地站岗；P 走到塔前 (34,0) 被占位制挡下（移动被挡，不再连体推挤）
-        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../../players/pioneer.wat");
-        let wat_text = std::fs::read_to_string(src).expect("应能读到 players/pioneer.wat");
+        //（D-023 修埋雷：pioneer.wat 副本迁 tests/fixtures——players/ 是玩家运行时
+        // 数据会被首建归档挪走；内容=git 基线字节不变）
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/pioneer.wat");
+        let wat_text = std::fs::read_to_string(src).expect("应能读到 tests/fixtures/pioneer.wat");
         let dir = temp_players_dir("pioneer-smoke");
         std::fs::write(dir.join("pioneer.wat"), wat_text).unwrap();
         let mut world = WorldState::new();
@@ -13433,29 +13454,44 @@ mod tests {
     }
 
     #[test]
-    fn t20_skill_intent_replays_player_template_and_rate_limits() {
-        // 技能栏端到端（D-020b 语义，验收 3/4 闭环）：玩家 spawn 成功造物→模板
-        // 自动入列→按格上行重放排队（出生点=操控实体旁重定位，带实名）；同拍
-        // 第二按=RATE_LIMITED 事件；空格/越界丢弃
-        let dir = temp_players_dir("t20-skill-replay");
+    fn t23_skill_intent_replays_carried_template_and_rate_limits() {
+        // 技能栏端到端（D-023 语义，验收 3 闭环）：@carry 清单进场建账（格序=清单
+        // 行序）→ 按格上行重放排队（出生点=操控实体旁重定位，带实名/文件外观）；
+        // 同拍第二按=RATE_LIMITED 事件；空格/越界丢弃
+        let dir = temp_players_dir("t23-skill-replay");
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
-        let creator = t20_make_online_player(&dir, &mut map, &mut world, "alice");
-        // 玩家代码 spawn 一只命名造物（模板入列数据源）
-        let mut req = lifespan_spawn_request(creator, 100);
-        req.pos = (20.0, 0.0);
-        req.name = Some("箭塔".to_string());
-        process_spawn_requests(&mut world, &mut map, vec![req.clone()], 1, &[]);
-        assert_eq!(map.skills.count("alice"), 1, "spawn 成功应自动入列");
+        // 文件即真相源：creations/箭塔.wat + players/alice.wat 带 @carry
+        //（嵌套目录隔离：temp 根/players + temp 根/creations，dir_for 按 parent 推导）
+        let players_dir = dir.join("players");
+        std::fs::create_dir_all(&players_dir).unwrap();
+        let cdir = crate::creations::dir_for(&players_dir);
+        std::fs::create_dir_all(&cdir).unwrap();
+        let creation_body = "(module (func (export \"life\") (result i32) i32.const 1))";
+        std::fs::write(
+            cdir.join("箭塔.wat"),
+            format!(";; §箭塔\n;; spawn 0.5 1.0 0 0 0 0 0 1.0 0 0 0 0 0 0.6 10000\n\n{creation_body}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            players_dir.join("alice.wat"),
+            format!(";; @carry 箭塔\n{EXAMPLE_PLAYER_WAT}\n"),
+        )
+        .unwrap();
+        map.players = PlayerDirectory::new(&players_dir);
+        assert!(map.spawn_player(&mut world, "alice", 1), "玩家应进场");
+        let creator = find_player_id(&world, "alice");
+        assert_eq!(map.skills.count("alice"), 1, "进场扫 @carry 应建账一格");
         // 按格 1 重放：排队一发模板造物（出生点=alice 旁重定位）
         handle_skill_intents(&world, &mut map, creator, &[1], 5);
-        assert_eq!(map.skill_spawns.len(), 1, "按 1 应重放一格（我的造物模板）");
+        assert_eq!(map.skill_spawns.len(), 1, "按 1 应重放一格（携带的造物模板）");
         let replay = &map.skill_spawns[0];
         assert_eq!(replay.creator, creator);
-        assert_eq!(replay.name.as_deref(), Some("箭塔"), "重放带实名");
-        assert_eq!(replay.code, req.code, "模板代码原样重放");
-        assert_eq!(replay.glyph, req.glyph, "外观声明重放");
-        assert!(replay.lifespan_ticks >= 1, "重放寿命声明 >=1（D-019 R1 不豁免）");
+        assert_eq!(replay.name.as_deref(), Some("箭塔"), "重放带实名（文件名锚）");
+        assert_eq!(replay.code, format!("{creation_body}\n"), "模板代码=文件代码体");
+        assert_eq!(replay.glyph, "箭", "文件造物外观=名字首字符");
+        assert_eq!(replay.color, "gray", "文件造物颜色=gray 定案");
+        assert_eq!(replay.lifespan_ticks, 10000, "重放寿命=spawn 行声明");
         // 同拍第二按 = 每实体每拍 1 发限流（事件回执 RATE_LIMITED）
         handle_skill_intents(&world, &mut map, creator, &[1], 5);
         assert_eq!(map.skill_spawns.len(), 1, "限流：不再追加排队");
@@ -13479,42 +13515,71 @@ mod tests {
     }
 
     #[test]
-    fn t20_skill_template_record_dedup_default_name_and_driver_skip() {
-        // 模板入列三锚（D-020b）：①同名去重保留首次（重放再落地不占新格）；
-        // ②无名造物默认名=造物#N（计数器递增）且入列；③驾驶层定装弹不入列
-        // 不计数（弹匣不是造物清单——每发默认名不同会绕过去重刷爆 9 格）
-        let dir = temp_players_dir("t20-skill-record");
+    fn t23_skill_cache_miss_rebuilds_ledger_same_tick() {
+        // 活建即放（B.1→B.2 验收链）：角色已在线，工坊事后写入 creations+@carry
+        // → 账本还是旧的（进场时清单空）→ 按格=缓存缺失 → 当拍重建一次账本 →
+        // 命中新模板照常重放（文件即真相源）
+        let dir = temp_players_dir("t23-skill-refresh");
+        let mut world = WorldState::new();
+        let mut map = test_sandbox_map();
+        //（嵌套目录隔离同上）
+        let players_dir = dir.join("players");
+        std::fs::create_dir_all(&players_dir).unwrap();
+        std::fs::write(players_dir.join("alice.wat"), EXAMPLE_PLAYER_WAT).unwrap();
+        map.players = PlayerDirectory::new(&players_dir);
+        assert!(map.spawn_player(&mut world, "alice", 1), "玩家应进场");
+        assert_eq!(map.skills.count("alice"), 0, "进场时无 @carry=空账");
+        let creator = find_player_id(&world, "alice");
+        // 角色在线期间：creations 文件出现 + 角色文件追加 @carry（工坊保存语义）
+        let cdir = crate::creations::dir_for(&players_dir);
+        std::fs::create_dir_all(&cdir).unwrap();
+        std::fs::write(
+            cdir.join("炮台.wat"),
+            ";; §炮台\n;; spawn 0.5 1.0 0 0 0 0 0 1.0 0 0 0 0 0 0.6 5000\n\n(module (func (export \"life\") (result i32) i32.const 1))\n",
+        )
+        .unwrap();
+        let (new_text, _) = crate::creations::append_carry_line(EXAMPLE_PLAYER_WAT, "炮台");
+        std::fs::write(players_dir.join("alice.wat"), new_text).unwrap();
+        // 按格 1：旧账没有 → 补账一次 → 命中
+        handle_skill_intents(&world, &mut map, creator, &[1], 5);
+        assert_eq!(map.skills.count("alice"), 1, "补账后应有一格");
+        assert_eq!(map.skill_spawns.len(), 1, "活建即放：当拍重放成功");
+        assert_eq!(map.skill_spawns[0].name.as_deref(), Some("炮台"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t23_spawn_default_naming_and_driver_skip_unchanged() {
+        // 造物落名语义（D-023 注记：spawn 不再自动入列，本测试收敛到落名本身）：
+        // ①命名造物落实名；②无名造物默认名=造物#N（计数器递增）；③驾驶层定装弹
+        // 不落名不占序号（弹匣不是造物清单）
+        let dir = temp_players_dir("t23-spawn-naming");
         let mut world = WorldState::new();
         let mut map = test_sandbox_map();
         let creator = t20_make_online_player(&dir, &mut map, &mut world, "alice");
-        // ① 命名造物入列；重放再落地同名不占新格（去重保留首次）
+        // ① 命名造物落实名（不自动入技能栏——入列时机=@carry 清单）
         let mut req = lifespan_spawn_request(creator, 100);
         req.pos = (20.0, 0.0);
         req.name = Some("箭塔".to_string());
-        process_spawn_requests(&mut world, &mut map, vec![req.clone()], 1, &[]);
-        assert_eq!(map.skills.count("alice"), 1);
-        let mut replay = req.clone();
-        replay.pos = (22.0, 0.0); // 模拟技能格重放（新出生点）
-        process_spawn_requests(&mut world, &mut map, vec![replay], 2, &[]);
-        assert_eq!(map.skills.count("alice"), 1, "同名去重保留首次，不占新格");
-        // ② 无名造物：默认名=造物#3（序号=该玩家累计 spawn 成功数——①命名占 1、
-        // ②重放占 2，本次无名取 3）+ 入列
+        process_spawn_requests(&mut world, &mut map, vec![req], 1, &[]);
+        assert_eq!(map.skills.count("alice"), 0, "D-023：spawn 不再自动入列");
+        let named = world
+            .entities
+            .values()
+            .find(|e| e.code_hash == "creation")
+            .expect("命名造物应在场");
+        assert_eq!(named.creation_name(), Some("箭塔"), "实名落库照旧");
+        // ② 无名造物：默认名=造物#2（序号=该玩家累计 spawn 成功数——①占 1）
         let mut anon = lifespan_spawn_request(creator, 100);
         anon.pos = (-20.0, 0.0);
         process_spawn_requests(&mut world, &mut map, vec![anon], 3, &[]);
-        assert_eq!(map.skills.count("alice"), 2, "无名造物也入列（默认名）");
-        assert_eq!(
-            map.skills.template("alice", 2).unwrap().name,
-            "造物#3",
-            "入列模板名=落名后的默认名（非空串——空串模板重放会穿透所有显示兜底）"
-        );
         let gid = world
             .entities
             .values()
             .find(|e| e.code_hash == "creation" && e.pos().0 < 0.0)
             .expect("无名造物应在场");
-        assert_eq!(gid.creation_name(), Some("造物#3"), "默认名=造物#累计序号");
-        // ③ 驾驶层定装弹（driver_spawn）不入列不计数
+        assert_eq!(gid.creation_name(), Some("造物#2"), "默认名=造物#累计序号");
+        // ③ 驾驶层定装弹（driver_spawn）不落名不占序号
         let shell = PendingSpawn {
             creator,
             pos: (24.0, 0.0),
@@ -13542,7 +13607,6 @@ mod tests {
             fuel_limit: 1_000_000,
         };
         process_spawn_requests(&mut world, &mut map, vec![shell], 4, &[]);
-        assert_eq!(map.skills.count("alice"), 2, "定装弹不入列");
         let shell_e = world
             .entities
             .values()

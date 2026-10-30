@@ -1,14 +1,15 @@
-//! 技能栏（D-020b 语义重定义，t_bdb1da48）：技能=玩家自己造物的服务器侧记忆，
-//! 不再是静态表。D-020a 的"预置四模板"（投掷器/飞剑/护盾场/侦察弹）退役——
-//! 开发期测试内容冒充产品内容（违 #011"开局四生物"同病）；D-020a 拍板原文
-//! "技能=玩家自己的造物模板快捷方式"，本模块回归该语义。
+//! 技能栏（D-020b 立项 / D-023 数据源切换）：技能=玩家携带造物的服务器侧记忆。
+//! D-020a 的"预置四模板"（投掷器/飞剑/护盾场/侦察弹）已退役——开发期测试内容
+//! 冒充产品内容（违 #011"开局四生物"同病）；D-020b 回归"技能=玩家自己的造物"；
+//! D-023 再把入列时机从「spawn 成功自动入列」改为「@carry 清单进场建账」——
+//! 文件即真相源（creations/*.wat），内存账本只是编译期缓存+复放加速，重启重扫
+//! 目录重建（不再清零）。
 //!
-//! 数据链：玩家 spawn 成功的造物在阶段二落地那刻自动入列（同名去重保留首次，
-//! 按首次出生顺序排列，上限 9 格）；玩家按技能格上行 `skill{slot:N}`，服务端
-//! 取出该格模板重新 spawn（出生点=操控实体旁重定位，#030 预检/上限/编译全适用）。
-//! 账本随进程存活不持久化——重启=空栏重来，与会话令牌 v2.9 同生命周期（api.md 载明）。
+//! 数据链：角色进场（spawn_player）扫 players/<名>.wat 的 @carry 清单 → 逐名读
+//! creations/<名>.wat → rebuild 建账（格序=清单行序，上限 9）；玩家按技能格上行
+//! `skill{slot:N}`，服务端取出该格模板重新 spawn（出生点=操控实体旁重定位，
+//! #030 预检/上限/编译全适用；缓存缺失当拍补账一次——工坊活建即放）。
 
-use codeworld_arena::sandbox::PendingSpawn;
 use std::collections::HashMap;
 
 /// 技能格数上限（上行 slot=1..=9；数据源派生的自然上限——超出的不显示不入列，
@@ -60,33 +61,8 @@ pub(crate) struct SkillTemplate {
 }
 
 impl SkillTemplate {
-    /// 从 PendingSpawn 提取模板（阶段二落地成功那刻调用——import 层拒绝/阶段二
-    /// 作废的失败品不进此路径，正确：失败品不上栏）
-    pub(crate) fn from_pending(req: &PendingSpawn) -> Self {
-        Self {
-            name: req.name.clone().unwrap_or_default(),
-            code: req.code.clone(),
-            glyph: req.glyph.clone(),
-            color: req.color.clone(),
-            radius: req.radius,
-            mass: req.mass,
-            binding: req.binding,
-            motion: req.motion,
-            vx: req.vx,
-            vy: req.vy,
-            blob: req.blob.clone(),
-            field_radius: req.field_radius,
-            field_gravity_scale: req.field_gravity_scale,
-            field_drag_delta: req.field_drag_delta,
-            liquid_density: req.liquid_density,
-            liquid_drag: req.liquid_drag,
-            link: req.link,
-            restitution: req.restitution,
-            friction: req.friction,
-            lifespan_ticks: req.lifespan_ticks,
-            fuel_limit: req.fuel_limit,
-        }
-    }
+    // D-023 注记：from_pending（PendingSpawn→模板提取）随「spawn 成功自动入列」
+    // 退役——模板唯一来源=creations 文件解析（creations::to_template）
 }
 
 /// 按玩家的技能格账本（服务端内存态：每玩家一个模板清单，格下标=清单下标+1）
@@ -134,6 +110,16 @@ impl SkillMemory {
         self.per_player
             .get(player)?
             .get((slot as usize).checked_sub(1)?)
+    }
+
+    /// 全量重建账本（D-023 数据源切换：进场扫 @carry 清单 / 缓存缺失当拍补账）：
+    /// 清旧账 → 逐条 record（同名去重/上限 9 由 record 收口——清单超 9 前 9 上栏）。
+    /// 文件即真相源，内存账本只是缓存
+    pub(crate) fn rebuild(&mut self, player: &str, templates: Vec<SkillTemplate>) {
+        self.per_player.remove(player);
+        for tpl in templates {
+            self.record(player, tpl);
+        }
     }
 
     /// 该玩家当前格数（测试/调试观测口；生产链路 record 日志自带 slot 序号）
@@ -226,5 +212,23 @@ mod tests {
         assert!(mem.template("alice", 0).is_none(), "slot 0 非法");
         assert!(mem.template("alice", 10).is_none(), "slot 10 越界");
         assert!(mem.template("bob", 1).is_none(), "无账本玩家=None");
+    }
+
+    #[test]
+    fn t_d023_rebuild_replaces_ledger_from_carry_list() {
+        // D-023 进场建账语义：rebuild=清旧账全量重建（格序=清单行序）；
+        // @carry 超 9 个 → 前 9 上栏（上限由 record 收口，第 10 个 INFO 拒绝）
+        let mut mem = SkillMemory::default();
+        mem.record("alice", tpl("旧模板"));
+        mem.rebuild("alice", vec![tpl("甲"), tpl("乙")]);
+        assert_eq!(mem.count("alice"), 2, "旧账清掉，按清单重建");
+        assert_eq!(mem.template("alice", 1).unwrap().name, "甲");
+        let ten: Vec<SkillTemplate> = (1..=10).map(|i| tpl(&format!("造物{i}"))).collect();
+        mem.rebuild("bob", ten);
+        assert_eq!(mem.count("bob"), 9, "@carry 超 9 → 前 9 上栏");
+        assert_eq!(mem.template("bob", 9).unwrap().name, "造物9");
+        // 空清单重建=清账（角色文件没了/清单空了，旧格不留）
+        mem.rebuild("bob", Vec::new());
+        assert_eq!(mem.count("bob"), 0, "空清单=清账");
     }
 }

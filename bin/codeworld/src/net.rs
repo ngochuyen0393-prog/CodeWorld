@@ -465,6 +465,9 @@ pub(crate) struct WsState {
     /// 玩家目录路径（D-022 工坊 HTTP 通道：/api/player-code 读写删 players/<名>.wat
     ///——工坊保存=写文件=世界目录轮询自动接手，零新进场协议）
     pub(crate) players_dir: std::path::PathBuf,
+    /// 造物目录路径（D-023 造物文件通道：/api/creation-code 读写删
+    /// creations/<名>.wat；DELETE 联动清全部 players/*.wat 的 @carry 行）
+    pub(crate) creations_dir: std::path::PathBuf,
     /// 外桥保险库只读句柄（D-022 GET /api/bridge-config 端口列表只读展示；
     /// None=桥未启用/未装配——GET 回 enabled:false 空列表。与主循环共享同一把
     /// RwLock，bridges.json mtime 热重载两边看同一份账）
@@ -540,6 +543,8 @@ pub(crate) fn init(
         avatars,
         roster: roster.clone(),
         players_dir: std::path::PathBuf::from(&config.players_dir),
+        // D-023：creations/ 与 players/ 同级（单一推导源 creations::dir_for）
+        creations_dir: crate::creations::dir_for(std::path::Path::new(&config.players_dir)),
         bridge_vault,
         // D-022b：登记表路径与 BridgeOutbox 装配同源（config.bridge_config，
         // 默认 bridges.json 与 codeworld.db 同级落世界工作目录）
@@ -638,6 +643,14 @@ pub(crate) async fn serve(
             post(player_code_write)
                 .get(player_code_read)
                 .delete(player_code_delete),
+        )
+        // D-023 造物文件通道：保存=写 creations/<名>.wat+当前角色清单追加、
+        // 读取=编辑器加载、删除=删文件+全角色清单同名行联动移除
+        .route(
+            "/api/creation-code",
+            post(creation_code_write)
+                .get(creation_code_read)
+                .delete(creation_code_delete),
         )
         .route("/api/bridge-config", get(bridge_config).post(bridge_config_save))
         .layer(axum::extract::DefaultBodyLimit::max(
@@ -909,6 +922,215 @@ async fn player_code_delete(
             workshop_reject_json("IO_ERROR")
         }
     }
+}
+
+// ---- D-023 造物文件 HTTP 通道（/api/creation-code 三动作）----
+
+/// POST /api/creation-code 请求体（JSON：造物名 + 造物文件全文——§头+spawn 行+代码体）
+#[derive(Debug, Deserialize)]
+struct CreationCodeBody {
+    name: String,
+    code: String,
+}
+
+/// POST /api/creation-code（D-023 工坊保存=造物入库）：JSON {name, code=全文} ->
+/// sanitize_name -> 64KB 护栏 -> 解析校验（坏头整单拒绝零落盘）-> 写
+/// creations/<名>.wat（原文原样，所见即所编）-> me.txt 声明的当前角色
+/// players/<角色>.wat 顶部追加 `;; @carry <名>`（去重；无 me 声明=只写文件）。
+/// 返回 {ok:true} / {ok:false,reason}。
+async fn creation_code_write(
+    State(state): State<Arc<WsState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req: CreationCodeBody = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "[creations] 保存请求 JSON 解析失败（BAD_JSON）");
+            return workshop_reject_json("BAD_JSON");
+        }
+    };
+    let name = match crate::onboarding::sanitize_name(&req.name) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::info!(reason = e.wire(), "[creations] 保存拒绝：名字闸门");
+            return workshop_reject_json(e.wire());
+        }
+    };
+    if req.code.len() > crate::creations::CREATION_FILE_MAX_BYTES {
+        tracing::info!(len = req.code.len(), "[creations] 保存拒绝：文件超 64KB 上限");
+        return workshop_reject_json("CODE_TOO_LONG");
+    }
+    // 解析校验（坏头整单拒绝零落盘——与"出生重叠拒绝+日志"同款严格哲学）。
+    // max_speed 取默认值即可：校验只判结构（烂数/寿命<1），域钳制在账本建账时
+    // 按世界实配重做，保存不改动玩家原文（所见即所编）
+    if let Err(e) = crate::creations::parse_creation_file(
+        &req.code,
+        crate::config::Config::default().max_speed,
+    ) {
+        tracing::info!(name = %name, reason = e.wire(), "[creations] 保存拒绝：坏头文件");
+        return workshop_reject_json(e.wire());
+    }
+    let path = state.creations_dir.join(format!("{name}.wat"));
+    // 目录兜底创建（creations/ 首次使用时还不存在）
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, req.code.as_bytes()) {
+        tracing::warn!(error = %e, path = %path.display(), "[creations] 保存写盘失败（IO_ERROR）");
+        return workshop_reject_json("IO_ERROR");
+    }
+    tracing::info!(
+        name = %name,
+        len = req.code.len(),
+        "[creations] 造物文件已保存（工坊保存→文件落地）"
+    );
+    // § 名与文件名不一致：文件名为锚，INFO 对账（不拒绝不改动）
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(cf) = crate::creations::parse_creation_file(
+            &text,
+            crate::config::Config::default().max_speed,
+        ) {
+            if cf.name != name {
+                tracing::info!(file = %name, header = %cf.name, "[creations] § 名与文件名不一致（文件名为锚）");
+            }
+        }
+    }
+    // 追加到 me.txt 声明的当前角色（工坊入库=写文件+追加 carry）；
+    // 无 me 声明/角色文件不在=只写文件（库存管理与操控声明解耦）
+    let me = crate::players::read_me_declaration(None, &state.players_dir);
+    match me {
+        Some(player) if state.players_dir.join(format!("{player}.wat")).exists() => {
+            let ppath = state.players_dir.join(format!("{player}.wat"));
+            match std::fs::read_to_string(&ppath) {
+                Ok(text) => {
+                    let (new_text, changed) =
+                        crate::creations::append_carry_line(&text, &name);
+                    if changed {
+                        match std::fs::write(&ppath, new_text) {
+                            Ok(()) => tracing::info!(
+                                player = %player,
+                                creation = %name,
+                                "[carry] 新建造物已追加到当前角色清单"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                player = %player,
+                                "[carry] 清单追加写盘失败（造物文件已入库，carry 未加）"
+                            ),
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, player = %player, "[carry] 角色文件读失败，未追加清单"),
+            }
+        }
+        Some(player) => {
+            tracing::info!(player = %player, "[carry] 声明的角色文件不存在，未追加清单");
+        }
+        None => {
+            tracing::info!("[carry] 无 me 声明，造物已入库但未挂到角色（下次保存带 me 声明即可）");
+        }
+    }
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+/// GET /api/creation-code?name=（D-023 工坊加载造物）：读 creations/<名>.wat 全文
+/// -> {ok,code} / NAME_UNKNOWN / NAME_* / CODE_TOO_LONG（64KB metadata 护栏）/ IO_ERROR。
+async fn creation_code_read(
+    State(state): State<Arc<WsState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(raw) = params.get("name") else {
+        return workshop_reject_json("NAME_EMPTY");
+    };
+    let name = match crate::onboarding::sanitize_name(raw) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::info!(reason = e.wire(), "[creations] 读取拒绝：名字闸门");
+            return workshop_reject_json(e.wire());
+        }
+    };
+    let path = state.creations_dir.join(format!("{name}.wat"));
+    // 64KB 读护栏（与写路径对称：落盘超限先拒，不整读进内存/响应体）
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > crate::creations::CREATION_FILE_MAX_BYTES as u64 {
+            tracing::info!(name = %name, len = meta.len(), "[creations] 读取拒绝：文件超上限（CODE_TOO_LONG）");
+            return workshop_reject_json("CODE_TOO_LONG");
+        }
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(code) => Json(serde_json::json!({ "ok": true, "code": code })).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(name = %name, "[creations] 读取拒绝：无此造物（NAME_UNKNOWN）");
+            workshop_reject_json("NAME_UNKNOWN")
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "[creations] 读取失败（IO_ERROR）");
+            workshop_reject_json("IO_ERROR")
+        }
+    }
+}
+
+/// DELETE /api/creation-code?name=（D-023 删除造物=删文件+清单联动）：删
+/// creations/<名>.wat，再扫全部 players/*.wat 移除同名 `;; @carry` 行（单文件
+/// 读写失败 WARN 跳过继续清其余——清单清理尽力而为，删除本体失败即 NAME_UNKNOWN/
+/// IO_ERROR）。返回 {ok:true,cleared:N}（N=移除了几份清单行）。
+async fn creation_code_delete(
+    State(state): State<Arc<WsState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(raw) = params.get("name") else {
+        return workshop_reject_json("NAME_EMPTY");
+    };
+    let name = match crate::onboarding::sanitize_name(raw) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::info!(reason = e.wire(), "[creations] 删除拒绝：名字闸门");
+            return workshop_reject_json(e.wire());
+        }
+    };
+    let path = state.creations_dir.join(format!("{name}.wat"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(name = %name, "[creations] 删除拒绝：无此造物（NAME_UNKNOWN）");
+            return workshop_reject_json("NAME_UNKNOWN");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "[creations] 删除失败（IO_ERROR）");
+            return workshop_reject_json("IO_ERROR");
+        }
+    }
+    tracing::info!(name = %name, "[creations] 造物文件已删除，开始清单联动清理");
+    // 清单联动：扫全部 players/*.wat，移除同名 @carry 行（尽力而为，逐文件容错）
+    let mut cleared = 0u32;
+    if let Ok(entries) = std::fs::read_dir(&state.players_dir) {
+        for entry in entries.flatten() {
+            let ppath = entry.path();
+            if !ppath.extension().map(|e| e == "wat").unwrap_or(false) {
+                continue;
+            }
+            let text = match std::fs::read_to_string(&ppath) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %ppath.display(), "[carry] 清单联动：角色文件读失败跳过");
+                    continue;
+                }
+            };
+            let (new_text, changed) = crate::creations::remove_carry_line(&text, &name);
+            if changed {
+                match std::fs::write(&ppath, new_text) {
+                    Ok(()) => {
+                        cleared += 1;
+                        tracing::info!(player = ?ppath.file_stem().map(|s| s.to_string_lossy().to_string()), creation = %name, "[carry] 清单同名行已移除");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %ppath.display(), "[carry] 清单联动：写回失败跳过");
+                    }
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({ "ok": true, "cleared": cleared })).into_response()
 }
 
 /// GET /api/bridge-config（D-022 工坊外桥展示；D-022b 升级可编辑回填）：
@@ -1804,6 +2026,9 @@ mod tests {
             avatars: avatars.clone(),
             roster: roster.clone(),
             players_dir: temp_assets_dir("shared-players"),
+            creations_dir: crate::creations::dir_for(std::path::Path::new(
+                &temp_assets_dir("shared-players"),
+            )),
             bridge_vault: None,
             bridge_config_path: temp_bridge_vault_path("shared-bridge"),
         });
@@ -2345,6 +2570,9 @@ mod tests {
             avatars: Arc::new(avatars::AvatarRegistry::load(&temp_assets_dir("d021f"))),
             roster: Arc::new(std::sync::Mutex::new(Vec::new())),
             players_dir: temp_assets_dir("d021f-players"),
+            creations_dir: crate::creations::dir_for(std::path::Path::new(
+                &temp_assets_dir("d021f-players"),
+            )),
             bridge_vault: None,
             bridge_config_path: temp_bridge_vault_path("d021f-bridge"),
         });
@@ -3154,7 +3382,10 @@ mod tests {
 
     /// 临时玩家目录（工坊通道测试用；路径带进程号+纳秒防并行撞）
     fn temp_net_players_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        // 嵌套目录（D-023）：返回 base/players——creations 目录由 dir_for 按
+        // parent 推导落 base/creations，temp 根直接当 players 目录会跟别的测试
+        // 共享 /tmp/creations（跨测试污染）
+        let base = std::env::temp_dir().join(format!(
             "codeworld-net-players-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -3162,7 +3393,8 @@ mod tests {
                 .unwrap()
                 .subsec_nanos()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("players");
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -3216,6 +3448,7 @@ mod tests {
             avatars: avatars.clone(),
             roster: roster.clone(),
             players_dir: players_dir.to_path_buf(),
+            creations_dir: crate::creations::dir_for(players_dir),
             bridge_vault: vault,
             bridge_config_path: bridge_config_path.to_path_buf(),
         });
@@ -3427,6 +3660,232 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
         assert_eq!(json["ok"], false);
         assert_eq!(json["reason"], "NAME_BAD_CHAR");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    /// 造物文件标准好全文（测试公用：§头 + spawn 15 数 + 代码体）
+    fn good_creation_text(name: &str) -> String {
+        format!(
+            ";; §{name}\n;; spawn 0.5 1.0 0 0 0 0 0 1.0 0 0 0 0 0 0.6 10000\n\n(module (func (export \"life\") (result i32) i32.const 1))\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn creation_save_writes_file_and_appends_carry_to_me_target() {
+        // 场景（D-023 A.7）：POST /api/creation-code {name, code=好头全文} ->
+        // ok:true -> creations/<名>.wat 落盘 + me.txt 声明的当前角色 players/<角色>.wat
+        // 顶部追加 ;; @carry（去重）；me.txt 不动；无 me 声明=只写文件不加 carry
+        let static_dir = temp_static_dir("cr-save");
+        let players_dir = temp_net_players_dir("cr-save");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("cr-save"),
+                &players_dir,
+                None,
+                &temp_bridge_vault_path("cr-save"),
+            )
+            .await;
+        let cdir = crate::creations::dir_for(&players);
+        // 无 me 声明：只写文件（受理不拒——库存文件管理与操控声明解耦）
+        let body = serde_json::json!({ "name": "箭塔", "code": good_creation_text("箭塔") });
+        assert_eq!(post_json(&addr, "/api/creation-code", &body).await["ok"], true);
+        let written = std::fs::read_to_string(cdir.join("箭塔.wat")).expect("造物文件应落盘");
+        assert_eq!(written, good_creation_text("箭塔"), "内容=提交全文原样");
+        assert!(
+            crate::creations::parse_carry_lines(&std::fs::read_to_string(players.join("tudou.wat")).unwrap_or_default())
+                .is_empty(),
+            "无 me 声明不该有角色被加 carry"
+        );
+        // me.txt 声明 alice → 再存另一只 → alice.wat 顶部追加 @carry；重复保存不重复加
+        std::fs::write(players.join("alice.wat"), "(module)\n").unwrap();
+        std::fs::write(players.join("me.txt"), "alice\n").unwrap();
+        let body2 = serde_json::json!({ "name": "炮台", "code": good_creation_text("炮台") });
+        assert_eq!(post_json(&addr, "/api/creation-code", &body2).await["ok"], true);
+        let alice = std::fs::read_to_string(players.join("alice.wat")).unwrap();
+        assert_eq!(
+            crate::creations::parse_carry_lines(&alice),
+            vec!["炮台".to_string()],
+            "当前角色清单应出现新造物"
+        );
+        assert_eq!(post_json(&addr, "/api/creation-code", &body2).await["ok"], true);
+        let alice2 = std::fs::read_to_string(players.join("me.txt").with_file_name("alice.wat")).unwrap();
+        assert_eq!(
+            crate::creations::parse_carry_lines(&alice2),
+            vec!["炮台".to_string()],
+            "重复保存同名=去重不加第二行"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn creation_save_rejects_bad_name_bad_header_and_oversize() {
+        // 拒绝路（D-023 A.6）：坏名/坏头（缺 §/缺 spawn 行）/超 64KB/坏 JSON
+        // 全拒绝且零落盘
+        let static_dir = temp_static_dir("cr-rej");
+        let players_dir = temp_net_players_dir("cr-rej");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("cr-rej"),
+                &players_dir,
+                None,
+                &temp_bridge_vault_path("cr-rej"),
+            )
+            .await;
+        let cdir = crate::creations::dir_for(&players);
+        // 坏名（路径注入）
+        let json = post_json(
+            &addr,
+            "/api/creation-code",
+            &serde_json::json!({ "name": "a/b", "code": good_creation_text("x") }),
+        )
+        .await;
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "NAME_BAD_CHAR");
+        // 坏头：缺 spawn 行 → BAD_SPAWN_LINE
+        let json = post_json(
+            &addr,
+            "/api/creation-code",
+            &serde_json::json!({ "name": "坏头", "code": ";; §坏头\n\n(module)\n" }),
+        )
+        .await;
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "BAD_SPAWN_LINE");
+        // 坏头：缺 §（首行普通注释）→ BAD_HEADER
+        let json = post_json(
+            &addr,
+            "/api/creation-code",
+            &serde_json::json!({ "name": "无头", "code": ";; 注释\n\n(module)\n" }),
+        )
+        .await;
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "BAD_HEADER");
+        // 超 64KB → CODE_TOO_LONG（零落盘）
+        let filler = ";; ".to_string() + &"x".repeat(70 * 1024) + "\n";
+        let big = good_creation_text("大块头") + &filler;
+        let json = post_json(
+            &addr,
+            "/api/creation-code",
+            &serde_json::json!({ "name": "大块头", "code": big }),
+        )
+        .await;
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "CODE_TOO_LONG");
+        // 坏 JSON（缺字段）
+        let raw = br#"{"code":"x"}"#;
+        let resp = http_request(&addr, "POST", "/api/creation-code", Some("application/json"), Some(raw)).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "BAD_JSON");
+        // 全部拒绝路径零落盘
+        let leftovers: Vec<String> = std::fs::read_dir(&cdir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "拒绝路径不该有任何造物文件落盘，实际残留 {leftovers:?}"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn creation_read_roundtrip_and_unknown_rejected() {
+        // 读回（所见即所编）：POST 保存 → GET 同名 → 内容逐字节一致；无此造物=NAME_UNKNOWN
+        let static_dir = temp_static_dir("cr-read");
+        let players_dir = temp_net_players_dir("cr-read");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("cr-read"),
+                &players_dir,
+                None,
+                &temp_bridge_vault_path("cr-read"),
+            )
+            .await;
+        let body = serde_json::json!({ "name": "箭塔", "code": good_creation_text("箭塔") });
+        assert_eq!(post_json(&addr, "/api/creation-code", &body).await["ok"], true);
+        let resp = http_request(
+            &addr,
+            "GET",
+            &format!("/api/creation-code?name={}", "箭塔"),
+            None,
+            None,
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], true, "读回应成功：{json}");
+        assert_eq!(
+            json["code"], good_creation_text("箭塔"),
+            "读回=保存原文（所见即所编）"
+        );
+        // 无此造物
+        let resp = http_request(&addr, "GET", "/api/creation-code?name=幽灵", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "NAME_UNKNOWN");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn creation_delete_cascades_carry_removal_across_players() {
+        // 删除联动（A.7 核心锚）：两角色都 carry 同一造物 → DELETE → creations
+        // 文件删 + 两份清单都干净；再删=NAME_UNKNOWN
+        let static_dir = temp_static_dir("cr-del");
+        let players_dir = temp_net_players_dir("cr-del");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("cr-del"),
+                &players_dir,
+                None,
+                &temp_bridge_vault_path("cr-del"),
+            )
+            .await;
+        // 两角色各 carry 箭塔；另一造物「炮台」的 carry 行不受牵连
+        std::fs::create_dir_all(crate::creations::dir_for(&players)).unwrap();
+        std::fs::write(players.join("alice.wat"), ";; @carry 炮台\n;; @carry 箭塔\n(module)\n").unwrap();
+        std::fs::write(players.join("bob.wat"), ";; @carry 箭塔\n(module)\n").unwrap();
+        std::fs::write(
+            crate::creations::dir_for(&players).join("箭塔.wat"),
+            good_creation_text("箭塔"),
+        )
+        .unwrap();
+        let resp = http_request(&addr, "DELETE", "/api/creation-code?name=箭塔", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], true, "删除应成功：{json}");
+        assert_eq!(
+            json["cleared"], 2,
+            "两份 @carry 清单都应被清理"
+        );
+        assert!(
+            !crate::creations::dir_for(&players).join("箭塔.wat").exists(),
+            "造物文件应消失"
+        );
+        let alice = std::fs::read_to_string(players.join("alice.wat")).unwrap();
+        assert_eq!(
+            crate::creations::parse_carry_lines(&alice),
+            vec!["炮台".to_string()],
+            "alice 清单只剩炮台（箭塔行移除，其余原样）"
+        );
+        assert_eq!(crate::creations::parse_carry_lines(&std::fs::read_to_string(players.join("bob.wat")).unwrap()), Vec::<String>::new(), "bob 清单应清空");
+        assert!(
+            alice.contains("(module)"),
+            "角色代码体不受删除联动影响"
+        );
+        // 再删=NAME_UNKNOWN
+        let resp = http_request(&addr, "DELETE", "/api/creation-code?name=箭塔", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "NAME_UNKNOWN");
         shutdown_tx.send(()).ok();
         let _ = server.await;
     }
