@@ -10,3 +10,5 @@ battle.log
 build.log
 codeworld.db
 assets/avatars/
+# 玩家运行时数据（D-023 造物文件，与 codeworld.db 同类：文件即持久化，不入 git）
+creations/

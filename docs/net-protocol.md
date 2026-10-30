@@ -1,4 +1,4 @@
-# CodeWorld 网络协议：快照推送 + 意图上行（期四 v1 - v1.6 / 期五 v1.7 - v1.9 / D-017 协议小刀 v2.0 / 收图通道 v2.2 / D-012 力场 v2.3 / 皮入沙箱 v2.4 / D-020a 事件流+技能栏 v2.5 / D-021b 进场仪式 v2.6 / D-021d 登录选角页 v2.7 / D-021e 角色列表私有化 v2.8 / D-021f 会话令牌 v2.9 / D-022 造物工坊 v3.0 / D-020b 技能栏独立+造物实名播报 v3.1）
+# CodeWorld 网络协议：快照推送 + 意图上行（期四 v1 - v1.6 / 期五 v1.7 - v1.9 / D-017 协议小刀 v2.0 / 收图通道 v2.2 / D-012 力场 v2.3 / 皮入沙箱 v2.4 / D-020a 事件流+技能栏 v2.5 / D-021b 进场仪式 v2.6 / D-021d 登录选角页 v2.7 / D-021e 角色列表私有化 v2.8 / D-021f 会话令牌 v2.9 / D-022 造物工坊 v3.0 / D-020b 技能栏独立+造物实名播报 v3.1 / D-023 造物文件化+库存 v3.2）
 
 > 前端契约文档。第二刀（Canvas 渲染）/第三刀（鼠标操控）/第五刀（操控飞行）/第六刀（半径物理）/期五第一刀（下线处置权）依赖本文字段名与语义；改字段先改这里再改代码。
 > 依据 decisions.md #026（薄客户端/快照推送）、#027（鼠标操控/操控独占）、#029（操控飞行无税：飞行=代码对抗世界规则，fuel 是保险丝不入玩法）、#030/#031（半径物理：格子降级为地址系统，实体不可重叠精确化为半径碰撞）、#025（操控独占与下线处置权）；世界是唯一权威，浏览器只是显示器+遥控器。
@@ -8,7 +8,7 @@
 | 项 | 值 |
 |----|----|
 | 协议 | WebSocket（升级自 HTTP） |
-| 路径 | `/ws`（同源；静态页由同一端口 ServeDir 伺服）。**v2.9 起支持 `?token=<会话令牌>` 参数**（D-021f 凭据认领，见 §11；不带=观战连接）。**v2.2 起**另有 HTTP 通道：`POST /upload/avatar`（收图）+ `GET /assets/{id}.png`（原图直取）；**v3.0 起再加工坊 HTTP 通道**：`GET/POST/DELETE /api/player-code` + `GET/POST /api/bridge-config`（D-022b 起外桥可编辑，见 §12） |
+| 路径 | `/ws`（同源；静态页由同一端口 ServeDir 伺服）。**v2.9 起支持 `?token=<会话令牌>` 参数**（D-021f 凭据认领，见 §11；不带=观战连接）。**v2.2 起**另有 HTTP 通道：`POST /upload/avatar`（收图）+ `GET /assets/{id}.png`（原图直取）；**v3.0 起再加工坊 HTTP 通道**：`GET/POST/DELETE /api/player-code` + `GET/POST /api/bridge-config`（D-022b 起外桥可编辑，见 §12）；**v3.2 起加造物文件通道**：`GET/POST/DELETE /api/creation-code`（D-023 造物文件化，见 §12.6） |
 | 端口 | `CODEWORLD_WS_PORT`，默认 8080；**0 = 禁用 WS**（纯终端模式，零开销） |
 | 绑定 | 127.0.0.1（仅本机浏览器可访问；局域网观战留后续） |
 | 方向 | 双向：下行=每拍全量快照推送；上行=客户端意图消息（v1.2 起） |
@@ -169,7 +169,7 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
 | `shoot` | **操控射击（v1.9，#036；#045 弹丸退役后世界侧换载具）**：操控目标向目标方向发射一发**定装造物弹**——世界不再配发弹丸身体（#045 修路不跑车），改为解算器 `solve_launch_vector` 解出初速后 **spawn 一个 dynamic 造物**（小圆点 0.15/同款质量/unbound），出生点沿发射方向外推出膛，命中归接触通道（on_contact 代码攻）。初速解算=速度梯搜索（基准 12 封顶 22）+真实物理步序逐拍模拟（重力→阻力→极速钳→中点位移），无解不发射（服务器侧不发射+INFO，前端同判据不发消息）。**自定义弹道**：env.shoot 已随 #045 退役——玩家代码用 spawn 第 11/12 参出生初速自己拼（教学模板 docs/newbie-first-thrower.md）。**每拍 1 发限流沿用**（同拍多次点击后到覆盖先到，恰 1 发）。**与 move 并存**（边走边射）：shoot 不清除走位目标，射击拍不移动、下拍恢复走位；悬空射击照常免重力（升力独立） |
 | `stop` | 清除走位目标站住（#025 操控独占的"我不动"）。**v1.4 起：stop 在空中 = 悬停不坠**（stop 语义是"停止移动"不是"坠落"；悬停锚点改写为脚下坐标，要落地玩家点地面）。前端由右键（contextmenu）或 S 键产生 |
 | `logout` | **主动登出三选一**（v1.7，#025 下线处置权；仅操控连接生效，观战连接照旧丢弃）：`disposition` 取 `take`（带走：角色立即移除，文件锚保留，重连认领=重新进场重生）/ `stay_auto`（停留+自主接管：on_tick 恢复，角色自己活，重连=接管者被顶掉）/ `stay_ai`（停留+AI 待接入：站桩等外部 AI，端点协议是 #014 未来端点本刀不实现）。服务器收即释放操控令牌、连接降级观战（快照照收）；**处置中的玩家不被 me 声明重认领**——抢回操控必须走重连认领（操控权=me 声明+连接在，#024 精神） |
-| `skill` | **技能栏**（v2.5 立项，D-020a；**v3.1 D-020b 语义重定义**）：`slot`=**该玩家技能格下标 1..9**（格=玩家 spawn 成功的造物模板清单，同名合并保留首次，上限 9；按格上行=服务端取出模板重新 spawn，出生点=操控实体旁 r+0.7，#030 预检/上限/编译全适用，失败走 spawn_rejected 事件闭环）。**技能=我的造物非预置清单**（v3.1 起预置四技能退役，`GET /skills/*.wat` 同退）；空格/越界 warn 丢弃。出生点=操控实体东侧身位偏移；**每实体每拍 1 发**（同拍连按只发第一发，再按报 RATE_LIMITED 事件）。非法槽位（0/10+/缺参）解析层拒绝丢弃。详见 api.md「五点十、技能栏」 |
+| `skill` | **技能栏**（v2.5 立项，D-020a；v3.1 D-020b 语义重定义；**v3.2 D-023 数据源=携带清单**）：`slot`=**该玩家技能格下标 1..9**（格=该角色 `players/<名>.wat` 里 `;; @carry` 清单的造物模板，进场扫清单建账，行序=格序，上限 9；v3.1 的「spawn 成功自动入列」退役——内联 spawn 不再上栏；按格上行=服务端取出模板重新 spawn，出生点=操控实体旁 r+0.7，#030 预检/上限/编译全适用，失败走 spawn_rejected 事件闭环）。空格/越界 warn 丢弃；工坊活建即放（缓存缺失当拍补账一次）。出生点=操控实体东侧身位偏移；**每实体每拍 1 发**（同拍连按只发第一发，再按报 RATE_LIMITED 事件）。非法槽位（0/10+/缺参）解析层拒绝丢弃。详见 api.md「五点十、技能栏」「十、造物文件与库存」 |
 | `create_player` | **进场仪式**（v2.6，D-021b）：`name`+`template`（blank/grazer/hunter 三选）→ 服务器写 `players/<name>.wat`（内容=模板全文，`GET /templates/<id>.wat` 同源）→ **当拍进场**（不等目录轮询）→ 写 `players/me.txt`（操控接管；`CODEWORLD_ME` 显式设置时不覆盖）。回执走 player_events 公共新闻：成功=`player_joined {name}`（面板收起+出生横幅），失败=`create_player_rejected {reason}`（NAME_EMPTY/NAME_TOO_LONG/NAME_BAD_CHAR/NAME_TAKEN/TEMPLATE_MISSING/IO_ERROR，红字回执）。名字校验的权威闸门在服务器 tick 侧（R1 复审改法 B：解析层不做名字校验——Err 分支=静默丢弃无回执，前端 busy 锁会挂死；全部拒绝统一走事件回执，含格式类 NAME_* 三码）。**v2.7 起：任意连接生效**（登出后的观战连接也要能新建——旧"仅操控连接生效"作废）。**v2.9 起：服务器收到即颁发会话令牌**（当场单播 `session_token {token,name}`，成功路径绑定进会话表——重连/刷新凭它认领操控，见 §11）。**首启归档**：空世界模式+空玩家目录启动时旧 db 挪 `archive/`（启动瞬间做——sqlite 句柄锁 db，进程内挪不动；create_player 链路永不碰 db）。详见 api.md「进场仪式」节 |
 | `select_player` | **选角进场**（v2.7，D-021d 登录/选角页）：`name` 必须在 `players/` 有 `.wat`（文件锚=身份）→ 覆写 `players/me.txt` 为单行该名字（#024 契约，等价 me 声明）→ 清该名字的 absent 离场标记（登出带走后选角=下拍扫描重生角色）+ 处置状态（接管者被顶掉）+ 编译失败黑名单（显式选择=允许重试一次，失败会重新拉黑）→ 回执 `player_selected {name}`（前端收到**才**断开重连——重连带 token=凭据认领操控，v2.9）。拒绝回执 `select_player_rejected {reason}`：`NAME_UNKNOWN`（players/ 无此角色）/ `ME_ENV_LOCKED`（`CODEWORLD_ME` 环境变量已设——env 锁定优先于一切 me 声明，诚实拒绝）/ `IO_ERROR`（me.txt 写失败）。**任意连接生效**（登出后的观战连接是登录页的选角通道）。**v2.9 起：服务器收到即颁发会话令牌**（同 create_player，见 §11）。me.txt 契约一字不动（单行玩家名；`CODEWORLD_ME` 优先级不变） |
 
@@ -425,6 +425,19 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
   其余 kind 照旧）；born 事件加 `name` 字段；died 事件加 `name`（死者显示名，
   死者已出实体表必须服务端带）且 `killer` 从 UUID 改**显示名**；十六进制 id
   前端降级为悬浮 tooltip。驾驶层定装弹不入技能格不占序号（driver_spawn 来源位）
+- **造物文件化+库存语义（v3.2，D-023，2026-10-31）**：造物升级一等文件公民
+  （微信开发者工具模型）——新增 `creations/` 目录与 §12.6 造物文件 HTTP 通道
+  （`GET/POST/DELETE /api/creation-code`：保存=写 creations/<名>.wat+当前角色
+  清单追加；删除=删文件+全角色清单联动清理）。角色文件新增强引用清单段
+  `;; @carry <造物名>`（0..N 行，无=空清单零破坏）；技能栏数据源从「spawn 成功
+  自动入列」改「**@carry 清单进场建账**」（格序=清单行序，上限 9，内存账本=
+  文件缓存重启重扫）；工坊「新建造物」从写 players/（实为建角色）改写
+  creations/<名>.wat（不再误建角色）；前端库存列表从 @carry+快照合成三态
+  （待命/在场 N/已消亡）。**WS 帧格式零变更**；老玩家内联 spawn 零破坏照跑
+  （只是不再自动上栏）。埋雷修复：main.rs 测试 include_str! 硬引用
+  players/link-demo.wat（+运行时读 jumper/pioneer）——players/ 是玩家运行时
+  数据会被首建归档挪走，副本迁 `bin/codeworld/tests/fixtures/`（git 基线字节
+  不变），测试不再依赖玩家目录内容
 - 预留演进（不在本版实现）：
   - delta 快照 / 二进制编码（实体数增长或拍频提高后再做）
   - 多操控连接 / 连接身份与 me 声明合并（认证化）
@@ -702,3 +715,39 @@ me.txt 声明）。**每个 WS 连接建立后下发一次**（avatar_assets 之
 - 删除确认弹窗：决策即关门 0.25s 淡出 + busy 守卫（logoutPanel 模式）。
 - **卡面声明：真·断点/单步/回放不做**（违拍制全局心跳，另卡挂信号=拍速升级/
   单步回放刀）；工坊页脚已注明。
+
+### 12.6 GET/POST/DELETE /api/creation-code（v3.2，D-023 造物文件化）
+
+造物独立文件通道（creations/ 目录与 players/ 同哲学：文件即持久化）。文件格式
+（§头+spawn 15 数行+代码体）与库存语义（待命/在场/已消亡）见 api.md「十、造物
+文件与库存」。
+
+- **POST**：请求 `application/json`，`{"name":"造物名","code":"造物文件全文"}`。
+  处理链：`sanitize_name` → 64KB 护栏 → **解析校验**（缺 §/缺 spawn 行/数字烂/
+  寿命 <1=整单拒绝零落盘，`BAD_HEADER`/`BAD_SPAWN_LINE`/`EMPTY_BODY`）→ 写
+  `creations/<名>.wat`（**原文原样**，所见即所编）→ 读 me.txt 声明的当前角色 →
+  `players/<角色>.wat` 顶部追加 `;; @carry <名>`（**去重**；无 me 声明/角色文件
+  不在=只写文件，INFO 日志）。响应 `{"ok":true}` / `{"ok":false,"reason"}`。
+- **GET ?name=**：读 `creations/<名>.wat` 全文 → `{"ok":true,"code":"..."}`；
+  64KB metadata 护栏与写路径对称。拒绝：`NAME_*` / `NAME_UNKNOWN` /
+  `CODE_TOO_LONG` / `IO_ERROR`。
+- **DELETE ?name=**：删 `creations/<名>.wat` + **清单联动**——扫全部
+  `players/*.wat` 移除同名 `;; @carry` 行（逐文件容错：单文件读写失败 WARN 跳过
+  继续清其余）。响应 `{"ok":true,"cleared":N}`（N=清了几份清单行）；
+  不存在=`NAME_UNKNOWN`。
+- 拒绝码表（POST/GET/DELETE 共用）：
+
+  | reason | 触发 |
+  |--------|------|
+  | `BAD_JSON` | 请求体不是合法 JSON / 缺 name 或 code 字段（POST） |
+  | `NAME_EMPTY` / `NAME_TOO_LONG` / `NAME_BAD_CHAR` | 名字闸门（同 create_player） |
+  | `BAD_HEADER` | 首行不是 `;; §<名>`（缺 § 头） |
+  | `BAD_SPAWN_LINE` | 头区缺 `;; spawn` 行 / 数字个数≠15 / 非数字 / 非有限 / 寿命 <1 |
+  | `EMPTY_BODY` | 空代码体 |
+  | `CODE_TOO_LONG` | code 超 64KB（写路径）/ 落盘文件超 64KB（读路径） |
+  | `NAME_UNKNOWN` | creations/ 无此造物（GET/DELETE） |
+  | `IO_ERROR` | 读/写/删盘失败（服务器日志留痕） |
+
+- **快照协议零新帧**（定案）：库存列表由前端从角色文件文本（GET
+  /api/player-code 可取，`;; @carry` 行客户端解析）+ 快照 entities（owner=操控
+  实体的 creation 系按名聚合）合成，待命/在场 N/已消亡三态实时刷新零轮询。
