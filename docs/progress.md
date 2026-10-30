@@ -2,7 +2,17 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-30 D-021d 登录/选角页重做落地，待土豆验收）
+## 现在（2026-10-30 D-021e 登录页三 bug 修复落地，待土豆验收）
+
+- 完成：D-021e（commit 13c6077，协议 v2.7→v2.8，轻装挡单 commit）——土豆实测抓的 D-021d 三个产品语义 bug 全修：①角色列表把 players/ 全目录列出来（pioneer/bridge-demo 等开发测试生物混进玩家列表）；②新建角色后还能控制旧世界的 P（新角色出生在被旧世界恢复污染的世界）；③登出处置完又弹一遍选角窗。
+- R1 角色列表私有化：新增**本机角色档案** `players/.my-characters`（隐藏文件 UTF-8 一行一名；本机单机阶段概念，多人时代"我的角色"走账号再换轨）——create_player/select_player **成功路径**追加（重复不追加；写失败只 warn 不阻断，身份锚仍是 .wat 文件）；build_roster 改**档案登记∩.wat 实存**（保持 scan_dir 字母序、签名零改动、先 scan_dir 再交集——档案有但 .wat 不在的角色不列）；档案不存在/读失败=空列表（宁可空也不泄露他人角色）。
+- R2 新建角色=干净世界（main.rs:3392 注释写了没做的"[首建归档旧档]"落实）：首建判定从"目录无 .wat"退役（players_dir_is_fresh 删除），改**档案空白口径**（不存在/无有效行=首建；**读失败≠空白**——档案被锁时宁可不归档也不错归档，错归档=老玩家重启世界被挪走）；首建时启动归档窗口把旧 db（archive_old_world 既有函数）**与旧 players/*.wat 一并**挪 archive/（新函数 archive_player_wats→players/archive/players-<stamp>/，me.txt/.my-characters/非 .wat 不挪）——.wat 不挪会被 load_players_initial+每拍目录轮询拉进场，R2 等于没修；档案非空=老玩家重启什么都不动。幂等自查过：档案空+连续两次启动安全（db 不在=None、无 .wat 可挪）。
+- R3 登出不回登录页：登出=退出世界，sessionSelected 保持 true（世界画面观战降级继续直播），顶部 logoutBanner 复活（"已登出——刷新页面可重新选择角色"；reenterBtn 保持 hidden 已退役）；**showLoginPanel 全文件只剩定义零调用**——登录页只在首次连接/刷新页面出现。
+- start-new.bat 注释改新语义（D-021d"old players stay on purpose"三行被本卡推翻）；文档 net-protocol v2.8（标题/§5 连接时序/版本史/§10 player_roster 档案过滤）+ api.md 三处（首建归档档案口径、角色列表私有化、登出留世界）。
+- 验证：workspace **1250 绿**（基线 1241+9 新增，TDD 全程红绿：档案读写/去重/首建判定含读失败≠空白/.wat 归档口径/roster 过滤 5 态/create+select 成功追加+拒绝不追加/首建归档窗口双向+幂等）/clippy 0 警告/Gate grep 五断言全过。**共享树纪律**：index.html 与 net-protocol.md 混有并行任务线 D-021c（世界贴图）未提交改动——用"备份→HEAD 重放→精准暂存→还原"切割，本卡 commit 只含 D-021e hunks，D-021c 工作区改动原样保留。
+- 下一步：土豆验收三步——①start-new.bat 起服（先删 my-world.db 与 players/ 或直接用现档看过滤效果）：登录页只列你自己创建/选过的角色，开发生物不再混入；②新建首个角色=干净世界（旧 db 与旧 .wat 落 archive/ 可找回）；③登出三选一后**留在世界画面**+顶部横幅，不再弹选角窗；刷新页面回登录页。
+
+## 现在（2026-10-30 D-021d 登录/选角页重做落地，三 bug 由 D-021e 修复跟进）
 
 - 完成：D-021d（commit 7fb4bd6，协议 v2.6→v2.7）——D-021b"世界为空才弹创建面板"是产品错误（土豆原话："其他游戏每次登录都有这个页面，可以新创建角色，可以用之前的角色，跟世界有没有玩家没关系"）。本卡按通行产品形态重做：**浏览器连接后未选角前永远先见登录/选角页**。
 - 服务端：下行 `player_roster`（连接建立 avatar_assets 后第二帧，players/*.wat 全量——在线条目取活实体实际 glyph/color，离线=首字符大写+中性灰 #8b949e"出生序号离线不可知，灰=诚实"；每拍 build_roster 重建共享槽 1Hz 白菜价）；上行 `select_player`（任意连接生效）：NAME_UNKNOWN / ME_ENV_LOCKED / IO_ERROR 三码结构化回执（IO_ERROR 是任务书两码外按"任何拒绝必须有事件回执"铁律补的第三码）；成功覆写 me.txt（#024 契约不动）+ 清 absent/处置/编译失败黑名单三样会话级状态 + `player_selected` 公共事件。create_player 同步放开任意连接生效（登出后的观战连接也要能新建）。
