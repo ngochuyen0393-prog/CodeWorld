@@ -2,7 +2,17 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-30 D-021e 登录页三 bug 修复落地，待土豆验收）
+## 现在（2026-10-30 D-021f 会话令牌+出生镜头落地，待土豆 A 轨亲验）
+
+- 完成：D-021f（commit 6b50468 主体+e804e44 终审修复，协议 v2.8→v2.9）——土豆实测 bug（新建角色后刷新页面=新连接变观战"操控权已被占用"，点不动自己角色）根除：**操控权认领从"先来者得"翻转为"凭据者得"**（Screeps token 认人不认网线/暴雪同账号新登录踢旧会话同款）。#024 独占不变（任意时刻仍只有一个操控连接），变的只是钥匙。
+- 服务端（net.rs）：WsState 的 ctrl_taken AtomicBool 退役，换 `watch<Option<连接id>>`（当前操控连接）+ `sessions` 令牌表（token→玩家名，进程生命周期）+ `legacy_first_conn`（CODEWORLD_ME env 非空=逃生门保留旧第一连接认领，loginSkip 行为不变）+ conn_ids 发号器。连接 URL `?token=`：命中会话表=操控端（踢旧沿 `control_revoked{taken}`，旧端降观战不断连、token 保留可抢回）/不命中=观战+立即 `control_revoked{stale}`/无 token=纯观战。Logout=token 从表移除（不得复用）+释放+降级。select/create 上行即颁 uuid 令牌（`session_token` 当场单播+Intent 带上），tick 侧成功路径绑定 token→name（拒绝路径令牌永不绑定=自然无效）；process_create/select_player 改返回 bool。断开清理双门守卫（本地标记∧watch 仍=自己，关死"被踢同拍死亡"竞态错拆新操控端——终审 3 Important 修复之一）。沿检测提纯函数 poll_conn_event（watch 翻转产 Claimed/Released，处置状态机触发源不变）。
+- 前端（index.html）：连接带 localStorage（`cw_session`）token（三助手全 try/catch 隐私模式兜底）；session_token 暂存→成功回执（player_selected/player_joined 按名匹配）才落盘，rejected 作废；control_revoked 两态横幅（taken="你的操控已在别处接管"留 token 可抢回/stale=清凭据+"登录已过期，刷新页面重新选择角色"）；登出三选一=交还钥匙（清 cw_session，下次连接全新观战→登录页）；**出生镜头**：观战全景中选角完成，镜头从视野中心平滑飞向自己实体（CAM_LERP 复用零新常数）。
+- 文档：net-protocol v2.9（§5 生命周期翻新/§6.4 凭据制重写/新增 §11 会话令牌专节：生命周期表+两下行帧+URL 参数+逃生门+前端配套）+ api.md 登录节会话令牌段（玩家视角文案终审校准：刷新后登录页照常出现，钥匙保证"操控权必回到你手上"非"免重选"）。
+- 验证：workspace **1260 绿**（基线 1250+10，T1-T8 全锚+legacy 逃生门+刷新重连认领；TDD 全程 net 侧 RED=编译期特性缺失 5 错亲见）/clippy 默认 0 警告（**口径发现：验收须加 --all-targets 才覆盖测试代码**——本刀测试告警 3 条在默认口径下漏检，已修；--all-targets 下仅 4 条存量旧账 git blame 10-22/23）/fresh reviewer 终审 PASS with issues→3 Important 全修（e804e44）/前端 node 语法+逻辑 7 项 PASS/表格分隔行校验 0 异常。
+- 开工前置处置：players/ 下 5 个已跟踪 .wat（bridge-demo/field-tower/jumper/link-demo/pioneer）被验收误删致 include_str! 编译炸，git checkout 恢复 HEAD 态（零 diff 不进 commit）；未跟踪验收产物（me.txt/.my-characters/archive/测试.wat）未动。**提交申报**：6b50468 由 Hermes worker（tudou@hermes.dev 16:36）读 CC gate 日志双确认后代为提交（内容=CC 工作区字节级快照），CC 终审修复按共享树纪律前进式追加 e804e44。
+- 下一步：土豆 A 轨三步亲验——①start-new.bat 起服→新建角色→F5 刷新→登录页点自己角色→直接操控成功（不再"操控权已被占用"）；②再开标签页同连接→旧窗口横幅"你的操控已在别处接管"（降观战不断连），关新窗刷新旧窗可抢回；③全景（F 键）中选角→镜头从全景中心平滑飞到自己。遗留两条 minor（poll_conn_event 死绑定标注/sessions 旧 token 进程内不清理）见 cc-report-d021f.md。
+
+## 上一轮（2026-10-30 D-021e 登录页三 bug 修复落地，验收已被 D-021f 覆盖跟进）
 
 - 完成：D-021e（commit 13c6077，协议 v2.7→v2.8，轻装挡单 commit）——土豆实测抓的 D-021d 三个产品语义 bug 全修：①角色列表把 players/ 全目录列出来（pioneer/bridge-demo 等开发测试生物混进玩家列表）；②新建角色后还能控制旧世界的 P（新角色出生在被旧世界恢复污染的世界）；③登出处置完又弹一遍选角窗。
 - R1 角色列表私有化：新增**本机角色档案** `players/.my-characters`（隐藏文件 UTF-8 一行一名；本机单机阶段概念，多人时代"我的角色"走账号再换轨）——create_player/select_player **成功路径**追加（重复不追加；写失败只 warn 不阻断，身份锚仍是 .wat 文件）；build_roster 改**档案登记∩.wat 实存**（保持 scan_dir 字母序、签名零改动、先 scan_dir 再交集——档案有但 .wat 不在的角色不列）；档案不存在/读失败=空列表（宁可空也不泄露他人角色）。
