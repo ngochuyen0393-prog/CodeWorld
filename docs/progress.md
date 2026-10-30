@@ -2,7 +2,16 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-30 D-022b 工坊并入世界页面+外桥可编辑落地，待土豆/Hermes 验收）
+## 现在（2026-10-31 D-023 造物文件化+库存语义落地，待土豆 A 轨验收）
+
+- 完成：D-023（协议 v3.1→v3.2，commits 8f6bcd3 后端 / 32abb22 前端 / 87b545d 文档 / dfc5008 R1 审修复 / fd451f6 R2 收尾）——土豆 10-30 拍板的宪法级架构落地：**造物升级一等文件公民**（微信开发者工具模型，三层）。①**文件层**：新建 `creations/` 目录（与 players/ 同哲学：文件即持久化重启重扫）+ `.wat` 文件格式（首行 `;; §名` + 次行 `;; spawn` 15 数[spawn 第 7..23 参原序，经 codeworld_core 既有钳制律收编] + 空行 + WAT 代码体；坏头/超 64KB=整文件作废 WARN+跳过不崩世界）+ `/api/creation-code` 三动词（保存=解析校验零落盘拒绝+写文件原文原样+me 目标追加 `;; @carry`；删=删文件+**全 players/*.wat 清单联动清理**）。②**库存层**：角色文件 `;; @carry <造物名>` 引用清单（0..N 行，老文件零破坏）；进场扫清单建技能账本（格序=清单行序，超 9 前 9 上栏）；「spawn 成功自动入列」退役——**内联 spawn 照常可用只是不再自动上栏**；按键即对账（每调用先无条件重建账本——活建即放/改码热生效/删除即失效同一机制）。③**状态层**：技能栏+工坊「我的造物」三态（待命/在场 N/已消亡·可再放），前端从 @carry 文本+快照合成，**协议零新帧**。工坊「新建造物」保存写 creations/（根除 D-020b 时代「新建造物实为建角色」bug）；点造物开造物文件（所见即所编）；保存/删除按 [角色]/[造物] 分流。
+- 埋雷修复（本卡第一步）：main.rs 测试硬引用 players/{link-demo,jumper,pioneer}.wat（include_str 编译炸+运行时读 NotFound——players/ 是运行时数据被首建归档挪走）→ git 基线副本迁 `bin/codeworld/tests/fixtures/`。**项目级约束**：players/ 目录内容会被首建归档挪走，任何代码不得硬引用（测试夹具化）。
+- 文档：api.md「十、造物文件与库存」新章+五点十技能栏重写+九工坊章改写；net-protocol.md v3.2（§12.6 全码表+变更记录）；.gitignore+creations/。
+- 验证：workspace **1312 绿 0 failed 2 ignored**（基线 1291+净增 21：creations 解析 17 锚+skills rebuild 1+t23 端到端 3[进场建账→按格重放→限流/热生效/删除失效]+net HTTP 5 锚[保存落盘+carried 回执/六路拒绝零落盘/读回一致/两角色删除联动 cleared=2/异源 POST+DELETE 拒+同源放行]）；clippy -D warnings 零告警（--all-targets 存量 7 条旧账 git blame 10-22/23/30 非本卡）；前端两 classic 块 new Function+module 块 node --check 三过；id 对账 32 引用零缺失。
+- 双审（改动>50 行宪法，本地子代理双路）：R1 需求审=**通过**（10 核对点 9 MATCH 1 PARTIAL）；R1 质量审=1 P0[账本缓存命中不校真=热生效落空]+3 P1[invSeen 跨角泄漏/me.txt 直拼路径/creation-code 缺同源防护]+9 P2 → dfc5008 全修（P0 翻转为「按键即对账」无条件重建；me 声明过 sanitize_name；写/删加 origin_header_allowed；api.md:222 旧文案改写）+P2 批[spawn 行首 token 数字预判防注释误判/carried 按实回执/fuel 常量统一等]；R2 确认审=**可收工**（5 主审项+5 P2 抽查全 CONFIRMED，锚测试实跑，无回归）。记录不改：非原子写=D-022 既有模式待统一小刀；player-code 同源防护=D-022 存量申报；孤儿造物（无 @carry 引用）前端不可达=任务书边界（列表=carry 合成）。报告 $LOCALAPPDATA/Temp/cc-report.md。
+- 下一步：土豆 A 轨验收（三步白话在 cc-report 第四节）——①工坊新建造物「箭塔」→技能栏出现「箭塔/待命」灰格且世界无新实体；②按 1 放出场→「在场 1」→改 creations/箭塔.wat 再放=行为变化（热生效）；③工坊删箭塔→文件删+清单移除+技能格消失；老玩家 pioneer.wat（内联 spawn）零改动照跑。
+
+## 上一轮（2026-10-30 D-022b 工坊并入世界页面+外桥可编辑落地，验收已被 D-023 接续）
 
 - 完成：D-022b（commit 66a5d38 主体 + 64e8110 R1 审修复 + b4dac8d R2 审修复）——土豆实测两处否决全落地：①**工坊从新标签页迁入世界页面侧滑面板**（workshop.html/workshop.js git rm 删除，ServeDir 自然 404；#wsPanel 左滑 min(640px,66vw) 与 #console 同家族，B 键/底栏按钮开合、ESC 收起[优先级 logoutPanel>delDialog>面板]，首开懒装配 Monaco[loader 动态注入]+独立观战 WS[全角色事件都看得到]+补全数据，面板关闭不销毁）；②**外桥从只读升级可编辑**（POST /api/bridge-config 整批校验[check_endpoint 唯一规则源=load 与复验共用防漂移]+headers 按 port 合并保留凭证+tmp/rename 原子写+写锁 reload 内存同步；GET 加 enabled+url 回填；前端每端点一行行编辑+保存+浏览器侧测试连接[HEAD no-cors 3s 超时 ✓可达/✗不通]+每次展开重新 GET；跨站写防护=Origin↔Host 同源校验）。
 - 顺带修的键位面（迁 Monaco 进页引出的全局 keydown 全量盘点）：Tab/'t' 快捷键补 INPUT/TEXTAREA 守卫（编辑器里缩进/敲 WAT 不再切控制台/翻 3D 层）；主页面 S 键排除 Ctrl/Cmd（Ctrl+S 保存不再触发角色急停）；logoutPanel z-index 5→46（面板开着按 L 弹窗不再被盖）。
