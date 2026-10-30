@@ -1360,9 +1360,9 @@ impl EntitySandboxMap {
                 1.0,
             ),
             current_tick,
-            1_000_000,
+            crate::creations::PLAYER_SANDBOX_FUEL,
         );
-        if let Err(e) = self.create(entity_id, &wasm_bytes, 1_000_000) {
+        if let Err(e) = self.create(entity_id, &wasm_bytes, crate::creations::PLAYER_SANDBOX_FUEL) {
             tracing::warn!(player = name, error = %e, "[players] 玩家沙箱创建失败，未进场");
             return false;
         }
@@ -1382,7 +1382,7 @@ impl EntitySandboxMap {
             self.players.dir(),
             name,
             self.max_speed,
-            1_000_000,
+            crate::creations::PLAYER_SANDBOX_FUEL,
         );
         self.skills.rebuild(name, ledger);
         true
@@ -3729,20 +3729,19 @@ fn handle_skill_intents(
         .get(&creator)
         .map(|e| e.code_hash.clone())
         .filter(|name| sandbox_map.players.is_online(name));
-    // D-023 缓存缺失当拍补账守卫：每玩家每次调用至多重建一次（文件 IO 不进热路径
-    // ——按格是键驱动作，重建只在查空格时发生一次）
-    let mut refreshed: Option<String> = None;
+    // D-023 文件即真相源：按键即对账——每次调用（每玩家）先无条件重建一次账本
+    // 再查格。缓存只是加速，**命中也校真**：工坊改码保存→再按格=新代码（热生效）；
+    // 删除造物→格序即时收缩不错位；活建即放同路径。按键频率的文件 IO（1 份角色
+    // 文件+≤9 份造物文件）成本可接受（R1 审 P0 修复：原「未命中才补账」漏掉
+    // 命中旧缓存路径，改码不热更/删除错位）
+    let mut rebuilt = false;
     for &slot in slots {
         let Some(player) = &player_name else {
             tracing::warn!(slot, "[skill] 操控实体非在线玩家（无技能格账本），忽略");
             continue;
         };
-        // 查格未命中 → 文件可能刚变（工坊活建即放/删除即失效）：当拍重建一次账本
-        // 再查（文件即真相源，内存账本只是缓存）；仍空=真空格，warn 丢弃
-        if sandbox_map.skills.template(player, slot).is_none()
-            && refreshed.as_deref() != Some(player.as_str())
-        {
-            refreshed = Some(player.clone());
+        if !rebuilt {
+            rebuilt = true;
             let ledger = crate::creations::build_player_ledger(
                 sandbox_map.players.dir(),
                 player,
@@ -13545,6 +13544,26 @@ mod tests {
         assert_eq!(map.skills.count("alice"), 1, "补账后应有一格");
         assert_eq!(map.skill_spawns.len(), 1, "活建即放：当拍重放成功");
         assert_eq!(map.skill_spawns[0].name.as_deref(), Some("炮台"));
+        // 热生效（R1 审 P0 修复锚）：改文件保存后再按格（先排水队列模拟拍界消费，
+        // 否则限流 any() 恒真）→ 重放的是新参数——缓存命中也校真（原「未命中才
+        // 补账」会拿旧缓存重放旧代码）
+        std::fs::write(
+            cdir.join("炮台.wat"),
+            ";; §炮台\n;; spawn 0.5 1.0 0 0 0 0 0 1.0 0 0 0 0 0 0.6 7777\n\n(module (func (export \"life\") (result i32) i32.const 1))\n",
+        )
+        .unwrap();
+        map.skill_spawns.clear(); // 排水（模拟拍界 process_spawn_requests 消费）
+        handle_skill_intents(&world, &mut map, creator, &[1], 6);
+        assert_eq!(map.skill_spawns.len(), 1, "新拍新队列：正常排队");
+        assert_eq!(
+            map.skill_spawns[0].lifespan_ticks, 7777,
+            "改文件后按格=新参数（热生效）"
+        );
+        // 删除即失效：文件删掉再按格 → 账本对账后空格，不排队不错位
+        std::fs::remove_file(cdir.join("炮台.wat")).unwrap();
+        map.skill_spawns.clear();
+        handle_skill_intents(&world, &mut map, creator, &[1], 7);
+        assert_eq!(map.skill_spawns.len(), 0, "造物文件没了=空格丢弃");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

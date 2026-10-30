@@ -934,14 +934,23 @@ struct CreationCodeBody {
 }
 
 /// POST /api/creation-code（D-023 工坊保存=造物入库）：JSON {name, code=全文} ->
-/// sanitize_name -> 64KB 护栏 -> 解析校验（坏头整单拒绝零落盘）-> 写
-/// creations/<名>.wat（原文原样，所见即所编）-> me.txt 声明的当前角色
-/// players/<角色>.wat 顶部追加 `;; @carry <名>`（去重；无 me 声明=只写文件）。
-/// 返回 {ok:true} / {ok:false,reason}。
+/// 同源校验（Origin↔Host，R1 审 P1 同款防护）-> sanitize_name -> 64KB 护栏 ->
+/// 解析校验（坏头整单拒绝零落盘）-> 写 creations/<名>.wat（原文原样，所见即所编）
+/// -> me.txt 声明的当前角色 players/<角色>.wat 顶部追加 `;; @carry <名>`（去重；
+/// 无 me 声明=只写文件）。返回 {ok:true,carried} / {ok:false,reason}（carried=
+/// 是否已挂到角色清单——追加写失败也 ok:true 但 carried:false，前端按实播报）。
 async fn creation_code_write(
     State(state): State<Arc<WsState>>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    if !origin_header_allowed(
+        headers.get("origin").and_then(|v| v.to_str().ok()),
+        headers.get("host").and_then(|v| v.to_str().ok()),
+    ) {
+        tracing::info!("[creations] 保存同源校验未过（ORIGIN_MISMATCH，疑似跨站免预检写），拒");
+        return workshop_reject_json("ORIGIN_MISMATCH");
+    }
     let req: CreationCodeBody = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -963,13 +972,16 @@ async fn creation_code_write(
     // 解析校验（坏头整单拒绝零落盘——与"出生重叠拒绝+日志"同款严格哲学）。
     // max_speed 取默认值即可：校验只判结构（烂数/寿命<1），域钳制在账本建账时
     // 按世界实配重做，保存不改动玩家原文（所见即所编）
-    if let Err(e) = crate::creations::parse_creation_file(
+    let parsed = match crate::creations::parse_creation_file(
         &req.code,
         crate::config::Config::default().max_speed,
     ) {
-        tracing::info!(name = %name, reason = e.wire(), "[creations] 保存拒绝：坏头文件");
-        return workshop_reject_json(e.wire());
-    }
+        Ok(cf) => cf,
+        Err(e) => {
+            tracing::info!(name = %name, reason = e.wire(), "[creations] 保存拒绝：坏头文件");
+            return workshop_reject_json(e.wire());
+        }
+    };
     let path = state.creations_dir.join(format!("{name}.wat"));
     // 目录兜底创建（creations/ 首次使用时还不存在）
     if let Some(parent) = path.parent() {
@@ -984,20 +996,23 @@ async fn creation_code_write(
         len = req.code.len(),
         "[creations] 造物文件已保存（工坊保存→文件落地）"
     );
-    // § 名与文件名不一致：文件名为锚，INFO 对账（不拒绝不改动）
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(cf) = crate::creations::parse_creation_file(
-            &text,
-            crate::config::Config::default().max_speed,
-        ) {
-            if cf.name != name {
-                tracing::info!(file = %name, header = %cf.name, "[creations] § 名与文件名不一致（文件名为锚）");
-            }
-        }
+    // § 名与文件名不一致：文件名为锚，INFO 对账（不拒绝不改动；复用上方解析结果）
+    if parsed.name != name {
+        tracing::info!(file = %name, header = %parsed.name, "[creations] § 名与文件名不一致（文件名为锚）");
     }
     // 追加到 me.txt 声明的当前角色（工坊入库=写文件+追加 carry）；
-    // 无 me 声明/角色文件不在=只写文件（库存管理与操控声明解耦）
-    let me = crate::players::read_me_declaration(None, &state.players_dir);
+    // 无 me 声明/角色文件不在=只写文件（库存管理与操控声明解耦）。
+    // me 声明过 sanitize_name（R1 审 P1：me.txt 内容直接拼路径前必须过闸，
+    // 坏名=按未声明处理）
+    let mut carried = false;
+    let me = crate::players::read_me_declaration(None, &state.players_dir)
+        .and_then(|raw| match crate::onboarding::sanitize_name(&raw) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                tracing::warn!(raw = %raw, reason = e.wire(), "[carry] me 声明未过名字闸门，按未声明处理");
+                None
+            }
+        });
     match me {
         Some(player) if state.players_dir.join(format!("{player}.wat")).exists() => {
             let ppath = state.players_dir.join(format!("{player}.wat"));
@@ -1007,17 +1022,22 @@ async fn creation_code_write(
                         crate::creations::append_carry_line(&text, &name);
                     if changed {
                         match std::fs::write(&ppath, new_text) {
-                            Ok(()) => tracing::info!(
-                                player = %player,
-                                creation = %name,
-                                "[carry] 新建造物已追加到当前角色清单"
-                            ),
+                            Ok(()) => {
+                                carried = true;
+                                tracing::info!(
+                                    player = %player,
+                                    creation = %name,
+                                    "[carry] 新建造物已追加到当前角色清单"
+                                );
+                            }
                             Err(e) => tracing::warn!(
                                 error = %e,
                                 player = %player,
                                 "[carry] 清单追加写盘失败（造物文件已入库，carry 未加）"
                             ),
                         }
+                    } else {
+                        carried = true; // 已在清单（重复保存去重）=语义上已挂
                     }
                 }
                 Err(e) => tracing::warn!(error = %e, player = %player, "[carry] 角色文件读失败，未追加清单"),
@@ -1030,7 +1050,7 @@ async fn creation_code_write(
             tracing::info!("[carry] 无 me 声明，造物已入库但未挂到角色（下次保存带 me 声明即可）");
         }
     }
-    Json(serde_json::json!({ "ok": true })).into_response()
+    Json(serde_json::json!({ "ok": true, "carried": carried })).into_response()
 }
 
 /// GET /api/creation-code?name=（D-023 工坊加载造物）：读 creations/<名>.wat 全文
@@ -1076,8 +1096,16 @@ async fn creation_code_read(
 /// IO_ERROR）。返回 {ok:true,cleared:N}（N=移除了几份清单行）。
 async fn creation_code_delete(
     State(state): State<Arc<WsState>>,
+    headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    if !origin_header_allowed(
+        headers.get("origin").and_then(|v| v.to_str().ok()),
+        headers.get("host").and_then(|v| v.to_str().ok()),
+    ) {
+        tracing::info!("[creations] 删除同源校验未过（ORIGIN_MISMATCH，疑似跨站免预检删），拒");
+        return workshop_reject_json("ORIGIN_MISMATCH");
+    }
     let Some(raw) = params.get("name") else {
         return workshop_reject_json("NAME_EMPTY");
     };
@@ -3690,7 +3718,12 @@ mod tests {
         let cdir = crate::creations::dir_for(&players);
         // 无 me 声明：只写文件（受理不拒——库存文件管理与操控声明解耦）
         let body = serde_json::json!({ "name": "箭塔", "code": good_creation_text("箭塔") });
-        assert_eq!(post_json(&addr, "/api/creation-code", &body).await["ok"], true);
+        let save = post_json(&addr, "/api/creation-code", &body).await;
+        assert_eq!(save["ok"], true);
+        assert_eq!(
+            save["carried"], false,
+            "无 me 声明=文件入库但未挂清单（carried 按实回执）"
+        );
         let written = std::fs::read_to_string(cdir.join("箭塔.wat")).expect("造物文件应落盘");
         assert_eq!(written, good_creation_text("箭塔"), "内容=提交全文原样");
         assert!(
@@ -3702,7 +3735,9 @@ mod tests {
         std::fs::write(players.join("alice.wat"), "(module)\n").unwrap();
         std::fs::write(players.join("me.txt"), "alice\n").unwrap();
         let body2 = serde_json::json!({ "name": "炮台", "code": good_creation_text("炮台") });
-        assert_eq!(post_json(&addr, "/api/creation-code", &body2).await["ok"], true);
+        let save2 = post_json(&addr, "/api/creation-code", &body2).await;
+        assert_eq!(save2["ok"], true);
+        assert_eq!(save2["carried"], true, "me 声明的角色存在=应挂清单成功");
         let alice = std::fs::read_to_string(players.join("alice.wat")).unwrap();
         assert_eq!(
             crate::creations::parse_carry_lines(&alice),
@@ -3792,6 +3827,64 @@ mod tests {
             leftovers.is_empty(),
             "拒绝路径不该有任何造物文件落盘，实际残留 {leftovers:?}"
         );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn creation_write_and_delete_reject_cross_site_origin() {
+        // R1 审 P1 同源防护锚：带异源 Origin 的 POST/DELETE 拒（ORIGIN_MISMATCH）——
+        // 造物文件通道可写盘可改清单可删文件，跨站免预检请求不设防=恶意网页一句话
+        // 改世界库存；无 Origin（curl/脚本）照常放行零回归
+        let static_dir = temp_static_dir("cr-origin");
+        let players_dir = temp_net_players_dir("cr-origin");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("cr-origin"),
+                &players_dir,
+                None,
+                &temp_bridge_vault_path("cr-origin"),
+            )
+            .await;
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "name": "箭塔",
+            "code": good_creation_text("箭塔")
+        }))
+        .unwrap();
+        let resp = http_request_with_origin(
+            &addr,
+            "POST",
+            "/api/creation-code",
+            Some("http://evil.example"),
+            Some(&raw),
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "ORIGIN_MISMATCH");
+        let resp = http_request_with_origin(
+            &addr,
+            "DELETE",
+            "/api/creation-code?name=箭塔",
+            Some("http://evil.example"),
+            None,
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "ORIGIN_MISMATCH");
+        // 同源 Origin（authority=Host）放行
+        let resp = http_request_with_origin(
+            &addr,
+            "POST",
+            "/api/creation-code",
+            Some(&format!("http://{addr}")),
+            Some(&raw),
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], true, "同源 Origin 应放行：{json}");
         shutdown_tx.send(()).ok();
         let _ = server.await;
     }

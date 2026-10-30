@@ -99,7 +99,7 @@ impl SkillMemory {
             player = %player,
             name = %tpl.name,
             slot = list.len() + 1,
-            "[skill] 造物模板入列（技能=我的造物，spawn 成功自动上栏）"
+            "[skill] 造物模板入列（D-023 清单建账：@carry 行序=格序）"
         );
         list.push(tpl);
         true

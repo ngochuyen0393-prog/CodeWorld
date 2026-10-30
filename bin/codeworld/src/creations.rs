@@ -100,7 +100,17 @@ pub(crate) fn parse_creation_file(
     let mut spawn: Option<CreationSpawnLine> = None;
     let mut body_start = lines.len(); // 默认=没有代码体
     for (idx, line) in lines.iter().enumerate().skip(1) {
-        if let Some(rest) = line.strip_prefix(";; spawn") {
+        // spawn 行判定：「;; spawn」+ 空白 + **首个 token 是数字**（R1 审 P2：
+        // 普通注释「;; spawn 行=出生参数」不误判——首 token 非数字当注释跳过；
+        // 真坏行「;; spawn 0.5 1.0 零 ...」首 token 数字照走解析，BadSpawnLine
+        // 作废语义不变）
+        let looks_like_spawn = line
+            .strip_prefix(";; spawn")
+            .filter(|rest| rest.starts_with(' '))
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|first| first.parse::<f64>().is_ok());
+        if looks_like_spawn {
+            let rest = line.strip_prefix(";; spawn").unwrap_or("");
             spawn = Some(parse_spawn_line(rest, max_speed).ok_or(CreationParseError::BadSpawnLine)?);
             continue;
         }
@@ -435,6 +445,19 @@ mod tests {
         let src = ";; §箭塔\n;; spawn 0.5 1.0 0 0 0 0 0 1.0 0 0 0 0 0 0.6 10000\n\n;; 这行属于代码体的注释\n(module)\n";
         let cf = parse_creation_file(src, 25.0).expect("应解析通过");
         assert_eq!(cf.code, ";; 这行属于代码体的注释\n(module)\n");
+    }
+
+    #[test]
+    fn spawn_prefix_requires_trailing_space() {
+        // ";; spawn" 后必须跟空白（R1 审 P2）：头区普通注释「;; spawn 行=出生参数」
+        // 不再误判成 spawn 行导致整文件作废；「;; spawnX」同理
+        let note = ";; §箭塔\n;; spawn 行=出生参数（15 数）\n;; spawn 0.5 1.0 0 0 0 0 0 1.0 0 0 0 0 0 0.6 10000\n\n(module)\n";
+        let cf = parse_creation_file(note, 25.0).expect("注释行不该误判，真 spawn 行应命中");
+        assert_eq!(cf.spawn.lifespan_ticks, 10000);
+        let glued = ";; §箭塔\n;; spawnX\n;; spawn 0.5 1.0 0 0 0 0 0 1.0 0 0 0 0 0 0.6 10000\n\n(module)\n";
+        assert!(parse_creation_file(glued, 25.0).is_ok(), ";; spawnX 不算 spawn 行");
+        let bare = ";; §箭塔\n;; spawn\n\n(module)\n";
+        assert_eq!(parse_creation_file(bare, 25.0), Err(CreationParseError::MissingSpawnLine), "裸 ;; spawn（无参数无空格）=缺 spawn 行");
     }
 
     #[test]

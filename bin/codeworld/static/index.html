@@ -2774,8 +2774,8 @@
       .then(function (j) {
         carryNames = j.ok
           ? String(j.code || '').split('\n')
-              .filter(function (l) { return l.indexOf(';; @carry ') === 0; })
-              .map(function (l) { return l.slice(';; @carry '.length).trim(); })
+              .filter(function (l) { return l.indexOf(';; @carry') === 0; })
+              .map(function (l) { return l.slice(';; @carry'.length).trim(); })
               .filter(function (t) { return t.length > 0; })
           : [];
         consoleRenderSkills(lastRawEnts || new Map());
@@ -3552,9 +3552,10 @@
       renderRoster();      // 在线圆点逐拍校真
       renderCreations();
       renderInventory();   // D-023 库存三态逐拍校真（快照驱动零轮询）
-      // 操控角色变了（选角/进场）才重拉 @carry 清单（每拍 fetch 会刷爆）
+      // 操控角色变了（选角/进场）才重拉 @carry 清单（每拍 fetch 会刷爆）；
+      // 换角连「出过场」记忆一起清（invSeen 是角色态不是全局态——R1 审 P1）
       var who = controlledName();
-      if (who !== lastCarryWho) { lastCarryWho = who; refreshCarry(); }
+      if (who !== lastCarryWho) { lastCarryWho = who; invSeen = {}; refreshCarry(); }
     }
     renderEvents(frame.player_events || []);
   }
@@ -3832,8 +3833,8 @@
       .then(function (j) {
         if (!j.ok) { invCarry = []; renderInventory(); return; }
         invCarry = String(j.code || '').split('\n')
-          .filter(function (l) { return l.indexOf(';; @carry ') === 0; })
-          .map(function (l) { return l.slice(';; @carry '.length).trim(); })
+          .filter(function (l) { return l.indexOf(';; @carry') === 0; })
+          .map(function (l) { return l.slice(';; @carry'.length).trim(); })
           .filter(function (s) { return s.length > 0; });
         renderInventory();
       })
@@ -3916,7 +3917,10 @@
           if (isCreation) {
             refreshCarry();
             notifyInventoryChanged();
-            flash('已保存造物 ' + name + '（写 creations/' + name + '.wat，已挂到当前角色清单）');
+            // carried=false=未挂清单（无 me 声明/清单写失败）——按实播报不说假话
+            flash(j.carried === false
+              ? '已保存造物 ' + name + '（写 creations/' + name + '.wat；**未**挂到角色清单——没有操控角色或清单写失败，看世界日志）'
+              : '已保存造物 ' + name + '（写 creations/' + name + '.wat，已挂到当前角色清单）');
           } else {
             mergeRosterLocal(name); // 本地合并（player_roster 只在连接时下发，不重连）
             flash(isOnline(name)
@@ -3993,7 +3997,7 @@
           } else {
             roster = roster.filter(function (c) { return c.name !== name; });
             renderRoster();
-            if (currentName === name) { currentName = null; updateTitle(); }
+            if (currentName === name && currentKind === 'player') { currentName = null; updateTitle(); }
             flash('已删除 ' + name + '（文件没了；世界下拍残影下线）');
           }
           closeDelDialog(null);
