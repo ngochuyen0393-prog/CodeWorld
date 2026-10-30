@@ -2352,6 +2352,8 @@
     });
   }
 
+  // 登录页显隐唯一入口（D-021e 后仅剩两处出现时机：页面加载 + 刷新页面重连）；
+  // 函数按任务卡保留（防后续刀想恢复"登出回登录页"时重写），当前零调用
   function showLoginPanel() {
     loginPanelEl.classList.remove('closing');
     loginErrEl.textContent = '';

@@ -3456,8 +3456,9 @@ fn process_create_player(
         );
         return;
     };
-    // （首建归档在 main() 启动时做——空世界模式+空玩家目录即归档，见 main 头部；
-    // 进程内不做：Windows 下 sqlite 句柄锁 db，rename 必失败 os error 32，实测）
+    // （首建归档在 main() 启动时做——空世界模式+本机角色档案空白即归档，
+    // 见 main 头部 first_build_archive；进程内不做：Windows 下 sqlite 句柄锁 db，
+    // rename 必失败 os error 32，实测）
     // 5. 写玩家文件 + me 声明（CODEWORLD_ME 环境变量优先级更高——显式设了 env
     //    的开发者不受面板影响；面板是浏览器玩家的 me 声明通道）
     if let Err(e) = std::fs::write(&wat_path, code.as_bytes()) {
