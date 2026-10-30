@@ -508,7 +508,6 @@
     if (delBusy) return;
     delTarget = name;
     delNameEl.textContent = name;
-    delBusy = false;
     delDialogEl.classList.remove('closing');
     delDialogEl.hidden = false;
   }

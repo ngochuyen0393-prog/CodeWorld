@@ -2005,6 +2005,7 @@
     stopPrediction();
   });
   window.addEventListener('keydown', function (ev) {
+    if (ev.target && ev.target.tagName === 'INPUT') return; // 输入框里敲键不触发快捷键（S/F/L/T/B 同治）
     if (ev.key === 's' || ev.key === 'S') {
       sendMsg({ type: 'stop' });
       stopPrediction();

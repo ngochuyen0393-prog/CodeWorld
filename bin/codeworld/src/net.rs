@@ -817,7 +817,8 @@ async fn player_code_write(State(state): State<Arc<WsState>>, body: axum::body::
 }
 
 /// GET /api/player-code?name=（D-022 工坊加载）：读 players/<名>.wat 全文 ->
-/// {ok:true,code} / NAME_UNKNOWN（无此角色）/ NAME_*（名字闸门）/ IO_ERROR。
+/// {ok:true,code} / NAME_UNKNOWN（无此角色）/ NAME_*（名字闸门）/
+/// CODE_TOO_LONG（落盘文件超上限，读前 metadata 护栏，与写路径对称）/ IO_ERROR。
 async fn player_code_read(
     State(state): State<Arc<WsState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -833,6 +834,14 @@ async fn player_code_read(
         }
     };
     let path = state.players_dir.join(format!("{name}.wat"));
+    // 读护栏（与写路径 CODE_TOO_LONG 对称）：落盘文件超上限先拒，不整读进内存/
+    // 响应体；metadata 失败（无此文件等）不拦，交给下方读分支按语义回
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > PLAYER_CODE_MAX_BYTES as u64 {
+            tracing::info!(name = %name, len = meta.len(), "[workshop] 读取拒绝：文件超上限（CODE_TOO_LONG）");
+            return workshop_reject_json("CODE_TOO_LONG");
+        }
+    }
     match std::fs::read_to_string(&path) {
         Ok(code) => Json(serde_json::json!({ "ok": true, "code": code })).into_response(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -3152,6 +3161,24 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
         assert_eq!(json["ok"], false);
         assert_eq!(json["reason"], "NAME_BAD_CHAR");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn workshop_read_rejects_oversized_file_on_disk() {
+        // 读护栏（与写路径对称）：>256KB 文件直接落盘构造（绕过 POST 上限门槛），
+        // GET 拒 CODE_TOO_LONG，不把大文件整读进响应体
+        let static_dir = temp_static_dir("ws-read-big");
+        let players_dir = temp_net_players_dir("ws-read-big");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
+            start_test_server_full(static_dir, &temp_assets_dir("ws-read-big"), &players_dir, None)
+                .await;
+        std::fs::write(players.join("bigguy.wat"), vec![b'a'; 256 * 1024 + 1]).unwrap();
+        let resp = http_request(&addr, "GET", "/api/player-code?name=bigguy", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false, "超上限文件应拒绝：{json}");
+        assert_eq!(json["reason"], "CODE_TOO_LONG");
         shutdown_tx.send(()).ok();
         let _ = server.await;
     }
