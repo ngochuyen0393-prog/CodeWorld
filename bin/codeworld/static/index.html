@@ -131,9 +131,11 @@
     font: inherit; padding: 0 8px; cursor: pointer;
   }
   #workshopBtn:hover { border-color: #8b949e; }
-  /* 登出处置面板：登出是主动行为，三选一离开（#025 下线处置权） */
+  /* 登出处置面板：登出是主动行为，三选一离开（#025 下线处置权）。
+     z-index 46（D-022b）：压过工坊侧滑面板(45)——L 键开着面板也能唤起，
+     弹窗不得被面板盖住；仍在 delDialog(50)/flash(60) 之下 */
   #logoutPanel {
-    position: absolute; inset: 0; z-index: 5;
+    position: absolute; inset: 0; z-index: 46;
     display: flex; align-items: center; justify-content: center;
     background: rgba(14, 17, 22, 0.72);
     transition: opacity 0.25s ease; /* 决策即关门：0.25s 透明淡出 */
@@ -2323,7 +2325,9 @@
     // 输入框/文本域里敲键不触发快捷键（S/F/L/T/B 同治；TEXTAREA 一并守卫——
     // D-022b 工坊 Monaco 自建 textarea 也是 TEXTAREA，编辑器里打字按 B 不得被截走）
     if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA')) return;
-    if (ev.key === 's' || ev.key === 'S') {
+    // S 键 stop（D-022b 修复：Ctrl+S/Cmd+S 是工坊保存快捷键，不得再触发 stop
+    // ——面板内焦点在按钮等非文本区时按 Ctrl+S 曾会"保存+角色急停"双触发）
+    if ((ev.key === 's' || ev.key === 'S') && !ev.ctrlKey && !ev.metaKey) {
       sendMsg({ type: 'stop' });
       stopPrediction();
     }
@@ -2664,14 +2668,16 @@
     consoleRenderStream();
   });
   window.addEventListener('keydown', function (ev) {
+    // 输入框/文本域焦点不抢快捷键（起名/创建角色面板打字不受技能快捷键干扰；
+    // D-022b：TEXTAREA 守卫一并覆盖工坊 Monaco 自建 textarea——编辑器里 Tab
+    // 缩进不得切控制台）
+    var tag = ev.target && ev.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
     if (ev.key === 'Tab') {
       ev.preventDefault();
       consoleToggle();
       return;
     }
-    // 输入框焦点不抢数字键（起名/创建角色面板打字不受技能快捷键干扰）
-    var tag = ev.target && ev.target.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
     // 技能快捷键：数字键 1-9 对应技能格 1..9（D-020b 起格数动态，超 9 格只用鼠标）
     if (ev.key >= '1' && ev.key <= '9') {
       consoleSendSkill(Number(ev.key));
@@ -3407,6 +3413,7 @@
   var entityEvents = {};            // entity_id -> [事件摘要]（造物展开面板用）
   var completions = null;           // 补全数据（fetch templates/api-completions.json）
   var bridgeEnabled = true;         // 外桥装配态（GET enabled 字段；保存提示文案分流）
+  var bridgeSaving = false;         // 外桥保存在途（防双发——整表替换 POST 不许并发）
   var bridgeTesting = false;        // 测试连接在途（防双发）
   var lastAssetId = null;           // 新建造物流程：最近上传成功的皮 asset_id
   var delTarget = null;             // 删除确认弹窗的目标名
@@ -3727,7 +3734,7 @@
   }
 
   function loadCharacter(name) {
-    if (dirty && !window.confirm('「' + currentName + '」有未保存的修改，切换会丢掉。继续？')) return;
+    if (dirty && !window.confirm('「' + (currentName || '（未选择）') + '」有未保存的修改，切换会丢掉。继续？')) return;
     fetch('/api/player-code?name=' + encodeURIComponent(name))
       .then(function (r) { return r.json(); })
       .then(function (j) {
@@ -3962,7 +3969,7 @@
   function renderBridgeRows(ports) {
     bridgeListEl.innerHTML = '';
     bridgeNoteEl.hidden = !bridgeEnabled ? false : true;
-    bridgeNoteEl.textContent = '桥未启用（CODEWORLD_BRIDGE=1 重启世界才启用）——仍可编辑保存，写盘即用';
+    bridgeNoteEl.textContent = '桥未启用（CODEWORLD_BRIDGE=1 重启世界才启用）——仍可编辑保存。注意：保存=整表替换 bridges.json（含此刻未显示的已登记条目与凭证），桥未启用时下方列表不读盘，先核对原档再保存';
     if (!ports.length) {
       var empty = document.createElement('div');
       empty.className = 'empty';
@@ -3990,6 +3997,8 @@
   });
 
   bridgeSaveEl.addEventListener('click', function () {
+    if (bridgeSaving) return; // 保存在途防双发（双击=两个整表替换 POST，last-wins 假象）
+    bridgeSaving = true;
     var ports = collectBridgeRows();
     fetch('/api/bridge-config', {
       method: 'POST',
@@ -3998,6 +4007,7 @@
     })
       .then(function (r) { return r.json(); })
       .then(function (j) {
+        bridgeSaving = false;
         if (j.ok) {
           // 文案区分 enabled 两种情况（bridgeEnabled 来自最近一次 GET）
           flash(bridgeEnabled
@@ -4007,7 +4017,10 @@
           flash('保存被拒：' + bridgeReasonText(j.reason, j.index), true);
         }
       })
-      .catch(function (e) { flash('保存请求失败：' + e, true); });
+      .catch(function (e) {
+        bridgeSaving = false;
+        flash('保存请求失败：' + e, true);
+      });
   });
 
   bridgeTestEl.addEventListener('click', function () {
@@ -4703,6 +4716,10 @@
 
   btnEl.addEventListener('click', toggle);
   window.addEventListener('keydown', function (ev) {
+    // 输入框/文本域里打字不触发（D-022b：工坊 Monaco 的 textarea 也冒泡到
+    // window——WAT 代码里的 't'（table/type 等关键字）不得翻 3D 层）
+    var tag = ev.target && ev.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
     if (ev.key === 't' || ev.key === 'T') toggle(); // 双入口之二：快捷键（按钮见上）
   });
 

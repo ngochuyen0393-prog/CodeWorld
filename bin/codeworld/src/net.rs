@@ -987,7 +987,7 @@ async fn bridge_config_save(State(state): State<Arc<WsState>>, body: axum::body:
                 path = %state.bridge_config_path.display(),
                 count = entries.len(),
                 vault_synced = synced,
-                "[bridge-config] 端点表已写盘+内存同步（bridge_send 下一拍按新表解析）"
+                "[bridge-config] 端点表已写盘（内存同步见 vault_synced：false=本拍未检出 mtime 变化，主循环每拍热重载会兜底重载，语义不变）"
             );
             Json(serde_json::json!({ "ok": true })).into_response()
         }
@@ -3557,6 +3557,13 @@ mod tests {
             (
                 serde_json::json!({ "ports": [
                     { "port": 4, "url": "http://Example.COM" }
+                ] }),
+                "URL_INVALID",
+                0,
+            ),
+            (
+                serde_json::json!({ "ports": [
+                    { "port": 6, "url": "http://127.0.0.1:0" }
                 ] }),
                 "URL_INVALID",
                 0,

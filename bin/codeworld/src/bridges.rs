@@ -102,13 +102,14 @@ pub(crate) struct BridgeEndpointView {
 /// 漂移）。合法返回 Ok(())；非法返回原因码：
 /// - PORT_INVALID：port<=0
 /// - URL_INVALID：https 拒（MVP 客户端只做本机 http，design-bridge §2.8）/
-///   非 http scheme / URL 解析失败 / host 非本机回环（127.0.0.1/localhost，
-///   localhost 大小写不敏感——P2-D 同锁）
+///   非 http scheme / URL 解析失败（scheme 前缀判定大小写不敏感，但解析步对
+///   原文大小写敏感——"HTTP://" 拒，两处行为一致）/ URL 端口 0 / host 非本机
+///   回环（127.0.0.1/localhost，localhost 大小写不敏感——P2-D 同锁）
 fn check_endpoint(port: i32, url: &str) -> Result<(), &'static str> {
     if port <= 0 {
         return Err("PORT_INVALID");
     }
-    // scheme 校验（大小写不敏感前缀匹配，与 load 校验同源）
+    // scheme 校验（大小写不敏感前缀匹配；解析步对原文大小写敏感——见函数文档）
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("https://") {
         return Err("URL_INVALID");
@@ -116,10 +117,13 @@ fn check_endpoint(port: i32, url: &str) -> Result<(), &'static str> {
     if !lower.starts_with("http://") {
         return Err("URL_INVALID");
     }
-    // host 校验：MVP 客户端只做本机回环
-    let Some((host, _, _)) = parse_http_url(url) else {
+    // host/端口校验：MVP 客户端只做本机回环；URL 内端口 0 拒（连接期必失败）
+    let Some((host, port_num, _)) = parse_http_url(url) else {
         return Err("URL_INVALID");
     };
+    if port_num == 0 {
+        return Err("URL_INVALID");
+    }
     if host != "127.0.0.1" && !host.eq_ignore_ascii_case("localhost") {
         return Err("URL_INVALID");
     }
@@ -128,9 +132,10 @@ fn check_endpoint(port: i32, url: &str) -> Result<(), &'static str> {
 
 /// 保存端点登记表（D-022b POST /api/bridge-config 写通道）：
 /// ① 整批校验（check_endpoint 唯一规则源，任一条非法=整单拒绝**不动盘**）->
-/// ② 读旧文件按 port 合并 headers（凭证不落浏览器，写盘保留已有值；坏 JSON=
-/// 无旧值可并，按 UI 提交为准）-> ③ pretty JSON 原子写（同目录 .tmp 先落再换名
-/// ——Windows rename 不覆盖已存在目标，先 remove；防写一半崩档）。
+/// ② 读旧文件按 port 合并 headers（凭证不落浏览器，写盘保留已有值；坏档 warn
+/// 留痕后按 UI 提交为准）-> ③ pretty JSON 原子写（同目录 .tmp 先落再 rename
+/// ——std::fs::rename 在 Windows 走 MoveFileExW(MOVEFILE_REPLACE_EXISTING)
+/// 本就覆盖已存在目标，Unix 亦原子替换，全程无"目标消失"窗口）。
 /// 返回 Err=整单拒绝（文件保持原样）。
 pub(crate) fn save_endpoint_entries(
     path: &Path,
@@ -146,22 +151,31 @@ pub(crate) fn save_endpoint_entries(
             });
         }
     }
-    // ② 读旧文件提取 headers（按 port 索引；读失败/坏 JSON 不阻断——登记表本就
-    // 人手维护，坏档时以 UI 提交为准，warn 留痕）
-    let old_headers: HashMap<i32, HashMap<String, String>> = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok())
-        .map(|list| {
-            list.into_iter()
+    // ② 读旧文件提取 headers（按 port 索引；读失败/坏 JSON warn 留痕后不阻断
+    // ——登记表本就人手维护，坏档时以 UI 提交为准，旧 headers 无声丢弃须防）
+    let raw_text = std::fs::read_to_string(path);
+    let old_headers: HashMap<i32, HashMap<String, String>> = match &raw_text {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(), // 首存无旧档，正常
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "[bridge-config] 旧登记表读取失败（headers 合并按空表走）");
+            HashMap::new()
+        }
+        Ok(text) => match serde_json::from_str::<Vec<serde_json::Value>>(text) {
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "[bridge-config] 旧登记表解析失败（坏档；headers 合并按空表走）");
+                HashMap::new()
+            }
+            Ok(list) => list
+                .into_iter()
                 .filter_map(|v| {
                     let port = v.get("port")?.as_i64()? as i32;
                     let headers: HashMap<String, String> =
                         serde_json::from_value(v.get("headers")?.clone()).ok()?;
                     Some((port, headers))
                 })
-                .collect()
-        })
-        .unwrap_or_default();
+                .collect(),
+        },
+    };
     // ③ 组装端点数组（headers=旧文件同 port 值原样保留；无则不写该字段）
     let list: Vec<serde_json::Value> = entries
         .iter()
@@ -173,10 +187,9 @@ pub(crate) fn save_endpoint_entries(
             obj
         })
         .collect();
-    let text =
-        serde_json::to_string_pretty(&list).expect("端点表应可序列化");
-    // ④ 原子写：同目录 .tmp 先落，remove 目标后换名（崩在窗口内=旧档还在或
-    // 新档已换名，无半截档）
+    let text = serde_json::to_string_pretty(&list).expect("端点表应可序列化");
+    // ④ 原子写：同目录 .tmp 先落，rename 换名（MoveFileExW REPLACE_EXISTING
+    // 覆盖目标，无中间态）
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text).map_err(|e| {
         tracing::warn!(error = %e, tmp = %tmp.display(), "[bridge-config] 临时文件写盘失败");
@@ -185,9 +198,8 @@ pub(crate) fn save_endpoint_entries(
             index: None,
         }
     })?;
-    std::fs::remove_file(path).ok(); // Windows rename 不覆盖已存在目标，先移除
     if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!(error = %e, path = %path.display(), "[bridge-config] 换名失败（临时文件留存）");
+        tracing::warn!(error = %e, path = %path.display(), "[bridge-config] 换名失败（临时文件留存可人工恢复）");
         return Err(BridgeSaveReject {
             reason: "IO_ERROR",
             index: None,
@@ -719,6 +731,11 @@ mod tests {
             "非回环 host 大写形态仍拒"
         );
         assert_eq!(check_endpoint(1, "http://"), Err("URL_INVALID"), "空 host 拒");
+        assert_eq!(
+            check_endpoint(1, "http://127.0.0.1:0"),
+            Err("URL_INVALID"),
+            "URL 内端口 0 拒（连接期必失败，入库即坏档）"
+        );
     }
 
     #[test]
