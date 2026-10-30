@@ -935,9 +935,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>, url_token: Option
             },
         }
     }
-    if controller {
-        // 自己仍是操控端时断开 = 操控权释放（Released 沿）。被踢后断开
-        //（controller 已降）不发 None——操控权已属新连接，误发会错拆新操控端
+    if controller && *state.ctrl_conn.borrow() == Some(conn_id) {
+        // 自己仍是操控端时断开 = 操控权释放（Released 沿）。双门守卫：①本地
+        // controller 标记（踢旧沿已消费的常规路径）②watch 当前值=自己（防
+        // "踢旧沿待处理 + socket 同拍退出"竞态——select! 多分支就绪随机选，
+        // 若只查标记，清理段会以过期身份发 None 错拆新操控端。borrow 与 send
+        // 间无 await，current_thread 单线程下原子）
         let _ = state.ctrl_conn.send(None);
         tracing::info!("[ws] 操控连接断开（操控权已释放）");
     } else {
@@ -2071,6 +2074,22 @@ mod tests {
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(queue.drain().is_empty(), "被踢连接上行已丢弃（降观战）");
+        // 被踢者断开不误拆新操控端：A 断开后 B 的操控权仍在（move 照常入队）
+        a.send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .ok();
+        drop(a);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        b.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":6.0,"y":0.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::WsMove { x: 6.0, y: 0.0 },
+            "被踢者断开后新操控端不受影响"
+        );
         shutdown_tx.send(()).ok();
         let _ = server.await;
     }

@@ -7090,7 +7090,7 @@ mod tests {
     #[test]
     fn bind_session_token_silent_noop_in_terminal_mode() {
         // 纯终端模式（WS 禁用，sessions=None）：分流处照常调用绑定但不炸不写
-        let (mut world, mut map, _dir) = onboarding_stage();
+        let (_world, map, _dir) = onboarding_stage();
         assert!(map.sessions.is_none(), "测试基线=纯终端模式（None）");
         bind_session_token(&map, "tok-x", "p1"); // 不应 panic
         assert!(map.sessions.is_none(), "None 模式无表可写");
