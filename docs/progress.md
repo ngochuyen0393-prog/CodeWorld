@@ -2,7 +2,15 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-30 D-022 造物工坊落地，待土豆验收）
+## 现在（2026-10-30 D-022b 工坊并入世界页面+外桥可编辑落地，待土豆/Hermes 验收）
+
+- 完成：D-022b（commit 66a5d38 主体 + 64e8110 R1 审修复 + b4dac8d R2 审修复）——土豆实测两处否决全落地：①**工坊从新标签页迁入世界页面侧滑面板**（workshop.html/workshop.js git rm 删除，ServeDir 自然 404；#wsPanel 左滑 min(640px,66vw) 与 #console 同家族，B 键/底栏按钮开合、ESC 收起[优先级 logoutPanel>delDialog>面板]，首开懒装配 Monaco[loader 动态注入]+独立观战 WS[全角色事件都看得到]+补全数据，面板关闭不销毁）；②**外桥从只读升级可编辑**（POST /api/bridge-config 整批校验[check_endpoint 唯一规则源=load 与复验共用防漂移]+headers 按 port 合并保留凭证+tmp/rename 原子写+写锁 reload 内存同步；GET 加 enabled+url 回填；前端每端点一行行编辑+保存+浏览器侧测试连接[HEAD no-cors 3s 超时 ✓可达/✗不通]+每次展开重新 GET；跨站写防护=Origin↔Host 同源校验）。
+- 顺带修的键位面（迁 Monaco 进页引出的全局 keydown 全量盘点）：Tab/'t' 快捷键补 INPUT/TEXTAREA 守卫（编辑器里缩进/敲 WAT 不再切控制台/翻 3D 层）；主页面 S 键排除 Ctrl/Cmd（Ctrl+S 保存不再触发角色急停）；logoutPanel z-index 5→46（面板开着按 L 弹窗不再被盖）。
+- 验证：workspace **1288 绿 0 failed 2 ignored**（基线 1278+净增 10：bridges 4 锚[规则源 13 态矩阵/保存落盘+headers 合并/整单拒绝文件不动/空表清空]+net 6 锚[T1 落盘回显/T2 五形态拒绝/T3 空数组清空/T4 vault=None 受理/T5 BAD_JSON/T6 跨站 Origin]；TDD 三轮全程红绿）；clippy -D warnings 零告警；经典脚本块语法机检双 PASS；id 双向对账 72 引用全过。
+- 双审（改动>50 行宪法）：R1 需求审=无 P0/P1 全兑现无越界；R1 质量审=1 P0[Tab/'t' 无守卫]+3 P1[Ctrl+S 急停/remove+rename 破坏原子性[卡面前提有误已纠]/vault=None 空表语义]→64e8110 全修（P1-2 按卡面既定决策改黄字警示不改语义）；R2 确认审=修复全落地无回归；R2 清扫审=1 P1[Monaco 就绪竞态占位骨架顶掉真档]+5 P2→b4dac8d 全修[跨站 Origin/parseInt 畸变/scheme 大小写对齐/收起态 DOM 门卫]，R3 确认审进行中。报告 $LOCALAPPDATA/Temp/cc-report-d022b.md。
+- 下一步：土豆/Hermes 亲验——①按 B 面板滑出世界照跑、ESC 收起；②面板内点角色→Monaco 载入（Tab 缩进/Ctrl+S 保存不急停）、新建/传皮/删除；③外桥改地址→保存→绿提示→测试连接 ✓/✗；④workshop.html 访问 404。
+
+## 上一轮（2026-10-30 D-022 造物工坊落地，页面形态已被 D-022b 面板化取代）
 
 - 完成：D-022（协议 v2.9→v3.0，工坊刀）——玩家主工作台 workshop.html：Monaco 编辑器（vendored 0.52.2 amd 版，static/vendor/monaco/vs/ 整目录 14MB 入 git，白名单例外同 three.module.min.js；禁 CDN）+ 造物管理 + 事件流。战场页底栏「🛠 工坊」按钮/B 键新标签打开；工坊 WS=无 token 观战连接（纯消费 player_roster/player_events/entities，上行零意图）。
 - 服务端四路由（net.rs，全部 HTTP 恒 200 看 ok 字段）：`POST /api/player-code`（sanitize_name→256KB 护栏→覆盖写 players/<名>.wat→**登记本机角色档案**[create_player 成功路径同款——工坊列表数据源=player_roster，档案不登记则看不见]→世界下拍目录轮询自动进场；**不写 me.txt 不手动 spawn**）/ `GET ?name=`（读全文）/ `DELETE ?name=`（删文件→下拍残影下线；**不动 me.txt**）/ `GET /api/bridge-config`（BridgeVault 读锁→ports 升序 [{port,note}]；None=空列表；不做写路由）。WsState 加 players_dir+bridge_vault 两字段（main.rs 装配处从 BridgeOutbox.vault_arc() 取 Arc；bridges.rs BridgeEndpoint 加 note 字段透传+port_notes()+vault_arc()）。
