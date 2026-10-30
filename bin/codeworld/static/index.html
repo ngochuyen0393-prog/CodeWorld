@@ -495,9 +495,13 @@
   #wsPanel .crow .dot.on { background: #3fb950; } /* 在场=绿 */
   #wsPanel .crow .glyph { width: 20px; text-align: center; font-weight: 700; flex-shrink: 0; }
   #wsPanel .crow .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #e6edf3; }
+  #wsPanel .crow .st { font-size: 11px; color: #8b949e; flex-shrink: 0; } /* 我的造物状态徽（待命/在场 N/已消亡，D-023） */
   #wsPanel .crow .del { padding: 0 6px; font-size: 12px; border: none; background: none; }
   #wsPanel .crow .del:hover { color: #f85149; }
   #wsPanel .empty { color: #484f58; padding: 8px 12px; font-size: 12px; }
+
+  /* 我的造物列表（D-023 库存） */
+  #wsPanel #wsInvList { max-height: 160px; overflow-y: auto; }
 
   /* 在场造物列表 */
   #wsPanel #wsCreatList { max-height: 160px; overflow-y: auto; }
@@ -745,6 +749,10 @@
         <div id="wsCharList"><div class="empty">打开面板时读取……</div></div>
       </div>
       <div class="sec">
+        <h3>我的造物（creations/）</h3>
+        <div id="wsInvList"><div class="empty">等待角色进场……</div></div>
+      </div>
+      <div class="sec">
         <h3>在场造物</h3>
         <div id="wsCreatList"><div class="empty">等待世界快照……</div></div>
       </div>
@@ -959,6 +967,7 @@
       if (snap.reason === 'stale') {
         clearSession();
         pendingSession = null;
+        carryNames = []; // D-023：凭据失效=库存清空（重选角后重拉）
         bannerTextEl.textContent = '登录已过期，刷新页面重新选择角色';
         logoutBannerEl.hidden = false;
       } else {
@@ -2418,6 +2427,8 @@
           sendMsg({ type: 'logout', disposition: d });
           clearSession(); // D-021f：登出=会话终结（服务器已删 token，本地凭据一并清——
           pendingSession = null; // R4：下次连接=全新观战→登录页）
+          carryNames = []; // D-023：登出=库存清空（重新选角后重拉）
+          consoleRenderSkills(lastRawEnts || new Map());
           moveTarget = null;
           clearPrediction(); // 已无操控：预测态清空（重进后从服务器快照重来）
           fadeOutLogoutPanel(function () {
@@ -2697,8 +2708,7 @@
   // 实体，按 name 聚合（同名合并一格+在场计数角标），按首次出生顺序排列，上限 9 格。
   // 历史名册（skillRoster）：首次见到的名字永久记格——造物全部消亡后格子保留
   //（这是"我的造物模板"不是"活体计数"：角标只算在场数，消亡后格子还在可重放）
-  var skillRoster = [];  // [{name, glyph, color, id, born}] 永不删格（历史模板）
-  var skillSeen = {};    // name -> roster 下标（查重）
+  var skillSeen = {};    // name -> true：本会话见过在场（「已消亡」判定锚）
   var skillRosterMe = null; // 名册归属的操控实体 id（换角清册——技能=该玩家的造物）
   function consoleRenderSkills(ents) {
     var now = performance.now();
@@ -2710,7 +2720,7 @@
       skillRoster = [];
       skillSeen = {};
     }
-    // 本拍在场计数（按名字聚合我的造物）
+    // 本拍在场计数（按名字聚合我的造物）；见过在场=「已消亡」判定锚
     var byName = {};
     ents.forEach(function (e) {
       if (!myId || e.owner !== myId) return;
@@ -2718,35 +2728,33 @@
       var nm = e.name || '造物';
       if (!byName[nm]) byName[nm] = { count: 0, glyph: e.glyph, color: e.color || '#8b949e', id: e.id, born: e.born_tick || 0 };
       byName[nm].count++;
+      skillSeen[nm] = true;
     });
-    // 新见过的名字入名册（已入册的不覆盖任何字段——格序锚=首见 born，保持
-    // 与服务端 SkillMemory 入列序恒一致；后续重 spawn 同名不改变格下标）
-    Object.keys(byName).forEach(function (nm) {
-      if (skillSeen[nm] !== undefined) return;
-      skillSeen[nm] = skillRoster.length;
-      skillRoster.push({ name: nm, glyph: byName[nm].glyph, color: byName[nm].color, id: byName[nm].id, born: byName[nm].born });
-    });
-    // 格序=首次出生拍序（与服务端技能格下标同源：spawn 落地拍序，每实体每拍
-    // 1 发限流保证同玩家不同名造物出生拍必异拍无歧义）；同拍按入册序稳定
-    var shown = skillRoster.slice().sort(function (a, b) { return a.born - b.born; }).slice(0, SKILL_SLOTS_MAX);
+    // D-023 格=携带清单前 9（@carry 行序=格序，与服务端进场建账同款截断；
+    // 协议零新帧——清单由角色文件文本客户端解析，工坊保存/删除广播刷新）
+    var shown = carryNames.slice(0, SKILL_SLOTS_MAX);
     var html = '';
     for (var i = 0; i < shown.length; i++) {
-      var s = shown[i];
+      var nm = shown[i];
       var slot = i + 1;
       var cool = (cSkillCool[slot] || 0) > now ? ' cool' : '';
-      var live = byName[s.name];
+      var live = byName[nm];
       var cnt = live ? live.count : 0;
-      var title = s.name + '（' + (cnt ? cnt + ' 只在场' : '已消亡，模板保留') + '）· 点击或按 ' + slot + ' 再造一只 · id ' + s.id.slice(0, 8);
+      var stateText = live ? '在场 ' + cnt : (skillSeen[nm] ? '已消亡·可再放' : '待命');
+      // 待命/已消亡外观：名字首字符+中性灰（与 player_roster 离场灰同款诚实——
+      // 文件造物未出场时世界没有它的真实外观）；在场=快照实体真实外观
+      var glyph = live ? live.glyph : nm.charAt(0).toUpperCase();
+      var color = live ? live.color : '#8b949e';
+      var title = nm + '（' + stateText + '）· 点击或按 ' + slot + (live ? ' 再造一只' : ' 放出场');
       html += '<div class="sbslot' + cool + '" data-slot="' + slot + '" title="' + attrEscape(title) + '">' +
-        '<div class="sg" style="color:' + attrEscape(s.color) + '">' + escapeHtml(s.glyph) + '</div>' +
-        '<div class="nm">' + escapeHtml(s.name) + '</div>' +
-        (cnt > 1 ? '<div class="cnt">' + cnt + '</div>' : '') +
-        '<div class="key">键 ' + slot + '</div></div>';
+        '<div class="sg" style="color:' + attrEscape(color) + '">' + escapeHtml(glyph) + '</div>' +
+        '<div class="nm">' + escapeHtml(nm) + '</div>' +
+        '<div class="key">' + stateText + ' · 键 ' + slot + '</div></div>';
     }
     if (!shown.length) {
       // 空栏起步：虚线空格 + 一格引导（空态必须给下一步动作）
       html += '<div class="sbempty"><div style="font-size:18px">＋</div><div>空技能格</div></div>' +
-        '<div class="sbhint">还没有技能——spawn 你的第一个造物后自动上栏（造物可起名，同名合并一格）</div>';
+        '<div class="sbhint">还没有携带造物——开工坊（B 键）「新建造物」，保存后自动上栏待命，按格放出场</div>';
     }
     cSkillsEl.innerHTML = html;
     Array.prototype.forEach.call(cSkillsEl.querySelectorAll('.sbslot'), function (el) {
@@ -2755,7 +2763,29 @@
       });
     });
   }
+  // ---- @carry 清单拉取（D-023 技能栏数据源；协议零新帧）----
+  var carryNames = [];  // 操控角色的携带清单（角色文件 ;; @carry 行客户端解析）
+  function refreshCarryNames() {
+    var s = readSession();
+    var who = s && s.name;
+    if (!who) { carryNames = []; consoleRenderSkills(lastRawEnts || new Map()); return; }
+    fetch('/api/player-code?name=' + encodeURIComponent(who))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        carryNames = j.ok
+          ? String(j.code || '').split('\n')
+              .filter(function (l) { return l.indexOf(';; @carry ') === 0; })
+              .map(function (l) { return l.slice(';; @carry '.length).trim(); })
+              .filter(function (t) { return t.length > 0; })
+          : [];
+        consoleRenderSkills(lastRawEnts || new Map());
+      })
+      .catch(function () { /* 网络抖动保旧清单；工坊操作会再广播 */ });
+  }
+  // 工坊侧造物保存/删除广播（cw-inventory-changed）→ 技能栏即时对账
+  window.addEventListener('cw-inventory-changed', refreshCarryNames);
   consoleRenderSkills(new Map());
+  refreshCarryNames();
   setInterval(function () { consoleRenderSkills(lastRawEnts || new Map()); }, 500); // 冷却解除重绘（0.5s 粒度足够观感）
 
   // ===== D-021d 登录/选角页（常驻：未选角前永远显示，与世界里有无玩家无关）=====
@@ -2882,6 +2912,7 @@
       sessionSelected = true;       // 选角完成才进世界画面
       createManualOpen = false;
       createDismissed = false;
+      refreshCarryNames();          // D-023：新角色的携带清单上技能栏（待命态）
       fadeHideLoginPanel();
       clearLoggedOutResidue();
       bornBannerTextEl.textContent = '「' + (ev.name || '?') + '」进场了';
@@ -3282,9 +3313,12 @@
  * 流程：1. 首开连 WS（无 token=观战连接，收 player_roster + 每拍快照的
  *          player_events/entities——工坊不需要操控权；独立于主页面操控连接，
  *          全角色事件都看得到，谁的 compile_failed 都能标红定位）
- *       2. 左列表点选角色 -> GET /api/player-code 载入编辑器
- *       3. Ctrl+S / 保存按钮 -> POST /api/player-code（写 players/<名>.wat，
- *          新文件=世界下拍目录轮询自动进场；在线角色=下次进场生效）
+ *       2. 左列表点选角色 -> GET /api/player-code 载入编辑器（D-023 起另有
+ *          「我的造物」区：点造物 -> GET /api/creation-code 载入造物文件）
+ *       3. Ctrl+S / 保存按钮按编辑对象分流（D-023）：角色 -> POST /api/player-code
+ *          （写 players/<名>.wat，新文件=世界下拍目录轮询自动进场；在线角色=下次
+ *          进场生效）；造物 -> POST /api/creation-code（写 creations/<名>.wat 入库
+ *          +自动挂当前角色清单）
  *       4. compile_failed -> 正则解析行号（wat 错误格式 `--> <anon>:行:列`）
  *          -> Monaco markers 红波浪线；运行错面板点击跳转导出函数所在行
  * 降级：Monaco 加载失败（vendor 缺失/超时）-> textarea + 顶部黄条，保存/加载/
@@ -3311,15 +3345,18 @@
     NAME_EMPTY: '名字不能为空',
     NAME_TOO_LONG: '名字太长（最多 24 字符）',
     NAME_BAD_CHAR: '名字只能用字母/数字/中文/_/-（拒路径分隔符和点号）',
-    CODE_TOO_LONG: '代码超过 256KB 上限',
+    CODE_TOO_LONG: '代码超过上限（角色 256KB / 造物 64KB）',
     IO_ERROR: '服务器写盘失败（看世界日志）',
-    BAD_JSON: '请求格式错误（浏览器侧 bug？）'
+    BAD_JSON: '请求格式错误（浏览器侧 bug？）',
+    BAD_HEADER: '造物文件首行必须是 ;; §<名字>（D-023 文件格式）',
+    BAD_SPAWN_LINE: '造物文件缺 ;; spawn 行或 15 个数有坏（个数/非数字/寿命<1）',
+    EMPTY_BODY: '造物文件空代码体——空行后要写 WAT 模块'
   };
   var DELETE_REJECT_TEXT = {
     NAME_EMPTY: '名字不能为空',
     NAME_TOO_LONG: '名字太长',
     NAME_BAD_CHAR: '非法名字',
-    NAME_UNKNOWN: '角色不存在（可能已被删除）',
+    NAME_UNKNOWN: '不存在（可能已被删除）',
     IO_ERROR: '服务器删除失败（看世界日志）'
   };
   // 外桥保存拒绝码 -> 人话（D-022b；与 api.md 码表同源）
@@ -3371,6 +3408,7 @@
   var warnBarEl = document.getElementById('wsMonacoWarn');
   var closeBtnEl = document.getElementById('wsCloseBtn');
   var listEl = document.getElementById('wsCharList');
+  var invListEl = document.getElementById('wsInvList');
   var creatListEl = document.getElementById('wsCreatList');
   var newNameEl = document.getElementById('wsNewName');
   var newTplEl = document.getElementById('wsNewTpl');
@@ -3401,6 +3439,10 @@
   var monacoReady = false;          // Monaco 可用（false=textarea 降级）
   var editor = null;                // Monaco 实例（降级时 null）
   var currentName = null;           // 正在编辑的角色名（保存目标）
+  var currentKind = 'player';       // 编辑对象种类（D-023）：'player'=players/ 角色文件，'creation'=creations/ 造物文件——保存/删除按此分流
+  var invCarry = [];                // 当前操控角色的 @carry 清单（fetch 角色文件客户端解析）
+  var invSeen = {};                 // 名字 -> true：本会话见过在场（待命/已消亡判定）
+  var lastCarryWho = null;          // 上次拉清单时的操控角色名（变更才重拉，防每拍 fetch）
   var dirty = false;                // 编辑器内容未保存标记
   var saving = false;               // 保存/删除请求在途（防双发）
   var roster = [];                  // player_roster 角色（{name,glyph,color,online}）
@@ -3417,6 +3459,7 @@
   var bridgeTesting = false;        // 测试连接在途（防双发）
   var lastAssetId = null;           // 新建造物流程：最近上传成功的皮 asset_id
   var delTarget = null;             // 删除确认弹窗的目标名
+  var delKind = 'player';           // 删除对象种类（D-023）：'player'=角色 / 'creation'=造物
   var delBusy = false;              // 删除弹窗决策/淡出中（防双发）
   var ws = null;
   var wsBackoff = WS_BACKOFF_INIT_MS;
@@ -3508,6 +3551,10 @@
     if (panelEl.classList.contains('open')) {
       renderRoster();      // 在线圆点逐拍校真
       renderCreations();
+      renderInventory();   // D-023 库存三态逐拍校真（快照驱动零轮询）
+      // 操控角色变了（选角/进场）才重拉 @carry 清单（每拍 fetch 会刷爆）
+      var who = controlledName();
+      if (who !== lastCarryWho) { lastCarryWho = who; refreshCarry(); }
     }
     renderEvents(frame.player_events || []);
   }
@@ -3734,7 +3781,8 @@
   }
 
   function updateTitle() {
-    editingNameEl.textContent = currentName || '（未选择——点左侧角色，或新建）';
+    var kindTag = currentKind === 'creation' ? '[造物] ' : '[角色] ';
+    editingNameEl.textContent = currentName ? kindTag + currentName : '（未选择——点左侧角色/造物，或新建）';
     saveBtnEl.textContent = dirty ? '保存 *' : '保存';
   }
 
@@ -3745,28 +3793,115 @@
       .then(function (j) {
         if (!j.ok) { flash('读取失败：' + (SAVE_REJECT_TEXT[j.reason] || j.reason), true); return; }
         currentName = name;
+        currentKind = 'player';
         setValue(j.code);
         errPanelEl.hidden = true;
-        flash('已载入 ' + name);
+        flash('已载入角色 ' + name);
       })
       .catch(function (e) { flash('读取请求失败：' + e, true); });
+  }
+
+  // 载入造物文件（D-023 所见即所编）：GET /api/creation-code -> 编辑器（currentKind=creation）
+  function loadCreation(name) {
+    if (dirty && !window.confirm('「' + (currentName || '（未选择）') + '」有未保存的修改，切换会丢掉。继续？')) return;
+    fetch('/api/creation-code?name=' + encodeURIComponent(name))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j.ok) { flash('读取失败：' + (SAVE_REJECT_TEXT[j.reason] || j.reason), true); return; }
+        currentName = name;
+        currentKind = 'creation';
+        setValue(j.code);
+        errPanelEl.hidden = true;
+        flash('已载入造物 ' + name + '（改完 Ctrl+S 保存入库，再放一只热生效）');
+      })
+      .catch(function (e) { flash('读取请求失败：' + e, true); });
+  }
+
+  // ---- 我的造物（D-023 库存：@carry 清单 + 快照在场计数 -> 待命/在场 N/已消亡）----
+  // 数据源（协议零新帧定案）：GET /api/player-code?name=<操控角色> 文本里解析
+  // ;; @carry 行 + 快照 entities（owner=操控实体 id 的 creation 系按名聚合）
+  function controlledName() {
+    var me = entities.filter(function (e) { return e.kind === 'player' && e.controlled; })[0];
+    return me ? (me.name || null) : null;
+  }
+  function refreshCarry() {
+    var who = controlledName();
+    if (!who) { invCarry = []; renderInventory(); return; }
+    fetch('/api/player-code?name=' + encodeURIComponent(who))
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j.ok) { invCarry = []; renderInventory(); return; }
+        invCarry = String(j.code || '').split('\n')
+          .filter(function (l) { return l.indexOf(';; @carry ') === 0; })
+          .map(function (l) { return l.slice(';; @carry '.length).trim(); })
+          .filter(function (s) { return s.length > 0; });
+        renderInventory();
+      })
+      .catch(function () { renderInventory(); });
+  }
+  // 工坊侧库存变化广播（主页面技能栏监听重拉 carry——同页两脚本块的桥）
+  function notifyInventoryChanged() {
+    try { window.dispatchEvent(new CustomEvent('cw-inventory-changed')); } catch (e) { /* 老浏览器降级：技能栏下次进场/刷新自愈 */ }
+  }
+  function renderInventory() {
+    if (!invListEl) return;
+    // 在场计数（快照 entities：owner=操控实体 id 的 creation 系按名聚合）
+    var byName = {};
+    entities.forEach(function (e) {
+      if (!myEntityId || e.owner !== myEntityId) return;
+      if (e.kind !== 'creation' && e.kind !== 'creation_dynamic') return;
+      var nm = e.name || '造物';
+      if (!byName[nm]) byName[nm] = { count: 0, glyph: e.glyph, color: e.color };
+      byName[nm].count++;
+    });
+    Object.keys(byName).forEach(function (nm) { invSeen[nm] = true; });
+    invListEl.innerHTML = '';
+    if (!invCarry.length) {
+      var who = controlledName();
+      invListEl.innerHTML = '<div class="empty">' + (who
+        ? '「' + esc(who) + '」还没有携带造物——<br>下方「新建造物」造一只，自动挂进清单。'
+        : '等你的角色进场后显示携带库存。<br>没有角色？左边新建一个。') + '</div>';
+      return;
+    }
+    invCarry.forEach(function (nm) {
+      var live = byName[nm];
+      var state = live ? '在场 ' + live.count : (invSeen[nm] ? '已消亡·可再放' : '待命');
+      var glyph = live ? live.glyph : nm.charAt(0).toUpperCase();
+      var color = live ? live.color : '#8b949e';
+      var row = document.createElement('div');
+      row.className = 'crow';
+      row.innerHTML =
+        '<span class="dot' + (live ? ' on' : '') + '" title="' + (live ? '在场' : '未出场') + '"></span>' +
+        '<span class="glyph" style="color:' + esc(color) + '">' + esc(glyph) + '</span>' +
+        '<span class="nm">' + esc(nm) + '</span>' +
+        '<span class="st">' + esc(state) + '</span>' +
+        '<button class="del" type="button" title="删除造物（删文件+全部角色清单移除）">🗑</button>';
+      row.querySelector('.nm').addEventListener('click', function () { loadCreation(nm); });
+      row.querySelector('.del').addEventListener('click', function () { askDeleteCreation(nm); });
+      invListEl.appendChild(row);
+    });
   }
 
   function saveCode() {
     if (saving) return;
     var name = (currentName || '').trim();
     if (!nameValid(name)) {
-      flash('没有合法的编辑目标名（trim 后 1..=24 字符：字母/数字/中文/_/-）——先点左侧角色或在「新建造物」起名', true);
+      flash('没有合法的编辑目标名（trim 后 1..=24 字符：字母/数字/中文/_/-）——先点左侧角色/造物或在「新建造物」起名', true);
       return;
     }
     var code = getValue();
-    if (new Blob([code]).size > 256 * 1024) {
-      flash('代码超过 256KB 上限', true);
+    // 尺寸护栏按对象分流：角色文件 256KB / 造物文件 64KB（服务端同款双门）
+    var maxBytes = currentKind === 'creation' ? 64 * 1024 : 256 * 1024;
+    if (new Blob([code]).size > maxBytes) {
+      flash('代码超过 ' + (currentKind === 'creation' ? '64KB（造物）' : '256KB（角色）') + ' 上限', true);
       return;
     }
     saving = true;
     saveBtnEl.disabled = true;
-    fetch('/api/player-code', {
+    // D-023 分流：造物文件 -> /api/creation-code（写 creations/ + 自动挂清单）；
+    // 角色文件 -> /api/player-code（写 players/ = 进场通道，既有语义）
+    var isCreation = currentKind === 'creation';
+    fetch(isCreation ? '/api/creation-code' : '/api/player-code', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: name, code: code })
@@ -3778,10 +3913,16 @@
         if (j.ok) {
           dirty = false;
           updateTitle();
-          mergeRosterLocal(name); // 本地合并（player_roster 只在连接时下发，不重连）
-          flash(isOnline(name)
-            ? '已保存 ' + name + '；该角色在场中，下次进场生效'
-            : '已保存 ' + name + '（写 players/' + name + '.wat；新文件=世界下拍进场）');
+          if (isCreation) {
+            refreshCarry();
+            notifyInventoryChanged();
+            flash('已保存造物 ' + name + '（写 creations/' + name + '.wat，已挂到当前角色清单）');
+          } else {
+            mergeRosterLocal(name); // 本地合并（player_roster 只在连接时下发，不重连）
+            flash(isOnline(name)
+              ? '已保存 ' + name + '；该角色在场中，下次进场生效'
+              : '已保存 ' + name + '（写 players/' + name + '.wat；新文件=世界下拍进场）');
+          }
         } else {
           flash('保存被拒：' + (SAVE_REJECT_TEXT[j.reason] || j.reason), true);
         }
@@ -3807,6 +3948,16 @@
   function askDelete(name) {
     if (delBusy) return;
     delTarget = name;
+    delKind = 'player';
+    delNameEl.textContent = name;
+    delDialogEl.classList.remove('closing');
+    delDialogEl.hidden = false;
+  }
+  // 删除造物（D-023）：删 creations 文件+全部角色清单同名行移除（服务端联动）
+  function askDeleteCreation(name) {
+    if (delBusy) return;
+    delTarget = name;
+    delKind = 'creation';
     delNameEl.textContent = name;
     delDialogEl.classList.remove('closing');
     delDialogEl.hidden = false;
@@ -3824,12 +3975,22 @@
     if (delBusy || !delTarget) return;
     delBusy = true;
     var name = delTarget;
+    var kind = delKind;
     setTimeout(function () {
-      fetch('/api/player-code?name=' + encodeURIComponent(name), { method: 'DELETE' })
+      var url = (kind === 'creation' ? '/api/creation-code' : '/api/player-code')
+        + '?name=' + encodeURIComponent(name);
+      fetch(url, { method: 'DELETE' })
         .then(function (r) { return r.json(); })
         .then(function (j) {
           if (!j.ok) { flash('删除被拒：' + (DELETE_REJECT_TEXT[j.reason] || j.reason), true); }
-          else {
+          else if (kind === 'creation') {
+            if (invSeen[name]) delete invSeen[name];
+            refreshCarry();
+            notifyInventoryChanged();
+            var cleared = typeof j.cleared === 'number' ? j.cleared : 0;
+            flash('已删除造物 ' + name + '（文件没了；' + cleared + ' 份角色清单已移除）');
+            if (currentName === name && currentKind === 'creation') { currentName = null; updateTitle(); }
+          } else {
             roster = roster.filter(function (c) { return c.name !== name; });
             renderRoster();
             if (currentName === name) { currentName = null; updateTitle(); }
@@ -3913,17 +4074,25 @@
         return r.text();
       })
       .then(function (tpl) {
+        // D-023 造物文件格式：§头 + spawn 15 数（默认律）+ 注释 + 空行 + 模板代码。
+        // 保存=写 creations/<名>.wat（不再写 players/——「新建造物」就是建造物，
+        // 不再误建角色）；15 数=spawn 第 7..23 参：半径 质量 绑定 运动 初速xy
+        // 场三参 液两参 链 弹性 摩擦 寿命
         var head =
-          ';; —— 造物工坊骨架 ——\n' +
+          ';; §' + name + '\n' +
+          ';; spawn 0.5 1.0 0 0 0 0 0 1.0 0 0 0 0 0 0.6 10000\n' +
+          ';; —— 造物工坊骨架（D-023 文件格式）——\n' +
           ';; 名字：' + name + '　模板：' + tplId + '\n' +
           (lastAssetId
             ? ';; 皮肤资产：' + lastAssetId + '（装戴 API 属后续刀）\n'
             : ';; 皮肤资产：（未上传——传了会在这里记 asset_id；装戴 API 属后续刀）\n') +
-          ';; 保存（Ctrl+S）= 写 players/' + name + '.wat，世界下拍进场\n\n';
+          ';; 保存（Ctrl+S）= 写 creations/' + name + '.wat 入库+自动挂当前角色清单（按技能格出场）\n\n';
         currentName = name;
+        currentKind = 'creation';
         setValue(head + tpl);
+        updateTitle();
         errPanelEl.hidden = true;
-        flash('骨架已生成——改完按 Ctrl+S 保存进场');
+        flash('造物骨架已生成——改完按 Ctrl+S 保存入库（技能栏出现待命格）');
       })
       .catch(function (e) { flash('生成失败：' + e, true); });
   });
@@ -4345,6 +4514,9 @@
     // 首开渲染空态文案占位，WS 数据到达后即校真；事件流一直在滚无需补）
     renderRoster();
     renderCreations();
+    lastCarryWho = null; // 强制重拉携带清单（面板外的保存/删除也能在开面板时对上）
+    renderInventory();
+    refreshCarry();
   }
   function closePanel() {
     panelEl.classList.remove('open');
