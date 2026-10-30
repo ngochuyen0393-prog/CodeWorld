@@ -577,6 +577,29 @@
                                 // 离屏掩码图（实心白半透明），avatar_assets 消息到达即重建
   var skinCache = new Map();    // #051 皮入沙箱：asset_id -> {img, state:'loading'|'ready'|'failed'}
                                 // 已见 id 复用缓存（同图全局一份）；failed 恒兜底圆形不再重试
+  // ---- D-021f 会话令牌：操控权随凭据走（踢旧留新） ----
+  var pendingSession = null;    // session_token 帧的暂存 {token, name}（不落盘）——
+                                // 成功回执（player_selected/player_joined 按名匹配）才写 localStorage；
+                                // 拒绝路径作废（null），令牌永不生效
+  var SESSION_KEY = 'cw_session'; // localStorage 键：{"token":..,"name":..}（刷新/重连凭它认领操控）
+
+  // localStorage 全 try/catch（本文件第一个使用者：隐私模式/Safari 阻断兜底——
+  // 读失败=null=无 token 观战，写失败=静默降级为每次重登录，不炸页面）
+  function readSession() {
+    try {
+      var raw = localStorage.getItem(SESSION_KEY);
+      if (!raw) return null;
+      var v = JSON.parse(raw);
+      return (v && v.token) ? v : null;
+    } catch (e) { return null; }
+  }
+  function writeSession(token, name) {
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify({ token: token, name: name })); }
+    catch (e) { /* 写失败静默：下次刷新重新选角（旧行为），页面功能不受影响 */ }
+  }
+  function clearSession() {
+    try { localStorage.removeItem(SESSION_KEY); } catch (e) { /* 已不可用则无从清起 */ }
+  }
 
   // ---- 快照接收：入缓冲 + 帧间隔滚动平均 ----
   function onMessage(ev) {
@@ -595,6 +618,27 @@
     if (snap && snap.type === 'player_roster') {
       rosterData = Array.isArray(snap.characters) ? snap.characters : [];
       renderLoginList();
+      return;
+    }
+    // D-021f：session_token（选角/创建上行后服务器当场颁发）——只暂存内存
+    // 不落盘，成功回执（loginPanelOnEvent 按名匹配）才写 localStorage
+    if (snap && snap.type === 'session_token') {
+      pendingSession = { token: snap.token, name: snap.name };
+      return;
+    }
+    // D-021f：control_revoked 操控权变动通知（本连接已被降观战，服务器侧已处理，
+    // 这里只同步 UI）。taken=被新凭据接管（同凭据攻防互换，token 保留——刷新
+    // 可抢回）；stale=token 失效（清本地凭据，刷新回登录页重新选角）
+    if (snap && snap.type === 'control_revoked') {
+      if (snap.reason === 'stale') {
+        clearSession();
+        pendingSession = null;
+        bannerTextEl.textContent = '登录已过期，刷新页面重新选择角色';
+        logoutBannerEl.hidden = false;
+      } else {
+        bannerTextEl.textContent = '你的操控已在别处接管';
+        logoutBannerEl.hidden = false;
+      }
       return;
     }
     if (!snap || !Array.isArray(snap.entities) || !snap.viewport) {
@@ -2021,6 +2065,8 @@
         setTimeout(function () {
           loggedOut = d; // 与发消息同拍置位：回执窗口内断线仍走自动重连（意外断开语义）
           sendMsg({ type: 'logout', disposition: d });
+          clearSession(); // D-021f：登出=会话终结（服务器已删 token，本地凭据一并清——
+          pendingSession = null; // R4：下次连接=全新观战→登录页）
           moveTarget = null;
           clearPrediction(); // 已无操控：预测态清空（重进后从服务器快照重来）
           fadeOutLogoutPanel(function () {
@@ -2066,10 +2112,15 @@
     connState = 'wait';
     renderConn();
     var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-    var ws = new WebSocket(proto + location.host + '/ws');
+    // D-021f：连接 URL 带会话令牌（localStorage 存的凭据）——服务器凭它认领
+    // 操控（刷新/重连不丢操控权）；无 token=观战连接（登录页通道）
+    var url = '/ws';
+    var sess = readSession();
+    if (sess && sess.token) url += '?token=' + encodeURIComponent(sess.token);
+    var ws = new WebSocket(proto + location.host + url);
     ws.onopen = function () {
       console.info('[cw] WS 已连接');
-      wsSock = ws; // 上行意图通道就绪（第一连接=操控端；后来连接上行被服务器丢弃）
+      wsSock = ws; // 上行意图通道就绪（操控权凭 token 认领；观战连接上行被服务器丢弃）
       connState = 'ok';
       backoffMs = BACKOFF_INIT; // 连上了就重置退避
       reconnectAttempts = 0;    // #036：重连成功计数清零
@@ -2172,7 +2223,14 @@
     if (vp) {
       if (camMode === 'follow' && meRendered) {
         if (!cam) {
-          cam = { x: meRendered.x, y: meRendered.y }; // 首帧直接对准，不从原点滑移
+          // D-021f 出生镜头：观战全景中选角完成 → 镜头从当前视野中心平滑飞向
+          // 自己（CAM_LERP 复用零新常数）；view 是上一帧值够用。从未渲染过
+          //（无 view）保持直接对准
+          if (view) {
+            cam = { x: view.x0 + view.w / 2, y: view.y0 + view.h / 2 };
+          } else {
+            cam = { x: meRendered.x, y: meRendered.y };
+          }
         } else {
           cam.x += (meRendered.x - cam.x) * CAM_LERP;
           cam.y += (meRendered.y - cam.y) * CAM_LERP;
@@ -2417,6 +2475,12 @@
       pendingSelect = null;
       loginBusy = false;
       if (loginBusyTimer) { clearTimeout(loginBusyTimer); loginBusyTimer = null; }
+      // D-021f：成功回执才落盘会话令牌（名字匹配=本机请求的回执；拒绝路径
+      // pendingSession 已作废，令牌永不生效）
+      if (pendingSession && pendingSession.name === ev.name) {
+        writeSession(pendingSession.token, pendingSession.name);
+      }
+      pendingSession = null;
       sessionSelected = true;       // 选角完成才进世界画面
       createManualOpen = false;
       createDismissed = false;
@@ -2426,11 +2490,12 @@
       bornBannerEl.hidden = false;
       if (bornTimer) clearTimeout(bornTimer);
       bornTimer = setTimeout(function () { bornBannerEl.hidden = true; }, 5000);
-      freshConnection(); // 断开重连（防早关丢消息；重连=第一连接重新认领操控令牌）
+      freshConnection(); // 断开重连（防早关丢消息；重连带 token=凭据认领，D-021f）
     } else if (ev.kind === 'select_player_rejected') {
       if (!loginBusy) return; // 拒绝事件不带名字：只有本机在途请求才认领（别人的被拒新闻不理）
       loginBusy = false;
       pendingSelect = null;
+      pendingSession = null; // D-021f：拒绝路径令牌作废（不落盘）
       if (loginBusyTimer) { clearTimeout(loginBusyTimer); loginBusyTimer = null; }
       if (ev.reason === 'ME_ENV_LOCKED') {
         // 开发者逃生门：env 已在服务器侧锁定操控（me 声明归 env 管）——
@@ -2442,9 +2507,13 @@
       }
     } else if (ev.kind === 'player_joined') {
       // 新建角色成功（createPanelOnEvent 已收面板+亮出生横幅）：这里统一做
-      // 登录页收场+断开重连——新建后 me.txt 已写，重连即操控（与选角一条路径）
+      // 登录页收场+断开重连——新建后 me.txt 已写，重连带 token=操控（与选角一条路径）
       if (pendingCreate !== ev.name) return; // 别人的进场新闻：不误触发本机重连
       pendingCreate = null;
+      if (pendingSession && pendingSession.name === ev.name) {
+        writeSession(pendingSession.token, pendingSession.name); // D-021f：成功才落盘
+      }
+      pendingSession = null;
       sessionSelected = true;
       createManualOpen = false;
       createDismissed = false;

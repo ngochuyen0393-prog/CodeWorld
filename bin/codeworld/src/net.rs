@@ -20,7 +20,7 @@ use codeworld_render::Viewport;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
@@ -419,16 +419,29 @@ pub(crate) fn build_snapshot(
 /// 静态验收页目录（相对工作目录；start.bat 已 cd 到项目根）
 pub(crate) const STATIC_DIR: &str = "bin/codeworld/static";
 
-/// WS 服务器共享状态：快照广播 + 上行意图队列 + 操控连接令牌（#027 单连接假设）
-/// + 头像资产登记表（D-017：上传路由写入 / ws 连接建立时全量下发）
-/// + 角色列表共享槽（D-021d：主循环每拍重建 / ws 连接建立时全量下发）
+/// WS 服务器共享状态：快照广播、上行意图队列、操控连接 id（D-021f 凭据制）、
+/// 会话令牌表（D-021f）、头像资产登记表（D-017：上传路由写入 / ws 连接建立时
+/// 全量下发）、角色列表共享槽（D-021d：主循环每拍重建 / ws 连接建立时全量下发）
 pub(crate) struct WsState {
     pub(crate) snapshots: broadcast::Sender<String>,
     /// 与终端键盘共享的意图队列生产端（单入口双来源，input.rs 路由不区分来源）
     pub(crate) intents: IntentSink,
-    /// 操控连接令牌：false=无主（下一连接即操控端）/ true=已被占用。
-    /// 第一连接认领、断开释放——"本机浏览器=我"的等价物（#024 me.txt 的连接版）。
-    pub(crate) ctrl_taken: Arc<AtomicBool>,
+    /// 当前操控连接 id：None=无操控端 / Some(n)=连接 n 持有操控权。
+    /// D-021f 凭据制取代旧 ctrl_taken AtomicBool：凭 token 认领时
+    /// send(Some(新 id))，旧操控端在 select! 的 watch 分支比对自己的 id
+    /// 降级观战（踢旧留新，连接不断）。#024 独占语义不变：任意时刻至多
+    /// 一个操控连接，变的只是钥匙（先来者得 → 凭据者得）
+    pub(crate) ctrl_conn: tokio::sync::watch::Sender<Option<u64>>,
+    /// 会话令牌表：token → 玩家名（D-021f）。写入方=tick 侧（选角/创建成功
+    /// 路径经 WsHandle 持有的 Arc），读取方=连接升级验证（?token= 认领）。
+    /// 生命周期=进程（重启即清空=全部失效，重新登录页选角）
+    pub(crate) sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// 逃生门：CODEWORLD_ME 启动时非空 = true，保留旧"第一连接=操控端"
+    ///（开发者 env 锁定场景 loginSkip 不重连也保有操控）；false=无 token
+    /// 连接纯观战（普通玩家走凭据认领）
+    pub(crate) legacy_first_conn: bool,
+    /// 连接 id 发号器（每连接递增；操控权认领的凭证，watch 里流转的值）
+    pub(crate) conn_ids: AtomicU64,
     /// 头像资产登记表（D-017 资产层：上传落盘+内存索引，掩码连接建立时下发）
     pub(crate) avatars: Arc<AvatarRegistry>,
     /// 角色列表共享槽（D-021d 登录/选角页）：主循环每拍 build_roster 重建，
@@ -436,19 +449,25 @@ pub(crate) struct WsState {
     pub(crate) roster: Arc<std::sync::Mutex<Vec<RosterEntry>>>,
 }
 
-/// 主循环持有的 WS 句柄：快照推送端、操控令牌观测（#025 期五第一刀）与
-/// 角色列表槽写入端（D-021d）。主循环每拍读 ctrl_taken 做翻转沿检测
-///（Claimed/Released），作为处置状态机触发源；每拍重建角色列表写共享槽。
+/// 主循环持有的 WS 句柄：快照推送端、操控连接 id 观测（#025 期五第一刀；
+/// D-021f 起改 watch Receiver）与会话令牌表/角色列表槽写入端。主循环每拍
+/// poll watch 做翻转沿检测（Claimed/Released），作为处置状态机触发源；
+/// 每拍重建角色列表写共享槽。
 pub(crate) struct WsHandle {
     pub(crate) snapshots: broadcast::Sender<String>,
-    pub(crate) ctrl_taken: Arc<AtomicBool>,
+    /// 操控连接 id 观测端（None↔Some 翻转沿 = 处置状态机触发源）
+    pub(crate) ctrl_conn: tokio::sync::watch::Receiver<Option<u64>>,
+    /// 会话令牌表（D-021f）：tick 侧选角/创建成功时写入 token→name（与
+    /// WsState.sessions 同一个 Arc）
+    pub(crate) sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// 角色列表共享槽（D-021d）：主循环每拍写入，ws 线程连接建立时读取下发
     pub(crate) roster: Arc<std::sync::Mutex<Vec<RosterEntry>>>,
 }
 
-/// 操控连接令牌翻转事件（主循环每拍沿检测；WS 禁用时恒 None）——
-/// #025 处置状态机的两条触发源：Claimed=重连认领（取消处置/重新进场），
-/// Released=意外断开（进入处置等待；主动登出沿由 tick 侧 logout_handled 抑制）
+/// 操控连接沿事件（主循环每拍沿检测；WS 禁用时恒 None）——
+/// #025 处置状态机的两条触发源：Claimed=重连认领（取消处置/重新进场；
+/// D-021f 起含凭 token 认领与踢旧易主），Released=意外断开（进入处置等待；
+/// 主动登出沿由 tick 侧 logout_handled 抑制）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnEvent {
     Claimed,
@@ -470,16 +489,29 @@ pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Optio
     //（load_players_initial 在 net::init 之前完成——见 main()），此后每拍刷新
     let roster: Arc<std::sync::Mutex<Vec<RosterEntry>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    // 会话令牌表（D-021f）：初值空表，tick 侧选角/创建成功时写入 token→name。
+    // 生命周期=进程：重启即清空=全部失效（重新登录页选角，单机阶段合理默认）
+    let sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // 逃生门：CODEWORLD_ME 非空 = 开发者 env 锁定场景，保留旧"第一连接=操控端"
+    //（loginSkip 不重连也保有操控）；普通玩家走凭据认领（无 token=纯观战）
+    let legacy_first_conn = std::env::var("CODEWORLD_ME")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
     let state = Arc::new(WsState {
         snapshots: tx.clone(),
         intents,
-        ctrl_taken: Arc::new(AtomicBool::new(false)),
+        ctrl_conn: tokio::sync::watch::channel(None).0,
+        sessions: sessions.clone(),
+        legacy_first_conn,
+        conn_ids: AtomicU64::new(1),
         avatars,
         roster: roster.clone(),
     });
     let handle = WsHandle {
         snapshots: tx,
-        ctrl_taken: state.ctrl_taken.clone(),
+        ctrl_conn: state.ctrl_conn.subscribe(),
+        sessions,
         roster,
     };
     let spawned = std::thread::Builder::new()
@@ -489,7 +521,7 @@ pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Optio
         Ok(_) => {
             tracing::info!(
                 port,
-                "[ws] WS 快照推送已启动（浏览器打开 http://localhost:{port} 看世界；第一连接=操控端）"
+                "[ws] WS 快照推送已启动（浏览器打开 http://localhost:{port} 看世界；操控权凭会话令牌认领，选角后刷新不丢）"
             );
             Some(handle)
         }
@@ -574,12 +606,16 @@ pub(crate) async fn serve(
         .await
 }
 
-/// WS 升级入口：连接建立后进入快照广播循环
+/// WS 升级入口：连接建立后进入快照广播循环。URL ?token= 是会话令牌
+///（D-021f 凭据认领：在 sessions 表=操控端，不在=观战+stale 通知；缺席=
+/// legacy 逃生门或纯观战）。axum 0.7 Query 提取器内建，零新依赖
 async fn ws_handler(
     ws: WebSocketUpgrade,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     State(state): State<Arc<WsState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    let token = params.get("token").cloned();
+    ws.on_upgrade(move |socket| handle_socket(socket, state, token))
 }
 
 // ---- D-017 收图通道（POST /upload/avatar + avatar_assets 下行）----
@@ -692,16 +728,46 @@ fn reject_json(reason: avatars::RejectReason) -> Response {
 
 /// 单连接循环：下行推快照广播，上行解析意图入共享队列（仅操控连接）。
 /// 循环退出即连接清理（socket/rx 随任务结束释放，无泄漏）。
-async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
-    // 操控权认领（#027 单连接假设）：第一连接=操控端，后来者=观战（上行丢弃）
-    let mut controller = state
-        .ctrl_taken
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok();
-    if controller {
-        tracing::info!("[ws] 客户端连接（操控连接：上行意图生效）");
+/// 操控权认领（D-021f 凭据制）：token 命中会话表=操控端（踢旧留新）；
+/// token 不命中=观战+stale 通知；无 token 走 legacy 逃生门（第一连接认领）
+/// 或纯观战。#024 独占不变：任意时刻仍只有一个操控连接。
+async fn handle_socket(socket: WebSocket, state: Arc<WsState>, url_token: Option<String>) {
+    let conn_id = state.conn_ids.fetch_add(1, Ordering::SeqCst);
+    let mut ctrl_rx = state.ctrl_conn.subscribe();
+    // 认领判定：钥匙=URL token（凭据者得）；my_token=本连接验证过的令牌
+    //（登出时从表移除用）
+    let mut my_token: Option<String> = None;
+    let mut controller = false;
+    if let Some(tok) = &url_token {
+        let hit = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tok)
+            .cloned();
+        if let Some(player) = hit {
+            my_token = Some(tok.clone());
+            controller = true;
+            // 踢旧沿：send(Some(本连接 id))——旧操控端 select! 的 watch 分支
+            // 监听到变化、比对自己已不是持有者，单播 control_revoked{taken} 降观战
+            let _ = state.ctrl_conn.send(Some(conn_id));
+            tracing::info!(conn_id, player = %player, "[ws] 客户端连接（操控连接：凭 token 认领）");
+        } else {
+            tracing::info!(conn_id, "[ws] 客户端连接（观战连接：token 已失效）");
+        }
+    } else if state.legacy_first_conn {
+        // 逃生门（CODEWORLD_ME env 锁定的开发者场景）：保留旧"第一连接=操控端"
+        //——watch 当前无操控者时认领（ws 线程是 current_thread 单线程 runtime，
+        // 判定与 send 之间无 await，无竞态窗）
+        if state.ctrl_conn.borrow().is_none() {
+            controller = true;
+            let _ = state.ctrl_conn.send(Some(conn_id));
+            tracing::info!(conn_id, "[ws] 客户端连接（操控连接：legacy 第一连接认领）");
+        } else {
+            tracing::info!(conn_id, "[ws] 客户端连接（观战连接：操控权已被占用）");
+        }
     } else {
-        tracing::info!("[ws] 客户端连接（观战连接：操控权已被占用）");
+        tracing::info!(conn_id, "[ws] 客户端连接（观战连接：无会话令牌）");
     }
     let mut rx = state.snapshots.subscribe();
     let (mut sender, mut receiver) = socket.split();
@@ -719,8 +785,29 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
     if sender.send(Message::Text(roster_json)).await.is_err() {
         tracing::debug!("[ws] player_roster 发送失败（连接已断，走常规清理）");
     }
+    // D-021f：stale 通知——带了 token 但不在会话表（过期/登出后/伪造），
+    // 立即单播告知观战身份（前端清本地凭据并提示重新登录页选角）
+    if url_token.is_some() && !controller {
+        let stale = r#"{"type":"control_revoked","reason":"stale"}"#.to_string();
+        if sender.send(Message::Text(stale)).await.is_err() {
+            tracing::debug!("[ws] control_revoked(stale) 发送失败（连接已断，走常规清理）");
+        }
+    }
     loop {
         tokio::select! {
+            // 踢旧沿（D-021f）：操控权易主且自己不再是持有者 -> 降观战（连接不断，
+            // 下行快照照收）。reason=taken；自己认领引发的沿（新值=自己）不触发
+            _ = ctrl_rx.changed() => {
+                let now = *ctrl_rx.borrow_and_update();
+                if controller && now != Some(conn_id) {
+                    tracing::info!(conn_id, "[ws] 操控已被新凭据接管（本连接降观战，下行照收）");
+                    let taken = r#"{"type":"control_revoked","reason":"taken"}"#.to_string();
+                    if sender.send(Message::Text(taken)).await.is_err() {
+                        break; // 发送失败=连接已死，走常规清理（controller 已降，不误释操控）
+                    }
+                    controller = false;
+                }
+            }
             recv = rx.recv() => match recv {
                 Ok(json) => {
                     if sender.send(Message::Text(json)).await.is_err() {
@@ -741,26 +828,53 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                         // D-021d（v2.7）：会话动作任意连接生效——登出后的浏览器
                         // 是观战连接，登录/选角/新建必须能用（登录页=观战连接的
                         // 进场通道）。落地全在 tick 侧（名字拒绝走事件回执，
-                        // R1 改法 B 同款），本层只转发意图
+                        // R1 改法 B 同款），本层只转发意图。
+                        // D-021f：本层颁发会话令牌（uuid）——Intent 带上（tick 侧
+                        // 成功后绑定 token→name）+ 当场单播 session_token 帧
+                        //（不等 tick 结果：拒绝路径该 token 永不绑定自然无效，
+                        // 前端只在成功回执后才落盘）
                         Ok(ClientMessage::CreatePlayer { name, template }) => {
+                            let token = uuid::Uuid::new_v4().simple().to_string();
                             tracing::info!(
                                 name = %name,
                                 template = %template,
-                                "[onboarding] WS 收到创建角色消息（任意连接生效）"
+                                "[onboarding] WS 收到创建角色消息（任意连接生效，颁发会话令牌）"
                             );
-                            state.intents.send(crate::input::Intent::CreatePlayer { name, template });
+                            let announce = serde_json::to_string(&serde_json::json!({
+                                "type": "session_token", "token": token, "name": name
+                            }))
+                            .unwrap_or_else(|_| r#"{"type":"session_token"}"#.to_string());
+                            state.intents.send(crate::input::Intent::CreatePlayer {
+                                name,
+                                template,
+                                token: token.clone(),
+                            });
+                            if sender.send(Message::Text(announce)).await.is_err() {
+                                break;
+                            }
                         }
                         Ok(ClientMessage::SelectPlayer { name }) => {
                             tracing::info!(
                                 name = %name,
-                                "[onboarding] WS 收到选角消息（任意连接生效）"
+                                "[onboarding] WS 收到选角消息（任意连接生效，颁发会话令牌）"
                             );
-                            state.intents.send(crate::input::Intent::SelectPlayer { name });
+                            let token = uuid::Uuid::new_v4().simple().to_string();
+                            let announce = serde_json::to_string(&serde_json::json!({
+                                "type": "session_token", "token": token, "name": name
+                            }))
+                            .unwrap_or_else(|_| r#"{"type":"session_token"}"#.to_string());
+                            state.intents.send(crate::input::Intent::SelectPlayer {
+                                name,
+                                token: token.clone(),
+                            });
+                            if sender.send(Message::Text(announce)).await.is_err() {
+                                break;
+                            }
                         }
                         Ok(other) => {
-                            // 其余上行仅操控连接生效（单连接假设 #027：非操控端丢弃）
+                            // 其余上行仅操控连接生效（#024 独占：非操控端丢弃）
                             if !controller {
-                                tracing::warn!("[ws] 观战连接的上行消息已丢弃（单连接假设：非操控端）");
+                                tracing::warn!("[ws] 观战连接的上行消息已丢弃（非操控端）");
                                 continue;
                             }
                             match other {
@@ -783,15 +897,24 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
                                 }
                                 ClientMessage::Logout { choice } => {
                                     // #025 登出处置：意图入共享队列（与键盘/鼠标单入口），
-                                    // 处置三选一由 tick 侧状态机落地；本层只做令牌语义——
-                                    // 主动登出=立即释放操控令牌（重连的第一个连接重新认领），
-                                    // 本连接降级观战：下行快照继续（登出后世界还能看），上行丢弃
+                                    // 处置三选一由 tick 侧状态机落地；本层做两件令牌语义——
+                                    // ①D-021f：登出=会话终结，本连接验证过的 token 从表
+                                    // 移除（不得复用）；②释放操控（Released 沿），
+                                    // 本连接降级观战：下行快照继续，上行丢弃
                                     tracing::info!(
                                         choice = choice.wire_name(),
-                                        "[dispose] WS 收到登出消息（令牌释放，连接降级观战）"
+                                        "[dispose] WS 收到登出消息（会话终结+令牌释放，连接降级观战）"
                                     );
                                     state.intents.send(crate::input::Intent::Logout { choice });
-                                    state.ctrl_taken.store(false, Ordering::SeqCst);
+                                    if let Some(tok) = my_token.take() {
+                                        state
+                                            .sessions
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .remove(&tok);
+                                        tracing::info!("[ws] 登出：会话令牌已失效（token 不得复用）");
+                                    }
+                                    let _ = state.ctrl_conn.send(None);
                                     controller = false;
                                 }
                                 // 会话动作已在上面分流（任意连接生效），此处不可达
@@ -813,8 +936,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<WsState>) {
         }
     }
     if controller {
-        state.ctrl_taken.store(false, Ordering::SeqCst);
-        tracing::info!("[ws] 操控连接断开（操控权已释放，下一连接接管）");
+        // 自己仍是操控端时断开 = 操控权释放（Released 沿）。被踢后断开
+        //（controller 已降）不发 None——操控权已属新连接，误发会错拆新操控端
+        let _ = state.ctrl_conn.send(None);
+        tracing::info!("[ws] 操控连接断开（操控权已释放）");
     } else {
         tracing::info!("[ws] 客户端断开（连接资源已清理）");
     }
@@ -1318,7 +1443,10 @@ mod tests {
         let state = Arc::new(WsState {
             snapshots: tx.clone(),
             intents: intents_tx,
-            ctrl_taken: Arc::new(AtomicBool::new(false)),
+            ctrl_conn: tokio::sync::watch::channel(None).0,
+            sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            legacy_first_conn: false,
+            conn_ids: AtomicU64::new(1),
             avatars: avatars.clone(),
             roster: roster.clone(),
         });
@@ -1637,10 +1765,11 @@ mod tests {
 
     #[tokio::test]
     async fn ws_move_message_lands_in_intent_queue() {
-        // 场景：第一连接 = 操控连接；发 move JSON -> 解析入共享意图队列（#027 单入口）
+        // 场景：凭 token 认领的操控连接（D-021f）；发 move JSON -> 解析入共享意图队列（#027 单入口）
         let static_dir = temp_static_dir("up-move");
-        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
-        let mut client = connect_client(addr).await;
+        let (addr, _tx, queue, shutdown_tx, server, _sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[("t1", "p1")], false).await;
+        let mut client = connect_client_with_token(addr, "t1").await;
         client
             .send(tokio_tungstenite::tungstenite::Message::Text(
                 r#"{"type":"move","x":12.0,"y":0.0}"#.to_string(),
@@ -1662,8 +1791,9 @@ mod tests {
     async fn ws_attack_and_stop_messages_forward_to_queue() {
         // attack/stop 同通路：WS 客户端消息 -> 共享意图队列（与键盘同一条 mpsc）
         let static_dir = temp_static_dir("up-multi");
-        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
-        let mut client = connect_client(addr).await;
+        let (addr, _tx, queue, shutdown_tx, server, _sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[("t1", "p1")], false).await;
+        let mut client = connect_client_with_token(addr, "t1").await;
         client
             .send(tokio_tungstenite::tungstenite::Message::Text(
                 r#"{"type":"attack","x":15.0,"y":1.0}"#.to_string(),
@@ -1693,8 +1823,9 @@ mod tests {
     async fn ws_shoot_message_lands_in_intent_queue() {
         // #036 远程射击同通路：WS shoot 消息 -> 共享意图队列（与键盘/鼠标单入口）
         let static_dir = temp_static_dir("up-shoot");
-        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
-        let mut client = connect_client(addr).await;
+        let (addr, _tx, queue, shutdown_tx, server, _sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[("t1", "p1")], false).await;
+        let mut client = connect_client_with_token(addr, "t1").await;
         client
             .send(tokio_tungstenite::tungstenite::Message::Text(
                 r#"{"type":"shoot","x":15.0,"y":2.5}"#.to_string(),
@@ -1715,8 +1846,9 @@ mod tests {
     async fn invalid_uplink_messages_dropped_connection_alive() {
         // 非法上行（未知 type/坏 JSON）：丢弃不入队，连接不断（后续合法消息照常转发）
         let static_dir = temp_static_dir("up-bad");
-        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
-        let mut client = connect_client(addr).await;
+        let (addr, _tx, queue, shutdown_tx, server, _sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[("t1", "p1")], false).await;
+        let mut client = connect_client_with_token(addr, "t1").await;
         for bad in [r#"{"type":"dance"}"#.to_string(), "not json".to_string()] {
             client
                 .send(tokio_tungstenite::tungstenite::Message::Text(bad))
@@ -1745,13 +1877,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_connection_uplink_dropped_controller_keeps_queue() {
-        // 单连接假设：第一连接拿操控权；第二连接（观战端）上行消息 warn 丢弃不入队；
-        // 操控连接的消息照常入队
+    async fn no_token_connection_is_spectator_uplink_dropped() {
+        // T3（D-021f 语义翻正）：默认（legacy=false）下无 token 连接=纯观战——
+        // 旧"第一连接=操控端"退役，操控权凭会话令牌认领；两个无 token 连接的
+        // 上行一律丢弃不入队
         let static_dir = temp_static_dir("up-second");
         let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
         let mut c1 = connect_client(addr).await;
         let mut c2 = connect_client(addr).await;
+        c1.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":12.0,"y":0.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
         c2.send(tokio_tungstenite::tungstenite::Message::Text(
             r#"{"type":"move","x":99.0,"y":99.0}"#.to_string(),
         ))
@@ -1760,45 +1898,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
             queue.drain().is_empty(),
-            "观战连接的意图不入队（操控权在第一连接）"
-        );
-        c1.send(tokio_tungstenite::tungstenite::Message::Text(
-            r#"{"type":"move","x":12.0,"y":0.0}"#.to_string(),
-        ))
-        .await
-        .unwrap();
-        let mut backlog = Vec::new();
-        assert_eq!(
-            next_intent(&queue, &mut backlog).await,
-            crate::input::Intent::WsMove { x: 12.0, y: 0.0 },
-            "操控连接意图照常入队"
-        );
-        shutdown_tx.send(()).ok();
-        let _ = server.await;
-    }
-
-    #[tokio::test]
-    async fn controller_released_on_disconnect_next_connection_takes_over() {
-        // 操控权随连接生命周期：操控连接断开 -> 释放；下一个连接成为新操控端
-        let static_dir = temp_static_dir("up-release");
-        let (addr, _tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
-        let mut c1 = connect_client(addr).await;
-        c1.send(tokio_tungstenite::tungstenite::Message::Close(None))
-            .await
-            .ok();
-        drop(c1);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let mut c2 = connect_client(addr).await;
-        c2.send(tokio_tungstenite::tungstenite::Message::Text(
-            r#"{"type":"move","x":7.0,"y":0.0}"#.to_string(),
-        ))
-        .await
-        .unwrap();
-        let mut backlog = Vec::new();
-        assert_eq!(
-            next_intent(&queue, &mut backlog).await,
-            crate::input::Intent::WsMove { x: 7.0, y: 0.0 },
-            "断开后新连接获得操控权（消息入队）"
+            "无 token 连接（含第一个）都是观战端，上行不入队"
         );
         shutdown_tx.send(()).ok();
         let _ = server.await;
@@ -1846,6 +1946,282 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.html"), "<html>cw-test</html>").unwrap();
         dir
+    }
+
+    // === D-021f 会话令牌：操控权随凭据走（踢旧留新）===
+
+    /// 带会话表预填与 legacy 标志的测试服务器（token 认领/踢旧/stale 测试用）。
+    /// 返回会话表 Arc（断言/再预填用）与操控连接 id watch 观测端（沿检测断言用）
+    #[allow(clippy::type_complexity)]
+    async fn start_test_server_with_sessions(
+        static_dir: std::path::PathBuf,
+        sessions_pre: &[(&str, &str)],
+        legacy_first_conn: bool,
+    ) -> (
+        std::net::SocketAddr,
+        broadcast::Sender<String>,
+        crate::input::IntentQueue,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+        tokio::sync::watch::Receiver<Option<u64>>,
+    ) {
+        let (tx, _) = broadcast::channel::<String>(SNAPSHOT_CHANNEL_CAP);
+        let (intents_tx, intents_rx) = crate::input::intent_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let sessions = Arc::new(std::sync::Mutex::new(
+            sessions_pre
+                .iter()
+                .map(|(t, n)| (t.to_string(), n.to_string()))
+                .collect::<std::collections::HashMap<_, _>>(),
+        ));
+        let (ctrl_tx, ctrl_rx) = tokio::sync::watch::channel(None);
+        let state = Arc::new(WsState {
+            snapshots: tx.clone(),
+            intents: intents_tx,
+            ctrl_conn: ctrl_tx,
+            sessions: sessions.clone(),
+            legacy_first_conn,
+            conn_ids: std::sync::atomic::AtomicU64::new(1),
+            avatars: Arc::new(avatars::AvatarRegistry::load(&temp_assets_dir("d021f"))),
+            roster: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let handle = tokio::spawn(async move {
+            serve(
+                listener,
+                state,
+                static_dir,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+        (addr, tx, intents_rx, shutdown_tx, handle, sessions, ctrl_rx)
+    }
+
+    /// 带 token 的测试客户端（连接 URL ?token=，与生产前端 connect() 同形）
+    async fn connect_client_with_token(addr: std::net::SocketAddr, token: &str) -> ClientWs {
+        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={token}"))
+            .await
+            .expect("测试客户端应能连上 /ws?token=");
+        ws
+    }
+
+    #[tokio::test]
+    async fn token_claim_via_query_becomes_controller() {
+        // T1：sessions 表预填 t1->p1；带 ?token=t1 的连接=操控端（move 意图入队）
+        let static_dir = temp_static_dir("tok-claim");
+        let (addr, _tx, queue, shutdown_tx, server, sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[("t1", "p1")], false).await;
+        assert_eq!(
+            sessions.lock().unwrap().get("t1").map(String::as_str),
+            Some("p1"),
+            "预填会话表可查"
+        );
+        let mut c = connect_client_with_token(addr, "t1").await;
+        consume_avatar_assets(&mut c).await;
+        c.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":3.0,"y":0.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::WsMove { x: 3.0, y: 0.0 },
+            "凭 token 认领的连接=操控端（上行入队）"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn new_token_claim_kicks_old_controller() {
+        // T2 踢旧留新：A 带 t1 操控中，B 带同 t1 连上 -> A 收 control_revoked{taken}
+        //（降观战但连接不断），B=新操控端（move 入队）；A 被踢后上行丢弃
+        let static_dir = temp_static_dir("tok-kick");
+        let (addr, _tx, queue, shutdown_tx, server, _sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[("t1", "p1")], false).await;
+        let mut a = connect_client_with_token(addr, "t1").await;
+        consume_avatar_assets(&mut a).await;
+        let mut b = connect_client_with_token(addr, "t1").await;
+        consume_avatar_assets(&mut b).await;
+        b.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":5.0,"y":0.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::WsMove { x: 5.0, y: 0.0 },
+            "新凭据连接接管操控（B 的意图入队）"
+        );
+        let frame: serde_json::Value =
+            serde_json::from_str(&next_text(&mut a).await).unwrap();
+        assert_eq!(frame["type"], "control_revoked", "被接管者收踢旧通知：{frame}");
+        assert_eq!(frame["reason"], "taken", "reason=taken（被新凭据接管）：{frame}");
+        a.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":99.0,"y":99.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(queue.drain().is_empty(), "被踢连接上行已丢弃（降观战）");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn stale_token_gets_revoked_and_uplink_dropped() {
+        // T4：未注册 token（过期/登出后/伪造）-> 观战 + 立即单播
+        // control_revoked{stale}；上行丢弃
+        let static_dir = temp_static_dir("tok-stale");
+        let (addr, _tx, queue, shutdown_tx, server, _sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[("t1", "p1")], false).await;
+        let mut c = connect_client_with_token(addr, "ghost-token").await;
+        consume_avatar_assets(&mut c).await;
+        let frame: serde_json::Value =
+            serde_json::from_str(&next_text(&mut c).await).unwrap();
+        assert_eq!(frame["type"], "control_revoked", "失效 token 连接收通知：{frame}");
+        assert_eq!(frame["reason"], "stale", "reason=stale（token 不在表）：{frame}");
+        c.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":1.0,"y":1.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(queue.drain().is_empty(), "stale 连接=观战（上行丢弃）");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn logout_invalidates_session_token() {
+        // T5：登出=会话终结。A 带 t1 操控 -> logout -> sessions 表 t1 移除；
+        // 新连接带同 token -> stale（token 不得复用）
+        let static_dir = temp_static_dir("tok-logout");
+        let (addr, _tx, _queue, shutdown_tx, server, sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[("t1", "p1")], false).await;
+        let mut a = connect_client_with_token(addr, "t1").await;
+        consume_avatar_assets(&mut a).await;
+        a.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"logout","disposition":"take"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !sessions.lock().unwrap().contains_key("t1"),
+            "登出后 token 已从会话表移除"
+        );
+        let mut b = connect_client_with_token(addr, "t1").await;
+        consume_avatar_assets(&mut b).await;
+        let frame: serde_json::Value =
+            serde_json::from_str(&next_text(&mut b).await).unwrap();
+        assert_eq!(frame["type"], "control_revoked");
+        assert_eq!(frame["reason"], "stale", "已登出的 token 不可复用：{frame}");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn select_player_intent_carries_token_and_unicasts_session_token() {
+        // T6：select_player 上行 -> 服务器生成会话 token：Intent 带上（tick 侧
+        // 成功后绑定）+ 当场单播 session_token 帧（两处 token 同值非空）
+        let static_dir = temp_static_dir("tok-sel");
+        let (addr, _tx, queue, shutdown_tx, server, _sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[], false).await;
+        let mut c = connect_client(addr).await; // 无 token（登录页观战连接）
+        consume_avatar_assets(&mut c).await;
+        c.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"select_player","name":"p1"}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let frame: serde_json::Value =
+            serde_json::from_str(&next_text(&mut c).await).unwrap();
+        assert_eq!(frame["type"], "session_token", "选角后当场单播会话令牌：{frame}");
+        assert_eq!(frame["name"], "p1", "单播帧带角色名：{frame}");
+        let tok = frame["token"].as_str().expect("token 字段应存在").to_string();
+        assert!(!tok.is_empty(), "token 非空");
+        let mut backlog = Vec::new();
+        match next_intent(&queue, &mut backlog).await {
+            crate::input::Intent::SelectPlayer { name, token } => {
+                assert_eq!(name, "p1");
+                assert_eq!(token, tok, "意图携带的 token 与单播帧同值");
+            }
+            other => panic!("应转 SelectPlayer 意图，实为 {other:?}"),
+        }
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn legacy_first_conn_keeps_first_connection_claim() {
+        // 逃生门：legacy_first_conn=true（CODEWORLD_ME env 锁定的开发者场景）
+        // 保留旧"第一连接=操控端"语义（无 token 也认领）；后来无 token 连接=观战
+        let static_dir = temp_static_dir("tok-legacy");
+        let (addr, _tx, queue, shutdown_tx, server, _sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[], true).await;
+        let mut c1 = connect_client(addr).await;
+        consume_avatar_assets(&mut c1).await;
+        c1.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":1.0,"y":0.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::WsMove { x: 1.0, y: 0.0 },
+            "legacy 模式第一连接无 token 也认领操控"
+        );
+        let mut c2 = connect_client(addr).await;
+        consume_avatar_assets(&mut c2).await;
+        c2.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":99.0,"y":99.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(queue.drain().is_empty(), "legacy 模式后来无 token 连接=观战");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_with_same_token_reclaims_control() {
+        // 刷新页面场景（D-021f 的 bug 修复锚）：带 t1 操控的连接断开 ->
+        // 同 token 新连接（刷新后的浏览器）重新认领操控——"出生点不出去"根除
+        let static_dir = temp_static_dir("tok-reclaim");
+        let (addr, _tx, queue, shutdown_tx, server, _sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[("t1", "p1")], false).await;
+        let mut a = connect_client_with_token(addr, "t1").await;
+        consume_avatar_assets(&mut a).await;
+        a.send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .ok();
+        drop(a);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut b = connect_client_with_token(addr, "t1").await;
+        consume_avatar_assets(&mut b).await;
+        b.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"move","x":7.0,"y":0.0}"#.to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut backlog = Vec::new();
+        assert_eq!(
+            next_intent(&queue, &mut backlog).await,
+            crate::input::Intent::WsMove { x: 7.0, y: 0.0 },
+            "断开后同 token 新连接重新认领（刷新页面不丢操控）"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -2235,13 +2611,15 @@ mod tests {
 
     #[tokio::test]
     async fn logout_message_releases_token_and_demotes_to_spectator() {
-        // #025 令牌语义：主动登出=立即释放操控令牌+本连接降级观战——
+        // #025 令牌语义（D-021f 凭据制）：主动登出=token 失效+释放操控+本连接降级观战——
         // ① Logout 意图入共享队列（处置由 tick 侧落地）；
-        // ② 令牌释放后新连接成为操控端（重连的第一个连接重新认领）；
+        // ② 操控权释放后凭另一有效 token 的连接成为操控端；
         // ③ 登出后的原连接降级观战：上行丢弃、下行快照照收（登出后世界还能看）
         let static_dir = temp_static_dir("logout");
-        let (addr, tx, queue, shutdown_tx, server) = start_test_server(static_dir).await;
-        let mut c1 = connect_client(addr).await;
+        let (addr, tx, queue, shutdown_tx, server, _sessions, _ctrl_rx) =
+            start_test_server_with_sessions(static_dir, &[("t1", "p1"), ("t2", "p2")], false).await;
+        let mut c1 = connect_client_with_token(addr, "t1").await;
+        consume_avatar_assets(&mut c1).await;
 
         c1.send(tokio_tungstenite::tungstenite::Message::Text(
             r#"{"type":"logout","disposition":"stay_auto"}"#.to_string(),
@@ -2258,8 +2636,9 @@ mod tests {
             "登出意图经单入口入共享队列"
         );
 
-        // ② 新连接拿到操控权（c1 已释放令牌）
-        let mut c2 = connect_client(addr).await;
+        // ② c2 凭另一有效 token 拿到操控权（c1 已释放）
+        let mut c2 = connect_client_with_token(addr, "t2").await;
+        consume_avatar_assets(&mut c2).await;
         c2.send(tokio_tungstenite::tungstenite::Message::Text(
             r#"{"type":"move","x":1.0,"y":0.0}"#.to_string(),
         ))
@@ -2269,7 +2648,7 @@ mod tests {
         assert_eq!(
             next_intent(&queue, &mut backlog2).await,
             crate::input::Intent::WsMove { x: 1.0, y: 0.0 },
-            "登出后新连接成为操控端（重连认领）"
+            "登出后凭有效 token 的新连接成为操控端"
         );
 
         // ③ c1 降级观战：再发 move 被丢弃（不入队）；下行快照照收
@@ -2280,7 +2659,6 @@ mod tests {
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(queue.drain().is_empty(), "登出连接的后续上行已丢弃");
-        consume_avatar_assets(&mut c1).await; // v2.2 首帧=资产消息（连接时排队未消费）
         let mut world = WorldState::new();
         world.advance_tick();
         let dir = PlayerDirectory::disabled();
@@ -2308,14 +2686,14 @@ mod tests {
         .await
         .unwrap();
         let mut backlog = Vec::new();
-        assert_eq!(
-            next_intent(&queue, &mut backlog).await,
-            crate::input::Intent::CreatePlayer {
-                name: "土豆".to_string(),
-                template: "hunter".to_string(),
-            },
-            "创建意图经单入口入共享队列（中文名原样）"
-        );
+        match next_intent(&queue, &mut backlog).await {
+            crate::input::Intent::CreatePlayer { name, template, .. } => {
+                // token 是 WS 层 uuid 随机颁发，只断言非空（同值断言见 T6）
+                assert_eq!(name, "土豆", "创建意图经单入口入共享队列（中文名原样）");
+                assert_eq!(template, "hunter");
+            }
+            other => panic!("应转 CreatePlayer 意图，实为 {other:?}"),
+        }
         // 观战连接（c1 占着操控权，c2=观战）：create_player 与 select_player
         // 都入队（v2.7 会话动作任意连接生效）
         let mut c2 = connect_client(addr).await;
@@ -2324,26 +2702,25 @@ mod tests {
         ))
         .await
         .unwrap();
-        assert_eq!(
-            next_intent(&queue, &mut backlog).await,
-            crate::input::Intent::CreatePlayer {
-                name: "ghost".to_string(),
-                template: "blank".to_string(),
-            },
-            "观战连接的创建请求也入队（v2.7）"
-        );
+        match next_intent(&queue, &mut backlog).await {
+            crate::input::Intent::CreatePlayer { name, template, .. } => {
+                assert_eq!(name, "ghost", "观战连接的创建请求也入队（v2.7）");
+                assert_eq!(template, "blank");
+            }
+            other => panic!("应转 CreatePlayer 意图，实为 {other:?}"),
+        }
         c2.send(tokio_tungstenite::tungstenite::Message::Text(
             r#"{"type":"select_player","name":"土豆"}"#.to_string(),
         ))
         .await
         .unwrap();
-        assert_eq!(
-            next_intent(&queue, &mut backlog).await,
-            crate::input::Intent::SelectPlayer {
-                name: "土豆".to_string(),
-            },
-            "观战连接的选角请求也入队（v2.7：登出后选角通道）"
-        );
+        match next_intent(&queue, &mut backlog).await {
+            crate::input::Intent::SelectPlayer { name, token } => {
+                assert_eq!(name, "土豆", "观战连接的选角请求也入队（v2.7：登出后选角通道）");
+                assert!(!token.is_empty(), "选角意图携带 WS 层颁发的会话令牌");
+            }
+            other => panic!("应转 SelectPlayer 意图，实为 {other:?}"),
+        }
         shutdown_tx.send(()).ok();
         let _ = server.await;
     }

@@ -109,6 +109,9 @@ struct EntitySandboxMap {
     /// 本拍连接事件（#025 期五第一刀：WS 操控令牌翻转沿，main 循环每拍写入、
     /// tick ②5 消费清空；WS 禁用/无翻转= None）。处置状态机的触发源
     conn_event: Option<net::ConnEvent>,
+    /// 会话令牌表（D-021f）：token→玩家名，tick 侧选角/创建成功路径绑定写入，
+    /// WS 层连接升级凭它认领操控。None=纯终端模式（无 WS，令牌在分流处丢弃）
+    sessions: Option<Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>>,
     /// 操控射击排队（#036：WsShoot 意图产的定装弹；route 后入队，阶段二 a1
     /// 与 sandbox 排队 spawn 同一 process_spawn_requests 出口统一落地。
     /// 同拍至多 1 发由 route 单行动折叠保证——操控路径与 spawn import 限流同语义）
@@ -214,6 +217,7 @@ impl EntitySandboxMap {
             session_takes: std::collections::HashSet::new(),
             move_stall: None,
             conn_event: None,
+            sessions: None,
             ctrl_shell_spawns: Vec::new(),
             attack_events: Vec::new(),
             asset_mirror: mirror::AssetMirror::new(),
@@ -1651,7 +1655,13 @@ fn main() -> Result<()> {
     // 期四第一刀：WS 快照推送（与终端 ANSI 渲染并行存在，不替代终端）。
     // 端口 0 = 禁用（返回 None，tick 循环走零开销分支）；WS 线程挂掉不影响主循环。
     // #027：第三刀起 WS 线程同时是上行意图入口（转发进共享 intent_sink）
-    let ws_snapshots = net::init(&config, intent_sink);
+    let mut ws_snapshots = net::init(&config, intent_sink);
+    // D-021f：会话令牌表交给 tick 侧——选角/创建成功路径绑定 token→name
+    //（连接升级凭它认领操控）。WS 禁用（纯终端模式）保持 None：token 在
+    // 分流处直接丢弃，无会话概念
+    if let Some(handle) = &ws_snapshots {
+        sandbox_map.sessions = Some(handle.sessions.clone());
+    }
     // D-021d：角色列表共享槽种子一次（load_players_initial 已完成——此刻目录与
     // 在场状态就绪；此后每拍刷新，这里只是补上"首拍前浏览器就连上"的窗口）
     if let Some(handle) = &ws_snapshots {
@@ -1662,21 +1672,15 @@ fn main() -> Result<()> {
     }
 
     tracing::info!("tick 循环开始（WASD/方向键操控，空格攻击，q=终端客户端退出，Q+Q=关闭世界）");
-    // #025：操控令牌上拍值（翻转沿检测；WS 禁用时恒 false，处置永不触发）
+    // #025：操控连接在否的上拍值（翻转沿检测；WS 禁用时恒 false，处置永不触发）
     let mut conn_prev = false;
     while running.load(Ordering::SeqCst) {
-        // #025 下线处置触发源：操控令牌翻转沿检测（重连认领=Claimed / 意外断开=Released；
-        // 主动登出沿由 tick 侧 logout_handled 抑制——登出意图与释放沿同拍到达）
-        sandbox_map.conn_event = ws_snapshots.as_ref().and_then(|h| {
-            let now = h.ctrl_taken.load(Ordering::SeqCst);
-            let ev = match (conn_prev, now) {
-                (false, true) => Some(net::ConnEvent::Claimed),
-                (true, false) => Some(net::ConnEvent::Released),
-                _ => None,
-            };
-            conn_prev = now;
-            ev
-        });
+        // #025 下线处置触发源：操控连接翻转沿检测（认领=Claimed / 释放=Released；
+        // D-021f 起读 watch<Option<连接id>>，凭 token 认领与踢旧易主同沿）；
+        // 主动登出沿由 tick 侧 logout_handled 抑制——登出意图与释放沿同拍到达
+        sandbox_map.conn_event = ws_snapshots
+            .as_mut()
+            .and_then(|h| poll_conn_event(&mut h.ctrl_conn, &mut conn_prev));
         // #036 世界常驻：终端客户端退出（q）后渲染静默——世界照常 tick/推快照/存档，
         // 只是 ANSI 帧不再写 stdout（终端已还原用户 shell，外泄会污染显示）
         renderer.set_output_enabled(terminal_alive.load(Ordering::SeqCst));
@@ -1851,19 +1855,28 @@ fn tick_with_intents(
     for it in intents {
         // D-021b CreatePlayer 分流（同 Logout 模式：会话动作不走操控路由）；
         // Copy 已退役：clone 入 ctrl 队，CreatePlayer 原地消费（String 载荷不复制
-        // 两次）。名字校验在此后的 process_create_player（唯一的名字闸门）
-        if let input::Intent::CreatePlayer { name, template } = it {
-            process_create_player(sandbox_map, world, name, template, current_tick);
+        // 两次）。名字校验在此后的 process_create_player（唯一的名字闸门）。
+        // D-021f：成功路径绑定会话令牌（token→name 进 sessions 表，连接升级凭它
+        // 认领操控）；拒绝路径不绑定——该 token 永不生效，前端只在成功回执后落盘
+        if let input::Intent::CreatePlayer { name, template, token } = it {
+            let joined = process_create_player(sandbox_map, world, name, template, current_tick);
+            if joined {
+                bind_session_token(sandbox_map, token, name);
+            }
             continue;
         }
         // D-021d SelectPlayer 分流（同 CreatePlayer 模式）：env_me_set 由调用方
         // 传入（std::env::var 语义与 read_me_declaration 同口径——trim 后非空才
-        // 算 env 锁定），process_select_player 保持纯函数可测
-        if let input::Intent::SelectPlayer { name } = it {
+        // 算 env 锁定），process_select_player 保持纯函数可测。
+        // D-021f：成功路径绑定会话令牌（同 CreatePlayer）
+        if let input::Intent::SelectPlayer { name, token } = it {
             let env_me_set = std::env::var("CODEWORLD_ME")
                 .map(|v| !v.trim().is_empty())
                 .unwrap_or(false);
-            process_select_player(sandbox_map, name, current_tick, env_me_set);
+            let selected = process_select_player(sandbox_map, name, current_tick, env_me_set);
+            if selected {
+                bind_session_token(sandbox_map, token, name);
+            }
             continue;
         }
         if let input::Intent::Logout { choice } = it {
@@ -3414,13 +3427,14 @@ fn process_spawn_requests(
 /// → player_joined 事件（前端收浮层收起 + 出生横幅）。
 /// 拒绝路径全部结构化回执（create_player_rejected 事件 + 面板红字）：
 /// NAME_* 三码 + NAME_TAKEN（同名已存在）+ TEMPLATE_MISSING（id 不在表/未装配）。
+/// 返回 true=进场成功（D-021f：调用方据此绑定会话令牌 token→name）。
 fn process_create_player(
     sandbox_map: &mut EntitySandboxMap,
     world: &mut WorldState,
     raw_name: &str,
     template_id: &str,
     current_tick: u64,
-) {
+) -> bool {
     // 1. 起名校验（唯一的名字闸门——R1 复审改法 B：解析层不校验名字，
     //    拒绝全部在此结构化回执，任何拒绝都有事件=前端 busy 锁永不悬空）
     let name = match crate::onboarding::sanitize_name(raw_name) {
@@ -3431,7 +3445,7 @@ fn process_create_player(
                 current_tick,
                 crate::events::EventBody::CreatePlayerRejected { reason: reason.wire() },
             );
-            return;
+            return false;
         }
     };
     // 2. 同名检查：在线/文件已存在 = 拒绝（本机单机阶段不做唯一性注册，文件在=名字在）
@@ -3445,7 +3459,7 @@ fn process_create_player(
             current_tick,
             crate::events::EventBody::CreatePlayerRejected { reason: "NAME_TAKEN" },
         );
-        return;
+        return false;
     }
     // 3. 模板解析（id 合法 + 已装配；模板缺文件=禁用态）
     let Some(code) = sandbox_map.templates.source(template_id).map(str::to_string) else {
@@ -3454,7 +3468,7 @@ fn process_create_player(
             current_tick,
             crate::events::EventBody::CreatePlayerRejected { reason: "TEMPLATE_MISSING" },
         );
-        return;
+        return false;
     };
     // （首建归档在 main() 启动时做——空世界模式+本机角色档案空白即归档，
     // 见 main 头部 first_build_archive；进程内不做：Windows 下 sqlite 句柄锁 db，
@@ -3467,7 +3481,7 @@ fn process_create_player(
             current_tick,
             crate::events::EventBody::CreatePlayerRejected { reason: "IO_ERROR" },
         );
-        return;
+        return false;
     }
     if std::env::var_os("CODEWORLD_ME").is_none() {
         let me_path = sandbox_map.players.dir().join("me.txt");
@@ -3492,11 +3506,13 @@ fn process_create_player(
         // 写失败只 warn 不阻断——档案是登录页体验，身份锚仍是 .wat 文件）。
         // 失败回滚路径（下方 else）不追加
         crate::onboarding::append_my_character(sandbox_map.players.dir(), &name);
+        true
     } else {
         // spawn 失败（编译/沙箱）：文件已写但进场失败——摘掉文件防下拍轮询反复
         // 重试刷 compile_failed；玩家重新起名再来
         let _ = std::fs::remove_file(&wat_path);
         tracing::warn!(player = %name, "[onboarding] 进场失败，已回滚玩家文件（重新起名再试）");
+        false
     }
 }
 
@@ -3508,14 +3524,14 @@ fn process_create_player(
 /// 成功：覆写 me.txt 为单行新名字（#024 契约同 create_player）+ 清三样会话级
 /// 状态（absent 离场标记=重连扫描即重生 / 处置状态=接管者被顶掉 / 编译失败
 /// 黑名单=显式选择允许重试一次，失败会重新拉黑不刷屏）+ player_selected 公共
-/// 事件（前端收到才断开重连——重连=第一连接重新认领操控令牌，既有 Claimed
-/// 边沿逻辑收敛，无新立法）。
+/// 事件（前端收到才断开重连——重连凭会话令牌重新认领操控，D-021f）。
+/// 返回 true=选角完成（D-021f：调用方据此绑定会话令牌 token→name）。
 fn process_select_player(
     sandbox_map: &mut EntitySandboxMap,
     name: &str,
     current_tick: u64,
     env_me_set: bool,
-) {
+) -> bool {
     // 1. 名字必须在 players/ 目录有 .wat（文件锚=身份）
     let wat_path = sandbox_map.players.dir().join(format!("{name}.wat"));
     if !wat_path.exists() {
@@ -3524,17 +3540,17 @@ fn process_select_player(
             current_tick,
             crate::events::EventBody::SelectPlayerRejected { reason: "NAME_UNKNOWN" },
         );
-        return;
+        return false;
     }
     // 2. CODEWORLD_ME 环境变量已设：env 锁定优先于一切 me 声明（诚实拒绝，
     //    不悄悄忽略选择；语义与 read_me_declaration 的"trim 后非空才生效"同口径）
     if env_me_set {
-        tracing::info!(player = %name, "[onboarding] 选角被拒（CODEWORLD_ME 已锁定操控）");
+        tracing::info!(player = %name, "[onboarding] 选角被拒（CODEWORLD_ME 锁定操控，拒绝路径不绑定令牌）");
         sandbox_map.events.emit_unowned(
             current_tick,
             crate::events::EventBody::SelectPlayerRejected { reason: "ME_ENV_LOCKED" },
         );
-        return;
+        return false;
     }
     // 3. 覆写 me.txt 为单行新名字（#024 契约：一行玩家名；覆盖写防旧内容残留）
     let me_path = sandbox_map.players.dir().join("me.txt");
@@ -3544,7 +3560,7 @@ fn process_select_player(
             current_tick,
             crate::events::EventBody::SelectPlayerRejected { reason: "IO_ERROR" },
         );
-        return;
+        return false;
     }
     // 4. 清三样会话级状态：absent（登出带走后选角=重新进场）/ 处置状态
     //    （接管者被顶掉，操控独占恢复）/ 黑名单（显式选择=允许重试一次）
@@ -3559,9 +3575,44 @@ fn process_select_player(
         current_tick,
         crate::events::EventBody::PlayerSelected { name: name.to_string() },
     );
-    tracing::info!(player = %name, tick = current_tick, "[onboarding] 选角完成：me 声明已写入（前端重连认领操控）");
+    tracing::info!(player = %name, tick = current_tick, "[onboarding] 选角完成：me 声明已写入（前端凭会话令牌重连认领操控）");
     // D-021e：选角成功=同样记入本机角色档案（"我曾使用过的角色"）
     crate::onboarding::append_my_character(sandbox_map.players.dir(), name);
+    true
+}
+
+/// 会话令牌绑定（D-021f）：选角/创建成功路径把 token→name 写进共享表
+///（WS 层连接升级凭它认领操控）。None=纯终端模式（无 WS 会话概念，令牌丢弃）。
+/// 拒绝路径不进来（分流处按 process_* 返回值把关）——令牌永不绑定=自然无效。
+fn bind_session_token(sandbox_map: &EntitySandboxMap, token: &str, name: &str) {
+    let Some(sessions) = &sandbox_map.sessions else {
+        tracing::debug!("[ws] 纯终端模式：会话令牌丢弃（无 WS 会话概念）");
+        return;
+    };
+    sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(token.to_string(), name.to_string());
+    tracing::info!(player = name, "[ws] 会话令牌已绑定（刷新页面/重连凭 token 认领操控）");
+}
+
+/// 操控连接沿检测（D-021f：watch Some/None 翻转 -> Claimed/Released 事件）。
+/// main 循环每拍调用（WS 禁用路径不进来）。None→Some=Claimed（凭 token/legacy
+/// 认领），Some→None=Released（断开/登出释放）。watch 初始 None——启动首拍
+/// None→None 无沿，不误报。旧 AtomicBool 的 true/false 语义等价 Some/None。
+fn poll_conn_event(
+    rx: &mut tokio::sync::watch::Receiver<Option<u64>>,
+    prev: &mut bool,
+) -> Option<net::ConnEvent> {
+    let _changed = rx.has_changed().unwrap_or(false);
+    let now = *rx.borrow_and_update();
+    let ev = match (*prev, now) {
+        (false, Some(_)) => Some(net::ConnEvent::Claimed),
+        (true, None) => Some(net::ConnEvent::Released),
+        _ => None,
+    };
+    *prev = now.is_some();
+    ev
 }
 
 /// 技能栏意图落地（D-020a，t_06b4efc6）：Skill 意图 -> 预置模板造物请求排队。
@@ -6951,6 +7002,121 @@ mod tests {
         frame.into_iter().map(|e| e.body).collect()
     }
 
+    // === D-021f 会话令牌：tick 侧绑定（T7）+ 操控连接沿检测（T8）===
+
+    /// 造共享会话表并装进 map（tick 分流成功路径绑定写入用）
+    fn stage_sessions(map: &mut EntitySandboxMap) -> Arc<std::sync::Mutex<std::collections::HashMap<String, String>>> {
+        let sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        map.sessions = Some(sessions.clone());
+        sessions
+    }
+
+    #[test]
+    fn session_token_bound_on_create_player_success() {
+        // T7 创建路径：CreatePlayer 意图成功 -> token→name 进共享表
+        let (mut world, mut map, _dir) = onboarding_stage();
+        let sessions = stage_sessions(&mut map);
+        let intents = vec![input::Intent::CreatePlayer {
+            name: "xinren".to_string(),
+            template: "grazer".to_string(),
+            token: "tok-create".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            sessions.lock().unwrap().get("tok-create").map(String::as_str),
+            Some("xinren"),
+            "创建成功路径绑定 token→name 进会话表"
+        );
+    }
+
+    #[test]
+    fn session_token_bound_on_select_player_success_not_on_reject() {
+        // T7 选角路径：成功绑定进表；拒绝路径（角色不存在）不绑定
+        //（token 永不生效，前端只在成功回执后落盘）
+        let (mut world, mut map, dir) = onboarding_stage();
+        std::fs::write(dir.join("tudou.wat"), "// test player").unwrap();
+        let sessions = stage_sessions(&mut map);
+        // 成功：选 tudou（文件在）
+        let intents = vec![input::Intent::SelectPlayer {
+            name: "tudou".to_string(),
+            token: "tok-sel".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            sessions.lock().unwrap().get("tok-sel").map(String::as_str),
+            Some("tudou"),
+            "选角成功路径绑定 token→name"
+        );
+        // 拒绝：选 nobody（文件不在）——tok-bad 不进表
+        let intents = vec![input::Intent::SelectPlayer {
+            name: "nobody".to_string(),
+            token: "tok-bad".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert!(
+            !sessions.lock().unwrap().contains_key("tok-bad"),
+            "拒绝路径不绑定令牌（自然无效）"
+        );
+    }
+
+    #[test]
+    fn bind_session_token_silent_noop_in_terminal_mode() {
+        // 纯终端模式（WS 禁用，sessions=None）：分流处照常调用绑定但不炸不写
+        let (mut world, mut map, _dir) = onboarding_stage();
+        assert!(map.sessions.is_none(), "测试基线=纯终端模式（None）");
+        bind_session_token(&map, "tok-x", "p1"); // 不应 panic
+        assert!(map.sessions.is_none(), "None 模式无表可写");
+    }
+
+    #[test]
+    fn poll_conn_event_watch_transitions_produce_claimed_released() {
+        // T8：watch Some/None 翻转沿 -> Claimed/Released 事件（处置状态机触发源）。
+        // 启动首拍 None→None 无沿（watch 初始值，不误报）
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let mut prev = false;
+        assert_eq!(poll_conn_event(&mut rx, &mut prev), None, "启动首拍无沿");
+        assert!(!prev, "无操控端时上拍值保持 false");
+        tx.send(Some(1)).unwrap(); // 凭 token/legacy 认领
+        assert_eq!(poll_conn_event(&mut rx, &mut prev), Some(ConnEvent::Claimed));
+        assert!(prev);
+        assert_eq!(poll_conn_event(&mut rx, &mut prev), None, "无新变化无沿");
+        tx.send(Some(2)).unwrap(); // 踢旧易主：Some→Some 也不是沿（独占不变）
+        assert_eq!(poll_conn_event(&mut rx, &mut prev), None, "Some→Some 非沿（#024 独占不变）");
+        tx.send(None).unwrap(); // 断开/登出释放
+        assert_eq!(poll_conn_event(&mut rx, &mut prev), Some(ConnEvent::Released));
+        assert!(!prev);
+        drop(tx); // 发送端没了：has_changed Err 兜底不炸
+        assert_eq!(poll_conn_event(&mut rx, &mut prev), None);
+    }
+
     #[test]
     fn create_player_intent_spawns_player_writes_file_and_me() {
         // 主链（验收 2）：CreatePlayer 意图 -> 写 players/xinren.wat + me.txt
@@ -6959,6 +7125,7 @@ mod tests {
         let intents = vec![input::Intent::CreatePlayer {
             name: "xinren".to_string(),
             template: "grazer".to_string(),
+            token: "t1".to_string(),
         }];
         tick_with_intents(
             &mut world,
@@ -7003,6 +7170,7 @@ mod tests {
         let intents = vec![input::Intent::CreatePlayer {
             name: "xinren".to_string(),
             template: "blank".to_string(),
+            token: "t1".to_string(),
         }];
         tick_with_intents(
             &mut world,
@@ -7049,6 +7217,7 @@ mod tests {
             let intents = vec![input::Intent::CreatePlayer {
                 name: raw.to_string(),
                 template: "blank".to_string(),
+                token: "t1".to_string(),
             }];
             tick_with_intents(
                 &mut world,
@@ -7090,6 +7259,7 @@ mod tests {
         let intents = vec![input::Intent::CreatePlayer {
             name: "xinren".to_string(),
             template: "dragon".to_string(),
+            token: "t1".to_string(),
         }];
         tick_with_intents(
             &mut world,
@@ -7125,6 +7295,7 @@ mod tests {
         let intents = vec![input::Intent::CreatePlayer {
             name: "xinren".to_string(),
             template: "blank".to_string(),
+            token: "t1".to_string(),
         }];
         tick_with_intents(
             &mut world,
@@ -7157,6 +7328,7 @@ mod tests {
         let intents = vec![input::Intent::CreatePlayer {
             name: "xinren".to_string(),
             template: "grazer".to_string(),
+            token: "t1".to_string(),
         }];
         tick_with_intents(
             &mut world,
@@ -7183,6 +7355,7 @@ mod tests {
         let intents = vec![input::Intent::CreatePlayer {
             name: "xinren".to_string(),
             template: "dragon".to_string(), // 表外 id = TEMPLATE_MISSING
+            token: "t1".to_string(),
         }];
         tick_with_intents(
             &mut world,
@@ -7207,6 +7380,7 @@ mod tests {
         std::fs::write(dir.join("tudou.wat"), "(module)").unwrap();
         let intents = vec![input::Intent::SelectPlayer {
             name: "tudou".to_string(),
+            token: "t1".to_string(),
         }];
         tick_with_intents(
             &mut world,
@@ -7318,6 +7492,7 @@ mod tests {
         map.players.mark_failed("tudou");
         let intents = vec![input::Intent::SelectPlayer {
             name: "tudou".to_string(),
+            token: "t1".to_string(),
         }];
         tick_with_intents(
             &mut world,
@@ -7354,6 +7529,7 @@ mod tests {
         let (mut world, mut map, dir) = onboarding_stage();
         let intents = vec![input::Intent::SelectPlayer {
             name: "nobody".to_string(),
+            token: "t1".to_string(),
         }];
         tick_with_intents(
             &mut world,

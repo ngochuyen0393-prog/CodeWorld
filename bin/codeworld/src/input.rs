@@ -46,12 +46,15 @@ pub enum Intent {
     Logout { choice: crate::dispose::LogoutChoice },
     /// 创建角色（D-021b 进场仪式：浏览器"创建你的角色"面板上行）。名字+模板
     /// id → 服务器写 players/<name>.wat + 首建归档旧档 + me 声明接管；
-    /// 落地在 main.rs process_create_player（不走 route_intents——不是操控动作）
-    CreatePlayer { name: String, template: String },
+    /// 落地在 main.rs process_create_player（不走 route_intents——不是操控动作）。
+    /// token（D-021f）：WS 层颁发的会话令牌，成功路径绑定进 sessions 表
+    ///（刷新/重连凭它认领操控）；纯终端模式（无 WS）直接丢弃
+    CreatePlayer { name: String, template: String, token: String },
     /// 选角（D-021d 登录/选角页：浏览器角色列表点选上行）。名字 → 覆写 me.txt
     /// （等价 me 声明）+ 清 absent/处置/黑名单 + player_selected 事件；
-    /// 落地在 main.rs process_select_player（不走 route_intents——不是操控动作）
-    SelectPlayer { name: String },
+    /// 落地在 main.rs process_select_player（不走 route_intents——不是操控动作）。
+    /// token（D-021f）：同 CreatePlayer，成功路径绑定进 sessions 表
+    SelectPlayer { name: String, token: String },
 }
 
 /// 按键 -> 意图映射全表（纯函数；crossterm KeyEvent 可在测试中直接构造）
