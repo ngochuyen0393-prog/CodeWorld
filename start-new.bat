@@ -13,9 +13,10 @@ if not exist my-world.db (
 )
 del /q my-world.db-journal my-world.db-wal my-world.db-shm 2>nul
 
-rem D-021d: old players stay in players\ on purpose - the login page lists
-rem every character (players\*.wat) so you can re-enter any of them.
-rem No more auto-archiving (it hid characters the roster would show anyway).
+rem D-021e: first start with no characters yet archives the old world - my-world.db
+rem AND old players\*.wat move into archive\ so your first character is born into a
+rem CLEAN world. Later restarts restore YOUR world + your character list, which the
+rem login page filters by players\.my-characters (only YOUR characters are listed).
 
 rem block: an old world process locks codeworld.exe and breaks the build below
 tasklist /FI "IMAGENAME eq codeworld.exe" 2>nul | find /I "codeworld.exe" >nul && (

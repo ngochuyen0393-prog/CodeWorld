@@ -144,21 +144,129 @@ pub(crate) fn archive_old_world(db_path: &str) -> Option<PathBuf> {
     }
 }
 
-/// 首建判定：玩家目录里没有任何 .wat（模板文件 _ 前缀/.txt 不算）——
-/// "这是本局第一个角色"= 归档旧档的触发口径（复用 scan 的加载口径，
-/// 不引入第二套"什么算玩家文件"定义）
-pub(crate) fn players_dir_is_fresh(players_dir: &Path) -> bool {
-    let mut has_wat = false;
-    if let Ok(entries) = std::fs::read_dir(players_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().map(|e| e == "wat").unwrap_or(false) {
-                has_wat = true;
-                break;
-            }
+/// 本机角色档案文件名（players/ 下隐藏文件，UTF-8 一行一名）。
+/// D-021e 角色列表私有化：登录页只列"我曾创建/使用过的角色"——players/ 里的
+/// 开发测试生物（pioneer/bridge-demo 等）不进档案就不列。档案是本机单机阶段的
+/// 概念（多人时代"我的角色"走账号，届时换轨）；身份权威仍是 players/<名>.wat
+/// 文件锚，档案只服务登录页体验。
+pub(crate) const MY_CHARACTERS_FILE: &str = ".my-characters";
+
+/// 读本机角色档案（内部）：一行一名，trim 每行、跳过空行；文件不存在=空表
+fn read_my_characters(players_dir: &Path) -> std::io::Result<Vec<String>> {
+    let text = match std::fs::read_to_string(players_dir.join(MY_CHARACTERS_FILE)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// 读本机角色档案（roster 过滤用）：读失败=warn+空表（宁可空也不泄露他人角色）
+pub(crate) fn my_characters(players_dir: &Path) -> Vec<String> {
+    match read_my_characters(players_dir) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %players_dir.join(MY_CHARACTERS_FILE).display(),
+                "[onboarding] 本机角色档案读取失败（按空表处理）"
+            );
+            Vec::new()
         }
     }
-    !has_wat
+}
+
+/// 首建判定：档案为空 = 本机第一个角色 = 归档旧世界的触发口径。
+/// 档案不存在/可读但无有效行 = 空白；**读失败 ≠ 空白**——档案被锁时宁可不归档
+/// 也不错归档（错归档=老玩家重启世界被挪走，而读失败恰是 Windows 锁文件的
+/// 常见姿势，与本文件 archive_old_world 的 os error 32 同族）
+pub(crate) fn my_characters_blank(players_dir: &Path) -> bool {
+    if !players_dir.join(MY_CHARACTERS_FILE).exists() {
+        return true;
+    }
+    matches!(read_my_characters(players_dir), Ok(v) if v.is_empty())
+}
+
+/// 追加本机角色档案（create/select 成功路径调用："我曾创建/使用过的角色"）。
+/// 重复名字不重复追加（追加前查含）；写失败只 warn 不阻断进场——档案是登录页
+/// 体验，身份权威仍是 players/<名>.wat 文件锚
+pub(crate) fn append_my_character(players_dir: &Path, name: &str) {
+    match read_my_characters(players_dir) {
+        Ok(v) if v.iter().any(|n| n == name) => return,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "[onboarding] 档案读取失败（跳过去重直接追加）");
+        }
+    }
+    let path = players_dir.join(MY_CHARACTERS_FILE);
+    let res = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(format!("{name}\n").as_bytes())
+        });
+    if let Err(e) = res {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "[onboarding] 本机角色档案追加失败（不阻断进场）"
+        );
+    }
+}
+
+/// 旧角色归档（D-021e 首建配套）：players/*.wat 挪 players/archive/players-<stamp>/
+///（归档而非删除，可找回）。me.txt / .my-characters / 非 .wat 文件一律不挪。
+/// 必须*与 db 归档同窗*执行：世界重开后 load_players_initial + 每拍目录轮询会把
+/// players/ 里所有 .wat 自动拉进场——留原地=干净世界被旧角色污染。返回挪动数量。
+pub(crate) fn archive_player_wats(players_dir: &Path) -> usize {
+    let wats: Vec<PathBuf> = match std::fs::read_dir(players_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "wat").unwrap_or(false))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %players_dir.display(), "[onboarding] 旧角色归档：目录读失败");
+            return 0;
+        }
+    };
+    if wats.is_empty() {
+        return 0;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest_dir = players_dir.join("archive").join(format!("players-{stamp}"));
+    if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+        tracing::warn!(error = %e, dir = %dest_dir.display(), "[onboarding] 旧角色归档目录创建失败（旧角色留在原地）");
+        return 0;
+    }
+    let mut moved = 0usize;
+    for src in &wats {
+        let Some(file_name) = src.file_name() else { continue };
+        match std::fs::rename(src, dest_dir.join(file_name)) {
+            Ok(()) => moved += 1,
+            Err(e) => tracing::warn!(
+                error = %e,
+                from = %src.display(),
+                "[onboarding] 旧角色归档失败（该文件留在原地）"
+            ),
+        }
+    }
+    tracing::info!(
+        count = moved,
+        to = %dest_dir.display(),
+        "[onboarding] 旧角色已归档（干净世界开局；归档可找回）"
+    );
+    moved
 }
 
 /// 模板书：启动读入的模板源（id -> WAT 全文；缺文件=该模板禁用，warn 不拖垮世界）
@@ -207,8 +315,12 @@ pub(crate) fn load_templates_from_static(static_dir: &Path) -> TemplateBook {
     TemplateBook::load(&static_dir.join(TEMPLATES_DIR_NAME))
 }
 
-/// 角色列表组装（D-021d 登录/选角页）：players/*.wat 全量投影为下行条目
-/// （纯函数，main 每拍刷新写共享槽——players 目录小，1Hz 全量重建白菜价）。
+/// 角色列表组装（D-021d 登录/选角页；D-021e 私有化）：本机角色档案
+///（players/.my-characters）登记 ∩ players/*.wat 实存，投影为下行条目
+///（纯函数，main 每拍刷新写共享槽——players 目录小，1Hz 全量重建白菜价）。
+/// - 档案过滤：登录页只列"我曾创建/使用过的角色"——开发测试生物（pioneer/
+///   bridge-demo 等）不进档案就不列；档案不存在/读失败 = 空列表（宁可空也
+///   不泄露他人角色）
 /// - online 条目：在线表 name→EntityId→世界里活实体查实际 glyph/color
 /// - 离线条目：glyph=名字首字符大写（既有 glyph_for），color=中性灰
 ///   （颜色依赖出生序号，离线时不可知，灰=诚实）
@@ -217,6 +329,10 @@ pub(crate) fn build_roster(
     players: &PlayerDirectory,
     world: &WorldState,
 ) -> Vec<RosterEntry> {
+    let mine = my_characters(players.dir());
+    if mine.is_empty() {
+        return Vec::new();
+    }
     let stems = match players.scan_dir() {
         Ok(s) => s,
         Err(e) => {
@@ -226,6 +342,7 @@ pub(crate) fn build_roster(
     };
     stems
         .into_iter()
+        .filter(|name| mine.iter().any(|m| m == name))
         .map(|name| match players
             .online_entity(&name)
             .and_then(|id| world.entities.get(&id))
@@ -285,15 +402,92 @@ mod tests {
     }
 
     #[test]
-    fn fresh_dir_detection_ignores_template_files() {
-        let dir = std::env::temp_dir().join(format!("cw-onboard-fresh-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // 模板文件（_ 前缀 wat / .txt）不算玩家——fresh 仍真
-        std::fs::write(dir.join("_template.wat.txt"), "x").unwrap();
-        std::fs::write(dir.join("README.md"), "x").unwrap();
-        assert!(players_dir_is_fresh(&dir), "只有模板/说明=首建");
-        std::fs::write(dir.join("pioneer.wat"), "x").unwrap();
-        assert!(!players_dir_is_fresh(&dir), "出现 .wat=非首建");
+    fn my_characters_blank_semantics_decides_first_build() {
+        // 首建判定（D-021e）：档案不存在/可读但无有效行 = 空白（首建）；
+        // 有有效行 = 非空白；**读失败 ≠ 空白**（档案被锁时宁可不归档也不错归档
+        // ——错归档=老玩家重启世界被挪走，而读失败恰是 Windows 锁文件的常见姿势）
+        let dir = archive_dir("blank");
+        assert!(my_characters_blank(&dir), "档案不存在=首建");
+        std::fs::write(dir.join(MY_CHARACTERS_FILE), "").unwrap();
+        assert!(my_characters_blank(&dir), "空文件=首建");
+        std::fs::write(dir.join(MY_CHARACTERS_FILE), "\n   \n").unwrap();
+        assert!(my_characters_blank(&dir), "纯空行=首建");
+        std::fs::write(dir.join(MY_CHARACTERS_FILE), "a\n").unwrap();
+        assert!(!my_characters_blank(&dir), "有角色=非首建");
+        std::fs::remove_dir_all(&dir).ok();
+        // 读失败模拟：.my-characters 是目录（read_to_string 必失败）
+        std::fs::create_dir_all(dir.join(MY_CHARACTERS_FILE)).unwrap();
+        assert!(!my_characters_blank(&dir), "读失败≠空白（不归档）");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn my_characters_reads_lines_trims_and_skips_empty() {
+        // 档案格式：UTF-8 一行一名，trim 每行、跳过空行；档案不存在=空表
+        let dir = archive_dir("read");
+        assert!(my_characters(&dir).is_empty(), "档案不存在=空表");
+        std::fs::write(dir.join(MY_CHARACTERS_FILE), "a\n\n b \n土豆\n").unwrap();
+        assert_eq!(
+            my_characters(&dir),
+            vec!["a".to_string(), "b".to_string(), "土豆".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn append_my_character_dedupes_by_name() {
+        // 追加幂等：重复名字不重复追加（追加前查含）
+        let dir = archive_dir("append");
+        append_my_character(&dir, "a");
+        append_my_character(&dir, "b");
+        append_my_character(&dir, "a");
+        assert_eq!(
+            my_characters(&dir),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_player_wats_moves_wat_files_only() {
+        // 归档口径（D-021e 首建配套）：players/*.wat 挪 players/archive/players-<stamp>/
+        // 可找回；me.txt / .my-characters / 非 .wat 文件（模板 .wat.txt）一律不挪
+        let dir = archive_dir("wats");
+        std::fs::write(dir.join("a.wat"), "(module)").unwrap();
+        std::fs::write(dir.join("b.wat"), "(module)").unwrap();
+        std::fs::write(dir.join("me.txt"), "a\n").unwrap();
+        std::fs::write(dir.join(MY_CHARACTERS_FILE), "a\n").unwrap();
+        std::fs::write(dir.join("_t.wat.txt"), "x").unwrap();
+        let moved = archive_player_wats(&dir);
+        assert_eq!(moved, 2, "只挪两个 .wat");
+        assert!(
+            !dir.join("a.wat").exists() && !dir.join("b.wat").exists(),
+            "顶层 .wat 已挪走"
+        );
+        assert!(dir.join("me.txt").exists(), "me 声明不挪");
+        assert!(dir.join(MY_CHARACTERS_FILE).exists(), "本机档案不挪");
+        assert!(dir.join("_t.wat.txt").exists(), "非 .wat 文件不挪");
+        let archive_root = dir.join("archive");
+        let stamps: Vec<PathBuf> = std::fs::read_dir(&archive_root)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(stamps.len(), 1, "一个时间戳归档目录");
+        assert!(
+            stamps[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("players-"),
+            "目录名 players-<stamp> 形态"
+        );
+        assert!(
+            stamps[0].join("a.wat").exists() && stamps[0].join("b.wat").exists(),
+            "两个 .wat 落归档目录"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -338,20 +532,58 @@ mod tests {
         d
     }
 
+    /// 档案单测台：空临时目录（my_characters/append/wats 单测共用）
+    fn archive_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "cw-onboard-mine-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 往临时玩家目录写本机角色档案（一行一名）
+    fn write_archive(dir: &Path, names: &[&str]) {
+        std::fs::write(
+            dir.join(MY_CHARACTERS_FILE),
+            names.iter().map(|n| format!("{n}\n")).collect::<String>(),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn build_roster_lists_all_wat_files_sorted() {
-        // 规则（D-021d）：角色列表 = players/*.wat 全量（旧角色照样列出——登录页
-        // 是"每次登录都有"的选角页，与世界里有无玩家/在场与否无关）；按名字
-        // 排序（scan_dir 已排序，保持确定性）；非 .wat 文件不列
-        let dir = roster_dir("sorted", &["b", "a"]);
+    fn build_roster_lists_only_my_characters_sorted() {
+        // 规则（D-021e 角色列表私有化）：角色列表 = 本机角色档案登记 ∩ players/*.wat
+        // 实存——开发测试生物（c.wat）不在档案就不列；顺序仍按 scan_dir 字母序
+        //（确定性）；非 .wat 文件不列
+        let dir = roster_dir("sorted", &["b", "a", "c"]);
         std::fs::write(dir.join("notes.txt"), "x").unwrap();
         std::fs::write(dir.join("_tpl.wat.txt"), "x").unwrap();
+        write_archive(&dir, &["b", "a"]);
         let players = PlayerDirectory::new(&dir);
         let world = WorldState::new();
         let roster = build_roster(&players, &world);
         let names: Vec<&str> = roster.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["a", "b"], "全量列出且按名字排序");
+        assert_eq!(names, vec!["a", "b"], "只列档案内角色且按名字排序");
         assert!(roster.iter().all(|e| !e.online), "无在线登记=全部离线");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_roster_without_archive_is_empty_even_with_wats() {
+        // 规则：档案不存在/为空 = 空列表（读失败同款 warn+空）——宁可空也不泄露
+        // 他人角色；目录里有再多 .wat 也不列
+        let dir = roster_dir("noarchive", &["a", "b"]);
+        let players = PlayerDirectory::new(&dir);
+        let world = WorldState::new();
+        assert!(build_roster(&players, &world).is_empty(), "无档案=空列表");
+        write_archive(&dir, &[]);
+        assert!(build_roster(&players, &world).is_empty(), "空档案=空列表");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -362,6 +594,7 @@ mod tests {
         // 残影）：glyph=glyph_for(name)（首字符大写），color=中性灰 #8b949e
         //（颜色依赖出生序号，离线时不可知，灰=诚实）
         let dir = roster_dir("appear", &["a", "土豆"]);
+        write_archive(&dir, &["a", "土豆"]);
         let mut players = PlayerDirectory::new(&dir);
         let mut world = WorldState::new();
         let id = EntityId::new();
@@ -395,6 +628,7 @@ mod tests {
         // 防御：在线表登记了但世界里查不到实体（异常时序）——按离线灰兜底，
         // 不 panic 不发空条目
         let dir = roster_dir("ghost", &["lonely"]);
+        write_archive(&dir, &["lonely"]);
         let mut players = PlayerDirectory::new(&dir);
         let world = WorldState::new();
         players.register_online("lonely", EntityId::new());
@@ -406,14 +640,16 @@ mod tests {
     }
 
     #[test]
-    fn build_roster_empty_dir_is_empty_list() {
-        // 规则：空目录/目录不存在 = 空列表（前端显示"还没有角色"），
-        // 目录不存在时 scan_dir 自动创建（与门一语义一致）
-        let dir = roster_dir("empty", &[]);
+    fn build_roster_skips_archive_names_without_wat() {
+        // 规则：档案里登记但 .wat 已不在的角色自然不列（先 scan_dir 再按档案交集
+        // ——档案是"我曾用过"的流水账，.wat 才是角色实存）
+        let dir = roster_dir("gone", &["a"]);
+        write_archive(&dir, &["gone", "a"]);
         let players = PlayerDirectory::new(&dir);
         let world = WorldState::new();
         let roster = build_roster(&players, &world);
-        assert!(roster.is_empty(), "空目录=空列表");
+        let names: Vec<&str> = roster.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a"], "档案有但 .wat 不在的角色不列");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1434,21 +1434,41 @@ impl EntitySandboxMap {
     }
 }
 
+/// D-021e 首建归档窗口（R2）：空世界模式下启动瞬间调用（调用方保证
+/// config.empty_world）。本机角色档案空白（.my-characters 不存在/无有效行）=
+/// 首建 → 旧世界 db（archive_old_world）与旧角色 .wat（archive_player_wats）
+/// 一并挪 archive/，返回 true；档案非空 = 老玩家重启，什么都不动，返回 false
+///（世界照常恢复）。时机必须在 StorageEngine::open **之前**——Windows 下
+/// sqlite 句柄锁着 db 文件，进程内 rename 必失败（os error 32，实测）。
+fn first_build_archive(db_path: &str, players_dir: &std::path::Path) -> bool {
+    if !crate::onboarding::my_characters_blank(players_dir) {
+        return false;
+    }
+    let db_archived = crate::onboarding::archive_old_world(db_path).is_some();
+    let wats_moved = crate::onboarding::archive_player_wats(players_dir);
+    if db_archived || wats_moved > 0 {
+        tracing::info!(
+            db_archived,
+            wats_moved,
+            "[onboarding] 首建归档完成：旧世界与旧角色已挪 archive/（新玩家从干净世界开始，归档可找回）"
+        );
+    } else {
+        tracing::info!("[onboarding] 首启（角色档案空白）：无旧档可归档，世界本就干净");
+    }
+    true
+}
+
 fn main() -> Result<()> {
     let config = Config::load();
     init_tracing(&config.log_level);
     tracing::info!(tick_ms = config.tick_interval_ms, db = %config.db_path, "CodeWorld 主程序启动");
 
-    // D-021b 进场仪式配套：空世界模式 + 玩家目录空（首建前夜）→ 旧档归档。
-    // 归档而非删除（archive/ 可找回）；必须在 StorageEngine::open **之前**——
-    // Windows 下 sqlite 句柄锁着 db 文件，进程内 rename 必失败（进程内首建归档
-    // 实测 os error 32，改启动时归档）。create_player 意图侧不再动 db。
-    if config.empty_world
-        && crate::onboarding::players_dir_is_fresh(std::path::Path::new(&config.players_dir))
-    {
-        if let Some(dest) = crate::onboarding::archive_old_world(&config.db_path) {
-            tracing::info!(to = %dest.display(), "[onboarding] 空世界首启：旧档已归档，新玩家从干净世界开始");
-        }
+    // D-021e 首建归档窗口（R2）：空世界模式 + 角色档案空白（首建前夜）→ 旧世界
+    // db 与旧角色 .wat 一并归档。归档而非删除（archive/ 可找回）；.wat 必须一并
+    // 挪走——世界重开后 load_players_initial + 每拍目录轮询会把 players/ 里所有
+    // .wat 自动拉进场，留原地=干净世界被旧角色污染。create_player 意图侧不碰 db。
+    if config.empty_world {
+        first_build_archive(&config.db_path, std::path::Path::new(&config.players_dir));
     }
 
     // 打开存储，尝试恢复快照；无快照则新建世界
@@ -3467,6 +3487,10 @@ fn process_create_player(
         );
         // 出生时刻日志（验收锚：grep "玩家进场仪式"）
         tracing::info!(player = %name, tick = current_tick, "[onboarding] 玩家进场仪式完成：你的生物出生了");
+        // D-021e：成功进场=记入本机角色档案（登录页从此只列"我曾创建的角色"；
+        // 写失败只 warn 不阻断——档案是登录页体验，身份锚仍是 .wat 文件）。
+        // 失败回滚路径（下方 else）不追加
+        crate::onboarding::append_my_character(sandbox_map.players.dir(), &name);
     } else {
         // spawn 失败（编译/沙箱）：文件已写但进场失败——摘掉文件防下拍轮询反复
         // 重试刷 compile_failed；玩家重新起名再来
@@ -3535,6 +3559,8 @@ fn process_select_player(
         crate::events::EventBody::PlayerSelected { name: name.to_string() },
     );
     tracing::info!(player = %name, tick = current_tick, "[onboarding] 选角完成：me 声明已写入（前端重连认领操控）");
+    // D-021e：选角成功=同样记入本机角色档案（"我曾使用过的角色"）
+    crate::onboarding::append_my_character(sandbox_map.players.dir(), name);
 }
 
 /// 技能栏意图落地（D-020a，t_06b4efc6）：Skill 意图 -> 预置模板造物请求排队。
@@ -7118,6 +7144,160 @@ mod tests {
         assert!(!db_dir.join("archive").exists(), "进程内不建 archive");
         assert!(map.players.is_online("xinren"), "创建照常成功");
         let _ = dir;
+    }
+
+    // === D-021e 本机角色档案（登录页私有化 R1 + 首建归档 R2）===
+
+    #[test]
+    fn create_player_success_appends_my_characters() {
+        // R1：创建成功（spawn+PlayerJoined 已发）= 记入本机角色档案——登录页
+        // 从此只列"我曾创建的角色"
+        let (mut world, mut map, dir) = onboarding_stage();
+        let intents = vec![input::Intent::CreatePlayer {
+            name: "xinren".to_string(),
+            template: "grazer".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert!(map.players.is_online("xinren"), "前置：创建成功进场");
+        assert_eq!(
+            crate::onboarding::my_characters(&dir),
+            vec!["xinren".to_string()],
+            "成功路径追加档案"
+        );
+    }
+
+    #[test]
+    fn create_player_rejected_does_not_append_my_characters() {
+        // R1：拒绝路径（模板缺失）零档案副作用——失败连档案文件都不该建
+        let (mut world, mut map, dir) = onboarding_stage();
+        let intents = vec![input::Intent::CreatePlayer {
+            name: "xinren".to_string(),
+            template: "dragon".to_string(), // 表外 id = TEMPLATE_MISSING
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert!(
+            !dir.join(crate::onboarding::MY_CHARACTERS_FILE).exists(),
+            "拒绝不建档案"
+        );
+    }
+
+    #[test]
+    fn select_player_success_appends_my_characters() {
+        // R1：选角成功（me.txt 覆写+事件已发）= 同样记入档案（"我曾使用过的角色"）
+        let (mut world, mut map, dir) = onboarding_stage();
+        std::fs::write(dir.join("tudou.wat"), "(module)").unwrap();
+        let intents = vec![input::Intent::SelectPlayer {
+            name: "tudou".to_string(),
+        }];
+        tick_with_intents(
+            &mut world,
+            &mut TimeEngine::new(),
+            &DefaultPhysicsEngine::new(),
+            &mut test_renderer(),
+            &mut StorageEngine::open_in_memory().unwrap(),
+            &mut Vec::new(),
+            &mut map,
+            &intents,
+        );
+        assert_eq!(
+            crate::onboarding::my_characters(&dir),
+            vec!["tudou".to_string()],
+            "选角成功追加档案"
+        );
+    }
+
+    #[test]
+    fn first_build_archive_blank_archive_moves_db_and_wats() {
+        // R2 首建归档窗口：档案空白（不存在）= 首建 → db 与 players/*.wat 一并挪
+        // archive/（可找回）——.wat 不挪走会被 load_players_initial+目录轮询拉进场，
+        // 干净世界被旧角色污染；me.txt / 档案本体不挪。幂等自查：二次调用 db 已不在
+        // =None、无 .wat 可挪，安全无害
+        let db_dir = temp_players_dir("fba-db");
+        let db = db_dir.join("codeworld.db");
+        std::fs::write(&db, b"old-world").unwrap();
+        std::fs::write(db_dir.join("codeworld.db-wal"), b"wal").unwrap();
+        let players_dir = temp_players_dir("fba-players");
+        std::fs::write(players_dir.join("pioneer.wat"), "(module)").unwrap();
+        std::fs::write(players_dir.join("me.txt"), "pioneer\n").unwrap();
+        assert!(
+            first_build_archive(db.to_string_lossy().as_ref(), &players_dir),
+            "档案空白=首建，窗口触发"
+        );
+        assert!(!db.exists(), "db 已归档挪走");
+        assert!(
+            db_dir.join("archive").exists(),
+            "db 落 archive/（db+wal sidecar 由 archive_old_world 一并挪入）"
+        );
+        assert!(
+            !players_dir.join("pioneer.wat").exists(),
+            "旧 .wat 一并归档（留原地=轮询拉进场污染干净世界）"
+        );
+        assert!(players_dir.join("me.txt").exists(), "me 声明不挪");
+        let stamp_root = players_dir.join("archive");
+        let stamps: Vec<PathBuf> = std::fs::read_dir(&stamp_root)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(stamps.len(), 1, "一个 players-<stamp> 归档目录");
+        assert!(
+            stamps[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("players-"),
+            "目录名 players-<stamp> 形态"
+        );
+        assert!(stamps[0].join("pioneer.wat").exists(), "旧角色落归档目录");
+        // 幂等：档案仍空白+二次调用 → db 不在=None、无 .wat 可挪，归档目录不涨
+        assert!(first_build_archive(db.to_string_lossy().as_ref(), &players_dir));
+        assert_eq!(
+            std::fs::read_dir(&stamp_root).unwrap().count(),
+            1,
+            "无 .wat 可挪=不建新归档目录"
+        );
+    }
+
+    #[test]
+    fn first_build_archive_with_characters_keeps_world() {
+        // R2：档案非空 = 老玩家重启 → 世界照常恢复，db 与 .wat 纹丝不动
+        let db_dir = temp_players_dir("fbb-db");
+        let db = db_dir.join("codeworld.db");
+        std::fs::write(&db, b"my-world").unwrap();
+        let players_dir = temp_players_dir("fbb-players");
+        std::fs::write(players_dir.join("tudou.wat"), "(module)").unwrap();
+        std::fs::write(
+            players_dir.join(crate::onboarding::MY_CHARACTERS_FILE),
+            "tudou\n",
+        )
+        .unwrap();
+        assert!(
+            !first_build_archive(db.to_string_lossy().as_ref(), &players_dir),
+            "档案非空=非首建，窗口不触发"
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), b"my-world", "db 原地未动");
+        assert!(players_dir.join("tudou.wat").exists(), ".wat 原地未动");
+        assert!(!players_dir.join("archive").exists(), "players/ 下不建归档");
     }
 
     // === D-021d 登录/选角页（select_player 落地）===

@@ -156,7 +156,8 @@
     font: inherit; padding: 6px; cursor: pointer; margin-top: 2px;
   }
   #logoutPanel .cancel:hover { color: #c9d1d9; }
-  /* 已登出横幅：非阻塞（世界继续直播），含重新进入入口 */
+  /* 已登出横幅（D-021e 复活为登出落点）：非阻塞（世界继续直播）；
+     reenterBtn 已退役（元素保留防引用悬空），重新选角=刷新页面 */
   #logoutBanner {
     position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
     z-index: 4; display: flex; gap: 12px; align-items: center;
@@ -373,9 +374,10 @@
   <canvas id="cv"></canvas>
   <div id="tip" hidden></div>
   <!-- D-021d 登录/选角页：本会话未选角前常驻（与世界里有无玩家无关——其他游戏
-       每次登录都有这个页面）。角色列表=players/*.wat 全量（player_roster 下行），
-       点选=select_player 上行以该角色进场；"+ 新建角色"复用 createPanel（盖上层）。
-       页面加载即显示（未连接时列表区显示"正在读取"） -->
+       每次登录都有这个页面）。角色列表=本机角色档案（players/.my-characters，
+       D-021e 私有化）过滤后的角色（player_roster 下行），点选=select_player 上行
+       以该角色进场；"+ 新建角色"复用 createPanel（盖上层）。只在首次连接/刷新
+       页面出现（D-021e：登出不回这里）。页面加载即显示（未连接时列表区显示"正在读取"） -->
   <div id="loginPanel">
     <div class="card">
       <div class="title">选择你的角色</div>
@@ -1919,9 +1921,10 @@
   }
 
   // 选项落地：卡片按下高亮一拍（视觉回执）→ 发 logout 消息（服务器释放操控令牌，
-  // 本连接降级观战）→ 弹窗 0.25s 淡出关门 → 登录页接管。
-  // D-021d：处置三选一语义（logout 消息+choice）一字不动，只是处置完成后的
-  // 落点从"世界画面观战+横幅"改为登录页——重新进场=在列表里点角色
+  // 本连接降级观战）→ 弹窗 0.25s 淡出关门 → 顶部横幅告知。
+  // 处置三选一语义（logout 消息+choice）一字不动。D-021e：登出=退出世界，
+  // 世界画面继续（观战降级直播）——不再弹登录页（登录页只在首次连接/刷新页面
+  // 出现），刷新页面才重新选角
   Array.prototype.forEach.call(
     document.querySelectorAll('#logoutPanel .disp'),
     function (btn) {
@@ -1936,8 +1939,9 @@
           moveTarget = null;
           clearPrediction(); // 已无操控：预测态清空（重进后从服务器快照重来）
           fadeOutLogoutPanel(function () {
-            sessionSelected = false; // 回登录页（重开浏览器=重新选角的会话语义）
-            showLoginPanel();
+            sessionSelected = true; // 保持进场态：世界画面继续（观战降级），不回登录页
+            bannerTextEl.textContent = '已登出——刷新页面可重新选择角色';
+            logoutBannerEl.hidden = false; // reenterBtn 保持 hidden（已退役，元素保留防引用悬空）
           });
         }, PANEL_ACK_MS);
       });
@@ -1947,8 +1951,8 @@
   logoutCancelEl.addEventListener('click', cancelLogoutPanel);
 
   // 重新进入世界：清登出残留 + 关掉观战连接 -> 全新连接（第一连接=操控端，
-  // 重新认领）。D-021d 起主路径=登录页点角色（loginPanelOnEvent 同款三步），
-  // 本按钮随 logoutBanner 退役（元素保留防引用悬空，不再有展示入口）
+  // 重新认领）。D-021e 起本按钮退役（元素保留防引用悬空，横幅不再展示它）
+  // ——重新选角的正规路径=刷新页面回登录页
   reenterBtnEl.addEventListener('click', function () {
     clearLoggedOutResidue();
     freshConnection();
