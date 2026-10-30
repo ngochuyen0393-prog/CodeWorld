@@ -1655,7 +1655,16 @@ fn main() -> Result<()> {
     // 期四第一刀：WS 快照推送（与终端 ANSI 渲染并行存在，不替代终端）。
     // 端口 0 = 禁用（返回 None，tick 循环走零开销分支）；WS 线程挂掉不影响主循环。
     // #027：第三刀起 WS 线程同时是上行意图入口（转发进共享 intent_sink）
-    let mut ws_snapshots = net::init(&config, intent_sink);
+    let mut ws_snapshots = net::init(
+        &config,
+        intent_sink,
+        // D-022：外桥保险库只读句柄交给工坊 bridge-config 路由（桥未启用=None
+        // ——路由回空列表）。net::init 在 BridgeOutbox 装配之后调用，Arc 拿得到
+        sandbox_map
+            .bridge
+            .as_ref()
+            .map(|outbox| outbox.vault_arc()),
+    );
     // D-021f：会话令牌表交给 tick 侧——选角/创建成功路径绑定 token→name
     //（连接升级凭它认领操控）。WS 禁用（纯终端模式）保持 None：token 在
     // 分流处直接丢弃，无会话概念

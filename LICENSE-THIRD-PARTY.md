@@ -5,6 +5,35 @@
 | 组件 | 许可证 | 位置 | 上游 | 用途 |
 |------|--------|------|------|------|
 | ToonShading 卡通渲染 shader | MIT | `bin/codeworld/static/genshin-toon/` | [KallkaGo/ToonShading](https://github.com/KallkaGo/ToonShading)（Copyright (c) 2024 KallkaGo） | 原神式卡通渲染材质（GenshinToonMaterial） |
+| Monaco Editor（vendored min/vs 整目录） | MIT | `bin/codeworld/static/vendor/monaco/` | [microsoft/monaco-editor](https://github.com/microsoft/monaco-editor)（Copyright (c) 2016 - present Microsoft Corporation） | 造物工坊代码编辑器（D-022，0.52.2 amd 版，禁 CDN） |
+
+## microsoft/monaco-editor (MIT)
+
+本仓库 `bin/codeworld/static/vendor/monaco/vs/` 为 monaco-editor npm 包
+`min/vs` 目录原样 vendored（版本 0.52.2，amd loader + editor.main，未修改
+任何文件），供造物工坊页本地加载（工坊编辑器底座，D-022）。
+
+MIT License 全文（英文原文为准）：
+
+> Copyright (c) 2016 - present Microsoft Corporation
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all
+> copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE OTHER DEALINGS IN THE
+> SOFTWARE.
 
 ## KallkaGo/ToonShading (MIT)
 

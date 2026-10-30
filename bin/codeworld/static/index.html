@@ -125,6 +125,12 @@
     background: #21262d; border: 1px solid #30363d; color: #f85149;
     font: inherit; padding: 0 8px; cursor: pointer;
   }
+  /* D-022 工坊入口：新标签打开造物工坊（可分屏），快捷键 B */
+  #workshopBtn {
+    background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+    font: inherit; padding: 0 8px; cursor: pointer;
+  }
+  #workshopBtn:hover { border-color: #8b949e; }
   /* 登出处置面板：登出是主动行为，三选一离开（#025 下线处置权） */
   #logoutPanel {
     position: absolute; inset: 0; z-index: 5;
@@ -459,6 +465,8 @@
   <button id="threeBtn" type="button">3D 层：关</button>
   <span id="threeStatus"></span>
   <button id="matBtn" type="button" hidden>材质</button>
+  <!-- D-022 工坊入口：workshop.html 新标签（可分屏；工坊自带观战 WS 连接） -->
+  <button id="workshopBtn" type="button" title="造物工坊（编辑器+造物管理，新标签打开）">🛠 工坊</button>
   <button id="logoutBtn" type="button">登出</button>
   <span id="mouse">x=- , y=-</span>
 </div>
@@ -507,6 +515,7 @@
   var mouseEl = document.getElementById('mouse');
   var tipEl = document.getElementById('tip');
   var camBtnEl = document.getElementById('camBtn');
+  var workshopBtnEl = document.getElementById('workshopBtn');
   var logoutBtnEl = document.getElementById('logoutBtn');
   var logoutPanelEl = document.getElementById('logoutPanel');
   var logoutCancelEl = document.getElementById('logoutCancel');
@@ -2003,6 +2012,10 @@
     if (ev.key === 'f' || ev.key === 'F') {
       toggleCamera();
     }
+    // D-022 造物工坊：B 键/底栏按钮，新标签打开（不与 S/F/L/T/1-4 冲突）
+    if (ev.key === 'b' || ev.key === 'B') {
+      openWorkshop();
+    }
     // 登出处置（#025）：L 键/底部按钮开面板，Esc 取消
     if (ev.key === 'l' || ev.key === 'L') {
       showLogoutPanel();
@@ -2012,6 +2025,13 @@
     }
   });
   camBtnEl.addEventListener('click', toggleCamera);
+
+  // ---- D-022 造物工坊入口：workshop.html 新标签打开（可分屏；工坊页自带观战
+  // WS 连接收事件流/角色列表，不动本页操控连接）----
+  function openWorkshop() {
+    window.open('workshop.html', '_blank');
+  }
+  workshopBtnEl.addEventListener('click', openWorkshop);
 
   // ---- 登出处置（#025 期五第一刀；期五第二刀决策即关门）----
   // 弹窗是一次决策的场所：点任一选项/取消/Esc = 决策完成 = 弹窗立刻淡出关门，

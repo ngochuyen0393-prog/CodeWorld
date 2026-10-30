@@ -447,6 +447,14 @@ pub(crate) struct WsState {
     /// 角色列表共享槽（D-021d 登录/选角页）：主循环每拍 build_roster 重建，
     /// ws 连接建立时全量下发。std Mutex 足够（读写都是瞬时快照）
     pub(crate) roster: Arc<std::sync::Mutex<Vec<RosterEntry>>>,
+    /// 玩家目录路径（D-022 工坊 HTTP 通道：/api/player-code 读写删 players/<名>.wat
+    ///——工坊保存=写文件=世界目录轮询自动接手，零新进场协议）
+    pub(crate) players_dir: std::path::PathBuf,
+    /// 外桥保险库只读句柄（D-022 GET /api/bridge-config 端口列表只读展示；
+    /// None=桥未启用/未装配——路由回空列表。与主循环共享同一把 RwLock，
+    /// bridges.json mtime 热重载两边看同一份账）
+    pub(crate) bridge_vault:
+        Option<Arc<std::sync::RwLock<crate::bridges::BridgeVault>>>,
 }
 
 /// 主循环持有的 WS 句柄：快照推送端、操控连接 id 观测（#025 期五第一刀；
@@ -476,7 +484,13 @@ pub(crate) enum ConnEvent {
 
 /// 生产装配：WS 启用（端口≠0）则起独立 ws-server 线程（内含 tokio runtime），
 /// 返回句柄（快照推送端 + 操控令牌观测）供主循环使用；禁用（端口 0）返回 None。
-pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Option<WsHandle> {
+/// bridge_vault=外桥保险库只读句柄（D-022 工坊 bridge-config 展示；主循环在
+/// net::init 之前装配 BridgeOutbox，取出 Arc 传入——None=桥未启用）
+pub(crate) fn init(
+    config: &crate::config::Config,
+    intents: IntentSink,
+    bridge_vault: Option<Arc<std::sync::RwLock<crate::bridges::BridgeVault>>>,
+) -> Option<WsHandle> {
     if config.ws_port == 0 {
         tracing::info!("[ws] CODEWORLD_WS_PORT=0，WS 快照推送禁用（纯终端模式）");
         return None;
@@ -507,6 +521,8 @@ pub(crate) fn init(config: &crate::config::Config, intents: IntentSink) -> Optio
         conn_ids: AtomicU64::new(1),
         avatars,
         roster: roster.clone(),
+        players_dir: std::path::PathBuf::from(&config.players_dir),
+        bridge_vault,
     });
     let handle = WsHandle {
         snapshots: tx,
@@ -593,6 +609,15 @@ pub(crate) async fn serve(
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/upload/avatar", post(upload_avatar))
+        // D-022 造物工坊 HTTP 通道：保存=写 players/<名>.wat（热进场靠目录轮询）、
+        // 读取=编辑器加载全文、删除=下拍残影下线；bridge-config=外桥端口只读展示
+        .route(
+            "/api/player-code",
+            post(player_code_write)
+                .get(player_code_read)
+                .delete(player_code_delete),
+        )
+        .route("/api/bridge-config", get(bridge_config))
         .layer(axum::extract::DefaultBodyLimit::max(
             avatars::MAX_AVATAR_PNG_BYTES * 2, // 2MB PNG + multipart 边界开销余量；护栏仍由 store_upload 按 PNG 字节判
         ))
@@ -724,6 +749,153 @@ async fn upload_avatar(State(state): State<Arc<WsState>>, mut mp: Multipart) -> 
 /// 拒绝响应体（{ok:false, reason}；HTTP 恒 200，成败看 ok 字段）
 fn reject_json(reason: avatars::RejectReason) -> Response {
     Json(serde_json::json!({ "ok": false, "reason": reason.wire() })).into_response()
+}
+
+// ---- D-022 造物工坊 HTTP 通道（/api/player-code 三动作 + /api/bridge-config）----
+
+/// 工坊保存代码长度上限（防滥用护栏：256KB；玩家代码都是小文件，卡面定值）
+pub(crate) const PLAYER_CODE_MAX_BYTES: usize = 256 * 1024;
+
+/// 工坊通道统一拒绝响应体（{ok:false, reason:string}；HTTP 恒 200，成败看 ok）
+fn workshop_reject_json(reason: &str) -> Response {
+    Json(serde_json::json!({ "ok": false, "reason": reason })).into_response()
+}
+
+/// POST /api/player-code 请求体（JSON：角色名 + WAT 全文）
+#[derive(Debug, Deserialize)]
+struct PlayerCodeBody {
+    name: String,
+    code: String,
+}
+
+/// POST /api/player-code（D-022 工坊保存=进场通道）：JSON {name, code} ->
+/// sanitize_name（唯一权威闸门 crate::onboarding::sanitize_name）-> 写
+/// players/<名>.wat（覆盖写）-> 世界下拍目录轮询自动拉进场。
+/// **不写 me.txt**（造物/角色文件管理≠操控声明）；成功登记本机角色档案
+///（与 create_player 成功路径同款——工坊角色列表数据源=player_roster，
+/// 档案不登记则列表看不见它）。返回 {ok:true} / {ok:false,reason}。
+async fn player_code_write(State(state): State<Arc<WsState>>, body: axum::body::Bytes) -> Response {
+    let req: PlayerCodeBody = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "[workshop] 保存请求 JSON 解析失败（BAD_JSON）");
+            return workshop_reject_json("BAD_JSON");
+        }
+    };
+    let name = match crate::onboarding::sanitize_name(&req.name) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::info!(reason = e.wire(), "[workshop] 保存拒绝：名字闸门");
+            return workshop_reject_json(e.wire());
+        }
+    };
+    if req.code.len() > PLAYER_CODE_MAX_BYTES {
+        tracing::info!(len = req.code.len(), "[workshop] 保存拒绝：代码超上限");
+        return workshop_reject_json("CODE_TOO_LONG");
+    }
+    let path = state.players_dir.join(format!("{name}.wat"));
+    // 目录兜底创建（正常启动时 players/ 已在；测试/手删目录场景防 IO_ERROR）
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, req.code.as_bytes()) {
+        Ok(()) => {
+            tracing::info!(
+                name = %name,
+                len = req.code.len(),
+                "[workshop] 代码已保存（写 players/<名>.wat；新文件=世界下拍进场）"
+            );
+            // 本机角色档案登记（create_player 成功路径同款；重复不重复追加）
+            crate::onboarding::append_my_character(&state.players_dir, &name);
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "[workshop] 保存写盘失败（IO_ERROR）");
+            workshop_reject_json("IO_ERROR")
+        }
+    }
+}
+
+/// GET /api/player-code?name=（D-022 工坊加载）：读 players/<名>.wat 全文 ->
+/// {ok:true,code} / NAME_UNKNOWN（无此角色）/ NAME_*（名字闸门）/ IO_ERROR。
+async fn player_code_read(
+    State(state): State<Arc<WsState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(raw) = params.get("name") else {
+        return workshop_reject_json("NAME_EMPTY");
+    };
+    let name = match crate::onboarding::sanitize_name(raw) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::info!(reason = e.wire(), "[workshop] 读取拒绝：名字闸门");
+            return workshop_reject_json(e.wire());
+        }
+    };
+    let path = state.players_dir.join(format!("{name}.wat"));
+    match std::fs::read_to_string(&path) {
+        Ok(code) => Json(serde_json::json!({ "ok": true, "code": code })).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(name = %name, "[workshop] 读取拒绝：无此角色（NAME_UNKNOWN）");
+            workshop_reject_json("NAME_UNKNOWN")
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "[workshop] 读取失败（IO_ERROR）");
+            workshop_reject_json("IO_ERROR")
+        }
+    }
+}
+
+/// DELETE /api/player-code?name=（D-022 工坊删除）：删 players/<名>.wat——
+/// 世界下拍残影下线（既有语义，在线角色删除同理）。**不动 me.txt**。
+/// 不存在=NAME_UNKNOWN。
+async fn player_code_delete(
+    State(state): State<Arc<WsState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(raw) = params.get("name") else {
+        return workshop_reject_json("NAME_EMPTY");
+    };
+    let name = match crate::onboarding::sanitize_name(raw) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::info!(reason = e.wire(), "[workshop] 删除拒绝：名字闸门");
+            return workshop_reject_json(e.wire());
+        }
+    };
+    let path = state.players_dir.join(format!("{name}.wat"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            tracing::info!(name = %name, "[workshop] 角色文件已删除（残影下线归世界轮询）");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(name = %name, "[workshop] 删除拒绝：无此角色（NAME_UNKNOWN）");
+            workshop_reject_json("NAME_UNKNOWN")
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "[workshop] 删除失败（IO_ERROR）");
+            workshop_reject_json("IO_ERROR")
+        }
+    }
+}
+
+/// GET /api/bridge-config（D-022 工坊外桥只读展示）：BridgeVault 读锁 ->
+/// {ok,ports:[{port,note}]}（端口升序；note 可空串）。vault 未装配（桥未启用）
+/// -> {ok,ports:[]}。不做写路由（改服务器配置越权，玩家侧不开放——端点登记
+/// 在世界目录 bridges.json，mtime 热重载改文件生效）。
+async fn bridge_config(State(state): State<Arc<WsState>>) -> Response {
+    let ports: Vec<serde_json::Value> = match &state.bridge_vault {
+        Some(vault) => vault
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .port_notes()
+            .into_iter()
+            .map(|(port, note)| serde_json::json!({ "port": port, "note": note }))
+            .collect(),
+        None => Vec::new(),
+    };
+    Json(serde_json::json!({ "ok": true, "ports": ports })).into_response()
 }
 
 /// 单连接循环：下行推快照广播，上行解析意图入共享队列（仅操控连接）。
@@ -1452,6 +1624,8 @@ mod tests {
             conn_ids: AtomicU64::new(1),
             avatars: avatars.clone(),
             roster: roster.clone(),
+            players_dir: temp_assets_dir("shared-players"),
+            bridge_vault: None,
         });
         let handle = tokio::spawn(async move {
             serve(
@@ -1990,6 +2164,8 @@ mod tests {
             conn_ids: std::sync::atomic::AtomicU64::new(1),
             avatars: Arc::new(avatars::AvatarRegistry::load(&temp_assets_dir("d021f"))),
             roster: Arc::new(std::sync::Mutex::new(Vec::new())),
+            players_dir: temp_assets_dir("d021f-players"),
+            bridge_vault: None,
         });
         let handle = tokio::spawn(async move {
             serve(
@@ -2386,7 +2562,7 @@ mod tests {
             ..crate::config::Config::default()
         };
         assert!(
-            init(&cfg, intent_channel().0).is_none(),
+            init(&cfg, intent_channel().0, None).is_none(),
             "端口 0 应禁用 WS（None = 主循环不组装快照）"
         );
     }
@@ -2789,6 +2965,284 @@ mod tests {
         assert_eq!(chars[0]["glyph"], "土");
         assert_eq!(chars[0]["color"], "green");
         assert_eq!(chars[0]["online"], true);
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    // === D-022 造物工坊 HTTP 通道（/api/player-code 三动作 + /api/bridge-config）===
+
+    /// 临时玩家目录（工坊通道测试用；路径带进程号+纳秒防并行撞）
+    fn temp_net_players_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "codeworld-net-players-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 带玩家目录与外桥保险库的测试服务器（D-022 工坊通道测试用；其余同
+    /// start_test_server_with_avatars。vault=None=桥未装配，路由应回空列表）
+    #[allow(clippy::type_complexity)]
+    async fn start_test_server_full(
+        static_dir: std::path::PathBuf,
+        avatars_dir: &std::path::Path,
+        players_dir: &std::path::Path,
+        vault: Option<Arc<std::sync::RwLock<crate::bridges::BridgeVault>>>,
+    ) -> (
+        std::net::SocketAddr,
+        broadcast::Sender<String>,
+        crate::input::IntentQueue,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        Arc<avatars::AvatarRegistry>,
+        Arc<std::sync::Mutex<Vec<RosterEntry>>>,
+        std::path::PathBuf,
+    ) {
+        let (tx, _) = broadcast::channel::<String>(SNAPSHOT_CHANNEL_CAP);
+        let (intents_tx, intents_rx) = crate::input::intent_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let avatars = Arc::new(avatars::AvatarRegistry::load(avatars_dir));
+        let roster = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = Arc::new(WsState {
+            snapshots: tx.clone(),
+            intents: intents_tx,
+            ctrl_conn: tokio::sync::watch::channel(None).0,
+            sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            legacy_first_conn: false,
+            conn_ids: AtomicU64::new(1),
+            avatars: avatars.clone(),
+            roster: roster.clone(),
+            players_dir: players_dir.to_path_buf(),
+            bridge_vault: vault,
+        });
+        let handle = tokio::spawn(async move {
+            serve(
+                listener,
+                state,
+                static_dir,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+        (
+            addr,
+            tx,
+            intents_rx,
+            shutdown_tx,
+            handle,
+            avatars,
+            roster,
+            players_dir.to_path_buf(),
+        )
+    }
+
+    /// 工坊保存的 POST 请求助手（JSON body）
+    async fn post_json(
+        addr: &std::net::SocketAddr,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> serde_json::Value {
+        let raw = serde_json::to_vec(body).unwrap();
+        let resp = http_request(addr, "POST", path, Some("application/json"), Some(&raw)).await;
+        serde_json::from_slice(http_body(&resp)).expect("响应应为 JSON")
+    }
+
+    #[tokio::test]
+    async fn workshop_save_writes_player_wat_and_registers_archive() {
+        // 场景：POST /api/player-code {name, code} -> ok:true -> players/<名>.wat
+        // 落盘（覆盖写）+ 本机角色档案登记（角色文件列表数据源=player_roster，
+        // 档案不登记则列表看不见本卡保存的角色——create_player 成功路径同款）
+        let static_dir = temp_static_dir("ws-save");
+        let players_dir = temp_net_players_dir("ws-save");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
+            start_test_server_full(static_dir, &temp_assets_dir("ws-save"), &players_dir, None)
+                .await;
+        let body = serde_json::json!({
+            "name": "工坊造物",
+            "code": "(module (func (export \"life\") (result i32) i32.const 1))",
+        });
+        let json = post_json(&addr, "/api/player-code", &body).await;
+        assert_eq!(json["ok"], true, "保存成功应回 ok:true：{json}");
+        let written = std::fs::read_to_string(players.join("工坊造物.wat")).expect("文件应落盘");
+        assert!(written.contains("life"), "内容=提交代码原文");
+        let archive = std::fs::read_to_string(players_dir.join(crate::onboarding::MY_CHARACTERS_FILE))
+            .expect("档案应存在");
+        assert!(
+            archive.contains("工坊造物"),
+            "保存成功应登记本机角色档案（player_roster 同源）"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn workshop_save_rejects_bad_name_oversize_and_missing_field() {
+        // 三条拒绝路：名字闸门同源 sanitize_name（a/b=NAME_BAD_CHAR）/ 代码超
+        // 256KB=CODE_TOO_LONG / 缺字段=BAD_JSON；全部拒绝零落盘
+        let static_dir = temp_static_dir("ws-rej");
+        let players_dir = temp_net_players_dir("ws-rej");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
+            start_test_server_full(static_dir, &temp_assets_dir("ws-rej"), &players_dir, None)
+                .await;
+        // 危险名字（路径注入）拒绝
+        let json = post_json(
+            &addr,
+            "/api/player-code",
+            &serde_json::json!({ "name": "a/b", "code": "(module)" }),
+        )
+        .await;
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "NAME_BAD_CHAR");
+        // 代码超上限（256KB+1）拒绝
+        let big = format!("(module){}", " ".repeat(256 * 1024));
+        let json = post_json(
+            &addr,
+            "/api/player-code",
+            &serde_json::json!({ "name": "bigguy", "code": big }),
+        )
+        .await;
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "CODE_TOO_LONG");
+        // 缺 name 字段拒绝
+        let raw = br#"{"code":"(module)"}"#;
+        let resp = http_request(&addr, "POST", "/api/player-code", Some("application/json"), Some(raw)).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "BAD_JSON");
+        // 全部拒绝零落盘
+        assert!(
+            !players.join("a").exists() && !players.join("bigguy.wat").exists(),
+            "拒绝路径不得写任何文件"
+        );
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn workshop_read_returns_saved_code_and_unknown_rejected() {
+        // GET /api/player-code?name= -> 读回全文；不存在=NAME_UNKNOWN；坏名=NAME_BAD_CHAR
+        let static_dir = temp_static_dir("ws-read");
+        let players_dir = temp_net_players_dir("ws-read");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
+            start_test_server_full(static_dir, &temp_assets_dir("ws-read"), &players_dir, None)
+                .await;
+        let body = serde_json::json!({ "name": "wstower", "code": "(module)\n;; 塔骨架" });
+        assert_eq!(post_json(&addr, "/api/player-code", &body).await["ok"], true);
+        let resp = http_request(&addr, "GET", "/api/player-code?name=wstower", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["code"], "(module)\n;; 塔骨架", "读回=保存原文");
+        // 不存在的角色
+        let resp = http_request(&addr, "GET", "/api/player-code?name=nobody", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "NAME_UNKNOWN");
+        // 危险名字（前端万一没拦）
+        let resp = http_request(&addr, "GET", "/api/player-code?name=a%2Fb", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "NAME_BAD_CHAR");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn workshop_delete_removes_wat_then_unknown() {
+        // DELETE /api/player-code?name= -> 文件消失；再删=NAME_UNKNOWN；坏名=NAME_BAD_CHAR
+        //（不碰 me.txt——造物文件管理≠操控声明）
+        let static_dir = temp_static_dir("ws-del");
+        let players_dir = temp_net_players_dir("ws-del");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
+            start_test_server_full(static_dir, &temp_assets_dir("ws-del"), &players_dir, None)
+                .await;
+        std::fs::write(players.join("me.txt"), "wstower\n").unwrap();
+        let body = serde_json::json!({ "name": "wstower", "code": "(module)" });
+        assert_eq!(post_json(&addr, "/api/player-code", &body).await["ok"], true);
+        let resp = http_request(&addr, "DELETE", "/api/player-code?name=wstower", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], true, "删除成功：{json}");
+        assert!(!players.join("wstower.wat").exists(), "文件应消失（残影下线归世界轮询）");
+        assert!(players.join("me.txt").exists(), "me 声明一字不动");
+        // 再删=NAME_UNKNOWN
+        let resp = http_request(&addr, "DELETE", "/api/player-code?name=wstower", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "NAME_UNKNOWN");
+        // 坏名拒绝
+        let resp = http_request(&addr, "DELETE", "/api/player-code?name=..", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["reason"], "NAME_BAD_CHAR");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn bridge_config_lists_registered_ports_with_notes() {
+        // GET /api/bridge-config：保险库读锁 -> ports 升序 [{port,note}]；
+        // 桥未装配（vault=None）-> {ok:true,ports:[]}（工坊只读展示，不做写路由）
+        let static_dir = temp_static_dir("ws-bridge");
+        let players_dir = temp_net_players_dir("ws-bridge");
+        let vault_path = std::env::temp_dir().join(format!(
+            "cw-net-bridges-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::write(
+            &vault_path,
+            serde_json::to_string(&serde_json::json!([
+                { "port": 2, "url": "http://127.0.0.1:9002", "note": "后装端点" },
+                { "port": 1, "url": "http://localhost:9001", "note": "外脑服务器" },
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let vault = Arc::new(std::sync::RwLock::new(crate::bridges::BridgeVault::load(
+            &vault_path,
+        )));
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
+            start_test_server_full(
+                static_dir,
+                &temp_assets_dir("ws-bridge"),
+                &players_dir,
+                Some(vault),
+            )
+            .await;
+        let resp = http_request(&addr, "GET", "/api/bridge-config", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], true);
+        let ports = json["ports"].as_array().expect("ports 数组恒有");
+        assert_eq!(ports.len(), 2, "登记的两条端点都该列出");
+        assert_eq!(ports[0]["port"], 1, "端口升序");
+        assert_eq!(ports[0]["note"], "外脑服务器", "note 原样透传");
+        assert_eq!(ports[1]["port"], 2);
+        assert_eq!(ports[1]["note"], "后装端点");
+        shutdown_tx.send(()).ok();
+        let _ = server.await;
+        let _ = std::fs::remove_file(&vault_path);
+        // 桥未装配：空列表（ok 仍 true——前端不必区分原因）
+        let static_dir = temp_static_dir("ws-bridge2");
+        let players_dir = temp_net_players_dir("ws-bridge2");
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
+            start_test_server_full(static_dir, &temp_assets_dir("ws-bridge2"), &players_dir, None)
+                .await;
+        let resp = http_request(&addr, "GET", "/api/bridge-config", None, None).await;
+        let json: serde_json::Value = serde_json::from_slice(http_body(&resp)).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["ports"].as_array().unwrap().len(), 0, "无保险库=空列表");
         shutdown_tx.send(()).ok();
         let _ = server.await;
     }

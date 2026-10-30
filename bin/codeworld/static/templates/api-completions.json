@@ -1,0 +1,231 @@
+{
+  "_说明": "造物工坊自动补全数据源（D-022）。手动维护：从 docs/api.md 提取——api.md「二、已开放 import」改动时必须同步本文件（卡面纪律）。doc 字段=api.md 中文原文摘要。",
+  "imports": [
+    {
+      "name": "log",
+      "signature": "log(v: i32)",
+      "doc": "日志。v 是你自定义的 marker，原样进运行日志（player_log 事件，工坊事件流可见）。无返回。",
+      "snippet": "(import \"env\" \"log\" (func $log (param i32)))"
+    },
+    {
+      "name": "get_pos",
+      "signature": "get_pos() -> (f64, f64)",
+      "doc": "读自己的坐标 (x, y)（本拍快照）。多值返回先压 x 再压 y：调用后栈顶是 y、下面是 x。",
+      "snippet": "(import \"env\" \"get_pos\" (func $get_pos (result f64 f64)))"
+    },
+    {
+      "name": "scan",
+      "signature": "scan(x_ptr: i32, y_ptr: i32) -> i32",
+      "doc": "锁定视野内最近敌人的坐标写进你的 memory（x @x_ptr 8 字节，y @y_ptr）。返回 1=找到；0=视野内没有其他存活实体或指针非法。视野外锁不到——超视距情报自己构建（哨兵网络/运动建模）。",
+      "snippet": "(import \"env\" \"scan\" (func $scan (param i32 i32) (result i32)))"
+    },
+    {
+      "name": "move_by",
+      "signature": "move_by(dx: f64, dy: f64) -> i32",
+      "doc": "相对移动：目标=当前坐标+偏移，本拍阶段二统一应用（分轴滑动裁决，被挡≠错误）。目标钻地（y<ground(x)）或非有限值拒绝。同拍多次调用只最后一次生效——每拍只 move 一次。返回 1=已排队。",
+      "snippet": "(import \"env\" \"move_by\" (func $move_by (param f64 f64) (result i32)))"
+    },
+    {
+      "name": "hover",
+      "signature": "hover()",
+      "doc": "悬停声明：宣告「本拍我要悬停」。每拍重申不跨拍延续——漏调的那拍重力照扣直接开坠。悬停不给位移，想动走 move_by。坐标稳定的代价是被点名必中。",
+      "snippet": "(import \"env\" \"hover\" (func $hover))"
+    },
+    {
+      "name": "thrust",
+      "signature": "thrust(dx: f64, dy: f64) -> i32",
+      "doc": "给自己一记冲量（跳跃/踏水推进）。单次上限 7.7 格/拍（超限归一化压回）；fuel 代价=模长比例×5%。static 钉死造物出力无效。地面水平冲量打不出位移（贴地摩擦），空中逐拍累积。返回 1=已排队。",
+      "snippet": "(import \"env\" \"thrust\" (func $thrust (param f64 f64) (result i32)))"
+    },
+    {
+      "name": "attack_at",
+      "signature": "attack_at(x: f64, y: f64, payload_ptr: i32, payload_len: i32, force: f64) -> i32",
+      "doc": "对坐标出刀（点命中制：点落在身体内=命中最近者；贴身判距=双方半径+0.5 接触容差，够不着=落空）。空 payload=默认击杀刀（裸奔特例）；非空 payload=游魂刀（命中后开决斗会话）。force=击退力度（格/拍速度增量，0=不击退，负钳 0 上限 25）。返回 1=已排队。",
+      "snippet": "(import \"env\" \"attack_at\" (func $attack_at (param f64 f64 i32 i32 f64) (result i32)))"
+    },
+    {
+      "name": "visible_count",
+      "signature": "visible_count() -> i32",
+      "doc": "眼睛列表长度：视口内的其他存活实体数（EntityId 升序稳定排序，不含自己）。",
+      "snippet": "(import \"env\" \"visible_count\" (func $visible_count (result i32)))"
+    },
+    {
+      "name": "visible_at",
+      "signature": "visible_at(idx: i32, x_ptr: i32, y_ptr: i32) -> i32",
+      "doc": "取眼睛列表第 idx 个实体的坐标写入 memory（同 scan 写法）。返回 1=成功；0=越界或指针非法。",
+      "snippet": "(import \"env\" \"visible_at\" (func $visible_at (param i32 i32 i32) (result i32)))"
+    },
+    {
+      "name": "probe",
+      "signature": "probe(tx: f64, ty: f64, req_ptr: i32, req_len: i32, resp_ptr: i32, resp_cap: i32) -> i32",
+      "doc": "探测可见实体（坐标寻址，只读）。request 字节从你的 memory 读；对方 on_probe 应答+24 字节被动体徵尾块（api_calls/fuel 剩余/on_probe 消耗，u64 LE×3）写入 [resp_ptr...)。返回 >=0=写入字节数；-1=坐标无实体；-2=对方无 on_probe（体徵照写）。比对对方的话和体徵是识破伪装的路子。",
+      "snippet": "(import \"env\" \"probe\" (func $probe (param f64 f64 i32 i32 i32 i32) (result i32)))"
+    },
+    {
+      "name": "spawn",
+      "signature": "spawn(code_ptr, code_len, x, y, glyph_ptr, color_ptr, radius, mass, binding, motion, vx, vy, blob_ptr, blob_len, field_radius, field_gravity_scale, field_drag_delta, liquid_density, liquid_drag, link, restitution, friction, lifespan_ticks: 23 参) -> i32",
+      "doc": "造物：提交 WAT 源码+出生坐标+外观+身体/质量参数+绑定契约+运动身份+出生初速+出生数据包+力场三参+液体两参+链声明+弹性/摩擦+寿命（强制声明 >=1，0/负=整次拒绝）。出生点须在你快照 ±10 格内；每实体每拍 1 次。返回 1=已排队（阶段二作废走 spawn_rejected 事件）；0=拒绝。",
+      "snippet": "(import \"env\" \"spawn\" (func $spawn (param i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 i32 i32 f64 f64 f64 f64 f64 i32 f64 f64 i32) (result i32)))"
+    },
+    {
+      "name": "birth_blob",
+      "signature": "birth_blob(ptr: i32, cap: i32) -> i32",
+      "doc": "读回出生数据包（母体塞进你沙箱的家书，≤64KB，随沙箱存活跨重启不保留）。三态：0=无包；正 N=已原子写入返回 N；负 -N=容量不足或指针非法（-N 即包长，按它重分配缓冲再读）。",
+      "snippet": "(import \"env\" \"birth_blob\" (func $birth_blob (param i32 i32) (result i32)))"
+    },
+    {
+      "name": "destroy",
+      "signature": "destroy(id_lo: i64, id_hi: i64) -> i32",
+      "doc": "销毁自家造物（EntityId 128 位拆两半传入；WAT 侧负 i64 按位恢复 u64）。框架在阶段二比对 owner，不匹配拒绝+警告。不触发掠夺（掠夺只属于击杀）——想自尽走 life() 返回 0。返回 1=已排队。",
+      "snippet": "(import \"env\" \"destroy\" (func $destroy (param i64 i64) (result i32)))"
+    },
+    {
+      "name": "field_pulse",
+      "signature": "field_pulse(x: f64, y: f64, vx: f64, vy: f64, radius: f64) -> i32",
+      "doc": "力场脉冲：以 (x,y) 为中心 radius 半径内，给所有带速度实体的速度一次性加上 (vx,vy)——物理推，分离式发射器（炮管推炮弹）。推不动静止的；冲量模长 ≤25；中心须在 ±10 格内；每拍 1 次。返回 1=已排队。",
+      "snippet": "(import \"env\" \"field_pulse\" (func $field_pulse (param f64 f64 f64 f64 f64) (result i32)))"
+    },
+    {
+      "name": "bridge_send",
+      "signature": "bridge_send(port: i32, ptr: i32, len: i32) -> i32",
+      "doc": "外桥发信：世界以自己身份把信 HTTP POST 给 port 对应端点（bridges.json 登记；你的沙箱里永远没有 URL/凭证），回信下一拍经 bridge_on_reply 投回。port 是保险库别名。返回 0=已排队；1=无此端点；2=超限（8KB）；3=限流（每拍 1 发/在途 4 条）；4=桥未启用。异步跨拍，0 只表示进了邮筒。",
+      "snippet": "(import \"env\" \"bridge_send\" (func $bridge_send (param i32 i32 i32) (result i32)))"
+    },
+    {
+      "name": "command",
+      "signature": "command(ptr: i32, len: i32) -> i32",
+      "doc": "链下行广播（母体剑诀控万剑）：payload 投给名下全部活链造物，对方经 on_command 收到。返回正数=入队链数；0=无活链或参数坏。每拍 1 次；无视口限制。两拍节律：拍 N 广播，拍 N+1 投递。",
+      "snippet": "(import \"env\" \"command\" (func $command (param i32 i32) (result i32)))"
+    },
+    {
+      "name": "report",
+      "signature": "report(ptr: i32, len: i32) -> i32",
+      "doc": "链上行（侦察弹报坐标）：你是活链造物时 payload 沿链投给母体，母体经 on_report(from, offset, len) 收到。返回 1=入队；0=参数坏；2=无链或断链。每拍 1 次；无视口限制。",
+      "snippet": "(import \"env\" \"report\" (func $report (param i32 i32) (result i32)))"
+    },
+    {
+      "name": "send",
+      "signature": "send(x: f64, y: f64, ptr: i32, len: i32) -> i32",
+      "doc": "横向数据通道（坐标寻址）：payload 投给坐标处视口内实体，对方经 on_message 收到。目标必须在你的视口内（visible_at 给什么发什么）。返回 1=入队；0=参数坏；-1=坐标无实体或不视口内。对方无 on_message 导出=入队成功但投递作废（聋是合法的）。",
+      "snippet": "(import \"env\" \"send\" (func $send (param f64 f64 i32 i32) (result i32)))"
+    },
+    {
+      "name": "storage_write",
+      "signature": "storage_write(ptr: i32, len: i32) -> i32",
+      "doc": "全量覆盖自己的公开存储块（世界侧数据，不烧燃料不占沙箱内存，随实体入快照=重启不丢）。写 0 字节=清盘。返回 N=写入字节数；-1=超容拒绝不截断（上限 4096 字节）；0=参数坏或本拍已写。每拍 1 次。",
+      "snippet": "(import \"env\" \"storage_write\" (func $storage_write (param i32 i32) (result i32)))"
+    },
+    {
+      "name": "storage_read",
+      "signature": "storage_read(x: f64, y: f64, ptr: i32, cap: i32) -> i32",
+      "doc": "贴身读对方的公开存储块（距离 < 你半径+对方半径+0.5 严格——读硬盘=物理凑过去读）。读自己坐标天然成立。返回 N=读到字节数（原子写入）；0=cap 不足或指针坏；-1=坐标无实体；-2=够不着；-3=对方无存储（空块同返 -3）。每拍 1 次。",
+      "snippet": "(import \"env\" \"storage_read\" (func $storage_read (param f64 f64 i32 i32) (result i32)))"
+    },
+    {
+      "name": "duel_read",
+      "signature": "duel_read(ptr: i32, len: i32, out_ptr: i32) -> i32",
+      "doc": "【决斗窗口专属】读守方线性内存 [ptr,ptr+len) 写进你自己的 memory [out_ptr...)。返回实际字节数；-1=越界/指针非法。决斗游魂窗口内才可调用——走私多余 import 的模块拒绝实例化=游魂崩溃。",
+      "snippet": "(import \"env\" \"duel_read\" (func $duel_read (param i32 i32 i32) (result i32)))"
+    },
+    {
+      "name": "duel_write",
+      "signature": "duel_write(ptr: i32, bytes_ptr: i32, len: i32) -> i32",
+      "doc": "【决斗窗口专属】把你 memory [bytes_ptr,+len) 写进守方内存 [ptr,...)。返回写入字节数；-1=越界。决斗游魂窗口内才可调用。",
+      "snippet": "(import \"env\" \"duel_write\" (func $duel_write (param i32 i32 i32) (result i32)))"
+    },
+    {
+      "name": "duel_round",
+      "signature": "duel_round() -> i32",
+      "doc": "【决斗窗口专属】当前窗口拍号（0 起），做轮次策略用。决斗游魂窗口内才可调用。",
+      "snippet": "(import \"env\" \"duel_round\" (func $duel_round (result i32)))"
+    }
+  ],
+  "exports": [
+    {
+      "name": "life",
+      "signature": "life() -> i32",
+      "doc": "【必需】每拍一次。返回 1=继续存在；0=主动自尽。缺 life 导出或调用失败，第一拍就会被判定死亡——没有 life 的模块活不过一拍。",
+      "snippet": "(func (export \"life\") (result i32) i32.const 1)"
+    },
+    {
+      "name": "on_tick",
+      "signature": "on_tick()",
+      "doc": "【可缺省】每拍一次（life 之前）。主逻辑入口：找敌人、移动、出刀都在这里。",
+      "snippet": "(func (export \"on_tick\"))"
+    },
+    {
+      "name": "on_probe",
+      "signature": "on_probe(req: i32) -> i32",
+      "doc": "【可缺省】被其他实体 probe 时调用。参数是探测 request 前 4 字节；返回值作为 response 前 4 字节透传给探测方（框架只搬运不审查——撒谎是你的自由，但 24 字节体徵藏不住）。跑在独立小 fuel 预算上。",
+      "snippet": "(func (export \"on_probe\") (param i32) (result i32) i32.const 0)"
+    },
+    {
+      "name": "on_attack",
+      "signature": "on_attack(payload: i32) -> i32",
+      "doc": "【可缺省】被攻击收件时（每刀一次）。参数是攻击 payload 前 4 字节（LE 转 i32）；返回非 0=拦截这一刀。每次调用消耗你的 fuel（围殴=磨你的算力）。不导出=不设防。",
+      "snippet": "(func (export \"on_attack\") (param i32) (result i32) i32.const 0)"
+    },
+    {
+      "name": "on_contact",
+      "signature": "on_contact(other_x: f64, other_y: f64)",
+      "doc": "【可缺省】某实体新进入物理接触时双方各收一次（边沿触发，持续贴着不重复）。参数是对方实况坐标（坐标寻址，世界零过滤——敌我判断是你自己的代码）。地雷/区域警报/哨戒圈从这一个原语长出。",
+      "snippet": "(func (export \"on_contact\") (param f64 f64))"
+    },
+    {
+      "name": "on_death",
+      "signature": "on_death()",
+      "doc": "【可缺省】死亡谢幕遗嘱钩子：死亡清理前世界托管执行一次（本人无需在场）。遗嘱里排队的 spawn 当拍生效（产权链照常继承）；排队的 attack 丢弃（死人不出刀）。限步数=预算即上限，烧尽不补偿。残影消散/登出带走不触发。",
+      "snippet": "(func (export \"on_death\"))"
+    },
+    {
+      "name": "on_field",
+      "signature": "on_field(n_ptr: i32, ids_cap: i32, ids_ptr: i32) -> i32",
+      "doc": "【可缺省】声明了力场（field_radius>0）且已成型时每拍被世界询问。调用前世界把域内实体数 n 写进 n_ptr、清单写进 ids_ptr（EntityId 低 64 位×8 字节，不含场源自己）。返回 0=维持出生声明；k≠0=本拍阻力改写量临时改为 k。粒度是 i32 整数。",
+      "snippet": "(func (export \"on_field\") (param i32 i32 i32) (result i32) i32.const 0)"
+    },
+    {
+      "name": "on_command",
+      "signature": "on_command(offset: i32, len: i32)",
+      "doc": "【可缺省】母体 command 广播到达时（下一拍投递）。信字节已由世界 grow 新页写进你的线性内存（offset=新页偏移，len=信长，永不覆盖你的数据）。缺省导出=收不到信。",
+      "snippet": "(func (export \"on_command\") (param i32 i32))"
+    },
+    {
+      "name": "on_report",
+      "signature": "on_report(from: i64, offset: i32, len: i32)",
+      "doc": "【可缺省】活链孩子 report 到达时。from=发送造物 EntityId 低 64 位（多孩子区分靠它）。独立小预算包裹（收信不占你的 tick 配额）。缺省导出=聋（合法）。",
+      "snippet": "(func (export \"on_report\") (param i64 i32 i32))"
+    },
+    {
+      "name": "on_message",
+      "signature": "on_message(from: i64, offset: i32, len: i32)",
+      "doc": "【可缺省】其他实体 send 到达时。from=发送方 EntityId 低 64 位。通信自由=发信自由，开门=收信自由（不导出=聋）。独立小预算包裹。",
+      "snippet": "(func (export \"on_message\") (param i64 i32 i32))"
+    },
+    {
+      "name": "bridge_on_reply",
+      "signature": "bridge_on_reply(port: i32, ptr: i32, len: i32)",
+      "doc": "【可缺省】外桥回信投递：世界收到外部服务器响应 body 后下一拍调用。回信字节已 grow 新页写进你的线性内存。port=当初发信的端点别名。缺省导出=收不到回信（世界零副作用丢弃）。超时/非 2xx 不投递。",
+      "snippet": "(func (export \"bridge_on_reply\") (param i32 i32 i32))"
+    },
+    {
+      "name": "on_duel",
+      "signature": "on_duel() -> i32",
+      "doc": "【决斗游魂专用】决斗窗口每拍被世界调用一次；返回 1=宣布完成收尾（会话正常关闭），其余=继续。窗口内可调 import 只有 duel_read/duel_write/duel_round 三件。游魂赌注=出生继承的燃料（死油箱不重发，拖下去必先油尽）。",
+      "snippet": "(func (export \"on_duel\") (result i32) i32.const 1)"
+    }
+  ],
+  "keywords": [
+    "module", "import", "func", "export", "memory", "table", "global", "param",
+    "result", "type", "local", "data", "elem", "start", "mut", "offset", "item",
+    "if", "then", "else", "block", "loop", "br", "br_if", "br_table", "return",
+    "call", "call_indirect", "drop", "select", "nop", "unreachable", "end",
+    "i32", "i64", "f32", "f64", "i32.const", "i64.const", "f32.const", "f64.const",
+    "i32.load", "i64.load", "f32.load", "f64.load", "i32.store", "i64.store",
+    "f32.store", "f64.store", "i32.add", "i32.sub", "i32.mul", "i32.div_s",
+    "f64.add", "f64.sub", "f64.mul", "f64.div", "f64.sqrt", "f64.lt", "f64.gt",
+    "f64.le", "f64.ge", "f64.eq", "i32.eqz", "i32.eq", "i32.lt_s", "i32.gt_s",
+    "i32.and", "i32.or", "i32.wrap_i64", "i64.extend_i32_s", "f64.convert_i32_s",
+    "local.get", "local.set", "global.get", "global.set", "ref.func", "ref.null",
+    "funcref", "externref"
+  ]
+}

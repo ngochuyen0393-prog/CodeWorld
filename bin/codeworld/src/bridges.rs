@@ -42,6 +42,8 @@ pub(crate) struct BridgeEndpoint {
     pub path: String,
     /// 鉴权头集（世界代签：原样贴上出站请求——凭证不落沙箱内存）
     pub headers: HashMap<String, String>,
+    /// 备注（bridges.json 人读字段，世界不解释；D-022 工坊 bridge-config 只读展示用）
+    pub note: String,
 }
 
 /// 凭证保险库（design-bridge 第三节：账号层外部端点登记表）
@@ -68,7 +70,6 @@ struct BridgeEndpointRaw {
     #[serde(default)]
     headers: HashMap<String, String>,
     #[serde(default)]
-    #[allow(dead_code)] // note 仅人读，世界不解释（保留字段完整性）
     note: String,
 }
 
@@ -166,6 +167,7 @@ impl BridgeVault {
                 port_num,
                 path,
                 headers: raw.headers,
+                note: raw.note,
             });
         }
         out
@@ -193,6 +195,18 @@ impl BridgeVault {
         let mut ports: Vec<i32> = self.endpoints.iter().map(|e| e.port).collect();
         ports.sort_unstable();
         ports
+    }
+
+    /// 端口+备注成对列表（升序；D-022 工坊 /api/bridge-config 只读展示数据源。
+    /// note=bridges.json 人读字段原样透传，缺省空串——世界不解释内容）
+    pub fn port_notes(&self) -> Vec<(i32, String)> {
+        let mut pairs: Vec<(i32, String)> = self
+            .endpoints
+            .iter()
+            .map(|e| (e.port, e.note.clone()))
+            .collect();
+        pairs.sort_by_key(|(p, _)| *p);
+        pairs
     }
 
     /// 解析 port -> 端点（collect 出站时解析 URL；热重载后消失 -> None 作废）
@@ -333,6 +347,12 @@ impl BridgeOutbox {
     /// 保险库只读访问（拍首 ports 快照 / collect 解析 URL）
     pub fn vault(&self) -> &RwLock<BridgeVault> {
         &self.vault
+    }
+
+    /// 保险库 Arc 只读句柄（D-022 工坊 /api/bridge-config 跨线程读锁展示端口
+    /// 列表——ws 线程持这个 Arc，主循环热重载同一把 RwLock 两边看同一份账）
+    pub fn vault_arc(&self) -> Arc<RwLock<BridgeVault>> {
+        Arc::clone(&self.vault)
     }
 
     /// 推一封信进出站通道（通道断=世界在关闭中，静默丢弃）
@@ -592,6 +612,30 @@ mod tests {
     }
 
     #[test]
+    fn port_notes_lists_ports_with_notes_sorted() {
+        // D-022 工坊 bridge-config 数据源：port+note 成对升序（note 缺省=空串）
+        let path = write_vault(
+            r#"[
+                {"port": 3, "url": "http://127.0.0.1:18083"},
+                {"port": 1, "url": "http://127.0.0.1:18081", "note": "外脑"},
+                {"port": 2, "url": "http://127.0.0.1:18082", "note": ""}
+            ]"#,
+        );
+        let vault = BridgeVault::load(&path);
+        let pairs = vault.port_notes();
+        assert_eq!(
+            pairs,
+            vec![
+                (1, "外脑".to_string()),
+                (2, String::new()),
+                (3, String::new()),
+            ],
+            "升序成对；缺省 note=空串"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn vault_missing_file_loads_empty() {
         // 首启无保险库文件 = 空表（不报错不崩世界）
         let path = std::env::temp_dir().join(format!(
@@ -816,6 +860,7 @@ mod tests {
             headers: [("Authorization".to_string(), "Bearer tok".to_string())]
                 .into_iter()
                 .collect(),
+            note: String::new(),
         };
         let body = envelope_json(9, 1, 1, b"ping");
         let reply = http_post(&endpoint, &body, Duration::from_secs(5)).expect("200 应成功");
@@ -865,6 +910,7 @@ mod tests {
             port_num: addr.port(),
             path: "/".to_string(),
             headers: HashMap::new(),
+            note: String::new(),
         };
         assert!(http_post(&endpoint, b"{}", Duration::from_secs(5)).is_err());
         server.join().unwrap();

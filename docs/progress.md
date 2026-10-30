@@ -2,7 +2,18 @@
 
 > 收工前由 Claude 更新「现在」一节；完成的移入「已完成」。
 
-## 现在（2026-10-30 D-021f 会话令牌+出生镜头落地，待土豆 A 轨亲验）
+## 现在（2026-10-30 D-022 造物工坊落地，待土豆验收）
+
+- 完成：D-022（协议 v2.9→v3.0，工坊刀）——玩家主工作台 workshop.html：Monaco 编辑器（vendored 0.52.2 amd 版，static/vendor/monaco/vs/ 整目录 14MB 入 git，白名单例外同 three.module.min.js；禁 CDN）+ 造物管理 + 事件流。战场页底栏「🛠 工坊」按钮/B 键新标签打开；工坊 WS=无 token 观战连接（纯消费 player_roster/player_events/entities，上行零意图）。
+- 服务端四路由（net.rs，全部 HTTP 恒 200 看 ok 字段）：`POST /api/player-code`（sanitize_name→256KB 护栏→覆盖写 players/<名>.wat→**登记本机角色档案**[create_player 成功路径同款——工坊列表数据源=player_roster，档案不登记则看不见]→世界下拍目录轮询自动进场；**不写 me.txt 不手动 spawn**）/ `GET ?name=`（读全文）/ `DELETE ?name=`（删文件→下拍残影下线；**不动 me.txt**）/ `GET /api/bridge-config`（BridgeVault 读锁→ports 升序 [{port,note}]；None=空列表；不做写路由）。WsState 加 players_dir+bridge_vault 两字段（main.rs 装配处从 BridgeOutbox.vault_arc() 取 Arc；bridges.rs BridgeEndpoint 加 note 字段透传+port_notes()+vault_arc()）。
+- 前端：R1 Monaco 集成（loader.js+editor.main，加载超时 8s/失败→textarea 降级+黄条，保存删除事件流不炸）；WAT Monarch tokenizer（;;/(; ;)嵌套块注/字符串/hex+浮点/关键字/$标识符/括号配色）；R2 错误标红（wat 错误串格式实证探针：`--> <anon>:行:列`，多正则兜底提取行号→setModelMarkers 红波浪线+reveal；提取不到只进错误面板；内容改动即清 markers）；R3 自动补全（templates/api-completions.json 手动维护与 api.md 二十 import 逐个对账+决斗三兄弟注释+可缺省导出+关键字；CompletionProvider 纯文本插入防 snippet $ 污染+HoverProvider 悬浮）；R4 造物管理（左 260px 面板：角色文件[●在场/○离场，逐拍按快照校真]+在场造物[owner=操控实体 id 的 creation，坐标/剩余寿命黄警/展开最近 3 条事件]+新建造物[名字前端镜像校验+模板四选+PNG 上传预览→/upload/avatar→asset_id→骨架头部注释 `;; 皮肤资产：av_xxx（装戴 API 属后续刀）` 进编辑器不落盘]+外桥折叠区懒加载；删除确认弹窗=决策即关门 0.25s+busy 守卫；保存成功本地合并列表不重连）；R5 事件流（四色/同实体同类连续折叠"又N次"/compile_failed+spawn_rejected+runtime_error 点击定位/**与编辑名匹配自动标红跳转**[runtime_error 靠快照实体 id 反查名字]）。
+- tower.wat 新模板（scan+贴身刀+on_attack 盾拦骨架，盾 3 点可改；站桩不走动+远程塔毕业作业引导；TemplateBook 真装配验证编译过）挂进 onboarding::TEMPLATES（create_player 同步可取，无害）；工坊模板下拉同源四选。
+- 文档：net-protocol.md §12「工坊 HTTP 通道」+v3.0 变更记录；api.md「九、造物工坊」玩家手册节；LICENSE-THIRD-PARTY.md Monaco MIT 条目（Copyright Microsoft）。
+- 验证：workspace **1267 绿 0 failed 2 ignored**（基线 1260+7 新增：工坊四路由 5 锚[保存落盘+档案登记/三路拒绝零落盘/读回+UNKNOWN+坏名/删除+me 不动+再删 UNKNOWN/bridge-config 升序 note+未装配空列表]+bridges port_notes+onboarding tower 真装配；TDD 全程红绿：RED=编译期特性缺失 3 错误实证）；clippy 0 警告；node --check workshop.js+补全 JSON+index.html 内联脚本三过。**机证注意**：土豆的世界进程在跑锁着 codeworld.exe——全量测试用 `cargo test --workspace --target-dir target-d022` 独立目录跑通（不动运行中的世界；默认 target 目录等世界停了再自然恢复）。
+- 已知边界（申报）：①在线热替换不做（保存→在线角色下次进场生效，面板有提示）；②皮只入库不装戴（骨架注释预埋 asset_id）；③真断点/单步/回放不做（页脚声明）；④工坊观战连接收的 player_events 沿用操控玩家过滤口径——born 等有主事件要世界有操控连接在场才广播（compile_failed 无主恒达），宁缺勿泄既有立法；⑤CODEWORLD_ME env 锁定（legacy 第一连接认领）场景下工坊 WS 若先连可能占操控端（开发者逃生门交互噪音，普通玩家凭 token 路径不受影响）。
+- 下一步：土豆 A 轨验收——①战场页「🛠 工坊」→新标签出编辑器（WAT 高亮分色）；②新建「箭塔」：起名+选 tower+传 PNG→生成骨架含皮肤注释→故意删个括号 Ctrl+S→世界 compile_failed→错误面板红字+红波浪线行号定位→改对再存→下拍进场（事件流实名播报）；③输入 `move_` 看补全悬浮；④删角色文件→确认→残影下线；⑤外桥折叠区只读列表。
+
+## 上一轮（2026-10-30 D-021f 会话令牌+出生镜头落地，待土豆 A 轨亲验）
 
 - 完成：D-021f（commit 6b50468 主体+e804e44 终审修复，协议 v2.8→v2.9）——土豆实测 bug（新建角色后刷新页面=新连接变观战"操控权已被占用"，点不动自己角色）根除：**操控权认领从"先来者得"翻转为"凭据者得"**（Screeps token 认人不认网线/暴雪同账号新登录踢旧会话同款）。#024 独占不变（任意时刻仍只有一个操控连接），变的只是钥匙。
 - 服务端（net.rs）：WsState 的 ctrl_taken AtomicBool 退役，换 `watch<Option<连接id>>`（当前操控连接）+ `sessions` 令牌表（token→玩家名，进程生命周期）+ `legacy_first_conn`（CODEWORLD_ME env 非空=逃生门保留旧第一连接认领，loginSkip 行为不变）+ conn_ids 发号器。连接 URL `?token=`：命中会话表=操控端（踢旧沿 `control_revoked{taken}`，旧端降观战不断连、token 保留可抢回）/不命中=观战+立即 `control_revoked{stale}`/无 token=纯观战。Logout=token 从表移除（不得复用）+释放+降级。select/create 上行即颁 uuid 令牌（`session_token` 当场单播+Intent 带上），tick 侧成功路径绑定 token→name（拒绝路径令牌永不绑定=自然无效）；process_create/select_player 改返回 bool。断开清理双门守卫（本地标记∧watch 仍=自己，关死"被踢同拍死亡"竞态错拆新操控端——终审 3 Important 修复之一）。沿检测提纯函数 poll_conn_event（watch 翻转产 Claimed/Released，处置状态机触发源不变）。

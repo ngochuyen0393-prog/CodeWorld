@@ -1,4 +1,4 @@
-# CodeWorld 网络协议：快照推送 + 意图上行（期四 v1 - v1.6 / 期五 v1.7 - v1.9 / D-017 协议小刀 v2.0 / 收图通道 v2.2 / D-012 力场 v2.3 / 皮入沙箱 v2.4 / D-020a 事件流+技能栏 v2.5 / D-021b 进场仪式 v2.6 / D-021d 登录选角页 v2.7 / D-021e 角色列表私有化 v2.8 / D-021f 会话令牌 v2.9）
+# CodeWorld 网络协议：快照推送 + 意图上行（期四 v1 - v1.6 / 期五 v1.7 - v1.9 / D-017 协议小刀 v2.0 / 收图通道 v2.2 / D-012 力场 v2.3 / 皮入沙箱 v2.4 / D-020a 事件流+技能栏 v2.5 / D-021b 进场仪式 v2.6 / D-021d 登录选角页 v2.7 / D-021e 角色列表私有化 v2.8 / D-021f 会话令牌 v2.9 / D-022 造物工坊 v3.0）
 
 > 前端契约文档。第二刀（Canvas 渲染）/第三刀（鼠标操控）/第五刀（操控飞行）/第六刀（半径物理）/期五第一刀（下线处置权）依赖本文字段名与语义；改字段先改这里再改代码。
 > 依据 decisions.md #026（薄客户端/快照推送）、#027（鼠标操控/操控独占）、#029（操控飞行无税：飞行=代码对抗世界规则，fuel 是保险丝不入玩法）、#030/#031（半径物理：格子降级为地址系统，实体不可重叠精确化为半径碰撞）、#025（操控独占与下线处置权）；世界是唯一权威，浏览器只是显示器+遥控器。
@@ -8,7 +8,7 @@
 | 项 | 值 |
 |----|----|
 | 协议 | WebSocket（升级自 HTTP） |
-| 路径 | `/ws`（同源；静态页由同一端口 ServeDir 伺服）。**v2.9 起支持 `?token=<会话令牌>` 参数**（D-021f 凭据认领，见 §11；不带=观战连接）。**v2.2 起**另有 HTTP 通道：`POST /upload/avatar`（收图）+ `GET /assets/{id}.png`（原图直取） |
+| 路径 | `/ws`（同源；静态页由同一端口 ServeDir 伺服）。**v2.9 起支持 `?token=<会话令牌>` 参数**（D-021f 凭据认领，见 §11；不带=观战连接）。**v2.2 起**另有 HTTP 通道：`POST /upload/avatar`（收图）+ `GET /assets/{id}.png`（原图直取）；**v3.0 起再加工坊 HTTP 通道**：`GET/POST/DELETE /api/player-code` + `GET /api/bridge-config`（见 §12） |
 | 端口 | `CODEWORLD_WS_PORT`，默认 8080；**0 = 禁用 WS**（纯终端模式，零开销） |
 | 绑定 | 127.0.0.1（仅本机浏览器可访问；局域网观战留后续） |
 | 方向 | 双向：下行=每拍全量快照推送；上行=客户端意图消息（v1.2 起） |
@@ -402,6 +402,15 @@ npc 实体**没有** `controlled`/`owner` 键（`skip_serializing_if` 保持 JSO
   WS URL 支持 `?token=` 参数。修复土豆实测 bug：新建角色后刷新页面=新连接变观战
   （"操控权已被占用"），点不动自己的角色——根因=操控端=第一个连接（开发期单连接
   假设残留），刷新=永久失去操控
+- **造物工坊（v3.0，D-022，2026-10-30）**：新增 §12 工坊 HTTP 通道四路由
+  （`GET/POST/DELETE /api/player-code` + `GET /api/bridge-config`；详见 §12）——
+  工坊保存=写 `players/<名>.wat`（新文件=世界下拍目录轮询自动进场，零新进场
+  协议），删除=下拍残影下线，外桥=保险库只读展示。**上行/下行 WS 帧格式零变更**
+  （工坊 WS=无 token 观战连接，纯消费既有 player_roster/player_events/entities）。
+  新增 vendored 依赖：Monaco 0.52.2（MIT，`static/vendor/monaco/vs/` 整目录，
+  白名单例外同 three.module.min.js 先例）。新手模板表新增 `tower` 箭塔
+ （create_player 模板选择同步可取，无害）。工坊保存成功路径登记本机角色档案
+ （create_player 同款——工坊角色列表数据源=player_roster）
 - 预留演进（不在本版实现）：
   - delta 快照 / 二进制编码（实体数增长或拍频提高后再做）
   - 多操控连接 / 连接身份与 me 声明合并（认证化）
@@ -583,3 +592,69 @@ me.txt 声明）。**每个 WS 连接建立后下发一次**（avatar_assets 之
   下次连接=全新观战 → 登录页
 - 出生镜头：观战全景中选角完成 → 相机从当前视野中心起步（`CAM_LERP` 复用，零新
   常数）平滑飞向自己实体；从未渲染过=直接对准（旧行为）
+
+## 12. 工坊 HTTP 通道（v3.0，D-022 造物工坊）
+
+玩家工作台 `workshop.html`（战场页底栏「🛠 工坊」/快捷键 B，新标签打开）的四个
+HTTP 路由，全部挂 WS 同端口，HTTP 恒 200、成败看 body `ok` 字段（upload/avatar
+同款约定）。工坊的 WS 是**无 token 观战连接**（收 player_events/player_roster
+做列表与事件流，不发任何上行意图，不需要操控权）。核心语义：**玩家 .wat=热进场
+——保存=写 `players/<名>.wat`，世界每拍目录轮询自动接手（新文件下拍进场、删除
+下拍残影下线），零新进场协议**。
+
+### 12.1 POST /api/player-code（工坊保存=进场通道）
+
+- 请求：`application/json`，`{"name":"角色名","code":"WAT 全文"}`。
+- 处理链：`sanitize_name`（唯一权威闸门，与 create_player 同源）→ 长度护栏
+  （**256KB**，防滥用）→ 写 `players/<名>.wat`（**覆盖写**）→ 成功路径登记本机
+  角色档案 `.my-characters`（与 create_player 成功路径同款——工坊角色列表数据源
+  =player_roster，档案不登记则列表看不见）。**不写 me.txt**（造物/角色文件管理
+  ≠操控声明）；**不手动 spawn**（进场靠目录轮询）。
+- 响应：`{"ok":true}` / `{"ok":false,"reason":"<码>"}`：
+  | reason | 触发 |
+  |--------|------|
+  | `BAD_JSON` | 请求体不是合法 JSON / 缺 name 或 code 字段 |
+  | `NAME_EMPTY` / `NAME_TOO_LONG` / `NAME_BAD_CHAR` | 名字闸门（同 create_player） |
+  | `CODE_TOO_LONG` | code 超 256KB |
+  | `IO_ERROR` | 写盘失败（服务器 error 日志留痕） |
+- 边界：**在线热替换不做**——目录轮询只看存在性，已进场玩家改文件不自动重载；
+  在线角色保存成功但下次进场才生效（工坊面板有提示）。
+
+### 12.2 GET /api/player-code?name=（工坊加载）
+
+- 读 `players/<名>.wat` 全文 → `{"ok":true,"code":"..."}`。
+- 拒绝：`NAME_*`（名字闸门）/ `NAME_UNKNOWN`（players/ 无此角色）/ `IO_ERROR`。
+
+### 12.3 DELETE /api/player-code?name=（工坊删除）
+
+- 删 `players/<名>.wat`（不存在=NAME_UNKNOWN）→ 世界下拍残影下线（既有语义，
+  在线角色删除同理）。**不动 me.txt**。
+- 拒绝：`NAME_*` / `NAME_UNKNOWN` / `IO_ERROR`。
+
+### 12.4 GET /api/bridge-config（外桥只读展示）
+
+- BridgeVault 读锁 → `{"ok":true,"ports":[{"port":1,"note":"外脑服务器"},...]}`
+  （端口升序；note=bridges.json 人读字段原样透传，可空串）。
+- 桥未启用（`CODEWORLD_BRIDGE` 未开）或 vault 未装配 → `{"ok":true,"ports":[]}`
+  （ok 恒 true，前端不必区分原因）。
+- **不做写路由**（改服务器配置越权，玩家侧不开放——端点登记在世界目录
+  bridges.json，mtime 热重载，改文件生效）。
+
+### 12.5 工坊页前端行为（static/workshop.html + workshop.js）
+
+- Monaco **vendored 单文件 amd 版**（`static/vendor/monaco/vs/` 整目录入 git，
+  白名单例外同 three.module.min.js 先例；**禁 CDN**）。加载失败/超时 → textarea
+  降级 + 顶部黄条，保存/删除/事件流照常（走 HTTP/WS 不依赖编辑器）。
+- WAT 语言注册（Monarch tokenizer：`;;` 行注释、`(;)` 可嵌套块注释、字符串、
+  hex/十进制数、s-expr 关键字、括号配色；语言 id=`wat`）。
+- 自动补全数据源 `static/templates/api-completions.json`（手动维护，与 api.md
+  「二、已开放 import」逐个对账；api.md 改动时同步）——输入 `move_` 弹
+  move_by（签名+中文文档悬浮）+ 关键字 + 可缺省导出。
+- 编译错标红：compile_failed/spawn_rejected(COMPILE_FAILED) 的 error/code_hint
+  是 wat crate 英文错误串（`--> <anon>:行:列` 格式），前端正则提行号 →
+  `setModelMarkers` 红波浪线+悬浮详情；提取不到行号只在错误面板显示全文。
+  编辑器内容改动即清 markers（改对了看得见）。运行错（runtime_error）在错误
+  面板列出，点击 → `revealLineInCenter` 到导出函数所在行（尽力而为）。
+- 删除确认弹窗：决策即关门 0.25s 淡出 + busy 守卫（logoutPanel 模式）。
+- **卡面声明：真·断点/单步/回放不做**（违拍制全局心跳，另卡挂信号=拍速升级/
+  单步回放刀）；工坊页脚已注明。

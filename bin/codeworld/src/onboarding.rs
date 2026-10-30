@@ -30,7 +30,7 @@ pub(crate) struct NewbieTemplate {
 }
 
 /// 模板静态表（面板顺序即此表顺序；id 与前端模板卡一一对应）
-pub(crate) const TEMPLATES: [NewbieTemplate; 3] = [
+pub(crate) const TEMPLATES: [NewbieTemplate; 4] = [
     NewbieTemplate {
         id: "blank",
         file: "blank.wat",
@@ -42,6 +42,12 @@ pub(crate) const TEMPLATES: [NewbieTemplate; 3] = [
     NewbieTemplate {
         id: "hunter",
         file: "hunter.wat",
+    },
+    // D-022 造物工坊新增箭塔骨架（scan+贴身刀+on_attack 盾拦）；create_player
+    // 模板选择同步可取（无害——create 与工坊共用同一张模板表）
+    NewbieTemplate {
+        id: "tower",
+        file: "tower.wat",
     },
 ];
 
@@ -398,7 +404,22 @@ mod tests {
         assert!(TEMPLATES.iter().any(|t| t.id == "blank"));
         assert!(TEMPLATES.iter().any(|t| t.id == "grazer"));
         assert!(TEMPLATES.iter().any(|t| t.id == "hunter"));
+        assert!(TEMPLATES.iter().any(|t| t.id == "tower"), "D-022 箭塔模板在册");
         assert!(!TEMPLATES.iter().any(|t| t.id == "dragon"));
+    }
+
+    #[test]
+    fn tower_template_loads_and_parses_from_static() {
+        // D-022 工坊 tower 模板：static/templates/tower.wat 真装配（文件在+编译过
+        // ——与 main.rs onboard 测试同款 cwd=bin/codeworld 口径；坏模板会被
+        // TemplateBook::load 禁用为 None）
+        let book = load_templates_from_static(Path::new("static"));
+        let src = book
+            .source("tower")
+            .expect("tower 模板应装配成功（文件缺失/WAT 编译失败都会禁用）");
+        assert!(src.contains("attack_at"), "箭塔骨架含贴身出刀");
+        assert!(src.contains("on_attack"), "箭塔骨架含拦截位");
+        assert!(src.contains("scan"), "箭塔骨架含扫描");
     }
 
     #[test]
