@@ -3894,7 +3894,7 @@ mod tests {
         // 读回（所见即所编）：POST 保存 → GET 同名 → 内容逐字节一致；无此造物=NAME_UNKNOWN
         let static_dir = temp_static_dir("cr-read");
         let players_dir = temp_net_players_dir("cr-read");
-        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, players) =
+        let (addr, _tx, _queue, shutdown_tx, server, _reg, _roster, _players) =
             start_test_server_full(
                 static_dir,
                 &temp_assets_dir("cr-read"),
