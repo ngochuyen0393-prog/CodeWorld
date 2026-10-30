@@ -4258,7 +4258,8 @@
       automaticLayout: true,
       scrollBeyondLastLine: false,
       renderWhitespace: 'none',
-      tabSize: 2
+      tabSize: 2,
+      wordWrap: 'on'               // 自动换行（土豆 1031：长行不出横向滚动条；Alt+Z 同款开关语义）
     });
     textareaEl.value = ''; // 内容已入编辑器（降级路径只在装配前存在，清空防重复）
     monacoReady = true;
