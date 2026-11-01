@@ -1,2 +1,0 @@
-[?1049l[1;6H[33m2[1;7H[33m0test tests::d009_wood_floats_iron_sinks_long_run ... FAILED
-test result: FAILED. 445 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.06s

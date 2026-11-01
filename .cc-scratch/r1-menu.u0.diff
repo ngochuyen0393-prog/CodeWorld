@@ -1,8 +1,0 @@
-diff --git a/docs/game-menu.md b/docs/game-menu.md
-index 9c8b219..e256763 100644
---- a/docs/game-menu.md
-+++ b/docs/game-menu.md
-@@ -108 +108,2 @@
--| 单沙箱资产配额 | 皮入沙箱的盒子容量（引擎+魂+皮合计封顶；超限拒绝装戴/换血，资产不丢） | 1MB（SANDBOX_ASSET_QUOTA_BYTES，CODEWORLD_ASSET_QUOTA 覆盖） | ⚠️ **待土豆拍板**（临时默认 1MB≈64MB 内存上限的 1/64，资产=富余量非主粮，Screeps 5MB 同款思路） |
-+| 外桥护栏全家 | 工程保险丝（防灌爆/防卡世界，与 fuel 同性质非玩法数值；design-bridge §2.5） | payload 8KB/信（CODEWORLD_BRIDGE_PAYLOAD_MAX）/ 出站超时 5s（CODEWORLD_BRIDGE_TIMEOUT_S）/ 每沙箱在途 4 条（CODEWORLD_BRIDGE_INFLIGHT）/ 每沙箱每拍 1 发（代码在跑，与接触容差同账本） | ✅ D-001b 代码在跑 |
-+| 单沙箱资产配额 | 皮入沙箱的盒子容量（引擎+皮入配额账；魂走 64MB 内存上限独立账，两账并行。超限拒绝装戴/换血，资产不丢） | 1MB（SANDBOX_ASSET_QUOTA_BYTES，CODEWORLD_ASSET_QUOTA 覆盖） | ⚠️ **待土豆拍板**（临时默认 1MB≈64MB 内存上限的 1/64，资产=富余量非主粮，Screeps 5MB 同款思路） |

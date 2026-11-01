@@ -1,9 +1,0 @@
-   Compiling codeworld v0.1.0 (D:\projects\CodeWorld\.cc-wt-d018\bin\codeworld)
-error[E0425]: cannot find value `sandbox_map` in this scope
-    --> bin\codeworld\src\main.rs:9220:17
-     |
-9220 |                 sandbox_map.last_touching,
-     |                 ^^^^^^^^^^^ not found in this scope
-
-For more information about this error, try `rustc --explain E0425`.
-error: could not compile `codeworld` (bin "codeworld" test) due to 1 previous error

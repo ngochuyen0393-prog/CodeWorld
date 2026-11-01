@@ -1,8 +1,0 @@
-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#while_let_loop
-    = note: `#[warn(clippy::while_let_loop)]` on by default
-
-warning: `codeworld` (bin "codeworld") generated 4 warnings (run `cargo clippy --fix --bin "codeworld" -p codeworld -- ` to apply 1 suggestion)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.06s
-
-warning: `codeworld` (bin "codeworld") generated 2 warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.96s

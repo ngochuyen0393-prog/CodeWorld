@@ -1,5 +1,0 @@
-test result: ok. 446 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.05s
-test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
-test collision::tests::segment_circle_start_inside_returns_zero ... FAILED
-test collision::tests::segment_circle_stationary_inside_returns_zero ... FAILED
-test result: FAILED. 231 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s

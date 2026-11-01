@@ -1,8 +1,0 @@
-diff --git a/docs/game-menu.md b/docs/game-menu.md
-index 9c8b219..e256763 100644
---- a/docs/game-menu.md
-+++ b/docs/game-menu.md
-@@ -108 +108 @@
--| 单沙箱资产配额 | 皮入沙箱的盒子容量（引擎+魂+皮合计封顶；超限拒绝装戴/换血，资产不丢） | 1MB（SANDBOX_ASSET_QUOTA_BYTES，CODEWORLD_ASSET_QUOTA 覆盖） | ⚠️ **待土豆拍板**（临时默认 1MB≈64MB 内存上限的 1/64，资产=富余量非主粮，Screeps 5MB 同款思路） |
-+| 单沙箱资产配额 | 皮入沙箱的盒子容量（引擎+皮入配额账；魂走 64MB 内存上限独立账，两账并行。超限拒绝装戴/换血，资产不丢） | 1MB（SANDBOX_ASSET_QUOTA_BYTES，CODEWORLD_ASSET_QUOTA 覆盖） | ⚠️ **待土豆拍板**（临时默认 1MB≈64MB 内存上限的 1/64，资产=富余量非主粮，Screeps 5MB 同款思路） |
-

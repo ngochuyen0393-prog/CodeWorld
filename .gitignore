@@ -12,3 +12,10 @@ codeworld.db
 assets/avatars/
 # 玩家运行时数据（D-023 造物文件，与 codeworld.db 同类：文件即持久化，不入 git）
 creations/
+# 开源清理 2026-11-01：开发过程废料不入库
+.cc-scratch/
+.cc-bugs.md
+.cc-progress.md
+no
+spike/
+*.log
