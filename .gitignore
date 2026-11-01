@@ -19,3 +19,9 @@ creations/
 no
 spike/
 *.log
+
+# 二轮清理
+.claude/
+.cc-context.md
+spike/
+TASK-*.md
